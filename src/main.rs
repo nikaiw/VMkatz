@@ -22,9 +22,27 @@ use vmkatz::windows::offsets::WIN10_X64_EPROCESS;
 use vmkatz::windows::process;
 
 #[derive(Parser, Debug)]
-#[command(name = "vmkatz", about = "VMware/VBox memory forensics - credential extractor")]
+#[command(
+    name = "vmkatz",
+    version,
+    about = "VM memory forensics - extract credentials from VMware/VirtualBox snapshots and disk images",
+    long_about = "vmkatz extracts Windows credentials from virtual machine memory snapshots and disk images.\n\n\
+        Supported inputs:\n  \
+        - VMware snapshots (.vmsn + .vmem)\n  \
+        - VirtualBox saved states (.sav)\n  \
+        - Disk images for SAM hashes (.vdi, .vmdk, .qcow2)\n  \
+        - VM directories (auto-discovers all files)\n\n\
+        Target: Windows 10 x64 22H2 (build 19045)",
+    after_help = "EXAMPLES:\n  \
+        vmkatz snapshot.vmsn                        Extract LSASS credentials\n  \
+        vmkatz --format ntlm snapshot.vmsn          Output as NTLM hashes\n  \
+        vmkatz disk.vdi                             Extract SAM hashes + LSA secrets\n  \
+        vmkatz /path/to/vm/directory/               Auto-discover and process all files\n  \
+        vmkatz --list-processes snapshot.vmsn        List running processes only\n  \
+        vmkatz -v snapshot.vmsn                     Verbose output with process list",
+)]
 struct Args {
-    /// Path to VMware snapshot (.vmsn/.vmem), VirtualBox saved state (.sav), disk image (.vdi/.vmdk), or VM directory
+    /// Path to a snapshot, disk image, or VM directory
     #[arg(value_name = "FILE_OR_DIR")]
     input_path: String,
 
@@ -32,13 +50,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     list_processes: bool,
 
-    /// Extract SAM hashes from disk image instead of LSASS credentials
+    /// Force SAM hash extraction mode (auto-detected for .vdi/.vmdk/.qcow2)
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
     sam: bool,
 
-    /// Output format: text (default), csv, or ntlm
-    #[arg(long, default_value = "text", value_name = "FORMAT")]
+    /// Output format
+    #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm"])]
     format: String,
 
     /// Verbose output (show memory regions, process list, etc.)
@@ -47,7 +65,15 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    // Show full help (not just error) when no arguments provided
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
+            Args::parse_from(["vmkatz", "--help"]);
+            unreachable!()
+        }
+        Err(e) => e.exit(),
+    };
     let log_level = if args.verbose { "info" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
         .format_timestamp(None)
