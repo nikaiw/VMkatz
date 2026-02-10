@@ -367,12 +367,15 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
 
 /// Process virtual memory: combines a DTB (CR3) with physical memory for address translation.
 /// Optional pagefile reader resolves pages swapped to pagefile.sys on disk.
+/// Optional file-backed resolver serves demand-paged DLL sections from disk.
 pub struct ProcessMemory<'a, P: PhysicalMemory> {
     phys: &'a P,
     walker: PageTableWalker<'a, P>,
     dtb: u64,
     #[cfg(feature = "sam")]
     pagefile: Option<&'a crate::paging::pagefile::PagefileReader>,
+    #[cfg(feature = "sam")]
+    filebacked: Option<&'a crate::paging::filebacked::FileBackedResolver>,
 }
 
 impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
@@ -383,20 +386,24 @@ impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
             dtb,
             #[cfg(feature = "sam")]
             pagefile: None,
+            #[cfg(feature = "sam")]
+            filebacked: None,
         }
     }
 
     #[cfg(feature = "sam")]
-    pub fn with_pagefile(
+    pub fn with_resolvers(
         phys: &'a P,
         dtb: u64,
         pagefile: Option<&'a crate::paging::pagefile::PagefileReader>,
+        filebacked: Option<&'a crate::paging::filebacked::FileBackedResolver>,
     ) -> Self {
         Self {
             phys,
             walker: PageTableWalker::new(phys),
             dtb,
             pagefile,
+            filebacked,
         }
     }
 
@@ -455,6 +462,17 @@ impl<'a, P: PhysicalMemory> VirtualMemory for ProcessMemory<'a, P> {
                     }
                 }
                 Err(ref e) => {
+                    // Try file-backed resolution for demand-paged DLL sections
+                    #[cfg(feature = "sam")]
+                    if let Some(fb) = self.filebacked {
+                        if let Some(page_data) = fb.resolve_page(current_vaddr) {
+                            let page_off = (current_vaddr & 0xFFF) as usize;
+                            buf[offset..offset + chunk]
+                                .copy_from_slice(&page_data[page_off..page_off + chunk]);
+                            offset += chunk;
+                            continue;
+                        }
+                    }
                     log::trace!("Page fault: {} at VA 0x{:x}", e, current_vaddr);
                     buf[offset..offset + chunk].fill(0);
                 }

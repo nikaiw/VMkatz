@@ -356,7 +356,7 @@ pub(crate) fn find_entry<'n, R: Read + Seek>(
 }
 
 /// Read file data ($DATA attribute) into a Vec<u8>.
-fn read_file_data<R: Read + Seek>(
+pub(crate) fn read_file_data<R: Read + Seek>(
     file: &ntfs::NtfsFile,
     reader: &mut R,
 ) -> Result<Vec<u8>> {

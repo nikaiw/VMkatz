@@ -25,20 +25,30 @@ pub type PagefileRef<'a> = Option<&'a crate::paging::pagefile::PagefileReader>;
 #[cfg(not(feature = "sam"))]
 pub type PagefileRef<'a> = ();
 
+/// Disk path reference type: wraps Option<&Path> when sam feature is enabled,
+/// or () when not. Allows a unified function signature across feature configurations.
+#[cfg(feature = "sam")]
+pub type DiskPathRef<'a> = Option<&'a std::path::Path>;
+#[cfg(not(feature = "sam"))]
+pub type DiskPathRef<'a> = ();
+
 /// Find LSASS and extract all credentials.
 /// When a pagefile reader is provided, paged-out memory is resolved from disk.
+/// When a disk path is provided, demand-paged DLL sections are resolved from DLL files.
 pub fn extract_all_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass: &Process,
     _kernel_dtb: u64,
     pagefile: PagefileRef<'_>,
+    disk_path: DiskPathRef<'_>,
 ) -> Result<Vec<Credential>> {
-    // Create virtual memory reader for LSASS (with optional pagefile resolution)
+    // Create initial virtual memory reader for module enumeration
     #[cfg(feature = "sam")]
-    let lsass_vmem = ProcessMemory::with_pagefile(phys, lsass.dtb, pagefile);
+    let lsass_vmem_init = ProcessMemory::with_resolvers(phys, lsass.dtb, pagefile, None);
     #[cfg(not(feature = "sam"))]
-    let lsass_vmem = {
+    let lsass_vmem_init = {
         let _ = pagefile;
+        let _ = disk_path;
         ProcessMemory::new(phys, lsass.dtb)
     };
 
@@ -50,7 +60,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     );
 
     // Enumerate DLLs in LSASS
-    let modules = peb::enumerate_modules(&lsass_vmem, lsass.peb_vaddr, &X64_LDR)?;
+    let modules = peb::enumerate_modules(&lsass_vmem_init, lsass.peb_vaddr, &X64_LDR)?;
 
     log::debug!("LSASS modules:");
     for m in &modules {
@@ -61,6 +71,36 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             m.base_name
         );
     }
+
+    // Build file-backed resolver from disk to serve demand-paged DLL sections
+    #[cfg(feature = "sam")]
+    let filebacked = disk_path.and_then(|p| {
+        match crate::paging::filebacked::FileBackedResolver::from_disk_and_modules(p, &modules) {
+            Ok(fb) if fb.section_count() > 0 => {
+                log::info!(
+                    "File-backed: {} sections, {:.1} MB from {} DLLs",
+                    fb.section_count(),
+                    fb.total_bytes() as f64 / (1024.0 * 1024.0),
+                    modules.len()
+                );
+                Some(fb)
+            }
+            Ok(_) => {
+                log::info!("File-backed: no DLL sections loaded from disk");
+                None
+            }
+            Err(e) => {
+                log::info!("File-backed resolver failed: {}", e);
+                None
+            }
+        }
+    });
+
+    // Create enhanced vmem with file-backed resolution for DLL sections
+    #[cfg(feature = "sam")]
+    let lsass_vmem = ProcessMemory::with_resolvers(phys, lsass.dtb, pagefile, filebacked.as_ref());
+    #[cfg(not(feature = "sam"))]
+    let lsass_vmem = lsass_vmem_init;
 
     let dlls = LsassDlls {
         lsasrv: find_module(&modules, "lsasrv.dll"),
@@ -295,6 +335,13 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         msv_status, wdigest_status, kerberos_status, tspkg_status, dpapi_status,
         ssp_status, livessp_status, credman_status, cloudap_status,
     );
+    #[cfg(feature = "sam")]
+    if let Some(fb) = &filebacked {
+        let resolved = fb.pages_resolved();
+        if resolved > 0 {
+            println!("[+] File-backed: {} DLL pages resolved from disk", resolved);
+        }
+    }
 
     // Merge MSV credentials with unknown LUID (0) into matching credentials by username+domain
     if let Some(orphan) = all_creds.remove(&0) {

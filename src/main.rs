@@ -110,7 +110,8 @@ fn main() -> anyhow::Result<()> {
     // LSASS credential extraction mode
     #[cfg(feature = "sam")]
     {
-        let pagefile_reader = args.disk.as_ref().and_then(|d| {
+        let disk_path_str = args.disk.clone();
+        let pagefile_reader = disk_path_str.as_ref().and_then(|d| {
             match vmkatz::paging::pagefile::PagefileReader::open(Path::new(d)) {
                 Ok(pf) => {
                     println!(
@@ -120,15 +121,16 @@ fn main() -> anyhow::Result<()> {
                     Some(pf)
                 }
                 Err(e) => {
-                    eprintln!("[!] Failed to open pagefile from {}: {}", d, e);
+                    log::info!("No pagefile from {}: {}", d, e);
                     None
                 }
             }
         });
-        return run_lsass(input_path, &args, pagefile_reader.as_ref());
+        let disk_ref = disk_path_str.as_ref().map(|d| Path::new(d.as_str()));
+        return run_lsass(input_path, &args, pagefile_reader.as_ref(), disk_ref);
     }
     #[cfg(not(feature = "sam"))]
-    run_lsass(input_path, &args, Default::default())
+    run_lsass(input_path, &args, Default::default(), Default::default())
 }
 
 #[cfg(feature = "sam")]
@@ -246,11 +248,18 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(not(feature = "sam"))]
     let pagefile: PagefileRef<'_> = Default::default();
 
+    // Disk path for file-backed DLL resolution
+    #[cfg(feature = "sam")]
+    let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> =
+        discovery.disk_files.first().map(|p| p.as_path());
+    #[cfg(not(feature = "sam"))]
+    let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = Default::default();
+
     #[cfg(any(feature = "vmware", feature = "vbox"))]
     for file in &discovery.lsass_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
         println!("\n[*] LSASS: {}", name);
-        if let Err(e) = run_lsass(file, args, pagefile) {
+        if let Err(e) = run_lsass(file, args, pagefile, disk_path) {
             eprintln!("[!] {}: {}", name, e);
         }
     }
@@ -272,7 +281,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>) -> anyhow::Result<()> {
+fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>, disk_path: vmkatz::lsass::finder::DiskPathRef<'_>) -> anyhow::Result<()> {
     let verbose = args.verbose || args.list_processes;
     let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -294,11 +303,12 @@ fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>) -> anyho
                 args,
                 verbose,
                 pagefile,
+                disk_path,
             )
         }
         #[cfg(not(feature = "vbox"))]
         {
-            let _ = pagefile;
+            let _ = (pagefile, disk_path);
             anyhow::bail!("VirtualBox .sav support not enabled (compile with --features vbox)")
         }
     } else {
@@ -330,11 +340,12 @@ fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>) -> anyho
                 args,
                 verbose,
                 pagefile,
+                disk_path,
             )
         }
         #[cfg(not(feature = "vmware"))]
         {
-            let _ = pagefile;
+            let _ = (pagefile, disk_path);
             anyhow::bail!("VMware .vmem/.vmsn support not enabled (compile with --features vmware)")
         }
     }
@@ -346,6 +357,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     args: &Args,
     verbose: bool,
     pagefile: PagefileRef<'_>,
+    disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
 ) -> anyhow::Result<()> {
     let layer = make_layer()?;
 
@@ -386,7 +398,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 
     // Extract credentials
     let credentials =
-        lsass::finder::extract_all_credentials(&layer, lsass_proc, system.dtb, pagefile)
+        lsass::finder::extract_all_credentials(&layer, lsass_proc, system.dtb, pagefile, disk_path)
             .context("Credential extraction failed")?;
 
     // Report pagefile resolution stats
