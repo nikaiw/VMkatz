@@ -100,168 +100,181 @@ pub fn extract_msv_sessions(
 
     let _ = msv_size; // Used in full credential extraction
 
-    let mut sessions = Vec::new();
-    let mut seen_luids = std::collections::HashSet::new();
+    // Use HashMap to allow metadata enrichment when a session is re-discovered
+    // by a variant with richer metadata (e.g. variant 2 has logon_time, variant 0 doesn't).
+    let mut session_map: std::collections::HashMap<u64, MsvSessionInfo> = std::collections::HashMap::new();
 
     // Walk all buckets of the pattern-resolved hash table
     if let Some(base) = list_base {
         log::info!("MSV session discovery: list=0x{:x} buckets={}", base, bucket_count);
         for offsets in MSV_OFFSET_VARIANTS {
-            let variant_start = sessions.len();
-            for bucket_idx in 0..bucket_count {
-                let bucket_addr = base + (bucket_idx as u64) * 16;
-                let head_flink = match vmem.read_virt_u64(bucket_addr) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                if head_flink == 0 || head_flink == bucket_addr {
-                    continue;
-                }
-
-                let mut current = head_flink;
-                let mut visited = std::collections::HashSet::new();
-
-                for _ in 0..256 {
-                    if current == bucket_addr || visited.contains(&current) || current == 0 {
-                        break;
-                    }
-                    visited.insert(current);
-
-                    let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
-                    let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
-                    let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
-
-                    if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
-                        seen_luids.insert(luid);
-                        let (logon_type, session_id, logon_time, logon_server, sid) =
-                            extract_session_metadata(vmem, current, offsets);
-                        sessions.push(MsvSessionInfo {
-                            luid, username, domain, logon_type, session_id,
-                            logon_time, logon_server, sid,
-                        });
-                    }
-
-                    current = match vmem.read_virt_u64(current + offsets.flink) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                }
-            }
-            if sessions.len() > variant_start {
+            let pre = session_map.len();
+            walk_session_buckets(vmem, base, bucket_count, offsets, &mut session_map);
+            if session_map.len() > pre {
                 log::info!("MSV sessions: variant luid=0x{:x} found {} sessions across {} buckets",
-                    offsets.luid, sessions.len() - variant_start, bucket_count);
+                    offsets.luid, session_map.len() - pre, bucket_count);
                 break;
             }
         }
     }
 
     // Also try .data scan candidates (single list heads) if pattern didn't find enough
-    if sessions.len() < 3 {
+    if session_map.len() < 3 {
         let list_addrs = find_all_logon_session_list_candidates(vmem, &pe, msv_base).unwrap_or_default();
 
         for list_addr in &list_addrs {
             for offsets in MSV_OFFSET_VARIANTS {
-                let head_flink = match vmem.read_virt_u64(*list_addr) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                if head_flink == 0 || head_flink == *list_addr {
-                    continue;
-                }
-
-                let mut current = head_flink;
-                let mut visited = std::collections::HashSet::new();
-                let mut found_any = false;
-
-                for _ in 0..256 {
-                    if current == *list_addr || visited.contains(&current) || current == 0 {
-                        break;
-                    }
-                    visited.insert(current);
-
-                    let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
-                    let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
-                    let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
-
-                    if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
-                        found_any = true;
-                        seen_luids.insert(luid);
-                        let (logon_type, session_id, logon_time, logon_server, sid) =
-                            extract_session_metadata(vmem, current, offsets);
-                        sessions.push(MsvSessionInfo {
-                            luid, username, domain, logon_type, session_id,
-                            logon_time, logon_server, sid,
-                        });
-                    }
-
-                    current = match vmem.read_virt_u64(current + offsets.flink) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                }
-
-                if found_any {
+                let pre = session_map.len();
+                walk_session_list(vmem, *list_addr, offsets, &mut session_map);
+                if session_map.len() > pre {
                     break;
                 }
             }
         }
     }
 
-    // Always try hash table walk to discover sessions in other buckets.
-    // The linked list walk above may only traverse one bucket; the hash table walk covers all.
+    // Always try ALL hash tables with ALL variants to enrich session metadata.
+    // Different tables hold different entries with different variants, and variants
+    // with higher offsets (e.g. luid=0x90) provide richer metadata (logon_time, SID).
     {
-        let pre_count = sessions.len();
+        let pre_count = session_map.len();
         if let Ok(tables) = find_inline_hash_table(vmem, &pe, msv_base) {
             for (table_addr, bucket_count) in &tables {
                 for offsets in MSV_OFFSET_VARIANTS {
-                    let variant_start = sessions.len();
-                    for bucket_idx in 0..*bucket_count {
-                        let bucket_addr = *table_addr + (bucket_idx as u64) * 16;
-                        let flink = match vmem.read_virt_u64(bucket_addr) {
-                            Ok(f) => f,
-                            Err(_) => continue,
-                        };
-                        if flink == bucket_addr || flink == 0 {
-                            continue;
-                        }
-                        let mut current = flink;
-                        let mut visited = std::collections::HashSet::new();
-                        loop {
-                            if current == bucket_addr || visited.contains(&current) || current == 0 {
-                                break;
-                            }
-                            visited.insert(current);
-                            let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
-                            let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
-                            let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
-                            if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
-                                seen_luids.insert(luid);
-                                let (logon_type, session_id, logon_time, logon_server, sid) =
-                                    extract_session_metadata(vmem, current, offsets);
-                                sessions.push(MsvSessionInfo {
-                                    luid, username, domain, logon_type, session_id,
-                                    logon_time, logon_server, sid,
-                                });
-                            }
-                            current = match vmem.read_virt_u64(current + offsets.flink) {
-                                Ok(f) => f,
-                                Err(_) => break,
-                            };
-                        }
-                    }
-                    // If this variant found new sessions, it's the right one for this table
-                    if sessions.len() > variant_start {
-                        break;
-                    }
+                    walk_session_buckets(vmem, *table_addr, *bucket_count, offsets, &mut session_map);
                 }
             }
         }
-        if sessions.len() > pre_count {
-            log::info!("Hash table walk found {} additional sessions", sessions.len() - pre_count);
+        if session_map.len() > pre_count {
+            log::info!("Hash table walk found {} additional sessions", session_map.len() - pre_count);
         }
     }
 
-    sessions
+    session_map.into_values().collect()
+}
+
+/// Walk a hash table (array of LIST_ENTRY buckets) and insert/merge sessions.
+fn walk_session_buckets(
+    vmem: &impl VirtualMemory,
+    base: u64,
+    bucket_count: usize,
+    offsets: &MsvOffsets,
+    session_map: &mut std::collections::HashMap<u64, MsvSessionInfo>,
+) {
+    for bucket_idx in 0..bucket_count {
+        let bucket_addr = base + (bucket_idx as u64) * 16;
+        let head_flink = match vmem.read_virt_u64(bucket_addr) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if head_flink == 0 || head_flink == bucket_addr {
+            continue;
+        }
+
+        let mut current = head_flink;
+        let mut visited = std::collections::HashSet::new();
+
+        for _ in 0..256 {
+            if current == bucket_addr || visited.contains(&current) || current == 0 {
+                break;
+            }
+            visited.insert(current);
+
+            let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+            let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
+            let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
+
+            if !username.is_empty() && luid != 0 {
+                let (logon_type, session_id, logon_time, logon_server, sid) =
+                    extract_session_metadata(vmem, current, offsets);
+                let info = MsvSessionInfo {
+                    luid, username, domain, logon_type, session_id,
+                    logon_time, logon_server, sid,
+                };
+                merge_session(session_map, info);
+            }
+
+            current = match vmem.read_virt_u64(current + offsets.flink) {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+        }
+    }
+}
+
+/// Walk a single linked list and insert/merge sessions.
+fn walk_session_list(
+    vmem: &impl VirtualMemory,
+    list_addr: u64,
+    offsets: &MsvOffsets,
+    session_map: &mut std::collections::HashMap<u64, MsvSessionInfo>,
+) {
+    let head_flink = match vmem.read_virt_u64(list_addr) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if head_flink == 0 || head_flink == list_addr {
+        return;
+    }
+
+    let mut current = head_flink;
+    let mut visited = std::collections::HashSet::new();
+
+    for _ in 0..256 {
+        if current == list_addr || visited.contains(&current) || current == 0 {
+            break;
+        }
+        visited.insert(current);
+
+        let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+        let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
+        let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
+
+        if !username.is_empty() && luid != 0 {
+            let (logon_type, session_id, logon_time, logon_server, sid) =
+                extract_session_metadata(vmem, current, offsets);
+            let info = MsvSessionInfo {
+                luid, username, domain, logon_type, session_id,
+                logon_time, logon_server, sid,
+            };
+            merge_session(session_map, info);
+        }
+
+        current = match vmem.read_virt_u64(current + offsets.flink) {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+    }
+}
+
+/// Insert or merge a session into the map. When re-discovering a LUID,
+/// enrich with richer metadata (prefer non-zero logon_time, non-empty SID, etc.).
+fn merge_session(
+    map: &mut std::collections::HashMap<u64, MsvSessionInfo>,
+    new: MsvSessionInfo,
+) {
+    match map.entry(new.luid) {
+        std::collections::hash_map::Entry::Vacant(e) => { e.insert(new); },
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let existing = e.get_mut();
+            // Enrich: prefer non-zero/non-empty values from the new variant
+            if existing.logon_time == 0 && new.logon_time != 0 {
+                existing.logon_time = new.logon_time;
+            }
+            if existing.logon_type == 0 && new.logon_type != 0 {
+                existing.logon_type = new.logon_type;
+            }
+            if existing.session_id == 0 && new.session_id != 0 {
+                existing.session_id = new.session_id;
+            }
+            if existing.sid.is_empty() && !new.sid.is_empty() {
+                existing.sid = new.sid;
+            }
+            if existing.logon_server.is_empty() && !new.logon_server.is_empty() {
+                existing.logon_server = new.logon_server;
+            }
+        }
+    }
 }
 
 /// Extract session metadata from an MSV list entry.
