@@ -1,3 +1,30 @@
+/// Convert Windows FILETIME (100-ns ticks since 1601-01-01) to a readable string.
+fn filetime_to_string(ft: u64) -> String {
+    if ft == 0 || ft == 0x7FFF_FFFF_FFFF_FFFF {
+        return "N/A".to_string();
+    }
+    // Windows epoch (1601-01-01) to Unix epoch (1970-01-01) = 11644473600 seconds
+    let unix_secs = (ft / 10_000_000).saturating_sub(11_644_473_600);
+    let secs = unix_secs % 60;
+    let mins = (unix_secs / 60) % 60;
+    let hours = (unix_secs / 3600) % 24;
+    let days = unix_secs / 86400;
+    // Rough date from days since unix epoch
+    let mut y = 1970u64;
+    let mut rem = days;
+    loop {
+        let days_in_year = if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) { 366 } else { 365 };
+        if rem < days_in_year { break; }
+        rem -= days_in_year;
+        y += 1;
+    }
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    while m < 12 && rem >= mdays[m] { rem -= mdays[m]; m += 1; }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m + 1, rem + 1, hours, mins, secs)
+}
+
 /// Aggregated credential for a logon session.
 #[derive(Debug)]
 pub struct Credential {
@@ -41,6 +68,48 @@ pub struct KerberosCredential {
     pub username: String,
     pub domain: String,
     pub password: String,
+    pub tickets: Vec<KerberosTicket>,
+}
+
+/// Kerberos ticket type (TGT, TGS, client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KerberosTicketType {
+    Tgt,
+    Tgs,
+    Client,
+}
+
+impl std::fmt::Display for KerberosTicketType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tgt => write!(f, "TGT"),
+            Self::Tgs => write!(f, "TGS"),
+            Self::Client => write!(f, "Client"),
+        }
+    }
+}
+
+/// Extracted Kerberos ticket (TGT/TGS).
+#[derive(Debug)]
+pub struct KerberosTicket {
+    pub ticket_type: KerberosTicketType,
+    pub service_name: Vec<String>,
+    pub service_name_type: i16,
+    pub client_name: Vec<String>,
+    pub client_name_type: i16,
+    pub domain_name: String,
+    pub target_domain_name: String,
+    pub ticket_flags: u32,
+    pub key_type: u32,
+    pub session_key: Vec<u8>,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub renew_until: u64,
+    pub ticket_enc_type: u32,
+    pub ticket_kvno: u32,
+    pub ticket_blob: Vec<u8>,
+    /// Pre-encoded .kirbi (KRB-CRED ASN.1 DER)
+    pub kirbi: Vec<u8>,
 }
 
 /// TsPkg credential.
@@ -117,7 +186,7 @@ impl Credential {
     pub fn has_credentials(&self) -> bool {
         self.msv.is_some()
             || self.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
-            || self.kerberos.as_ref().is_some_and(|k| !k.password.is_empty())
+            || self.kerberos.as_ref().is_some_and(|k| !k.password.is_empty() || !k.tickets.is_empty())
             || self.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
             || !self.dpapi.is_empty()
             || !self.credman.is_empty()
@@ -157,7 +226,20 @@ impl std::fmt::Display for Credential {
         }
         if let Some(krb) = &self.kerberos {
             writeln!(f, "  [Kerberos]")?;
-            writeln!(f, "    Password: {}", krb.password)?;
+            if !krb.password.is_empty() {
+                writeln!(f, "    Password: {}", krb.password)?;
+            }
+            for ticket in &krb.tickets {
+                writeln!(f, "    [{}] {}", ticket.ticket_type, ticket.service_name.join("/"))?;
+                writeln!(f, "      Domain : {}", ticket.domain_name)?;
+                writeln!(f, "      Client : {}", ticket.client_name.join("/"))?;
+                writeln!(f, "      EncType: {} | KeyType: {}", ticket.ticket_enc_type, ticket.key_type)?;
+                writeln!(f, "      Flags  : 0x{:08x}", ticket.ticket_flags)?;
+                writeln!(f, "      Start  : {}", filetime_to_string(ticket.start_time))?;
+                writeln!(f, "      End    : {}", filetime_to_string(ticket.end_time))?;
+                writeln!(f, "      Kirbi  : {} bytes (base64: {})", ticket.kirbi.len(),
+                    crate::lsass::crypto::base64_encode(&ticket.kirbi))?;
+            }
         }
         if let Some(ts) = &self.tspkg {
             writeln!(f, "  [TsPkg]")?;
