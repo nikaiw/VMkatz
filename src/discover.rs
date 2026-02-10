@@ -47,6 +47,8 @@ pub fn discover_vm_files(dir: &Path) -> Result<VmDiscovery> {
     discover_vmdk(dir, &all_files, &mut disk_files);
     discover_vdi(&all_files, &scan_dirs, &mut disk_files);
     discover_qcow2(&all_files, &mut disk_files);
+    discover_vhdx(&all_files, &mut disk_files);
+    discover_vhd(&all_files, &mut disk_files);
 
     // Sort for consistent ordering
     lsass_files.sort();
@@ -201,6 +203,26 @@ fn discover_qcow2(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
     for file in all_files {
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("qcow2") || ext.eq_ignore_ascii_case("qcow") {
+            out.push(file.clone());
+        }
+    }
+}
+
+/// Find VHDX files.
+fn discover_vhdx(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
+    for file in all_files {
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("vhdx") {
+            out.push(file.clone());
+        }
+    }
+}
+
+/// Find VHD files.
+fn discover_vhd(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
+    for file in all_files {
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("vhd") {
             out.push(file.clone());
         }
     }

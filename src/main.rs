@@ -26,14 +26,14 @@ use vmkatz::windows::process;
 #[command(
     name = "vmkatz",
     version,
-    about = "VM memory forensics - extract credentials from VMware/VirtualBox snapshots and disk images",
+    about = "VM memory forensics - extract credentials from VMware/VirtualBox/Hyper-V snapshots and disk images",
     long_about = "vmkatz extracts Windows credentials from virtual machine memory snapshots and disk images.\n\n\
         Supported inputs:\n  \
         - VMware snapshots (.vmsn + .vmem)\n  \
         - VirtualBox saved states (.sav)\n  \
-        - Disk images for SAM hashes (.vdi, .vmdk, .qcow2)\n  \
+        - Disk images for SAM hashes (.vdi, .vmdk, .qcow2, .vhdx, .vhd)\n  \
         - VM directories (auto-discovers all files)\n\n\
-        Target: Windows 10 x64 22H2 (build 19045)",
+        Target: Windows 7 SP1 through Windows 11 x64",
     after_help = "EXAMPLES:\n  \
         vmkatz snapshot.vmsn                        Extract LSASS credentials\n  \
         vmkatz --format ntlm snapshot.vmsn          Output as NTLM hashes\n  \
@@ -52,7 +52,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     list_processes: bool,
 
-    /// Force SAM hash extraction mode (auto-detected for .vdi/.vmdk/.qcow2)
+    /// Force SAM hash extraction mode (auto-detected for .vdi/.vmdk/.qcow2/.vhdx/.vhd)
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
     sam: bool,
@@ -101,7 +101,9 @@ fn main() -> anyhow::Result<()> {
             || ext.eq_ignore_ascii_case("vdi")
             || ext.eq_ignore_ascii_case("vmdk")
             || ext.eq_ignore_ascii_case("qcow2")
-            || ext.eq_ignore_ascii_case("qcow");
+            || ext.eq_ignore_ascii_case("qcow")
+            || ext.eq_ignore_ascii_case("vhdx")
+            || ext.eq_ignore_ascii_case("vhd");
         if sam_mode {
             return run_sam(input_path, &args);
         }

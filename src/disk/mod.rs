@@ -1,5 +1,7 @@
 pub mod qcow2;
 pub mod vdi;
+pub mod vhd;
+pub mod vhdx;
 pub mod vmdk;
 
 use std::io::{Read, Seek};
@@ -31,6 +33,14 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         }
         "qcow2" | "qcow" => {
             let disk = qcow2::QcowDisk::open(path)?;
+            Ok(Box::new(disk))
+        }
+        "vhdx" => {
+            let disk = vhdx::VhdxDisk::open(path)?;
+            Ok(Box::new(disk))
+        }
+        "vhd" => {
+            let disk = vhd::VhdDisk::open(path)?;
             Ok(Box::new(disk))
         }
         _ => Err(crate::error::GovmemError::ProcessNotFound(format!(
