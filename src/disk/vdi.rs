@@ -155,9 +155,7 @@ fn find_parent_via_vbox(child_path: &Path, parent_uuid: &VdiUuid) -> Option<Path
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("vbox") {
-                    if let Some(found) =
-                        parse_vbox_for_disk(&path, &parent_uuid_str, search_dir)
-                    {
+                    if let Some(found) = parse_vbox_for_disk(&path, &parent_uuid_str, search_dir) {
                         return Some(found);
                     }
                 }
@@ -293,13 +291,19 @@ impl VdiDisk {
     }
 
     /// Read from a specific block, returning bytes read.
-    fn read_block(&mut self, block_idx: usize, offset_in_block: u32, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_block(
+        &mut self,
+        block_idx: usize,
+        offset_in_block: u32,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
         let bat_entry = self.bat.get(block_idx).copied().unwrap_or(BAT_UNALLOCATED);
 
         if bat_entry == BAT_UNALLOCATED {
             if let Some(ref mut parent) = self.parent {
                 // Delegate to parent for differencing images
-                let virtual_offset = block_idx as u64 * self.block_size as u64 + offset_in_block as u64;
+                let virtual_offset =
+                    block_idx as u64 * self.block_size as u64 + offset_in_block as u64;
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
@@ -309,9 +313,8 @@ impl VdiDisk {
         }
 
         // data_offset = offset_data + bat_entry * block_size + offset_in_block
-        let data_offset = self.offset_data
-            + bat_entry as u64 * self.block_size as u64
-            + offset_in_block as u64;
+        let data_offset =
+            self.offset_data + bat_entry as u64 * self.block_size as u64 + offset_in_block as u64;
         self.file.seek(SeekFrom::Start(data_offset))?;
         self.file.read(buf)
     }

@@ -15,38 +15,32 @@ const VHDX_METADATA_SIGNATURE: u64 = 0x6174_6164_6174_656D; // "metadata" LE
 
 /// BAT region GUID: {2DC27766-F623-4200-9D64-115E9BFD4A08}
 const BAT_REGION_GUID: [u8; 16] = [
-    0x66, 0x77, 0xC2, 0x2D, 0x23, 0xF6, 0x00, 0x42,
-    0x9D, 0x64, 0x11, 0x5E, 0x9B, 0xFD, 0x4A, 0x08,
+    0x66, 0x77, 0xC2, 0x2D, 0x23, 0xF6, 0x00, 0x42, 0x9D, 0x64, 0x11, 0x5E, 0x9B, 0xFD, 0x4A, 0x08,
 ];
 
 /// Metadata region GUID: {8B7CA206-4790-4B9A-B8FE-575F050F886E}
 const METADATA_REGION_GUID: [u8; 16] = [
-    0x06, 0xA2, 0x7C, 0x8B, 0x90, 0x47, 0x9A, 0x4B,
-    0xB8, 0xFE, 0x57, 0x5F, 0x05, 0x0F, 0x88, 0x6E,
+    0x06, 0xA2, 0x7C, 0x8B, 0x90, 0x47, 0x9A, 0x4B, 0xB8, 0xFE, 0x57, 0x5F, 0x05, 0x0F, 0x88, 0x6E,
 ];
 
 /// File Parameters metadata GUID: {CAA16737-FA36-4D43-B3B6-33F0AA44E76B}
 const META_FILE_PARAMETERS: [u8; 16] = [
-    0x37, 0x67, 0xA1, 0xCA, 0x36, 0xFA, 0x43, 0x4D,
-    0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44, 0xE7, 0x6B,
+    0x37, 0x67, 0xA1, 0xCA, 0x36, 0xFA, 0x43, 0x4D, 0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44, 0xE7, 0x6B,
 ];
 
 /// Virtual Disk Size metadata GUID: {2FA54224-CD1B-4876-B211-5DBED83BF4B8}
 const META_VIRTUAL_DISK_SIZE: [u8; 16] = [
-    0x24, 0x42, 0xA5, 0x2F, 0x1B, 0xCD, 0x76, 0x48,
-    0xB2, 0x11, 0x5D, 0xBE, 0xD8, 0x3B, 0xF4, 0xB8,
+    0x24, 0x42, 0xA5, 0x2F, 0x1B, 0xCD, 0x76, 0x48, 0xB2, 0x11, 0x5D, 0xBE, 0xD8, 0x3B, 0xF4, 0xB8,
 ];
 
 /// Logical Sector Size metadata GUID: {8141BF1D-A96F-4709-BA47-F233A8FAAB5F}
 const META_LOGICAL_SECTOR_SIZE: [u8; 16] = [
-    0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47,
-    0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA, 0xAB, 0x5F,
+    0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47, 0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA, 0xAB, 0x5F,
 ];
 
 /// Parent Locator metadata GUID: {A8D35F2D-B30B-454D-ABF7-D3D84834AB0C}
 const META_PARENT_LOCATOR: [u8; 16] = [
-    0x2D, 0x5F, 0xD3, 0xA8, 0x0B, 0xB3, 0x4D, 0x45,
-    0xAB, 0xF7, 0xD3, 0xD8, 0x48, 0x34, 0xAB, 0x0C,
+    0x2D, 0x5F, 0xD3, 0xA8, 0x0B, 0xB3, 0x4D, 0x45, 0xAB, 0xF7, 0xD3, 0xD8, 0x48, 0x34, 0xAB, 0x0C,
 ];
 
 /// BAT payload block states.
@@ -155,9 +149,7 @@ fn parse_headers(file: &mut File) -> Result<VhdxHeader> {
         }
     }
 
-    best.ok_or_else(|| {
-        GovmemError::ProcessNotFound("No valid VHDX header found".to_string())
-    })
+    best.ok_or_else(|| GovmemError::ProcessNotFound("No valid VHDX header found".to_string()))
 }
 
 /// Parse region table at the given offset, extract BAT and metadata region info.
@@ -293,10 +285,7 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
 }
 
 /// Parse parent locator from metadata to find the parent VHDX path.
-fn parse_parent_locator(
-    file: &mut File,
-    metadata_offset: u64,
-) -> Result<Option<String>> {
+fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<String>> {
     // Re-read metadata entries to find parent locator
     file.seek(SeekFrom::Start(metadata_offset + 8))?; // skip signature
     let mut hdr_rest = [0u8; 2];
@@ -563,8 +552,7 @@ impl VhdxDisk {
             PAYLOAD_BLOCK_NOT_PRESENT => {
                 // Dynamic: zeros. Differencing: parent.
                 if let Some(ref mut parent) = self.parent {
-                    let virtual_offset =
-                        block_index * self.block_size as u64 + offset_in_block;
+                    let virtual_offset = block_index * self.block_size as u64 + offset_in_block;
                     parent.seek(SeekFrom::Start(virtual_offset))?;
                     parent.read(buf)
                 } else {
@@ -608,8 +596,7 @@ impl VhdxDisk {
         if sb_state != 6 || sb_file_offset == 0 {
             // Sector bitmap not present — fall through to parent
             if let Some(ref mut parent) = self.parent {
-                let virtual_offset =
-                    block_index * self.block_size as u64 + offset_in_block;
+                let virtual_offset = block_index * self.block_size as u64 + offset_in_block;
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
@@ -645,8 +632,7 @@ impl VhdxDisk {
                 self.file.read_exact(&mut buf[filled..filled + chunk])?;
             } else if let Some(ref mut parent) = self.parent {
                 // Read from parent
-                let virtual_offset =
-                    block_index * block_size + pos_in_block;
+                let virtual_offset = block_index * block_size + pos_in_block;
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 parent.read_exact(&mut buf[filled..filled + chunk])?;
             } else {
@@ -682,7 +668,8 @@ impl Read for VhdxDisk {
             let avail_in_block = (block_size - offset_in_block) as usize;
             let chunk = (to_read - total).min(avail_in_block);
 
-            let n = self.read_block(block_index, offset_in_block, &mut buf[total..total + chunk])?;
+            let n =
+                self.read_block(block_index, offset_in_block, &mut buf[total..total + chunk])?;
             if n == 0 {
                 break;
             }

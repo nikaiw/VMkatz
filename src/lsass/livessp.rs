@@ -95,11 +95,18 @@ pub fn extract_livessp_credentials(
                 .unwrap_or_default();
 
             if !username.is_empty() {
-                let password = crate::lsass::crypto::decrypt_unicode_string_password(vmem, supp_ptr + SUPP_PASSWORD, keys);
+                let password = crate::lsass::crypto::decrypt_unicode_string_password(
+                    vmem,
+                    supp_ptr + SUPP_PASSWORD,
+                    keys,
+                );
 
                 log::debug!(
                     "LiveSSP: LUID=0x{:x} user={} domain={} pwd_len={}",
-                    luid, username, domain, password.len()
+                    luid,
+                    username,
+                    domain,
+                    password.len()
                 );
                 results.push((
                     luid,
@@ -118,9 +125,15 @@ pub fn extract_livessp_credentials(
         };
     }
 
-    let with_passwords = results.iter().filter(|(_, c)| !c.password.is_empty()).count();
-    log::info!("LiveSSP: found {} entries ({} with passwords)", results.len(), with_passwords);
+    let with_passwords = results
+        .iter()
+        .filter(|(_, c)| !c.password.is_empty())
+        .count();
+    log::info!(
+        "LiveSSP: found {} entries ({} with passwords)",
+        results.len(),
+        with_passwords
+    );
 
     Ok(results)
 }
-

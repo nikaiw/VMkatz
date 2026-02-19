@@ -23,7 +23,11 @@ impl<'a> EprocessReader<'a> {
     }
 
     /// Read the ImageFileName (15-byte ASCII) from an EPROCESS at the given physical address.
-    pub fn read_image_name(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<String> {
+    pub fn read_image_name(
+        &self,
+        phys: &impl PhysicalMemory,
+        eprocess_phys: u64,
+    ) -> Result<String> {
         let mut buf = [0u8; 15];
         phys.read_phys(eprocess_phys + self.offsets.image_file_name, &mut buf)?;
         // ImageFileName is null-terminated ASCII; filter to printable bytes

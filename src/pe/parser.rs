@@ -23,7 +23,10 @@ impl PeHeaders {
         // DOS header: MZ signature
         let mz = vmem.read_virt_u16(base)?;
         if mz != 0x5A4D {
-            return Err(GovmemError::PeError(base, "Invalid MZ signature".to_string()));
+            return Err(GovmemError::PeError(
+                base,
+                "Invalid MZ signature".to_string(),
+            ));
         }
 
         // e_lfanew at offset 0x3C
@@ -33,7 +36,10 @@ impl PeHeaders {
         // PE signature
         let pe_sig = vmem.read_virt_u32(pe_offset)?;
         if pe_sig != 0x00004550 {
-            return Err(GovmemError::PeError(base, "Invalid PE signature".to_string()));
+            return Err(GovmemError::PeError(
+                base,
+                "Invalid PE signature".to_string(),
+            ));
         }
 
         // COFF header (20 bytes after PE signature)

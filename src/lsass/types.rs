@@ -13,16 +13,47 @@ fn filetime_to_string(ft: u64) -> String {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let days_in_year = if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) { 366 } else { 365 };
-        if rem < days_in_year { break; }
+        let days_in_year =
+            if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+                366
+            } else {
+                365
+            };
+        if rem < days_in_year {
+            break;
+        }
         rem -= days_in_year;
         y += 1;
     }
     let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0usize;
-    while m < 12 && rem >= mdays[m] { rem -= mdays[m]; m += 1; }
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m + 1, rem + 1, hours, mins, secs)
+    while m < 12 && rem >= mdays[m] {
+        rem -= mdays[m];
+        m += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y,
+        m + 1,
+        rem + 1,
+        hours,
+        mins,
+        secs
+    )
 }
 
 /// Human-readable Windows logon type.
@@ -211,13 +242,22 @@ impl Credential {
     /// Returns true if this credential has any useful extracted data.
     pub fn has_credentials(&self) -> bool {
         self.msv.is_some()
-            || self.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
-            || self.kerberos.as_ref().is_some_and(|k| !k.password.is_empty() || !k.tickets.is_empty())
+            || self
+                .wdigest
+                .as_ref()
+                .is_some_and(|w| !w.password.is_empty())
+            || self
+                .kerberos
+                .as_ref()
+                .is_some_and(|k| !k.password.is_empty() || !k.tickets.is_empty())
             || self.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
             || !self.dpapi.is_empty()
             || !self.credman.is_empty()
             || self.ssp.as_ref().is_some_and(|s| !s.password.is_empty())
-            || self.livessp.as_ref().is_some_and(|l| !l.password.is_empty())
+            || self
+                .livessp
+                .as_ref()
+                .is_some_and(|l| !l.password.is_empty())
             || self.cloudap.is_some()
     }
 }
@@ -233,7 +273,12 @@ impl std::fmt::Display for Credential {
         };
         writeln!(f, "  LUID: 0x{:x}{}", self.luid, luid_label)?;
         if self.session_id != 0 || self.logon_type != 0 {
-            writeln!(f, "  Session: {} | LogonType: {}", self.session_id, logon_type_name(self.logon_type))?;
+            writeln!(
+                f,
+                "  Session: {} | LogonType: {}",
+                self.session_id,
+                logon_type_name(self.logon_type)
+            )?;
         }
         writeln!(f, "  Username: {}", self.username)?;
         writeln!(f, "  Domain: {}", self.domain)?;
@@ -269,15 +314,32 @@ impl std::fmt::Display for Credential {
                 writeln!(f, "    Password: {}", krb.password)?;
             }
             for ticket in &krb.tickets {
-                writeln!(f, "    [{}] {}", ticket.ticket_type, ticket.service_name.join("/"))?;
+                writeln!(
+                    f,
+                    "    [{}] {}",
+                    ticket.ticket_type,
+                    ticket.service_name.join("/")
+                )?;
                 writeln!(f, "      Domain : {}", ticket.domain_name)?;
                 writeln!(f, "      Client : {}", ticket.client_name.join("/"))?;
-                writeln!(f, "      EncType: {} | KeyType: {}", ticket.ticket_enc_type, ticket.key_type)?;
+                writeln!(
+                    f,
+                    "      EncType: {} | KeyType: {}",
+                    ticket.ticket_enc_type, ticket.key_type
+                )?;
                 writeln!(f, "      Flags  : 0x{:08x}", ticket.ticket_flags)?;
-                writeln!(f, "      Start  : {}", filetime_to_string(ticket.start_time))?;
+                writeln!(
+                    f,
+                    "      Start  : {}",
+                    filetime_to_string(ticket.start_time)
+                )?;
                 writeln!(f, "      End    : {}", filetime_to_string(ticket.end_time))?;
-                writeln!(f, "      Kirbi  : {} bytes (base64: {})", ticket.kirbi.len(),
-                    crate::lsass::crypto::base64_encode(&ticket.kirbi))?;
+                writeln!(
+                    f,
+                    "      Kirbi  : {} bytes (base64: {})",
+                    ticket.kirbi.len(),
+                    crate::lsass::crypto::base64_encode(&ticket.kirbi)
+                )?;
             }
         }
         if let Some(ts) = &self.tspkg {

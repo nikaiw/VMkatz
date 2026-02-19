@@ -32,10 +32,7 @@ impl PageTableEntry {
     /// not prototype (bit 11=0), and non-zero (has pagefile info).
     /// Bits 1-4 = pagefile number, bits 32-63 = page offset in pagefile.
     pub fn is_pagefile(&self) -> bool {
-        self.0 != 0
-            && (self.0 & 1) == 0
-            && (self.0 & (1 << 10)) == 0
-            && (self.0 & (1 << 11)) == 0
+        self.0 != 0 && (self.0 & 1) == 0 && (self.0 & (1 << 10)) == 0 && (self.0 & (1 << 11)) == 0
     }
 
     /// Pagefile number from bits 1-4 (usually 0 for primary pagefile.sys).

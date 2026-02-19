@@ -4,9 +4,9 @@
 //! These are stored in `SECURITY\Cache\NL$n` values and encrypted with
 //! the NL$KM key (an LSA secret). Output is hashcat mode 2100 format.
 
-use crate::error::{GovmemError, Result};
-use super::hive::Hive;
 use super::hashes::{aes128_cbc_decrypt, decode_utf16le};
+use super::hive::Hive;
+use crate::error::{GovmemError, Result};
 
 /// A single domain cached credential entry.
 #[derive(Debug)]
@@ -136,7 +136,11 @@ pub fn extract_cached_credentials(
         // Encrypted data starts at 0x60
         let encrypted = &data[0x60..];
         if encrypted.len() < 0x48 + user_length {
-            log::warn!("NL${}: encrypted data too short ({} bytes)", i, encrypted.len());
+            log::warn!(
+                "NL${}: encrypted data too short ({} bytes)",
+                i,
+                encrypted.len()
+            );
             continue;
         }
 
@@ -181,12 +185,12 @@ pub fn extract_cached_credentials(
 
         // Extract DNS domain name after domain (with padding)
         let dns_offset = domain_offset + pad4(domain_name_length);
-        let dns_domain = if dns_domain_length > 0 && dns_offset + dns_domain_length <= plaintext.len()
-        {
-            decode_utf16le(&plaintext[dns_offset..dns_offset + dns_domain_length])
-        } else {
-            String::new()
-        };
+        let dns_domain =
+            if dns_domain_length > 0 && dns_offset + dns_domain_length <= plaintext.len() {
+                decode_utf16le(&plaintext[dns_offset..dns_offset + dns_domain_length])
+            } else {
+                String::new()
+            };
 
         log::info!(
             "NL${}: user={} domain={} dns={} hash={}",

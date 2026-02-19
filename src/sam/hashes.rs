@@ -5,12 +5,12 @@
 
 use aes::Aes128;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-use des::cipher::{BlockDecrypt, KeyInit};
 use des::cipher::generic_array::GenericArray;
+use des::cipher::{BlockDecrypt, KeyInit};
 
-use crate::error::{GovmemError, Result};
 use super::hive::Hive;
 use super::SamEntry;
+use crate::error::{GovmemError, Result};
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
@@ -61,7 +61,12 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
 
         match extract_user_hashes(&v_data, &hashed_bootkey, rid) {
             Ok(entry) => {
-                log::info!("RID {}: user={}, NT={}", rid, entry.username, hex::encode(entry.nt_hash));
+                log::info!(
+                    "RID {}: user={}, NT={}",
+                    rid,
+                    entry.username,
+                    hex::encode(entry.nt_hash)
+                );
                 entries.push(entry);
             }
             Err(e) => {
@@ -134,7 +139,12 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<
     let lm_offset = u32_le(v, 0x9C) as usize + 0xCC;
     let lm_length = u32_le(v, 0xA0) as usize;
     let lm_hash = if lm_length >= 4 && lm_offset + lm_length <= v.len() {
-        decrypt_sam_hash(&v[lm_offset..lm_offset + lm_length], hashed_bootkey, rid, false)?
+        decrypt_sam_hash(
+            &v[lm_offset..lm_offset + lm_length],
+            hashed_bootkey,
+            rid,
+            false,
+        )?
     } else {
         [0u8; 16]
     };
@@ -143,7 +153,12 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<
     let nt_offset = u32_le(v, 0xA8) as usize + 0xCC;
     let nt_length = u32_le(v, 0xAC) as usize;
     let nt_hash = if nt_length >= 4 && nt_offset + nt_length <= v.len() {
-        decrypt_sam_hash(&v[nt_offset..nt_offset + nt_length], hashed_bootkey, rid, true)?
+        decrypt_sam_hash(
+            &v[nt_offset..nt_offset + nt_length],
+            hashed_bootkey,
+            rid,
+            true,
+        )?
     } else {
         [0u8; 16] // Empty hash
     };
@@ -247,10 +262,10 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     let mut block1 = GenericArray::clone_from_slice(&encrypted[0..8]);
     let mut block2 = GenericArray::clone_from_slice(&encrypted[8..16]);
 
-    let cipher1 = des::Des::new_from_slice(&des_key1)
-        .map_err(|e| sam_err(&format!("DES key1: {}", e)))?;
-    let cipher2 = des::Des::new_from_slice(&des_key2)
-        .map_err(|e| sam_err(&format!("DES key2: {}", e)))?;
+    let cipher1 =
+        des::Des::new_from_slice(&des_key1).map_err(|e| sam_err(&format!("DES key1: {}", e)))?;
+    let cipher2 =
+        des::Des::new_from_slice(&des_key2).map_err(|e| sam_err(&format!("DES key2: {}", e)))?;
 
     cipher1.decrypt_block(&mut block1);
     cipher2.decrypt_block(&mut block2);
@@ -291,8 +306,8 @@ pub(crate) fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<V
     let pad_len = (16 - (buf.len() % 16)) % 16;
     buf.extend(std::iter::repeat_n(0u8, pad_len));
 
-    let decryptor = Aes128CbcDec::new_from_slices(key, iv)
-        .map_err(|e| sam_err(&format!("AES init: {}", e)))?;
+    let decryptor =
+        Aes128CbcDec::new_from_slices(key, iv).map_err(|e| sam_err(&format!("AES init: {}", e)))?;
     decryptor
         .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
         .map_err(|e| sam_err(&format!("AES decrypt: {}", e)))?;

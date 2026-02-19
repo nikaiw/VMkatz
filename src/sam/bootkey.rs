@@ -3,8 +3,8 @@
 //! The bootkey is derived from the class names of four LSA subkeys
 //! (JD, Skew1, GBG, Data), concatenated and permuted.
 
-use crate::error::{GovmemError, Result};
 use super::hive::Hive;
+use crate::error::{GovmemError, Result};
 
 /// Permutation table applied to the raw 16-byte key.
 const PBOX: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
@@ -86,7 +86,11 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
         .filter(|p| p.iter().all(|&b| b == 0))
         .count();
     let total_pages = hive_size / 0x1000;
-    let gap_pct = if total_pages > 0 { zero_pages * 100 / total_pages } else { 0 };
+    let gap_pct = if total_pages > 0 {
+        zero_pages * 100 / total_pages
+    } else {
+        0
+    };
 
     if gap_pct > 10 {
         Err(GovmemError::DecryptionError(format!(
@@ -110,10 +114,7 @@ fn extract_bootkey_from_lsa(hive: &Hive<'_>, lsa: &super::hive::Key<'_>) -> Resu
         let sub = lsa.subkey(hive, kn)?;
         let class = sub.class_name(hive)?;
         let bytes = hex::decode(&class).map_err(|e| {
-            GovmemError::DecryptionError(format!(
-                "Bad hex in {} class name '{}': {}",
-                kn, class, e
-            ))
+            GovmemError::DecryptionError(format!("Bad hex in {} class name '{}': {}", kn, class, e))
         })?;
         raw.extend_from_slice(&bytes);
     }
@@ -160,9 +161,7 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
         if pos + 4 > hive_data.len() {
             break;
         }
-        let size_raw = i32::from_le_bytes(
-            hive_data[pos..pos + 4].try_into().unwrap(),
-        );
+        let size_raw = i32::from_le_bytes(hive_data[pos..pos + 4].try_into().unwrap());
         let cell_size = size_raw.unsigned_abs() as usize;
         if !(8..=0x100000).contains(&cell_size) || pos + cell_size > hive_data.len() {
             // Invalid cell — try next aligned position
@@ -175,7 +174,9 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
         // Check for NK signature
         if cell_data_off + 0x50 < hive_data.len() {
             let sig = u16::from_le_bytes(
-                hive_data[cell_data_off..cell_data_off + 2].try_into().unwrap(),
+                hive_data[cell_data_off..cell_data_off + 2]
+                    .try_into()
+                    .unwrap(),
             );
             if sig == 0x6B6E {
                 // "nk"
@@ -259,7 +260,10 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
         bootkey[i] = raw[p];
     }
 
-    log::info!("Bootkey extracted via brute-force NK scan: {}", hex::encode(bootkey));
+    log::info!(
+        "Bootkey extracted via brute-force NK scan: {}",
+        hex::encode(bootkey)
+    );
     Some(bootkey)
 }
 
@@ -278,9 +282,7 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
         // Scan cells within this hbin block (skip 0x20 hbin header)
         let mut pos = 0x20;
         while pos + 0x50 < block_data.len() {
-            let size_raw = i32::from_le_bytes(
-                block_data[pos..pos + 4].try_into().unwrap(),
-            );
+            let size_raw = i32::from_le_bytes(block_data[pos..pos + 4].try_into().unwrap());
             let cell_size = size_raw.unsigned_abs() as usize;
             if !(8..=0x100000).contains(&cell_size) || pos + cell_size > block_data.len() {
                 pos += 8;
@@ -289,20 +291,17 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
             let cd = pos + 4; // cell data offset (past size)
             if cd + 0x50 < block_data.len() {
-                let sig = u16::from_le_bytes(
-                    block_data[cd..cd + 2].try_into().unwrap(),
-                );
+                let sig = u16::from_le_bytes(block_data[cd..cd + 2].try_into().unwrap());
                 if sig == 0x6B6E {
                     // "nk"
-                    let name_len = u16::from_le_bytes(
-                        block_data[cd + 0x48..cd + 0x4A].try_into().unwrap(),
-                    ) as usize;
+                    let name_len =
+                        u16::from_le_bytes(block_data[cd + 0x48..cd + 0x4A].try_into().unwrap())
+                            as usize;
 
                     if name_len > 0 && cd + 0x4C + name_len <= block_data.len() {
-                        let name = std::str::from_utf8(
-                            &block_data[cd + 0x4C..cd + 0x4C + name_len],
-                        )
-                        .unwrap_or("");
+                        let name =
+                            std::str::from_utf8(&block_data[cd + 0x4C..cd + 0x4C + name_len])
+                                .unwrap_or("");
 
                         for &(target, idx) in &targets {
                             if name.eq_ignore_ascii_case(target) && class_bytes[idx].is_none() {
@@ -315,11 +314,9 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
                                 if class_offset != 0xFFFF_FFFF && class_len > 0 {
                                     // Try to resolve class cell across all blocks
-                                    if let Some(bytes) = resolve_class_across_blocks(
-                                        blocks,
-                                        class_offset,
-                                        class_len,
-                                    ) {
+                                    if let Some(bytes) =
+                                        resolve_class_across_blocks(blocks, class_offset, class_len)
+                                    {
                                         log::info!(
                                             "Bootkey block scan: found {} class ({} bytes) in hbin at offset 0x{:x}",
                                             target, bytes.len(), block_hive_off,
@@ -395,9 +392,8 @@ fn resolve_class_across_blocks(
                 continue;
             }
             // Read cell at this position
-            let size_raw = i32::from_le_bytes(
-                block_data[local_off..local_off + 4].try_into().unwrap(),
-            );
+            let size_raw =
+                i32::from_le_bytes(block_data[local_off..local_off + 4].try_into().unwrap());
             let abs_size = size_raw.unsigned_abs() as usize;
             if abs_size < 4 || local_off + abs_size > block_data.len() {
                 continue;
@@ -432,9 +428,7 @@ fn read_class_hex(hive_data: &[u8], class_offset: u32, class_len: usize) -> Opti
         return None;
     }
     // Read cell size
-    let size_raw = i32::from_le_bytes(
-        hive_data[file_off..file_off + 4].try_into().unwrap(),
-    );
+    let size_raw = i32::from_le_bytes(hive_data[file_off..file_off + 4].try_into().unwrap());
     let abs_size = size_raw.unsigned_abs() as usize;
     if abs_size < 4 || file_off + abs_size > hive_data.len() {
         return None;

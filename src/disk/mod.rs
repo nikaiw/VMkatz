@@ -23,10 +23,7 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
     // Detect flat VMDK (e.g., "name-flat.vmdk") — raw disk, not sparse
     if ext == "vmdk" && stem.ends_with("-flat") {

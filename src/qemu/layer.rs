@@ -62,7 +62,10 @@ impl QemuElfLayer {
             ])));
         }
         if data[4] != ELFCLASS64 {
-            return Err(GovmemError::PeError(0, "Not ELF64 (only 64-bit supported)".into()));
+            return Err(GovmemError::PeError(
+                0,
+                "Not ELF64 (only 64-bit supported)".into(),
+            ));
         }
         if data[5] != ELFDATA2LSB {
             return Err(GovmemError::PeError(0, "Not little-endian ELF".into()));
@@ -83,7 +86,10 @@ impl QemuElfLayer {
         if e_phentsize < ELF64_PHDR_SIZE {
             return Err(GovmemError::PeError(
                 0,
-                format!("ELF phdr size {} < expected {}", e_phentsize, ELF64_PHDR_SIZE),
+                format!(
+                    "ELF phdr size {} < expected {}",
+                    e_phentsize, ELF64_PHDR_SIZE
+                ),
             ));
         }
 
@@ -124,7 +130,10 @@ impl QemuElfLayer {
         }
 
         if segments.is_empty() {
-            return Err(GovmemError::PeError(0, "No PT_LOAD segments found in ELF".into()));
+            return Err(GovmemError::PeError(
+                0,
+                "No PT_LOAD segments found in ELF".into(),
+            ));
         }
 
         // Sort by GPA for binary search
@@ -154,9 +163,7 @@ impl QemuElfLayer {
 
     /// Find the segment containing the given GPA using binary search.
     fn find_segment(&self, gpa: u64) -> Option<&LoadSegment> {
-        let idx = self
-            .segments
-            .partition_point(|s| s.gpa_start <= gpa);
+        let idx = self.segments.partition_point(|s| s.gpa_start <= gpa);
         if idx == 0 {
             return None;
         }
@@ -204,8 +211,7 @@ impl PhysicalMemory for QemuElfLayer {
                 let end = file_off + to_copy;
                 if end <= self.mmap.len() {
                     let dst_start = pos as usize;
-                    buf[dst_start..dst_start + to_copy]
-                        .copy_from_slice(&self.mmap[file_off..end]);
+                    buf[dst_start..dst_start + to_copy].copy_from_slice(&self.mmap[file_off..end]);
                 }
                 pos += to_copy as u64;
             } else {

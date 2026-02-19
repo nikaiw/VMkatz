@@ -1,5 +1,5 @@
 pub mod header;
-pub mod tags;
 pub mod layer;
+pub mod tags;
 
 pub use layer::VmwareLayer;

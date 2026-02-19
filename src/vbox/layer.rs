@@ -315,7 +315,11 @@ impl VBoxLayer {
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
         let file_size = file.metadata()?.len();
-        log::info!("VBox .sav file: {} bytes ({} MB)", file_size, file_size / (1024 * 1024));
+        log::info!(
+            "VBox .sav file: {} bytes ({} MB)",
+            file_size,
+            file_size / (1024 * 1024)
+        );
 
         let mut reader = io::BufReader::new(file);
 
@@ -336,7 +340,10 @@ impl VBoxLayer {
 
         // 2. Find the "pgm" unit by scanning for unit headers
         let pgm_data_offset = Self::find_pgm_unit(&mut reader, file_size)?;
-        log::info!("PGM unit data starts at file offset 0x{:x}", pgm_data_offset);
+        log::info!(
+            "PGM unit data starts at file offset 0x{:x}",
+            pgm_data_offset
+        );
 
         // 3. Seek to PGM data and create SSM stream
         reader.seek(SeekFrom::Start(pgm_data_offset))?;
@@ -370,7 +377,14 @@ impl VBoxLayer {
             let _gcphys = stream.read_u64_le()?;
             let _cb = stream.read_u64_le()?;
             rom_count += 1;
-            log::debug!("ROM range {}: id={} desc='{}' gcphys=0x{:x} size=0x{:x}", rom_count, id, _desc, _gcphys, _cb);
+            log::debug!(
+                "ROM range {}: id={} desc='{}' gcphys=0x{:x} size=0x{:x}",
+                rom_count,
+                id,
+                _desc,
+                _gcphys,
+                _cb
+            );
         }
         log::info!("Skipped {} ROM range declarations", rom_count);
 
@@ -387,7 +401,13 @@ impl VBoxLayer {
             let _desc = stream.read_strz()?;
             let _cb = stream.read_u64_le()?;
             mmio2_count += 1;
-            log::debug!("MMIO2 range {}: id={} desc='{}' size=0x{:x}", mmio2_count, id, _desc, _cb);
+            log::debug!(
+                "MMIO2 range {}: id={} desc='{}' size=0x{:x}",
+                mmio2_count,
+                id,
+                _desc,
+                _cb
+            );
         }
         log::info!("Skipped {} MMIO2 range declarations", mmio2_count);
 
@@ -431,7 +451,7 @@ impl VBoxLayer {
                 }
                 PGM_MMIO2_RAW => {
                     if has_addr {
-                        stream.read_u8()?;   // range_id
+                        stream.read_u8()?; // range_id
                         stream.read_u32_le()?; // page_index
                     }
                     stream.skip(PAGE_SIZE)?;
@@ -508,7 +528,11 @@ impl VBoxLayer {
             .map(|&max_gpa| max_gpa + PAGE_SIZE as u64)
             .unwrap_or(cb_ram);
 
-        log::info!("Physical address space end: 0x{:x} ({} MB)", phys_end, phys_end / (1024 * 1024));
+        log::info!(
+            "Physical address space end: 0x{:x} ({} MB)",
+            phys_end,
+            phys_end / (1024 * 1024)
+        );
 
         Ok(Self {
             page_data,
@@ -559,7 +583,7 @@ impl VBoxLayer {
 
                     // Strip null terminator
                     let name = String::from_utf8_lossy(
-                        &name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(cb_name)]
+                        &name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(cb_name)],
                     );
 
                     if name == "pgm" {
@@ -574,7 +598,9 @@ impl VBoxLayer {
                     }
 
                     // Seek back to continue scanning
-                    reader.seek(SeekFrom::Start(file_pos + i as u64 + unit_magic.len() as u64))?;
+                    reader.seek(SeekFrom::Start(
+                        file_pos + i as u64 + unit_magic.len() as u64,
+                    ))?;
                 }
             }
 

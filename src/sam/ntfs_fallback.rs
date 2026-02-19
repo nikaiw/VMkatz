@@ -29,9 +29,7 @@ struct DataRun {
 /// Parse NTFS boot sector.
 fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     if data.len() < 0x48 {
-        return Err(GovmemError::DecryptionError(
-            "Boot sector too small".into(),
-        ));
+        return Err(GovmemError::DecryptionError("Boot sector too small".into()));
     }
     if &data[3..7] != b"NTFS" {
         return Err(GovmemError::DecryptionError(
@@ -290,8 +288,7 @@ fn read_resident_data(record: &[u8]) -> Option<Vec<u8>> {
     }
     let value_length =
         u32::from_le_bytes(record[pos + 0x10..pos + 0x14].try_into().unwrap()) as usize;
-    let value_offset =
-        u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
+    let value_offset = u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
     let start = pos + value_offset;
     if start + value_length > record.len() {
         return None;
@@ -398,7 +395,13 @@ fn read_hive_from_record<R: Read + Seek>(
 
     log::info!("{}: {} data runs, {} bytes", name, runs.len(), file_size);
 
-    read_from_data_runs(reader, &runs, file_size, params.cluster_size, partition_offset)
+    read_from_data_runs(
+        reader,
+        &runs,
+        file_size,
+        params.cluster_size,
+        partition_offset,
+    )
 }
 
 /// Verify that a parent record chain leads to \Windows\System32\config.
@@ -461,12 +464,15 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     // Read $MFTMirr (contains copies of MFT records 0-3)
     let mftmirr_abs = partition_offset + params.mftmirr_position;
     reader.seek(SeekFrom::Start(mftmirr_abs)).map_err(|e| {
-        GovmemError::DecryptionError(format!("Cannot seek to MFTMirr at 0x{:x}: {}", mftmirr_abs, e))
+        GovmemError::DecryptionError(format!(
+            "Cannot seek to MFTMirr at 0x{:x}: {}",
+            mftmirr_abs, e
+        ))
     })?;
     let mut mftmirr_data = vec![0u8; params.record_size as usize * 4];
-    reader.read_exact(&mut mftmirr_data).map_err(|e| {
-        GovmemError::DecryptionError(format!("Cannot read MFTMirr: {}", e))
-    })?;
+    reader
+        .read_exact(&mut mftmirr_data)
+        .map_err(|e| GovmemError::DecryptionError(format!("Cannot read MFTMirr: {}", e)))?;
 
     // Parse record 0 ($MFT) from MFTMirr
     let mut mft_record = mftmirr_data[..params.record_size as usize].to_vec();
@@ -477,9 +483,8 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     }
 
     // Get $MFT data runs — tells us where all MFT data is on disk
-    let (mft_runs, mft_size) = extract_data_attribute(&mft_record).ok_or_else(|| {
-        GovmemError::DecryptionError("MFTMirr: no $DATA in $MFT record".into())
-    })?;
+    let (mft_runs, mft_size) = extract_data_attribute(&mft_record)
+        .ok_or_else(|| GovmemError::DecryptionError("MFTMirr: no $DATA in $MFT record".into()))?;
 
     let total_records = mft_size / params.record_size as u64;
     log::info!(
@@ -508,7 +513,11 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
             first_record,
             first_record + num_records - 1,
             abs_offset,
-            if accessible { "accessible" } else { "inaccessible" },
+            if accessible {
+                "accessible"
+            } else {
+                "inaccessible"
+            },
         );
 
         if accessible {
@@ -604,7 +613,9 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     // If parent verification failed for all candidates, retry without parent check
     // (parent MFT records may be in inaccessible segments)
     if sam_record.is_none() || system_record.is_none() {
-        log::info!("MFTMirr: retrying without parent verification (parent records may be inaccessible)");
+        log::info!(
+            "MFTMirr: retrying without parent verification (parent records may be inaccessible)"
+        );
 
         'segments2: for &(abs_offset, first_rec, num_recs) in &accessible_segments {
             let mut rec_idx = 0u64;
@@ -643,12 +654,8 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
 
                         // Without parent check, validate data starts with "regf"
                         let rec_num = first_rec + rec_idx + i as u64;
-                        let hive_check = try_read_hive_start(
-                            reader,
-                            &record,
-                            &params,
-                            partition_offset,
-                        );
+                        let hive_check =
+                            try_read_hive_start(reader, &record, &params, partition_offset);
 
                         match hive_check {
                             Some(true) => {
@@ -723,18 +730,16 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
         }
     };
     let system_data = match system_record {
-        Some(ref rec) => {
-            read_hive_from_record(reader, rec, "SYSTEM", &params, partition_offset)?
-        }
+        Some(ref rec) => read_hive_from_record(reader, rec, "SYSTEM", &params, partition_offset)?,
         None => {
             return Err(GovmemError::DecryptionError(
                 "MFTMirr: SYSTEM hive not found in accessible MFT segments".into(),
             ))
         }
     };
-    let security_data = security_record
-        .as_ref()
-        .and_then(|rec| read_hive_from_record(reader, rec, "SECURITY", &params, partition_offset).ok());
+    let security_data = security_record.as_ref().and_then(|rec| {
+        read_hive_from_record(reader, rec, "SECURITY", &params, partition_offset).ok()
+    });
 
     // Validate hive data
     if sam_data.len() < 0x1000 || &sam_data[0..4] != b"regf" {

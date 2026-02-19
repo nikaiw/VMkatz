@@ -27,9 +27,21 @@ struct WdigestOffsets {
 /// Multiple offset variants for different Windows versions.
 const WDIGEST_OFFSET_VARIANTS: &[WdigestOffsets] = &[
     // Win10 1507+ / Win11: extra This+padding before LUID
-    WdigestOffsets { flink: 0x00, luid: 0x20, username: 0x30, domain: 0x40, password: 0x50 },
+    WdigestOffsets {
+        flink: 0x00,
+        luid: 0x20,
+        username: 0x30,
+        domain: 0x40,
+        password: 0x50,
+    },
     // Win7 / Win8 / Win8.1: no extra padding, smaller struct
-    WdigestOffsets { flink: 0x00, luid: 0x10, username: 0x28, domain: 0x38, password: 0x48 },
+    WdigestOffsets {
+        flink: 0x00,
+        luid: 0x10,
+        username: 0x28,
+        domain: 0x38,
+        password: 0x48,
+    },
 ];
 
 /// Extract WDigest credentials (plaintext passwords) from wdigest.dll.
@@ -86,8 +98,21 @@ pub fn extract_wdigest_credentials(
         if let Ok(entry_dump) = vmem.read_virt_bytes(head_flink, 0x70) {
             log::debug!("WDigest first entry at 0x{:x} dump:", head_flink);
             for (i, chunk) in entry_dump.chunks(16).enumerate() {
-                let hex_str: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                let ascii: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+                let hex_str: String = chunk
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
                 log::debug!("  {:04x}: {}  {}", i * 16, hex_str, ascii);
             }
         }
@@ -120,9 +145,19 @@ pub fn extract_wdigest_credentials(
             continue;
         }
 
-        let password = crate::lsass::crypto::decrypt_unicode_string_password(vmem, current + offsets.password, keys);
+        let password = crate::lsass::crypto::decrypt_unicode_string_password(
+            vmem,
+            current + offsets.password,
+            keys,
+        );
 
-        log::debug!("WDigest: LUID=0x{:x} user={} domain={} pwd_len={}", luid, username, domain, password.len());
+        log::debug!(
+            "WDigest: LUID=0x{:x} user={} domain={} pwd_len={}",
+            luid,
+            username,
+            domain,
+            password.len()
+        );
         results.push((
             luid,
             WdigestCredential {
@@ -138,8 +173,15 @@ pub fn extract_wdigest_credentials(
         };
     }
 
-    let with_passwords = results.iter().filter(|(_, c)| !c.password.is_empty()).count();
-    log::info!("WDigest: found {} entries ({} with passwords)", results.len(), with_passwords);
+    let with_passwords = results
+        .iter()
+        .filter(|(_, c)| !c.password.is_empty())
+        .count();
+    log::info!(
+        "WDigest: found {} entries ({} with passwords)",
+        results.len(),
+        with_passwords
+    );
 
     Ok(results)
 }
@@ -151,11 +193,9 @@ fn find_wdigest_list_in_data(
     wdigest_base: u64,
     _keys: &CryptoKeys,
 ) -> Result<u64> {
-    let data_sec = pe
-        .find_section(".data")
-        .ok_or_else(|| crate::error::GovmemError::PatternNotFound(
-            ".data section in wdigest.dll".to_string(),
-        ))?;
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        crate::error::GovmemError::PatternNotFound(".data section in wdigest.dll".to_string())
+    })?;
 
     let data_base = wdigest_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
@@ -163,7 +203,8 @@ fn find_wdigest_list_in_data(
 
     log::debug!(
         "Scanning wdigest.dll .data for LIST_ENTRY heads: base=0x{:x} size=0x{:x}",
-        data_base, data_size
+        data_base,
+        data_size
     );
 
     for off in (0..data_size.saturating_sub(16)).step_by(8) {
@@ -226,8 +267,12 @@ fn find_wdigest_list(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<u64
     let data = vmem.read_virt_bytes(search_start, 0x100)?;
 
     for i in 0..data.len().saturating_sub(6) {
-        let is_lea = (data[i] == 0x48 && data[i + 1] == 0x8D && (data[i + 2] == 0x0D || data[i + 2] == 0x15))
-            || (data[i] == 0x4C && data[i + 1] == 0x8D && (data[i + 2] == 0x05 || data[i + 2] == 0x0D));
+        let is_lea = (data[i] == 0x48
+            && data[i + 1] == 0x8D
+            && (data[i + 2] == 0x0D || data[i + 2] == 0x15))
+            || (data[i] == 0x4C
+                && data[i + 1] == 0x8D
+                && (data[i + 2] == 0x05 || data[i + 2] == 0x0D));
         if is_lea {
             return patterns::resolve_rip_relative(vmem, search_start + i as u64, 3);
         }
@@ -260,4 +305,3 @@ fn detect_wdigest_offsets(vmem: &impl VirtualMemory, first_entry: u64) -> &'stat
     // Default to Win10+ offsets
     &WDIGEST_OFFSET_VARIANTS[0]
 }
-

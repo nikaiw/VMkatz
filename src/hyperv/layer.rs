@@ -48,10 +48,7 @@ impl HypervLayer {
             );
         }
 
-        log::info!(
-            "Hyper-V .bin: {} MB identity-mapped",
-            size / (1024 * 1024)
-        );
+        log::info!("Hyper-V .bin: {} MB identity-mapped", size / (1024 * 1024));
 
         Ok(Self { mmap, size })
     }

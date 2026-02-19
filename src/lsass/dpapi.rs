@@ -44,13 +44,21 @@ pub fn extract_dpapi_credentials(
                 patterns::DPAPI_MASTER_KEY_PATTERNS,
                 "g_MasterKeyCacheList",
             ) {
-                Ok((pattern_addr, _)) => patterns::find_list_via_lea(vmem, pattern_addr, "g_MasterKeyCacheList")?,
+                Ok((pattern_addr, _)) => {
+                    patterns::find_list_via_lea(vmem, pattern_addr, "g_MasterKeyCacheList")?
+                }
                 Err(e) => {
-                    log::debug!("DPAPI .text pattern scan failed ({}), trying LEA-to-data scan", e);
+                    log::debug!(
+                        "DPAPI .text pattern scan failed ({}), trying LEA-to-data scan",
+                        e
+                    );
                     match find_dpapi_list_via_lea_scan(vmem, &pe, lsasrv_base) {
                         Ok(addr) => addr,
                         Err(e2) => {
-                            log::debug!("DPAPI LEA-to-data scan failed ({}), trying .data fallback", e2);
+                            log::debug!(
+                                "DPAPI LEA-to-data scan failed ({}), trying .data fallback",
+                                e2
+                            );
                             find_dpapi_list_in_data(vmem, &pe, lsasrv_base)?
                         }
                     }
@@ -119,7 +127,9 @@ fn read_and_decrypt_entry(
     }
     let guid = format_guid(&guid_bytes);
 
-    let enc_key = vmem.read_virt_bytes(entry_addr + OFF_KEY_DATA, key_size as usize).ok()?;
+    let enc_key = vmem
+        .read_virt_bytes(entry_addr + OFF_KEY_DATA, key_size as usize)
+        .ok()?;
 
     // Decrypt with 3DES/AES (same as all other credential providers)
     let dec_key = match crypto::decrypt_credential(keys, &enc_key) {
@@ -131,8 +141,21 @@ fn read_and_decrypt_entry(
     };
 
     let sha1 = sha1_digest(&dec_key);
-    log::debug!("DPAPI: LUID=0x{:x} GUID={} key_size={}", luid, guid, key_size);
-    Some((luid, DpapiCredential { guid, key: dec_key, key_size, sha1_masterkey: sha1 }))
+    log::debug!(
+        "DPAPI: LUID=0x{:x} GUID={} key_size={}",
+        luid,
+        guid,
+        key_size
+    );
+    Some((
+        luid,
+        DpapiCredential {
+            guid,
+            key: dec_key,
+            key_size,
+            sha1_masterkey: sha1,
+        },
+    ))
 }
 
 /// Scan lsasrv.dll .text for LEA instructions referencing .data addresses,
@@ -188,11 +211,17 @@ fn find_dpapi_list_via_lea_scan(
 
     candidates.sort_unstable();
     candidates.dedup();
-    log::debug!("DPAPI LEA scan: {} unique .data targets found", candidates.len());
+    log::debug!(
+        "DPAPI LEA scan: {} unique .data targets found",
+        candidates.len()
+    );
 
     for target in &candidates {
         if validate_dpapi_list_head(vmem, *target, lsasrv_base) {
-            log::info!("DPAPI LEA scan: found g_MasterKeyCacheList at 0x{:x}", target);
+            log::info!(
+                "DPAPI LEA scan: found g_MasterKeyCacheList at 0x{:x}",
+                target
+            );
             return Ok(*target);
         }
     }
@@ -208,17 +237,19 @@ fn find_dpapi_list_in_data(
     pe: &PeHeaders,
     lsasrv_base: u64,
 ) -> Result<u64> {
-    let data_sec = pe
-        .find_section(".data")
-        .ok_or_else(|| crate::error::GovmemError::PatternNotFound(
-            ".data section in lsasrv.dll".to_string(),
-        ))?;
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        crate::error::GovmemError::PatternNotFound(".data section in lsasrv.dll".to_string())
+    })?;
 
     let data_base = lsasrv_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x20000);
     let data = vmem.read_virt_bytes(data_base, data_size)?;
 
-    log::debug!("DPAPI: scanning .data for g_MasterKeyCacheList: base=0x{:x} size=0x{:x}", data_base, data_size);
+    log::debug!(
+        "DPAPI: scanning .data for g_MasterKeyCacheList: base=0x{:x} size=0x{:x}",
+        data_base,
+        data_size
+    );
 
     for off in (0..data_size.saturating_sub(16)).step_by(8) {
         let flink = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
@@ -340,7 +371,11 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         }
     });
 
-    log::info!("DPAPI physical scan: {} pages scanned, {} candidates", pages_scanned, candidates.len());
+    log::info!(
+        "DPAPI physical scan: {} pages scanned, {} candidates",
+        pages_scanned,
+        candidates.len()
+    );
 
     let mut seen_guids = std::collections::HashSet::new();
 
@@ -361,7 +396,10 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
             continue;
         }
         // Validate GUID doesn't look like ASCII text (false positive filter)
-        if guid_bytes.iter().all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ') {
+        if guid_bytes
+            .iter()
+            .all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ')
+        {
             continue;
         }
         let guid = format_guid(&guid_bytes);
@@ -385,8 +423,21 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         };
 
         let sha1 = sha1_digest(&dec_key);
-        log::info!("DPAPI phys-scan: LUID=0x{:x} GUID={} key_size={}", luid, guid, key_size);
-        results.push((luid, DpapiCredential { guid, key: dec_key, key_size, sha1_masterkey: sha1 }));
+        log::info!(
+            "DPAPI phys-scan: LUID=0x{:x} GUID={} key_size={}",
+            luid,
+            guid,
+            key_size
+        );
+        results.push((
+            luid,
+            DpapiCredential {
+                guid,
+                key: dec_key,
+                key_size,
+                sha1_masterkey: sha1,
+            },
+        ));
     }
 
     log::info!("DPAPI physical scan: {} entries extracted", results.len());
@@ -420,7 +471,10 @@ fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
     }
     // GUID should not be all ASCII (false positive filter)
     let guid_slice = &page[off + 0x18..off + 0x28];
-    if guid_slice.iter().all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ') {
+    if guid_slice
+        .iter()
+        .all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ')
+    {
         return false;
     }
     // insertTime at +0x28: FILETIME should be a reasonable date (2000-2040)
@@ -444,8 +498,13 @@ fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
 
 /// SHA-1 digest for computing sha1_masterkey.
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) =
-        (0x67452301u32, 0xEFCDAB89u32, 0x98BADCFEu32, 0x10325476u32, 0xC3D2E1F0u32);
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
+        0x67452301u32,
+        0xEFCDAB89u32,
+        0x98BADCFEu32,
+        0x10325476u32,
+        0xC3D2E1F0u32,
+    );
     let bit_len = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -456,7 +515,12 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     for block in msg.chunks(64) {
         let mut w = [0u32; 80];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -469,11 +533,23 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
                 _ => (b ^ c ^ d, 0xCA62C1D6u32),
             };
-            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
-            e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
         }
-        h0 = h0.wrapping_add(a); h1 = h1.wrapping_add(b); h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d); h4 = h4.wrapping_add(e);
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
     }
     let mut r = [0u8; 20];
     r[0..4].copy_from_slice(&h0.to_be_bytes());
@@ -494,8 +570,16 @@ fn format_guid(bytes: &[u8]) -> String {
     let d3 = u16::from_le_bytes([bytes[6], bytes[7]]);
     format!(
         "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1, d2, d3,
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        d1,
+        d2,
+        d3,
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }

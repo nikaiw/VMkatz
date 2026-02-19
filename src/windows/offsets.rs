@@ -122,10 +122,10 @@ pub fn offsets_for_build(build: u32) -> Result<EprocessOffsets> {
 /// All known EPROCESS offset sets for brute-force scan (when build is unknown).
 /// Ordered by likelihood (most common first).
 pub const ALL_EPROCESS_OFFSETS: &[EprocessOffsets] = &[
-    WIN10_X64_EPROCESS,         // Win10 1703+ / Win11 21H2-23H2
-    WIN11_24H2_X64_EPROCESS,    // Win11 24H2+
-    WIN10_EARLY_X64_EPROCESS,   // Win10 1507-1607
-    WIN81_X64_EPROCESS,         // Win8.1
-    WIN8_X64_EPROCESS,          // Win8
-    WIN7_X64_EPROCESS,          // Win7
+    WIN10_X64_EPROCESS,       // Win10 1703+ / Win11 21H2-23H2
+    WIN11_24H2_X64_EPROCESS,  // Win11 24H2+
+    WIN10_EARLY_X64_EPROCESS, // Win10 1507-1607
+    WIN81_X64_EPROCESS,       // Win8.1
+    WIN8_X64_EPROCESS,        // Win8
+    WIN7_X64_EPROCESS,        // Win7
 ];

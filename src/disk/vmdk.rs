@@ -152,8 +152,7 @@ impl VmdkDisk {
 
             // Find which extent this sector belongs to
             let ext = match self.extents.iter_mut().find(|e| {
-                virtual_sector >= e.start_sector
-                    && virtual_sector < e.start_sector + e.capacity
+                virtual_sector >= e.start_sector && virtual_sector < e.start_sector + e.capacity
             }) {
                 Some(e) => e,
                 None => {
@@ -213,7 +212,10 @@ impl VmdkDisk {
                 let data_off = grain_sector as u64 * SECTOR_SIZE + grain_offset;
                 // Handle truncated extent files: if data is beyond file, treat as zeros
                 let read_ok = ext.file.seek(SeekFrom::Start(data_off)).is_ok()
-                    && ext.file.read_exact(&mut buf[filled..filled + chunk]).is_ok();
+                    && ext
+                        .file
+                        .read_exact(&mut buf[filled..filled + chunk])
+                        .is_ok();
                 if !read_ok {
                     buf[filled..filled + chunk].fill(0);
                 }
@@ -272,19 +274,14 @@ impl VmdkDisk {
                     .file
                     .seek(SeekFrom::Start(gt_offset))
                     .is_ok()
-                    && self.extents[ext_idx]
-                        .file
-                        .read_exact(&mut gt_buf)
-                        .is_ok();
+                    && self.extents[ext_idx].file.read_exact(&mut gt_buf).is_ok();
                 if !ok {
                     continue;
                 }
 
                 for gte_idx in 0..num_gtes as usize {
                     let grain_sector = u32::from_le_bytes(
-                        gt_buf[gte_idx * 4..(gte_idx + 1) * 4]
-                            .try_into()
-                            .unwrap(),
+                        gt_buf[gte_idx * 4..(gte_idx + 1) * 4].try_into().unwrap(),
                     );
                     if grain_sector == 0 {
                         continue;
@@ -307,9 +304,9 @@ impl VmdkDisk {
 
                     // Virtual byte offset = (start_sector + local_grain_index * grain_size) * SECTOR_SIZE
                     let local_grain = gd_idx as u64 * num_gtes as u64 + gte_idx as u64;
-                    let virtual_byte =
-                        (start_sector + local_grain * self.extents[ext_idx].grain_size)
-                            * SECTOR_SIZE;
+                    let virtual_byte = (start_sector
+                        + local_grain * self.extents[ext_idx].grain_size)
+                        * SECTOR_SIZE;
 
                     if !callback(virtual_byte, &grain_data) {
                         return Ok(());

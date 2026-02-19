@@ -48,23 +48,43 @@ struct TicketOffsets {
 const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
     // Win10 1607+ / Win11: KIWI_KERBEROS_LOGON_SESSION_10_1607
     KerbOffsets {
-        avl_node_data_offset: 0x20, luid: 0x48, credentials_ptr: 0x88, cred_password: 0x30,
-        tickets_1: 0x128, tickets_2: 0x140, tickets_3: 0x158,
+        avl_node_data_offset: 0x20,
+        luid: 0x48,
+        credentials_ptr: 0x88,
+        cred_password: 0x30,
+        tickets_1: 0x128,
+        tickets_2: 0x140,
+        tickets_3: 0x158,
     },
     // Win10 1507-1511: KIWI_KERBEROS_LOGON_SESSION_10
     KerbOffsets {
-        avl_node_data_offset: 0x20, luid: 0x48, credentials_ptr: 0x88, cred_password: 0x28,
-        tickets_1: 0x118, tickets_2: 0x130, tickets_3: 0x148,
+        avl_node_data_offset: 0x20,
+        luid: 0x48,
+        credentials_ptr: 0x88,
+        cred_password: 0x28,
+        tickets_1: 0x118,
+        tickets_2: 0x130,
+        tickets_3: 0x148,
     },
     // Win8/8.1: KIWI_KERBEROS_LOGON_SESSION (session_10 variant)
     KerbOffsets {
-        avl_node_data_offset: 0x20, luid: 0x40, credentials_ptr: 0x80, cred_password: 0x28,
-        tickets_1: 0xE8, tickets_2: 0x100, tickets_3: 0x118,
+        avl_node_data_offset: 0x20,
+        luid: 0x40,
+        credentials_ptr: 0x80,
+        cred_password: 0x28,
+        tickets_1: 0xE8,
+        tickets_2: 0x100,
+        tickets_3: 0x118,
     },
     // Win7: KIWI_KERBEROS_LOGON_SESSION
     KerbOffsets {
-        avl_node_data_offset: 0x20, luid: 0x18, credentials_ptr: 0x50, cred_password: 0x28,
-        tickets_1: 0xA0, tickets_2: 0xB8, tickets_3: 0xD0,
+        avl_node_data_offset: 0x20,
+        luid: 0x18,
+        credentials_ptr: 0x50,
+        cred_password: 0x28,
+        tickets_1: 0xA0,
+        tickets_2: 0xB8,
+        tickets_3: 0xD0,
     },
 ];
 
@@ -163,7 +183,10 @@ pub fn extract_kerberos_credentials(
 
     // The pattern "48 8B 18 48 8D 0D" ends with LEA RCX, [rip+disp]
     let table_addr = patterns::resolve_rip_relative(vmem, pattern_addr, 6)?;
-    log::info!("Kerberos session table (RTL_AVL_TABLE) at 0x{:x}", table_addr);
+    log::info!(
+        "Kerberos session table (RTL_AVL_TABLE) at 0x{:x}",
+        table_addr
+    );
 
     // RTL_AVL_TABLE: BalancedRoot at +0x00 (Parent/Left/Right/Balance = 0x20 bytes)
     let parent = vmem.read_virt_u64(table_addr).unwrap_or(0);
@@ -173,14 +196,17 @@ pub fn extract_kerberos_credentials(
 
     log::info!(
         "Kerberos AVL table: elements={}, Parent=0x{:x}, Left=0x{:x}, Right=0x{:x}",
-        num_elements, parent, left_child, right_child
+        num_elements,
+        parent,
+        left_child,
+        right_child
     );
 
     let root_node = right_child;
-    if (root_node == 0 || root_node == table_addr)
-        && (left_child == 0 || left_child == table_addr) {
-            return Ok(results);
-        }
+    if (root_node == 0 || root_node == table_addr) && (left_child == 0 || left_child == table_addr)
+    {
+        return Ok(results);
+    }
 
     // Walk AVL tree
     let mut nodes = Vec::new();
@@ -198,29 +224,37 @@ pub fn extract_kerberos_credentials(
     for node_ptr in &nodes {
         let entry = node_ptr + offsets.avl_node_data_offset;
         let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
-        let cred_ptr = vmem.read_virt_u64(entry + offsets.credentials_ptr).unwrap_or(0);
+        let cred_ptr = vmem
+            .read_virt_u64(entry + offsets.credentials_ptr)
+            .unwrap_or(0);
 
         if cred_ptr == 0 || luid == 0 {
             log::debug!(
                 "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} (skipped)",
-                node_ptr, luid, cred_ptr
+                node_ptr,
+                luid,
+                cred_ptr
             );
             continue;
         }
 
         let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
-        let domain = vmem.read_win_unicode_string(cred_ptr + 0x10).unwrap_or_default();
+        let domain = vmem
+            .read_win_unicode_string(cred_ptr + 0x10)
+            .unwrap_or_default();
 
         if username.is_empty() {
             log::debug!(
                 "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} empty username (paged?)",
-                node_ptr, luid, cred_ptr
+                node_ptr,
+                luid,
+                cred_ptr
             );
             continue;
         }
 
-        let password = extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys)
-            .unwrap_or_default();
+        let password =
+            extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default();
 
         // Extract tickets from all 3 lists
         let mut tickets = Vec::new();
@@ -235,7 +269,11 @@ pub fn extract_kerberos_credentials(
 
         log::info!(
             "Kerberos: LUID=0x{:x} user={} domain={} password_len={} tickets={}",
-            luid, username, domain, password.len(), tickets.len()
+            luid,
+            username,
+            domain,
+            password.len(),
+            tickets.len()
         );
 
         results.push((
@@ -273,7 +311,9 @@ fn extract_tickets_from_list(
             Some(ticket) => {
                 log::debug!(
                     "Kerberos ticket: {} {} ({} bytes)",
-                    ticket.ticket_type, ticket.service_name.join("/"), ticket.ticket_blob.len()
+                    ticket.ticket_type,
+                    ticket.service_name.join("/"),
+                    ticket.ticket_blob.len()
                 );
                 tickets.push(ticket);
             }
@@ -294,44 +334,77 @@ fn extract_single_ticket(
     offsets: &TicketOffsets,
 ) -> Option<KerberosTicket> {
     // Read service name
-    let svc_name_ptr = vmem.read_virt_u64(ticket_addr + offsets.service_name_ptr).ok()?;
+    let svc_name_ptr = vmem
+        .read_virt_u64(ticket_addr + offsets.service_name_ptr)
+        .ok()?;
     let (service_name, service_name_type) = read_kerb_external_name(vmem, svc_name_ptr);
 
     // Read client name
-    let client_name_ptr = vmem.read_virt_u64(ticket_addr + offsets.client_name_ptr).ok()?;
+    let client_name_ptr = vmem
+        .read_virt_u64(ticket_addr + offsets.client_name_ptr)
+        .ok()?;
     let (client_name, client_name_type) = read_kerb_external_name(vmem, client_name_ptr);
 
     // Read domain strings
-    let domain_name = vmem.read_win_unicode_string(ticket_addr + offsets.domain_name).unwrap_or_default();
-    let target_domain_name = vmem.read_win_unicode_string(ticket_addr + offsets.target_domain_name).unwrap_or_default();
+    let domain_name = vmem
+        .read_win_unicode_string(ticket_addr + offsets.domain_name)
+        .unwrap_or_default();
+    let target_domain_name = vmem
+        .read_win_unicode_string(ticket_addr + offsets.target_domain_name)
+        .unwrap_or_default();
 
     // Ticket flags (stored big-endian in memory)
-    let ticket_flags = vmem.read_virt_u32(ticket_addr + offsets.ticket_flags).unwrap_or(0).swap_bytes();
+    let ticket_flags = vmem
+        .read_virt_u32(ticket_addr + offsets.ticket_flags)
+        .unwrap_or(0)
+        .swap_bytes();
 
     // Session key
-    let key_type = vmem.read_virt_u32(ticket_addr + offsets.key_type).unwrap_or(0);
-    let key_length = vmem.read_virt_u32(ticket_addr + offsets.key_length).unwrap_or(0) as usize;
-    let key_value_ptr = vmem.read_virt_u64(ticket_addr + offsets.key_value).unwrap_or(0);
+    let key_type = vmem
+        .read_virt_u32(ticket_addr + offsets.key_type)
+        .unwrap_or(0);
+    let key_length = vmem
+        .read_virt_u32(ticket_addr + offsets.key_length)
+        .unwrap_or(0) as usize;
+    let key_value_ptr = vmem
+        .read_virt_u64(ticket_addr + offsets.key_value)
+        .unwrap_or(0);
     let session_key = if key_length > 0 && key_length <= 256 && key_value_ptr != 0 {
-        vmem.read_virt_bytes(key_value_ptr, key_length).unwrap_or_default()
+        vmem.read_virt_bytes(key_value_ptr, key_length)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
 
     // Timestamps
-    let start_time = vmem.read_virt_u64(ticket_addr + offsets.start_time).unwrap_or(0);
-    let end_time = vmem.read_virt_u64(ticket_addr + offsets.end_time).unwrap_or(0);
-    let renew_until = vmem.read_virt_u64(ticket_addr + offsets.renew_until).unwrap_or(0);
+    let start_time = vmem
+        .read_virt_u64(ticket_addr + offsets.start_time)
+        .unwrap_or(0);
+    let end_time = vmem
+        .read_virt_u64(ticket_addr + offsets.end_time)
+        .unwrap_or(0);
+    let renew_until = vmem
+        .read_virt_u64(ticket_addr + offsets.renew_until)
+        .unwrap_or(0);
 
     // Ticket encryption info
-    let ticket_enc_type = vmem.read_virt_u32(ticket_addr + offsets.ticket_enc_type).unwrap_or(0);
-    let ticket_kvno = vmem.read_virt_u32(ticket_addr + offsets.ticket_kvno).unwrap_or(0);
+    let ticket_enc_type = vmem
+        .read_virt_u32(ticket_addr + offsets.ticket_enc_type)
+        .unwrap_or(0);
+    let ticket_kvno = vmem
+        .read_virt_u32(ticket_addr + offsets.ticket_kvno)
+        .unwrap_or(0);
 
     // Ticket blob (encrypted ticket data)
-    let ticket_length = vmem.read_virt_u32(ticket_addr + offsets.ticket_length).unwrap_or(0) as usize;
-    let ticket_value_ptr = vmem.read_virt_u64(ticket_addr + offsets.ticket_value).unwrap_or(0);
+    let ticket_length = vmem
+        .read_virt_u32(ticket_addr + offsets.ticket_length)
+        .unwrap_or(0) as usize;
+    let ticket_value_ptr = vmem
+        .read_virt_u64(ticket_addr + offsets.ticket_value)
+        .unwrap_or(0);
     let ticket_blob = if ticket_length > 0 && ticket_length <= 65536 && ticket_value_ptr != 0 {
-        vmem.read_virt_bytes(ticket_value_ptr, ticket_length).unwrap_or_default()
+        vmem.read_virt_bytes(ticket_value_ptr, ticket_length)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -342,12 +415,21 @@ fn extract_single_ticket(
 
     // Build .kirbi (KRB-CRED ASN.1 DER)
     let kirbi = build_kirbi(
-        &service_name, service_name_type,
-        &client_name, client_name_type,
-        &domain_name, &target_domain_name,
-        ticket_flags, key_type, &session_key,
-        start_time, end_time, renew_until,
-        ticket_enc_type, ticket_kvno, &ticket_blob,
+        &service_name,
+        service_name_type,
+        &client_name,
+        client_name_type,
+        &domain_name,
+        &target_domain_name,
+        ticket_flags,
+        key_type,
+        &session_key,
+        start_time,
+        end_time,
+        renew_until,
+        ticket_enc_type,
+        ticket_kvno,
+        &ticket_blob,
     );
 
     Some(KerberosTicket {
@@ -434,8 +516,13 @@ fn detect_kerb_offsets(vmem: &impl VirtualMemory, nodes: &[u64]) -> (&'static Ke
             }
             let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
             if !username.is_empty() && username.len() < 256 {
-                log::debug!("Kerberos: auto-detected variant {} (luid=0x{:x} cred=0x{:x} pwd=0x{:x})",
-                    idx, variant.luid, variant.credentials_ptr, variant.cred_password);
+                log::debug!(
+                    "Kerberos: auto-detected variant {} (luid=0x{:x} cred=0x{:x} pwd=0x{:x})",
+                    idx,
+                    variant.luid,
+                    variant.credentials_ptr,
+                    variant.cred_password
+                );
                 return (variant, idx);
             }
         }
@@ -466,12 +553,21 @@ pub fn extract_kerb_password(
 /// Build a .kirbi blob (KRB-CRED ASN.1 DER) from ticket data.
 #[allow(clippy::too_many_arguments)]
 fn build_kirbi(
-    service_name: &[String], service_name_type: i16,
-    client_name: &[String], client_name_type: i16,
-    domain: &str, target_domain: &str,
-    ticket_flags: u32, key_type: u32, session_key: &[u8],
-    start_time: u64, end_time: u64, renew_until: u64,
-    enc_type: u32, kvno: u32, ticket_blob: &[u8],
+    service_name: &[String],
+    service_name_type: i16,
+    client_name: &[String],
+    client_name_type: i16,
+    domain: &str,
+    target_domain: &str,
+    ticket_flags: u32,
+    key_type: u32,
+    session_key: &[u8],
+    start_time: u64,
+    end_time: u64,
+    renew_until: u64,
+    enc_type: u32,
+    kvno: u32,
+    ticket_blob: &[u8],
 ) -> Vec<u8> {
     // KRB-CRED ::= [APPLICATION 22] SEQUENCE {
     //   pvno     [0] INTEGER (5),
@@ -479,31 +575,49 @@ fn build_kirbi(
     //   tickets  [2] SEQUENCE OF Ticket,
     //   enc-part [3] EncryptedData
     // }
-    let ticket = build_ticket(service_name, service_name_type, domain, enc_type, kvno, ticket_blob);
+    let ticket = build_ticket(
+        service_name,
+        service_name_type,
+        domain,
+        enc_type,
+        kvno,
+        ticket_blob,
+    );
     let tickets_seq = asn1_sequence(&[&ticket]);
     let enc_krb_cred_part = build_enc_krb_cred_part(
-        client_name, client_name_type, domain, target_domain,
-        ticket_flags, key_type, session_key,
-        start_time, end_time, renew_until,
-        service_name, service_name_type,
+        client_name,
+        client_name_type,
+        domain,
+        target_domain,
+        ticket_flags,
+        key_type,
+        session_key,
+        start_time,
+        end_time,
+        renew_until,
+        service_name,
+        service_name_type,
     );
     // EncryptedData with etype=0 (NULL encryption), cipher = EncKrbCredPart DER
     let enc_part = build_encrypted_data(0, &enc_krb_cred_part);
 
     let krb_cred_body = asn1_sequence(&[
-        &asn1_context_explicit(0, &asn1_integer_u32(5)),       // pvno
-        &asn1_context_explicit(1, &asn1_integer_u32(22)),      // msg-type
-        &asn1_context_explicit(2, &tickets_seq),               // tickets
-        &asn1_context_explicit(3, &enc_part),                  // enc-part
+        &asn1_context_explicit(0, &asn1_integer_u32(5)), // pvno
+        &asn1_context_explicit(1, &asn1_integer_u32(22)), // msg-type
+        &asn1_context_explicit(2, &tickets_seq),         // tickets
+        &asn1_context_explicit(3, &enc_part),            // enc-part
     ]);
     // [APPLICATION 22]
     asn1_application(22, &krb_cred_body)
 }
 
 fn build_ticket(
-    sname: &[String], sname_type: i16,
+    sname: &[String],
+    sname_type: i16,
     realm: &str,
-    enc_type: u32, kvno: u32, cipher: &[u8],
+    enc_type: u32,
+    kvno: u32,
+    cipher: &[u8],
 ) -> Vec<u8> {
     // Ticket ::= [APPLICATION 1] SEQUENCE {
     //   tkt-vno  [0] INTEGER (5),
@@ -523,35 +637,55 @@ fn build_ticket(
 
 #[allow(clippy::too_many_arguments)]
 fn build_enc_krb_cred_part(
-    client_name: &[String], client_name_type: i16,
-    prealm: &str, srealm: &str,
-    flags: u32, key_type: u32, key_value: &[u8],
-    start_time: u64, end_time: u64, renew_until: u64,
-    sname: &[String], sname_type: i16,
+    client_name: &[String],
+    client_name_type: i16,
+    prealm: &str,
+    srealm: &str,
+    flags: u32,
+    key_type: u32,
+    key_value: &[u8],
+    start_time: u64,
+    end_time: u64,
+    renew_until: u64,
+    sname: &[String],
+    sname_type: i16,
 ) -> Vec<u8> {
     // EncKrbCredPart ::= [APPLICATION 29] SEQUENCE {
     //   ticket-info [0] SEQUENCE OF KrbCredInfo
     // }
     let krb_cred_info = build_krb_cred_info(
-        client_name, client_name_type, prealm, srealm,
-        flags, key_type, key_value,
-        start_time, end_time, renew_until,
-        sname, sname_type,
+        client_name,
+        client_name_type,
+        prealm,
+        srealm,
+        flags,
+        key_type,
+        key_value,
+        start_time,
+        end_time,
+        renew_until,
+        sname,
+        sname_type,
     );
     let seq_of = asn1_sequence(&[&krb_cred_info]);
-    let body = asn1_sequence(&[
-        &asn1_context_explicit(0, &seq_of),
-    ]);
+    let body = asn1_sequence(&[&asn1_context_explicit(0, &seq_of)]);
     asn1_application(29, &body)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_krb_cred_info(
-    client_name: &[String], client_name_type: i16,
-    prealm: &str, srealm: &str,
-    flags: u32, key_type: u32, key_value: &[u8],
-    start_time: u64, end_time: u64, renew_until: u64,
-    sname: &[String], sname_type: i16,
+    client_name: &[String],
+    client_name_type: i16,
+    prealm: &str,
+    srealm: &str,
+    flags: u32,
+    key_type: u32,
+    key_value: &[u8],
+    start_time: u64,
+    end_time: u64,
+    renew_until: u64,
+    sname: &[String],
+    sname_type: i16,
 ) -> Vec<u8> {
     // KrbCredInfo ::= SEQUENCE {
     //   key       [0] EncryptionKey,
@@ -565,14 +699,15 @@ fn build_krb_cred_info(
     //   sname     [9] PrincipalName OPTIONAL
     // }
     let enc_key = build_encryption_key(key_type, key_value);
-    let mut fields: Vec<Vec<u8>> = vec![
-        asn1_context_explicit(0, &enc_key),
-    ];
+    let mut fields: Vec<Vec<u8>> = vec![asn1_context_explicit(0, &enc_key)];
     if !prealm.is_empty() {
         fields.push(asn1_context_explicit(1, &asn1_general_string(prealm)));
     }
     if !client_name.is_empty() {
-        fields.push(asn1_context_explicit(2, &build_principal_name(client_name_type, client_name)));
+        fields.push(asn1_context_explicit(
+            2,
+            &build_principal_name(client_name_type, client_name),
+        ));
     }
     fields.push(asn1_context_explicit(3, &asn1_bitstring_u32(flags)));
     if start_time != 0 {
@@ -582,13 +717,19 @@ fn build_krb_cred_info(
         fields.push(asn1_context_explicit(6, &asn1_generalized_time(end_time)));
     }
     if renew_until != 0 {
-        fields.push(asn1_context_explicit(7, &asn1_generalized_time(renew_until)));
+        fields.push(asn1_context_explicit(
+            7,
+            &asn1_generalized_time(renew_until),
+        ));
     }
     if !srealm.is_empty() {
         fields.push(asn1_context_explicit(8, &asn1_general_string(srealm)));
     }
     if !sname.is_empty() {
-        fields.push(asn1_context_explicit(9, &build_principal_name(sname_type, sname)));
+        fields.push(asn1_context_explicit(
+            9,
+            &build_principal_name(sname_type, sname),
+        ));
     }
     let refs: Vec<&[u8]> = fields.iter().map(|f| f.as_slice()).collect();
     asn1_sequence(&refs)
@@ -645,7 +786,13 @@ fn asn1_length(len: usize) -> Vec<u8> {
     } else if len < 0x100_0000 {
         vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
     } else {
-        vec![0x84, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        vec![
+            0x84,
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
     }
 }
 
@@ -742,15 +889,45 @@ fn asn1_generalized_time(filetime: u64) -> Vec<u8> {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let diy = if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) { 366 } else { 365 };
-        if rem < diy { break; }
+        let diy = if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+            366
+        } else {
+            365
+        };
+        if rem < diy {
+            break;
+        }
         rem -= diy;
         y += 1;
     }
     let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0usize;
-    while m < 12 && rem >= mdays[m] { rem -= mdays[m]; m += 1; }
-    let s = format!("{:04}{:02}{:02}{:02}{:02}{:02}Z", y, m + 1, rem + 1, hours, mins, secs);
+    while m < 12 && rem >= mdays[m] {
+        rem -= mdays[m];
+        m += 1;
+    }
+    let s = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        y,
+        m + 1,
+        rem + 1,
+        hours,
+        mins,
+        secs
+    );
     asn1_tag_length_value(0x18, s.as_bytes())
 }

@@ -69,9 +69,7 @@ impl<'a> Hive<'a> {
         if file_off + 4 > self.data.len() {
             return Err(hive_err("Cell offset out of bounds"));
         }
-        let size = i32::from_le_bytes(
-            self.data[file_off..file_off + 4].try_into().unwrap(),
-        );
+        let size = i32::from_le_bytes(self.data[file_off..file_off + 4].try_into().unwrap());
         // Allocated cells have negative size
         let abs_size = size.unsigned_abs() as usize;
         if abs_size < 4 || file_off + abs_size > self.data.len() {
@@ -86,11 +84,17 @@ impl<'a> Key<'a> {
     pub fn subkey(&self, hive: &Hive<'a>, name: &str) -> Result<Key<'a>> {
         let subkey_count = u32_at(self.data, self.cell_offset + 0x14);
         if subkey_count == 0 {
-            return Err(hive_err(&format!("Key has no subkeys, looking for '{}'", name)));
+            return Err(hive_err(&format!(
+                "Key has no subkeys, looking for '{}'",
+                name
+            )));
         }
         let subkeys_list_offset = u32_at(self.data, self.cell_offset + 0x1C);
         if subkeys_list_offset == 0xFFFF_FFFF {
-            return Err(hive_err(&format!("No subkeys list, looking for '{}'", name)));
+            return Err(hive_err(&format!(
+                "No subkeys list, looking for '{}'",
+                name
+            )));
         }
 
         self.find_in_subkey_list(hive, subkeys_list_offset, name)

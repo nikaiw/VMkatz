@@ -5,13 +5,13 @@
 //! Supports both modern (AES-256-ECB, revision >= 0x00010006) and legacy
 //! (RC4, older revisions) encryption schemes.
 
-use aes::Aes256;
 use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::Aes256;
 use sha2::Digest;
 
-use crate::error::{GovmemError, Result};
+use super::hashes::{decode_utf16le, md5_hash, rc4};
 use super::hive::Hive;
-use super::hashes::{rc4, md5_hash, decode_utf16le};
+use crate::error::{GovmemError, Result};
 
 /// A single LSA secret with its name, raw data, and parsed interpretation.
 #[derive(Debug)]
@@ -114,7 +114,11 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
     let is_modern = revision >= 0x0001_0006;
     log::info!(
         "LSA encryption scheme: {}",
-        if is_modern { "modern (AES)" } else { "legacy (RC4)" }
+        if is_modern {
+            "modern (AES)"
+        } else {
+            "legacy (RC4)"
+        }
     );
 
     // Extract LSA key
@@ -246,7 +250,9 @@ fn extract_lsa_key_modern(
     let key_data_offset = keys_header + 16 + 4 + 4; // skip KeyId + KeyType + KeySize = 68
     if decrypted.len() >= key_data_offset + 32 {
         let key_size = u32::from_le_bytes(
-            decrypted[keys_header + 20..keys_header + 24].try_into().unwrap()
+            decrypted[keys_header + 20..keys_header + 24]
+                .try_into()
+                .unwrap(),
         ) as usize;
         if key_size == 32 && decrypted.len() >= key_data_offset + 32 {
             let mut key = [0u8; 32];
@@ -437,9 +443,7 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
     }
 
     if name.eq_ignore_ascii_case("NL$KM") || name.eq_ignore_ascii_case("_NL$KM_") {
-        return LsaSecretType::CachedDomainKey {
-            key: data.to_vec(),
-        };
+        return LsaSecretType::CachedDomainKey { key: data.to_vec() };
     }
 
     if let Some(service_name) = name.strip_prefix("_SC_") {

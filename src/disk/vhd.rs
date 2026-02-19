@@ -79,7 +79,9 @@ fn parse_footer(file: &mut File) -> Result<VhdFooter> {
     // Footer is the last 512 bytes of the file
     let file_size = file.seek(SeekFrom::End(0))?;
     if file_size < 512 {
-        return Err(GovmemError::ProcessNotFound("File too small for VHD".to_string()));
+        return Err(GovmemError::ProcessNotFound(
+            "File too small for VHD".to_string(),
+        ));
     }
     file.seek(SeekFrom::Start(file_size - 512))?;
 
@@ -180,10 +182,7 @@ fn parse_dynamic_header(file: &mut File, data_offset: u64) -> Result<VhdDynamicH
 }
 
 /// Read a parent locator path from the file.
-fn read_parent_path(
-    file: &mut File,
-    locator: &ParentLocator,
-) -> std::io::Result<String> {
+fn read_parent_path(file: &mut File, locator: &ParentLocator) -> std::io::Result<String> {
     file.seek(SeekFrom::Start(locator.platform_data_offset))?;
     let mut data = vec![0u8; locator.platform_data_length as usize];
     file.read_exact(&mut data)?;
@@ -193,7 +192,8 @@ fn read_parent_path(
     if code == 0x5769326B   // Wi2k
         || code == 0x57693272 // Wi2r
         || code == 0x57326B75 // W2ku
-        || code == 0x57327275 // W2ru
+        || code == 0x57327275
+    // W2ru
     {
         let u16s: Vec<u16> = data
             .chunks_exact(2)
@@ -315,7 +315,11 @@ impl VhdDisk {
                                     break;
                                 }
                                 Err(e) => {
-                                    log::warn!("VHD: failed to open parent {:?}: {}", parent_path, e);
+                                    log::warn!(
+                                        "VHD: failed to open parent {:?}: {}",
+                                        parent_path,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -417,8 +421,7 @@ impl VhdDisk {
                 self.file.seek(SeekFrom::Start(read_off))?;
                 self.file.read_exact(&mut buf[filled..filled + chunk])?;
             } else if let Some(ref mut parent) = self.parent {
-                let virtual_offset =
-                    block_index as u64 * self.block_size as u64 + pos as u64;
+                let virtual_offset = block_index as u64 * self.block_size as u64 + pos as u64;
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 parent.read_exact(&mut buf[filled..filled + chunk])?;
             } else {

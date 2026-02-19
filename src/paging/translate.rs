@@ -62,7 +62,10 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
             if pte.is_pagefile() {
                 log::trace!(
                     "PageFileFault: VA=0x{:x} PTE=0x{:016x} pfn={} offset=0x{:x}",
-                    vaddr, pte.raw(), pte.pagefile_number(), pte.pagefile_offset()
+                    vaddr,
+                    pte.raw(),
+                    pte.pagefile_number(),
+                    pte.pagefile_offset()
                 );
                 return Err(GovmemError::PageFileFault(vaddr, pte.raw()));
             }
@@ -327,7 +330,11 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                 if pdpte.is_large_page() {
                     let vaddr = (pml4_idx << 39) | (pdpt_idx << 30);
                     let paddr = pdpte.raw() & 0x000F_FFFF_C000_0000;
-                    callback(PageMapping { vaddr, paddr, size: 0x4000_0000 });
+                    callback(PageMapping {
+                        vaddr,
+                        paddr,
+                        size: 0x4000_0000,
+                    });
                     continue;
                 }
 
@@ -343,7 +350,11 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                     if pde.is_large_page() {
                         let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21);
                         let paddr = pde.raw() & 0x000F_FFFF_FFE0_0000;
-                        callback(PageMapping { vaddr, paddr, size: 0x20_0000 });
+                        callback(PageMapping {
+                            vaddr,
+                            paddr,
+                            size: 0x20_0000,
+                        });
                         continue;
                     }
 
@@ -354,9 +365,16 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                             Err(_) => continue,
                         };
                         if pte.is_present() || pte.is_transition() {
-                            let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12);
+                            let vaddr = (pml4_idx << 39)
+                                | (pdpt_idx << 30)
+                                | (pd_idx << 21)
+                                | (pt_idx << 12);
                             let paddr = pte.frame_addr();
-                            callback(PageMapping { vaddr, paddr, size: 0x1000 });
+                            callback(PageMapping {
+                                vaddr,
+                                paddr,
+                                size: 0x1000,
+                            });
                         }
                     }
                 }
@@ -442,7 +460,11 @@ impl<'a, P: PhysicalMemory> VirtualMemory for ProcessMemory<'a, P> {
 
             match translate_result {
                 Ok(phys_addr) => {
-                    if self.phys.read_phys(phys_addr, &mut buf[offset..offset + chunk]).is_err() {
+                    if self
+                        .phys
+                        .read_phys(phys_addr, &mut buf[offset..offset + chunk])
+                        .is_err()
+                    {
                         buf[offset..offset + chunk].fill(0);
                     }
                 }

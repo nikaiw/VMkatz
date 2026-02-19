@@ -133,11 +133,7 @@ pub fn dump_process<P: PhysicalMemory>(
 
 /// Walk page tables collecting all user-mode VAs with valid PTEs.
 /// Includes present, transition, and pagefile PTEs (not just present+transition).
-fn collect_all_user_pages<P: PhysicalMemory>(
-    phys: &P,
-    cr3: u64,
-    pages: &mut BTreeSet<u64>,
-) {
+fn collect_all_user_pages<P: PhysicalMemory>(phys: &P, cr3: u64, pages: &mut BTreeSet<u64>) {
     let pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
 
     for pml4_idx in 0..256u64 {
@@ -176,8 +172,7 @@ fn collect_all_user_pages<P: PhysicalMemory>(
                     continue;
                 }
                 if pde.is_large_page() {
-                    let base_va =
-                        (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21);
+                    let base_va = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21);
                     for i in 0..512u64 {
                         pages.insert(base_va + i * 0x1000);
                     }
@@ -192,10 +187,8 @@ fn collect_all_user_pages<P: PhysicalMemory>(
                     };
                     // Include present, transition, and pagefile PTEs
                     if pte.is_present() || pte.is_transition() || pte.is_pagefile() {
-                        let va = (pml4_idx << 39)
-                            | (pdpt_idx << 30)
-                            | (pd_idx << 21)
-                            | (pt_idx << 12);
+                        let va =
+                            (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12);
                         pages.insert(va);
                     }
                 }

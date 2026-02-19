@@ -131,13 +131,12 @@ fn try_extract_from_partition(
 ) -> Result<(Vec<PagefileDataRun>, u64)> {
     let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
 
-    let ntfs = ntfs::Ntfs::new(&mut part_reader).map_err(|e| {
-        GovmemError::DecryptionError(format!("NTFS parse error: {}", e))
-    })?;
+    let ntfs = ntfs::Ntfs::new(&mut part_reader)
+        .map_err(|e| GovmemError::DecryptionError(format!("NTFS parse error: {}", e)))?;
 
-    let root = ntfs.root_directory(&mut part_reader).map_err(|e| {
-        GovmemError::DecryptionError(format!("NTFS root dir error: {}", e))
-    })?;
+    let root = ntfs
+        .root_directory(&mut part_reader)
+        .map_err(|e| GovmemError::DecryptionError(format!("NTFS root dir error: {}", e)))?;
 
     let pagefile = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "pagefile.sys")?;
 
@@ -146,17 +145,15 @@ fn try_extract_from_partition(
         .ok_or_else(|| {
             GovmemError::DecryptionError("pagefile.sys: no $DATA attribute".to_string())
         })?
-        .map_err(|e| {
-            GovmemError::DecryptionError(format!("pagefile.sys $DATA error: {}", e))
-        })?;
+        .map_err(|e| GovmemError::DecryptionError(format!("pagefile.sys $DATA error: {}", e)))?;
 
     let data_attr = data_item.to_attribute().map_err(|e| {
         GovmemError::DecryptionError(format!("pagefile.sys to_attribute error: {}", e))
     })?;
 
-    let data_value = data_attr.value(&mut part_reader).map_err(|e| {
-        GovmemError::DecryptionError(format!("pagefile.sys value error: {}", e))
-    })?;
+    let data_value = data_attr
+        .value(&mut part_reader)
+        .map_err(|e| GovmemError::DecryptionError(format!("pagefile.sys value error: {}", e)))?;
 
     let pagefile_size = data_value.len();
 
@@ -168,10 +165,7 @@ fn try_extract_from_partition(
 
             for run_result in nr.data_runs() {
                 let run = run_result.map_err(|e| {
-                    GovmemError::DecryptionError(format!(
-                        "pagefile.sys data run error: {}",
-                        e
-                    ))
+                    GovmemError::DecryptionError(format!("pagefile.sys data run error: {}", e))
                 })?;
 
                 let allocated = run.allocated_size();

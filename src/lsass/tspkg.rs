@@ -66,7 +66,10 @@ pub fn extract_tspkg_credentials(
         return Ok(results);
     }
     if list_head < 0x10000 || (list_head >> 48) != 0 {
-        log::info!("TsPkg: TSGlobalCredTable has invalid pointer: 0x{:x}", list_head);
+        log::info!(
+            "TsPkg: TSGlobalCredTable has invalid pointer: 0x{:x}",
+            list_head
+        );
         return Ok(results);
     }
 
@@ -129,10 +132,7 @@ fn detect_tspkg_primary_ptr(vmem: &impl VirtualMemory, entry: u64) -> u64 {
 /// The pattern matches a function prologue. We scan forward for LEA reg, [rip+disp]
 /// instructions and find the one that dereferences to a valid heap pointer (the table).
 /// If none have a non-null value, fall back to the first LEA (original behavior).
-fn find_table_from_leas(
-    vmem: &impl VirtualMemory,
-    pattern_addr: u64,
-) -> Result<u64> {
+fn find_table_from_leas(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<u64> {
     let code = vmem.read_virt_bytes(pattern_addr, 0x80)?;
     let mut first_target = None;
 
@@ -168,7 +168,9 @@ fn find_table_from_leas(
 
     // No LEA target had a valid pointer - use the first one (table may be NULL)
     first_target.ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound("No LEA instruction found near TsPkg pattern".to_string())
+        crate::error::GovmemError::PatternNotFound(
+            "No LEA instruction found near TsPkg pattern".to_string(),
+        )
     })
 }
 
@@ -212,7 +214,11 @@ fn extract_primary_credential(
         return None;
     }
 
-    Some(TspkgCredential { username, domain, password })
+    Some(TspkgCredential {
+        username,
+        domain,
+        password,
+    })
 }
 
 /// Read a UNICODE_STRING embedded in a decrypted credential blob.
@@ -225,9 +231,8 @@ fn read_blob_ustring(blob: &[u8], offset: usize) -> String {
     if len == 0 || len > 0x200 {
         return String::new();
     }
-    let buf_off = u64::from_le_bytes(
-        blob[offset + 8..offset + 16].try_into().unwrap_or([0; 8]),
-    ) as usize;
+    let buf_off =
+        u64::from_le_bytes(blob[offset + 8..offset + 16].try_into().unwrap_or([0; 8])) as usize;
     if buf_off + len > blob.len() {
         return String::new();
     }

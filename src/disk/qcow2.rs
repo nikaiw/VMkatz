@@ -157,11 +157,7 @@ impl QcowDisk {
 
     /// Read data at a given virtual offset within a single cluster boundary.
     /// Returns bytes read.
-    fn read_cluster(
-        &mut self,
-        virtual_offset: u64,
-        buf: &mut [u8],
-    ) -> std::io::Result<usize> {
+    fn read_cluster(&mut self, virtual_offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         let l1_idx = (virtual_offset >> (self.l2_bits + self.cluster_bits)) as usize;
         let l2_idx = ((virtual_offset >> self.cluster_bits) & ((1 << self.l2_bits) - 1)) as usize;
         let cluster_off = virtual_offset & (self.cluster_size - 1);

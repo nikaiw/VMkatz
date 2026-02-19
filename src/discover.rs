@@ -105,7 +105,9 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
 /// Check if a file is an ELF core dump (magic + ET_CORE). Reads only 18 bytes.
 fn is_elf_core(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = fs::File::open(path) else { return false };
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
     let mut buf = [0u8; 18];
     if f.read_exact(&mut buf).is_err() {
         return false;
@@ -139,10 +141,7 @@ fn discover_vmdk(dir: &Path, all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
             continue;
         }
 
-        let stem = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
         // Skip extent files: pattern *-sNNN
         if is_extent_filename(stem) {

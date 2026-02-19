@@ -49,7 +49,10 @@ impl VmwareLayer {
                     vmem_page_num: 0,
                     page_count: vmem_file_size / PAGE_SIZE as u64,
                 }];
-                log::info!("No .vmsn found, using identity mapping ({} pages)", regions[0].page_count);
+                log::info!(
+                    "No .vmsn found, using identity mapping ({} pages)",
+                    regions[0].page_count
+                );
                 (vmem_path, regions, Vec::new(), Vec::new())
             }
         } else {
@@ -68,13 +71,20 @@ impl VmwareLayer {
         // Memory-map the VMEM file
         let vmem_file = fs::File::open(&vmem_path)?;
         let mmap = unsafe { Mmap::map(&vmem_file)? };
-        log::info!("VMEM mapped: {} bytes ({} MB)", mmap.len(), mmap.len() / (1024 * 1024));
+        log::info!(
+            "VMEM mapped: {} bytes ({} MB)",
+            mmap.len(),
+            mmap.len() / (1024 * 1024)
+        );
 
         // Fall back to identity mapping when VMSN has no region tags
         // (older VMware snapshots or snapshots without explicit region metadata)
         let regions = if regions.is_empty() {
             let page_count = mmap.len() as u64 / PAGE_SIZE as u64;
-            log::info!("No memory regions in VMSN, using identity mapping ({} pages)", page_count);
+            log::info!(
+                "No memory regions in VMSN, using identity mapping ({} pages)",
+                page_count
+            );
             vec![MemoryRegion {
                 guest_page_num: 0,
                 vmem_page_num: 0,

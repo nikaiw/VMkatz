@@ -41,11 +41,7 @@ impl FileBackedResolver {
             {
                 Ok(()) => break,
                 Err(e) => {
-                    log::debug!(
-                        "File-backed: partition 0x{:x}: {}",
-                        partition_offset,
-                        e
-                    );
+                    log::debug!("File-backed: partition 0x{:x}: {}", partition_offset, e);
                 }
             }
         }
@@ -86,25 +82,23 @@ impl FileBackedResolver {
             }
 
             match crate::sam::find_entry(&ntfs, &sys32, &mut part_reader, dll_name) {
-                Ok(file) => {
-                    match Self::read_pe_sections(&file, &mut part_reader, module.base) {
-                        Ok(secs) => {
-                            let bytes: usize = secs.iter().map(|s| s.data.len()).sum();
-                            log::debug!(
-                                "File-backed: {} @ 0x{:x}: {} sections, {} KB",
-                                dll_name,
-                                module.base,
-                                secs.len(),
-                                bytes / 1024
-                            );
-                            loaded_count += 1;
-                            sections.extend(secs);
-                        }
-                        Err(e) => {
-                            log::debug!("File-backed: {} PE parse: {}", dll_name, e);
-                        }
+                Ok(file) => match Self::read_pe_sections(&file, &mut part_reader, module.base) {
+                    Ok(secs) => {
+                        let bytes: usize = secs.iter().map(|s| s.data.len()).sum();
+                        log::debug!(
+                            "File-backed: {} @ 0x{:x}: {} sections, {} KB",
+                            dll_name,
+                            module.base,
+                            secs.len(),
+                            bytes / 1024
+                        );
+                        loaded_count += 1;
+                        sections.extend(secs);
                     }
-                }
+                    Err(e) => {
+                        log::debug!("File-backed: {} PE parse: {}", dll_name, e);
+                    }
+                },
                 Err(_) => {
                     log::debug!("File-backed: {} not in System32", dll_name);
                 }
@@ -146,8 +140,7 @@ impl FileBackedResolver {
         }
 
         // PE signature
-        if u32::from_le_bytes(pe_data[e_lfanew..e_lfanew + 4].try_into().unwrap()) != 0x0000_4550
-        {
+        if u32::from_le_bytes(pe_data[e_lfanew..e_lfanew + 4].try_into().unwrap()) != 0x0000_4550 {
             return Err(GovmemError::DecryptionError(
                 "Invalid PE signature".to_string(),
             ));
@@ -156,9 +149,8 @@ impl FileBackedResolver {
         // COFF header
         let num_sections =
             u16::from_le_bytes(pe_data[e_lfanew + 6..e_lfanew + 8].try_into().unwrap()) as usize;
-        let opt_hdr_size = u16::from_le_bytes(
-            pe_data[e_lfanew + 20..e_lfanew + 22].try_into().unwrap(),
-        ) as usize;
+        let opt_hdr_size =
+            u16::from_le_bytes(pe_data[e_lfanew + 20..e_lfanew + 22].try_into().unwrap()) as usize;
 
         let section_table = e_lfanew + 24 + opt_hdr_size;
         let mut sections = Vec::new();

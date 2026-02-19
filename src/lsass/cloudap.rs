@@ -57,7 +57,9 @@ pub fn extract_cloudap_credentials(
                 patterns::CLOUDAP_CACHE_PATTERNS,
                 "CloudApCache",
             ) {
-                Ok((pattern_addr, _)) => patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")?,
+                Ok((pattern_addr, _)) => {
+                    patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")?
+                }
                 Err(e) => {
                     log::debug!(
                         "CloudAP .text pattern scan failed ({}), trying .data fallback",
@@ -98,13 +100,18 @@ fn walk_cloudap_cache(
         visited.insert(current);
 
         let luid = vmem.read_virt_u64(current + OFFSET_LUID).unwrap_or(0);
-        let cache_entry_ptr = vmem.read_virt_u64(current + OFFSET_CACHE_ENTRY).unwrap_or(0);
+        let cache_entry_ptr = vmem
+            .read_virt_u64(current + OFFSET_CACHE_ENTRY)
+            .unwrap_or(0);
 
         if cache_entry_ptr > 0x10000 && (cache_entry_ptr >> 48) == 0 {
             if let Some(cred) = extract_cache_entry(vmem, cache_entry_ptr, keys) {
                 log::info!(
                     "CloudAP: LUID=0x{:x} user={} domain={} dpapi_key_len={}",
-                    luid, cred.username, cred.domain, cred.dpapi_key.len()
+                    luid,
+                    cred.username,
+                    cred.domain,
+                    cred.dpapi_key.len()
                 );
                 results.push((luid, cred));
             }
@@ -130,7 +137,9 @@ fn extract_cache_entry(
     let to_determine_ptr = vmem.read_virt_u64(entry_addr + ENTRY_TO_DETERMINE).ok()?;
 
     // Read the PackageSid pointer to get the user SID (helps identify the account)
-    let sid_ptr = vmem.read_virt_u64(entry_addr + ENTRY_PACKAGE_SID).unwrap_or(0);
+    let sid_ptr = vmem
+        .read_virt_u64(entry_addr + ENTRY_PACKAGE_SID)
+        .unwrap_or(0);
 
     // Try to extract DPAPI key from toDetermine structure
     let dpapi_key = if to_determine_ptr > 0x10000 && (to_determine_ptr >> 48) == 0 {
@@ -212,7 +221,9 @@ fn read_sid_string(vmem: &impl VirtualMemory, sid_addr: u64) -> (String, String)
         return (String::new(), String::new());
     }
 
-    let authority = u64::from_be_bytes([0, 0, header[2], header[3], header[4], header[5], header[6], header[7]]);
+    let authority = u64::from_be_bytes([
+        0, 0, header[2], header[3], header[4], header[5], header[6], header[7],
+    ]);
 
     let mut sub_auths = Vec::with_capacity(sub_auth_count);
     for i in 0..sub_auth_count {
@@ -242,13 +253,9 @@ fn find_cloudap_cache_in_data(
     pe: &PeHeaders,
     dll_base: u64,
 ) -> Result<u64> {
-    let data_sec = pe
-        .find_section(".data")
-        .ok_or_else(|| {
-            crate::error::GovmemError::PatternNotFound(
-                ".data section in cloudap.dll".to_string(),
-            )
-        })?;
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        crate::error::GovmemError::PatternNotFound(".data section in cloudap.dll".to_string())
+    })?;
 
     let data_base = dll_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
@@ -256,7 +263,8 @@ fn find_cloudap_cache_in_data(
 
     log::debug!(
         "CloudAP: scanning .data for cache list: base=0x{:x} size=0x{:x}",
-        data_base, data_size
+        data_base,
+        data_size
     );
 
     for off in (0..data_size.saturating_sub(16)).step_by(8) {
@@ -317,7 +325,9 @@ fn find_cloudap_cache_in_data(
 
         log::debug!(
             "CloudAP: found cache list candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
-            list_addr, flink, luid
+            list_addr,
+            flink,
+            luid
         );
         return Ok(list_addr);
     }

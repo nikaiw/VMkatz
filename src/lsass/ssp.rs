@@ -49,11 +49,12 @@ pub fn extract_ssp_credentials(
                 patterns::SSP_CREDENTIAL_PATTERNS,
                 "SspCredentialList",
             ) {
-                Ok((pattern_addr, _)) => {
-                    patterns::resolve_rip_relative(vmem, pattern_addr, 7)?
-                }
+                Ok((pattern_addr, _)) => patterns::resolve_rip_relative(vmem, pattern_addr, 7)?,
                 Err(e) => {
-                    log::debug!("SSP .text pattern scan failed ({}), trying .data fallback", e);
+                    log::debug!(
+                        "SSP .text pattern scan failed ({}), trying .data fallback",
+                        e
+                    );
                     find_ssp_list_in_data(vmem, &pe, msv_base)?
                 }
             }
@@ -100,11 +101,18 @@ fn walk_ssp_list(
                 .unwrap_or_default();
 
             if !username.is_empty() {
-                let password = crate::lsass::crypto::decrypt_unicode_string_password(vmem, cred_ptr + CRED_PASSWORD, keys);
+                let password = crate::lsass::crypto::decrypt_unicode_string_password(
+                    vmem,
+                    cred_ptr + CRED_PASSWORD,
+                    keys,
+                );
 
                 log::debug!(
                     "SSP: LUID=0x{:x} user={} domain={} pwd_len={}",
-                    luid, username, domain, password.len()
+                    luid,
+                    username,
+                    domain,
+                    password.len()
                 );
                 results.push((
                     luid,
@@ -123,8 +131,15 @@ fn walk_ssp_list(
         };
     }
 
-    let with_passwords = results.iter().filter(|(_, c)| !c.password.is_empty()).count();
-    log::info!("SSP: found {} entries ({} with passwords)", results.len(), with_passwords);
+    let with_passwords = results
+        .iter()
+        .filter(|(_, c)| !c.password.is_empty())
+        .count();
+    log::info!(
+        "SSP: found {} entries ({} with passwords)",
+        results.len(),
+        with_passwords
+    );
 
     Ok(results)
 }
@@ -133,16 +148,10 @@ fn walk_ssp_list(
 ///
 /// Validates candidates by checking that the first entry has a valid LUID
 /// and credentials pointer at the expected offsets.
-fn find_ssp_list_in_data(
-    vmem: &impl VirtualMemory,
-    pe: &PeHeaders,
-    msv_base: u64,
-) -> Result<u64> {
-    let data_sec = pe
-        .find_section(".data")
-        .ok_or_else(|| crate::error::GovmemError::PatternNotFound(
-            ".data section in msv1_0.dll".to_string(),
-        ))?;
+fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u64) -> Result<u64> {
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        crate::error::GovmemError::PatternNotFound(".data section in msv1_0.dll".to_string())
+    })?;
 
     let data_base = msv_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
@@ -150,7 +159,8 @@ fn find_ssp_list_in_data(
 
     log::debug!(
         "SSP: scanning msv1_0.dll .data for SspCredentialList: base=0x{:x} size=0x{:x}",
-        data_base, data_size
+        data_base,
+        data_size
     );
 
     for off in (0..data_size.saturating_sub(16)).step_by(8) {
@@ -213,7 +223,9 @@ fn find_ssp_list_in_data(
 
         log::debug!(
             "SSP: found SspCredentialList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
-            list_addr, flink, luid
+            list_addr,
+            flink,
+            luid
         );
         return Ok(list_addr);
     }
@@ -223,4 +235,3 @@ fn find_ssp_list_in_data(
         "SspCredentialList in msv1_0.dll .data section".to_string(),
     ))
 }
-

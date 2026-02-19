@@ -1,5 +1,6 @@
 use crate::error::{GovmemError, Result};
 use crate::memory::{PhysicalMemory, VirtualMemory};
+use crate::paging::ept::EptLayer;
 use crate::paging::translate::{PageTableWalker, ProcessMemory};
 use crate::windows::eprocess::EprocessReader;
 use crate::windows::offsets::{EprocessOffsets, ALL_EPROCESS_OFFSETS};
@@ -21,9 +22,7 @@ pub struct Process {
 
 /// Find the System process by trying all known EPROCESS offset sets.
 /// Returns the process and the matching offsets.
-pub fn find_system_process_auto(
-    phys: &impl PhysicalMemory,
-) -> Result<(Process, EprocessOffsets)> {
+pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, EprocessOffsets)> {
     for offsets in ALL_EPROCESS_OFFSETS {
         match find_system_process(phys, offsets) {
             Ok(proc) => return Ok((proc, *offsets)),
@@ -80,7 +79,10 @@ pub fn find_system_process(
             // Validate PID = 4
             let pid = match reader.read_pid(phys, eprocess_phys) {
                 Ok(pid) => pid,
-                Err(_) => { off += 1; continue; }
+                Err(_) => {
+                    off += 1;
+                    continue;
+                }
             };
             if pid != 4 {
                 off += 1;
@@ -91,7 +93,10 @@ pub fn find_system_process(
             // and only low 12 bits may differ (PCID)
             let dtb = match reader.read_dtb(phys, eprocess_phys) {
                 Ok(dtb) => dtb,
-                Err(_) => { off += 1; continue; }
+                Err(_) => {
+                    off += 1;
+                    continue;
+                }
             };
             let dtb_base = dtb & 0x000F_FFFF_FFFF_F000;
             if dtb_base == 0 || dtb_base >= phys_size {
@@ -106,7 +111,10 @@ pub fn find_system_process(
             // Validate Flink: should be a canonical kernel address (0xFFFF...)
             let flink = match reader.read_flink(phys, eprocess_phys) {
                 Ok(f) => f,
-                Err(_) => { off += 1; continue; }
+                Err(_) => {
+                    off += 1;
+                    continue;
+                }
             };
             if (flink >> 48) != 0xFFFF {
                 log::debug!(
@@ -122,7 +130,10 @@ pub fn find_system_process(
 
             log::info!(
                 "Found System process: eprocess_phys=0x{:x}, PID={}, DTB=0x{:x}, Flink=0x{:x}",
-                eprocess_phys, pid, dtb, flink
+                eprocess_phys,
+                pid,
+                dtb,
+                flink
             );
 
             return Ok(Process {
@@ -135,6 +146,118 @@ pub fn find_system_process(
         }
 
         page_addr += 4096;
+    }
+
+    Err(GovmemError::SystemProcessNotFound)
+}
+
+/// Fast System process scan for EPT layers.
+/// Instead of scanning the full L2 address space (which is huge and mostly unmapped),
+/// iterates only over pages that are actually mapped in the EPT.
+/// Reads L1 data directly for the bulk scan, uses EPT translation only for validation.
+pub fn find_system_process_ept<P: PhysicalMemory>(
+    ept: &EptLayer<'_, P>,
+    l1: &P,
+) -> Result<(Process, EprocessOffsets)> {
+    let pattern = b"System\0\0\0\0\0\0\0\0\0";
+    let mut page_buf = vec![0u8; 4096];
+    let mapped = ept.mapped_page_count();
+
+    log::info!(
+        "EPT fast scan: {} mapped pages ({} MB)",
+        mapped,
+        mapped * 4 / 1024,
+    );
+
+    for offsets in ALL_EPROCESS_OFFSETS {
+        let reader = EprocessReader::new(offsets);
+
+        for (l2_page, l1_page) in ept.mapped_pages() {
+            // Read L1 page directly (no EPT translation needed for bulk read)
+            if l1.read_phys(l1_page, &mut page_buf).is_err() {
+                continue;
+            }
+
+            // Skip zero pages
+            if page_buf.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            // Search for "System\0" in this page
+            let mut off = 0usize;
+            while off + pattern.len() <= page_buf.len() {
+                if &page_buf[off..off + pattern.len()] != pattern {
+                    off += 1;
+                    continue;
+                }
+
+                // Compute L2 physical address of the match
+                let match_l2 = l2_page + off as u64;
+                if match_l2 < offsets.image_file_name {
+                    off += 1;
+                    continue;
+                }
+                let eprocess_l2 = match_l2 - offsets.image_file_name;
+
+                // Validate PID = 4 (read through EPT)
+                let pid = match reader.read_pid(ept, eprocess_l2) {
+                    Ok(pid) => pid,
+                    Err(_) => {
+                        off += 1;
+                        continue;
+                    }
+                };
+                if pid != 4 {
+                    off += 1;
+                    continue;
+                }
+
+                // Validate DTB
+                let dtb = match reader.read_dtb(ept, eprocess_l2) {
+                    Ok(dtb) => dtb,
+                    Err(_) => {
+                        off += 1;
+                        continue;
+                    }
+                };
+                let dtb_base = dtb & 0x000F_FFFF_FFFF_F000;
+                if dtb_base == 0 || dtb_base >= ept.phys_size() {
+                    off += 1;
+                    continue;
+                }
+
+                // Validate Flink (canonical kernel address)
+                let flink = match reader.read_flink(ept, eprocess_l2) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        off += 1;
+                        continue;
+                    }
+                };
+                if (flink >> 48) != 0xFFFF {
+                    off += 1;
+                    continue;
+                }
+
+                let peb = reader.read_peb(ept, eprocess_l2).unwrap_or(0);
+
+                log::info!(
+                    "EPT: Found System at L2=0x{:x} (L1=0x{:x}+0x{:x}), PID={}, DTB=0x{:x}, Flink=0x{:x}",
+                    eprocess_l2, l1_page, off, pid, dtb, flink
+                );
+
+                return Ok((
+                    Process {
+                        pid,
+                        name: "System".to_string(),
+                        dtb,
+                        eprocess_phys: eprocess_l2,
+                        peb_vaddr: peb,
+                    },
+                    *offsets,
+                ));
+            }
+        }
     }
 
     Err(GovmemError::SystemProcessNotFound)
@@ -256,10 +379,7 @@ fn read_full_image_name(phys: &impl PhysicalMemory, dtb: u64, peb: u64) -> Optio
     }
 
     // Extract just the filename from the path (handles both \ and / separators)
-    let name = full_path
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(&full_path);
+    let name = full_path.rsplit(['\\', '/']).next().unwrap_or(&full_path);
 
     if name.is_empty() {
         return None;
