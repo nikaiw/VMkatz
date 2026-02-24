@@ -95,8 +95,10 @@ pub fn extract_cached_credentials(
 
     log::info!("DCC2 iteration count: {}", iteration_count);
 
-    // AES key = NL$KM[16..32]
-    let aes_key = &nlkm_key[16..32];
+    // AES key = first 16 bytes of the NL$KM secret.
+    // Note: pypykatz/impacket use [16:32] on the RAW blob (including the 16-byte
+    // LSA_SECRET_BLOB header), which is equivalent to [0:16] on the stripped secret.
+    let aes_key = &nlkm_key[..16];
 
     let mut credentials = Vec::new();
 

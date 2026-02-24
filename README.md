@@ -54,9 +54,10 @@ All 9 SSP credential providers that mimikatz implements:
 | VirtualBox virtual disks | `.vdi` | VirtualBox |
 | QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox |
 | Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V |
+| LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs |
 | VM directories | any folder | Auto-discovers all processable files |
 
-**Target OS**: Windows 7 SP1 through Windows 11 x64 (auto-detected).
+**Target OS**: Windows 7 SP1 through Windows Server 2025 x64 (auto-detected).
 
 ## Quick Start
 
@@ -200,7 +201,7 @@ cargo build --release --no-default-features --features "sam ntds.dit"
 
 ## Tested Targets
 
-20 VMs tested across 6 Windows versions and 3 hypervisors.
+Tested across 7 Windows versions and 4 hypervisors.
 
 | Hypervisor | Guest OS | Artifact | Result | Notes |
 | --- | --- | --- | --- | --- |
@@ -219,6 +220,9 @@ cargo build --release --no-default-features --features "sam ntds.dit"
 | ESXi 8.0 | Windows 11 x64 | LSASS (`.vmsn`) | PASS | 2 VMs, no VBS |
 | ESXi 8.0 | Windows 11 x64 | SAM (flat `.vmdk`) | PASS | Powered-off VM |
 | ESXi 8.0 | Windows 11 x64 (VBS) | LSASS (`.vmsn`) | FAIL | Credential Guard / VBS |
+| Proxmox 8 | Windows Server 2016 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | Live + stopped VMs |
+| Proxmox 8 | Windows Server 2019 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | 3 VMs, incl. DCs |
+| Proxmox 8 | Windows Server 2025 x64 | SAM / LSA (LVM block device) | PASS | Template VM |
 
 ### Known limitations
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works when the VM is powered off.

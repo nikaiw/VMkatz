@@ -447,6 +447,13 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
     }
 
     if let Some(service_name) = name.strip_prefix("_SC_") {
+        // GMSA managed passwords are binary blobs, not UTF-16LE text
+        if service_name.starts_with("GMSA_") || service_name.starts_with("GMSA{") {
+            return LsaSecretType::ServicePassword {
+                service: service_name.to_string(),
+                password: hex::encode(data),
+            };
+        }
         let password = decode_utf16le(data);
         return LsaSecretType::ServicePassword {
             service: service_name.to_string(),

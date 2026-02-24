@@ -150,30 +150,24 @@ fn main() -> anyhow::Result<()> {
         return run_directory(input_path, &args);
     }
 
-    // Auto-detect SAM mode for disk images, or explicit --sam flag
+    // Auto-detect SAM mode for disk images / block devices, or explicit --sam flag
     #[cfg(feature = "sam")]
     {
         let ext = input_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
+        let is_disk_ext = ext.eq_ignore_ascii_case("vdi")
+            || ext.eq_ignore_ascii_case("vmdk")
+            || ext.eq_ignore_ascii_case("qcow2")
+            || ext.eq_ignore_ascii_case("qcow")
+            || ext.eq_ignore_ascii_case("vhdx")
+            || ext.eq_ignore_ascii_case("vhd");
+        let is_block_device = is_block_dev(input_path);
         #[cfg(feature = "ntds.dit")]
-        let sam_mode = args.sam
-            || args.ntds
-            || ext.eq_ignore_ascii_case("vdi")
-            || ext.eq_ignore_ascii_case("vmdk")
-            || ext.eq_ignore_ascii_case("qcow2")
-            || ext.eq_ignore_ascii_case("qcow")
-            || ext.eq_ignore_ascii_case("vhdx")
-            || ext.eq_ignore_ascii_case("vhd");
+        let sam_mode = args.sam || args.ntds || is_disk_ext || is_block_device;
         #[cfg(not(feature = "ntds.dit"))]
-        let sam_mode = args.sam
-            || ext.eq_ignore_ascii_case("vdi")
-            || ext.eq_ignore_ascii_case("vmdk")
-            || ext.eq_ignore_ascii_case("qcow2")
-            || ext.eq_ignore_ascii_case("qcow")
-            || ext.eq_ignore_ascii_case("vhdx")
-            || ext.eq_ignore_ascii_case("vhd");
+        let sam_mode = args.sam || is_disk_ext || is_block_device;
         if sam_mode {
             return run_sam(input_path, &args);
         }
@@ -665,6 +659,22 @@ fn run_lsass(
                 )
             }
         }
+    }
+}
+
+/// Check if a path is a block device (Linux /dev/...).
+fn is_block_dev(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path)
+            .map(|m| m.file_type().is_block_device())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 

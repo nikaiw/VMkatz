@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::error::{GovmemError, Result};
 
 /// Raw flat disk image — no container format, just raw sectors.
-/// Handles flat VMDKs (`-flat.vmdk`), raw dumps (`.raw`, `.img`, `.dd`).
+/// Handles flat VMDKs (`-flat.vmdk`), raw dumps (`.raw`, `.img`, `.dd`),
+/// and block devices (`/dev/...`).
 pub struct RawDisk {
     file: File,
     size: u64,
@@ -13,11 +14,13 @@ pub struct RawDisk {
 
 impl RawDisk {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(GovmemError::Io)?;
-        let size = file.metadata().map_err(GovmemError::Io)?.len();
+        let mut file = File::open(path).map_err(GovmemError::Io)?;
+        // metadata().len() returns 0 for block devices, so seek to end instead
+        let size = file.seek(SeekFrom::End(0)).map_err(GovmemError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(GovmemError::Io)?;
         log::info!(
             "Raw disk: {} ({} MB)",
-            path.file_name().unwrap_or_default().to_string_lossy(),
+            path.display(),
             size / (1024 * 1024)
         );
         Ok(Self { file, size })

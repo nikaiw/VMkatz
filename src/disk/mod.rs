@@ -25,7 +25,7 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         .to_lowercase();
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-    // Detect flat VMDK (e.g., "name-flat.vmdk") — raw disk, not sparse
+    // Detect flat VMDK (e.g., "name-flat.vmdk") - raw disk, not sparse
     if ext == "vmdk" && stem.ends_with("-flat") {
         let disk = raw::RawDisk::open(path)?;
         return Ok(Box::new(disk));
@@ -56,9 +56,10 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
             let disk = raw::RawDisk::open(path)?;
             Ok(Box::new(disk))
         }
-        _ => Err(crate::error::GovmemError::ProcessNotFound(format!(
-            "Unsupported disk format: .{}",
-            ext
-        ))),
+        _ => {
+            // No recognized extension - try as raw disk (block devices, etc.)
+            let disk = raw::RawDisk::open(path)?;
+            Ok(Box::new(disk))
+        }
     }
 }
