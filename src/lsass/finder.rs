@@ -213,14 +213,18 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
         let mut next_synth_luid = 0x8000_0000_0000_0000u64;
         for (luid, msv_cred) in msv_creds {
-            // When physical scan returns LUID=0, match by username+domain to existing session
+            // When physical scan returns LUID=0, match by username+domain to existing session.
+            // If domain is empty or "." (local machine shorthand), match by username only.
             let effective_luid = if luid == 0 {
                 all_creds
                     .iter()
                     .find(|(_, c)| {
-                        c.username.eq_ignore_ascii_case(&msv_cred.username)
-                            && c.domain.eq_ignore_ascii_case(&msv_cred.domain)
-                            && c.msv.is_none()
+                        let name_match =
+                            c.username.eq_ignore_ascii_case(&msv_cred.username);
+                        let domain_match = msv_cred.domain.is_empty()
+                            || msv_cred.domain == "."
+                            || c.domain.eq_ignore_ascii_case(&msv_cred.domain);
+                        name_match && domain_match && c.msv.is_none()
                     })
                     .map(|(&k, _)| k)
                     .unwrap_or_else(|| {

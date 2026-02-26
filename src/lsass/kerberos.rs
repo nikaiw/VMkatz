@@ -546,7 +546,38 @@ fn extract_single_ticket(
         Vec::new()
     };
 
-    if ticket_blob.is_empty() && service_name.is_empty() {
+    // Validate ticket quality: reject garbage or paged-out tickets
+    if service_name.is_empty() && domain_name.is_empty() {
+        return None;
+    }
+    if ticket_blob.is_empty() {
+        return None;
+    }
+    // ticket_blob that is mostly zeros = paged out memory, not a real ticket
+    let zero_count = ticket_blob.iter().filter(|&&b| b == 0).count();
+    if zero_count > ticket_blob.len() * 3 / 4 {
+        log::debug!(
+            "Kerberos ticket at 0x{:x}: ticket_blob is {:.0}% zeros (paged out), skipping",
+            ticket_addr,
+            zero_count as f64 / ticket_blob.len() as f64 * 100.0
+        );
+        return None;
+    }
+    // Reject tickets with garbage key_type (valid etypes are small numbers)
+    if key_type > 0xFF {
+        log::debug!(
+            "Kerberos ticket at 0x{:x}: invalid key_type {} (garbage), skipping",
+            ticket_addr,
+            key_type
+        );
+        return None;
+    }
+    // Reject tickets with all-zero timestamps
+    if start_time == 0 && end_time == 0 && renew_until == 0 {
+        log::debug!(
+            "Kerberos ticket at 0x{:x}: all timestamps are zero (paged out), skipping",
+            ticket_addr
+        );
         return None;
     }
 
