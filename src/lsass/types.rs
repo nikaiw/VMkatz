@@ -294,6 +294,7 @@ impl std::fmt::Display for Credential {
             0x3e4 => " (NETWORK SERVICE)",
             0x3e5 => " (LOCAL SERVICE)",
             0x3e3 => " (IUSER)",
+            l if l >= 0x8000_0000_0000_0000 => " (physical scan)",
             _ => "",
         };
         writeln!(f, "  LUID: 0x{:x}{}", self.luid, luid_label)?;
@@ -322,10 +323,11 @@ impl std::fmt::Display for Credential {
         }
         if let Some(msv) = &self.msv {
             writeln!(f, "  [MSV1_0]")?;
-            writeln!(f, "    LM Hash : {}", hex::encode(msv.lm_hash))?;
+            if msv.lm_hash != [0u8; 16] {
+                writeln!(f, "    LM Hash : {}", hex::encode(msv.lm_hash))?;
+            }
             writeln!(f, "    NT Hash : {}", hex::encode(msv.nt_hash))?;
             writeln!(f, "    SHA1    : {}", hex::encode(msv.sha1_hash))?;
-            writeln!(f, "    DPAPI   : {}", hex::encode(msv.sha1_hash))?;
         }
         if let Some(wd) = &self.wdigest {
             if !wd.password.is_empty() {

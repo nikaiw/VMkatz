@@ -1603,7 +1603,6 @@ fn print_text(credentials: &[Credential], c: &Colors) {
             }
             println!("    NT Hash : {}", fmt_hash(&msv.nt_hash, c));
             println!("    SHA1    : {}", fmt_hash(&msv.sha1_hash, c));
-            println!("    DPAPI   : {}", fmt_hash(&msv.sha1_hash, c));
         }
         if let Some(wd) = &cred.wdigest {
             if !wd.password.is_empty() {

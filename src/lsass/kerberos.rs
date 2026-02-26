@@ -26,21 +26,21 @@ struct KerbOffsets {
 }
 
 /// Kerberos key hash entry offsets per Windows version.
-struct KerbKeyEntryOffsets {
+pub struct KerbKeyEntryOffsets {
     /// Size of each KERB_HASHPASSWORD entry
-    entry_size: u64,
+    pub entry_size: u64,
     /// Offset to KERB_HASHPASSWORD_GENERIC within the entry
-    generic_offset: u64,
+    pub generic_offset: u64,
 }
 
 /// Win10 1607+: KERB_HASHPASSWORD_6_1607 (0x38 bytes, generic at 0x20)
-const KEY_ENTRY_1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+pub const KEY_ENTRY_1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
     entry_size: 0x38,
     generic_offset: 0x20,
 };
 
 /// Pre-1607 (Win7/8/Win10-1507): KERB_HASHPASSWORD_6 (0x30 bytes, generic at 0x18)
-const KEY_ENTRY_PRE1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+pub const KEY_ENTRY_PRE1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
     entry_size: 0x30,
     generic_offset: 0x18,
 };
@@ -269,20 +269,15 @@ pub fn extract_kerberos_credentials(
             .read_win_unicode_string(cred_ptr + 0x10)
             .unwrap_or_default();
 
-        if username.is_empty() {
-            log::debug!(
-                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} empty username (paged?)",
-                node_ptr,
-                luid,
-                cred_ptr
-            );
-            continue;
-        }
-
-        let password =
-            extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default();
+        let password = if !username.is_empty() {
+            extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // Extract encryption keys (AES128, AES256, RC4, DES) from pKeyList
+        // Keys live in the session entry, not the credential, so they may be
+        // available even when the credential substructure is paged out.
         let key_entry_offsets = match variant_idx {
             0 => &KEY_ENTRY_1607,
             _ => &KEY_ENTRY_PRE1607,
@@ -300,11 +295,22 @@ pub fn extract_kerberos_credentials(
             extract_tickets_from_list(vmem, list_head, ticket_type, ticket_offsets, &mut tickets);
         }
 
+        // Skip nodes that have nothing useful (credential paged out AND no keys/tickets)
+        if username.is_empty() && kerb_keys.is_empty() && tickets.is_empty() {
+            log::debug!(
+                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} fully paged out",
+                node_ptr,
+                luid,
+                cred_ptr
+            );
+            continue;
+        }
+
         log::info!(
             "Kerberos: LUID=0x{:x} user={} domain={} password_len={} keys={} tickets={}",
             luid,
-            username,
-            domain,
+            if username.is_empty() { "(paged)" } else { &username },
+            if domain.is_empty() { "(paged)" } else { &domain },
             password.len(),
             kerb_keys.len(),
             tickets.len()

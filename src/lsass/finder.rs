@@ -1,6 +1,6 @@
 use crate::error::{GovmemError, Result};
 use crate::lsass::crypto::{self, CryptoKeys};
-use crate::lsass::types::{Credential, KerberosCredential, MsvCredential};
+use crate::lsass::types::{Credential, KerberosCredential, KerberosKey, MsvCredential};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::translate::{PageTableWalker, ProcessMemory};
 use crate::windows::offsets::X64_LDR;
@@ -299,11 +299,95 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         if !krb_creds.is_empty() {
             kerberos_status = "ok";
         }
+        // Check if any Kerberos credentials have keys
+        let has_keys = krb_creds.iter().any(|(_, k)| !k.keys.is_empty());
+
         for (luid, krb_cred) in krb_creds {
-            let entry = all_creds.entry(luid).or_insert_with(|| {
-                Credential::new_empty(luid, krb_cred.username.clone(), krb_cred.domain.clone())
+            // When physical scan returns LUID=0, match by username+domain to existing session
+            let effective_luid = if luid == 0 {
+                all_creds
+                    .iter()
+                    .find(|(_, c)| {
+                        c.username.eq_ignore_ascii_case(&krb_cred.username)
+                            && c.domain.eq_ignore_ascii_case(&krb_cred.domain)
+                            && c.kerberos.is_none()
+                    })
+                    .map(|(&k, _)| k)
+                    .unwrap_or(luid)
+            } else {
+                luid
+            };
+            let entry = all_creds.entry(effective_luid).or_insert_with(|| {
+                Credential::new_empty(
+                    effective_luid,
+                    krb_cred.username.clone(),
+                    krb_cred.domain.clone(),
+                )
             });
             entry.kerberos = Some(krb_cred);
+        }
+
+        // If no keys were found via AVL walk or physical credential scan,
+        // try dedicated physical scan for KIWI_KERBEROS_KEYS_LIST_6 structures
+        if !has_keys {
+            let key_groups =
+                scan_phys_for_kerberos_keys(phys, lsass.dtb, &lsass_vmem, &keys);
+            if !key_groups.is_empty() {
+                kerberos_status = "ok";
+
+                // Build NT hash → LUID mapping for RC4 key matching
+                let nt_to_luid: std::collections::HashMap<[u8; 16], u64> = all_creds
+                    .iter()
+                    .filter_map(|(&luid, c)| c.msv.as_ref().map(|m| (m.nt_hash, luid)))
+                    .collect();
+
+                let mut unassigned: Vec<Vec<KerberosKey>> = Vec::new();
+
+                for key_group in key_groups {
+                    // Try to match RC4 key (etype 23) to an NT hash
+                    let rc4_match = key_group.iter().find(|k| k.etype == 23).and_then(|k| {
+                        if k.key.len() == 16 {
+                            let mut hash = [0u8; 16];
+                            hash.copy_from_slice(&k.key);
+                            nt_to_luid.get(&hash).copied()
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(luid) = rc4_match {
+                        if let Some(cred) = all_creds.get_mut(&luid) {
+                            if cred.kerberos.is_none() {
+                                cred.kerberos = Some(KerberosCredential {
+                                    username: cred.username.clone(),
+                                    domain: cred.domain.clone(),
+                                    password: String::new(),
+                                    keys: key_group,
+                                    tickets: Vec::new(),
+                                });
+                            } else if let Some(krb) = &mut cred.kerberos {
+                                if krb.keys.is_empty() {
+                                    krb.keys = key_group;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    unassigned.push(key_group);
+                }
+
+                // Remaining: assign to creds with Kerberos but no keys (best effort)
+                for key_group in unassigned {
+                    let target = all_creds.values_mut().find(|c| {
+                        c.kerberos.as_ref().is_some_and(|k| k.keys.is_empty())
+                    });
+                    if let Some(cred) = target {
+                        if let Some(krb) = &mut cred.kerberos {
+                            krb.keys = key_group;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1096,6 +1180,209 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
     }
 
     results
+}
+
+/// Physical scan for KIWI_KERBEROS_KEYS_LIST_6 structures in LSASS pages.
+/// Returns extracted Kerberos keys grouped by heuristic (each key list → group).
+fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
+    phys: &P,
+    lsass_dtb: u64,
+    vmem: &impl VirtualMemory,
+    keys: &CryptoKeys,
+) -> Vec<Vec<KerberosKey>> {
+    let walker = PageTableWalker::new(phys);
+    let mut key_list_candidates: Vec<u64> = Vec::new();
+    let mut pages_scanned = 0u64;
+
+    log::info!("Kerberos key physical scan: searching for key list structures in LSASS pages...");
+
+    walker.enumerate_present_pages(lsass_dtb, |mapping| {
+        if mapping.size != 0x1000 {
+            return;
+        }
+        pages_scanned += 1;
+
+        let page_data = match phys.read_phys_bytes(mapping.paddr, 0x1000) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        if page_data.iter().all(|&b| b == 0) {
+            return;
+        }
+
+        // Search for KIWI_KERBEROS_KEYS_LIST_6 header:
+        //   +0x00: unk0 (DWORD)
+        //   +0x04: cbItem (DWORD) - number of entries (1-10)
+        //   +0x28: first KERB_HASHPASSWORD entry
+        // Try both 1607+ and pre-1607 layouts for the first entry.
+        for off in (0..0x1000usize - 0x80).step_by(8) {
+            let cb_item = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
+            if cb_item == 0 || cb_item > 10 {
+                continue;
+            }
+
+            // Try each layout: generic_offset within the first entry
+            for &generic_off_in_entry in &[0x20usize, 0x18] {
+                let entry_off = off + 0x28;
+                let generic_off = entry_off + generic_off_in_entry;
+                if generic_off + 0x18 > 0x1000 {
+                    continue;
+                }
+
+                let etype = u32::from_le_bytes(
+                    page_data[generic_off..generic_off + 4].try_into().unwrap(),
+                );
+                let key_size = u64::from_le_bytes(
+                    page_data[generic_off + 8..generic_off + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let key_ptr = u64::from_le_bytes(
+                    page_data[generic_off + 16..generic_off + 24]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                let valid_etype = matches!(etype, 1 | 3 | 17 | 18 | 23 | 24);
+                if !valid_etype {
+                    continue;
+                }
+
+                let expected = match etype {
+                    17 => 16,
+                    18 => 32,
+                    23 | 24 => 16,
+                    1 | 3 => 8,
+                    _ => continue,
+                };
+                if key_size != expected {
+                    continue;
+                }
+
+                if key_ptr < 0x10000 || (key_ptr >> 48) != 0 {
+                    continue;
+                }
+
+                let vaddr = mapping.vaddr + off as u64;
+                key_list_candidates.push(vaddr);
+                break; // Don't add same offset for both layouts
+            }
+        }
+    });
+
+    log::info!(
+        "Kerberos key physical scan: {} pages scanned, {} key list candidates",
+        pages_scanned,
+        key_list_candidates.len()
+    );
+
+    let mut all_key_groups: Vec<Vec<KerberosKey>> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+    for vaddr in &key_list_candidates {
+        let cb_item = match vmem.read_virt_u32(*vaddr + 0x04) {
+            Ok(n) if n > 0 && n <= 10 => n as usize,
+            _ => continue,
+        };
+
+        let mut key_group = Vec::new();
+        let entries_base = *vaddr + 0x28;
+
+        // Try 1607+ layout first, then pre-1607
+        for key_entry in &[
+            &crate::lsass::kerberos::KEY_ENTRY_1607,
+            &crate::lsass::kerberos::KEY_ENTRY_PRE1607,
+        ] {
+            key_group.clear();
+            let mut valid_count = 0usize;
+
+            for i in 0..cb_item {
+                let entry_base = entries_base + (i as u64) * key_entry.entry_size;
+                let generic_base = entry_base + key_entry.generic_offset;
+
+                let etype = match vmem.read_virt_u32(generic_base) {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                let key_size = match vmem.read_virt_u64(generic_base + 0x08) {
+                    Ok(s) if s > 0 && s <= 256 => s as usize,
+                    _ => break,
+                };
+                let checksum_ptr = match vmem.read_virt_u64(generic_base + 0x10) {
+                    Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+                    _ => break,
+                };
+
+                let enc_key_data = match vmem.read_virt_bytes(checksum_ptr, key_size) {
+                    Ok(d) => d,
+                    Err(_) => break,
+                };
+                let decrypted = match crate::lsass::crypto::decrypt_credential(keys, &enc_key_data)
+                {
+                    Ok(d) => d,
+                    Err(_) => break,
+                };
+
+                let expected_len = match etype {
+                    17 => 16,
+                    18 => 32,
+                    23 | 24 => 16,
+                    1 | 3 => 8,
+                    _ => {
+                        // Unknown etype — skip but don't break the chain
+                        continue;
+                    }
+                };
+                if decrypted.len() < expected_len {
+                    break;
+                }
+                let key_bytes = decrypted[..expected_len].to_vec();
+                if key_bytes.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                valid_count += 1;
+                key_group.push(KerberosKey {
+                    etype,
+                    key: key_bytes,
+                });
+            }
+
+            if valid_count > 0 {
+                break;
+            }
+        }
+
+        if key_group.is_empty() {
+            continue;
+        }
+
+        // Dedup by key content
+        let sig: Vec<u8> = key_group.iter().flat_map(|k| &k.key).copied().collect();
+        if !seen_keys.insert(sig) {
+            continue;
+        }
+
+        log::info!(
+            "Kerberos key physical scan: found {} keys at 0x{:x} (etypes: {})",
+            key_group.len(),
+            vaddr,
+            key_group
+                .iter()
+                .map(|k| format!("{}", k.etype))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        all_key_groups.push(key_group);
+    }
+
+    log::info!(
+        "Kerberos key physical scan: {} unique key groups found",
+        all_key_groups.len()
+    );
+
+    all_key_groups
 }
 
 fn find_module(modules: &[LoadedModule], name: &str) -> Option<LoadedModule> {
