@@ -4,6 +4,8 @@ pub mod vdi;
 pub mod vhd;
 pub mod vhdx;
 pub mod vmdk;
+#[cfg(feature = "vmfs")]
+pub mod vmfs;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

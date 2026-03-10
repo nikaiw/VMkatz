@@ -182,14 +182,19 @@ struct Args {
     carve: bool,
 
     /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "DEVICE")]
     vmfs_device: Option<String>,
 
     /// Flat VMDK path within the VMFS datastore (e.g., "VM-Name/VM-Name-flat.vmdk")
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "PATH")]
     vmdk: Option<String>,
+
+    /// List VMFS-6 devices and available flat VMDKs, then exit
+    #[cfg(feature = "vmfs")]
+    #[arg(long)]
+    vmfs_list: bool,
 }
 
 impl Args {
@@ -285,6 +290,7 @@ fn fmt_hash(hash: &[u8], c: &Colors) -> String {
 }
 
 /// Format LM hash for pwdump output: zero → standard empty LM placeholder.
+#[cfg(feature = "ntds.dit")]
 fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
     if *hash == ZERO_HASH_16 {
         BLANK_LM_HEX.to_string()
@@ -361,9 +367,14 @@ fn main() -> anyhow::Result<()> {
     log::set_max_level(log_level);
 
     // VMFS-6 raw device mode: read flat VMDKs directly from SCSI device
-    #[cfg(feature = "sam")]
-    if let Some(ref vmfs_device) = args.vmfs_device {
-        return run_vmfs(Path::new(vmfs_device), args.vmdk.as_deref(), &args);
+    #[cfg(feature = "vmfs")]
+    {
+        if args.vmfs_list {
+            return run_vmfs_list(args.vmfs_device.as_deref());
+        }
+        if let Some(ref vmfs_device) = args.vmfs_device {
+            return run_vmfs(Path::new(vmfs_device), args.vmdk.as_deref(), &args);
+        }
     }
 
     if args.input_paths.is_empty() {
@@ -488,12 +499,11 @@ fn main() -> anyhow::Result<()> {
         run_lsass(input_path, &args, pagefile_reader.as_ref(), disk_ref)
     }
     #[cfg(not(feature = "sam"))]
-    run_lsass(input_path, &args, Default::default(), Default::default())
+    run_lsass(input_path, &args, (), ())
 }
 
-/// Run VMFS-6 raw device mode: read flat VMDKs directly from SCSI device.
-#[cfg(feature = "sam")]
 /// Quick check for MBR partition type 0x07 (NTFS/HPFS) in first sector.
+#[cfg(feature = "vmfs")]
 fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool {
     use std::io::SeekFrom;
     let pos = reader.stream_position().unwrap_or(0);
@@ -514,6 +524,62 @@ fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool
     false
 }
 
+/// List available VMFS-6 devices and their flat VMDKs.
+#[cfg(feature = "vmfs")]
+fn run_vmfs_list(device_filter: Option<&str>) -> anyhow::Result<()> {
+    use vmkatz::disk::vmfs;
+
+    let devices = vmfs::list_vmfs6_devices();
+    if devices.is_empty() {
+        eprintln!("[!] No VMFS-6 devices found in /dev/disks/");
+        eprintln!("    (Are you running this on an ESXi host?)");
+        return Ok(());
+    }
+
+    eprintln!("[+] VMFS-6 devices:");
+    for dev in &devices {
+        let label = if dev.label.is_empty() {
+            "(unlabeled)".to_string()
+        } else {
+            dev.label.clone()
+        };
+        eprintln!("    {} — {}", dev.path.display(), label);
+    }
+
+    // If a specific device is given, or if there's only one, list its VMDKs
+    let targets: Vec<_> = if let Some(filter) = device_filter {
+        let filter_path = std::path::Path::new(filter);
+        devices
+            .iter()
+            .filter(|d| d.path == filter_path)
+            .collect()
+    } else {
+        devices.iter().collect()
+    };
+
+    for dev in &targets {
+        let label = if dev.label.is_empty() {
+            dev.path.display().to_string()
+        } else {
+            dev.label.clone()
+        };
+        match vmfs::list_vmfs6_vmdks(&dev.path) {
+            Ok(vmdks) => {
+                eprintln!("\n[+] {} — {} flat VMDKs:", label, vmdks.len());
+                for (vm, vmdk) in &vmdks {
+                    println!("--vmfs-device {} --vmdk '{}/{}'", dev.path.display(), vm, vmdk);
+                }
+            }
+            Err(e) => {
+                eprintln!("[!] {}: {}", dev.path.display(), e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "vmfs")]
 fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow::Result<()> {
     use vmkatz::disk::vmfs;
     use vmkatz::disk::DiskImage;
@@ -1363,14 +1429,14 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         #[cfg(feature = "sam")]
         let pagefile: PagefileRef<'_> = pagefile_reader.as_ref();
         #[cfg(not(feature = "sam"))]
-        let pagefile: PagefileRef<'_> = Default::default();
+        let pagefile: PagefileRef<'_> = ();
 
         // Disk path for file-backed DLL resolution
         #[cfg(feature = "sam")]
         let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> =
             discovery.disk_files.first().map(|p| p.as_path());
         #[cfg(not(feature = "sam"))]
-        let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = Default::default();
+        let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = ();
 
         for file in &discovery.lsass_files {
             let name = file.file_name().unwrap_or_default().to_string_lossy();
@@ -1440,6 +1506,7 @@ fn run_recursive(root: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::let_unit_value, clippy::unit_arg)]
 fn run_lsass(
     input_path: &Path,
     args: &Args,

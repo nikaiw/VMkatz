@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["vmware", "vbox", "qemu", "hyperv", "sam", "ntds.dit", "carve", "dump"]
+default = ["vmware", "vbox", "qemu", "hyperv", "sam", "ntds.dit", "carve", "dump", "vmfs"]
 vmware = ["dep:memmap2"]
 vbox = []
 qemu = ["dep:memmap2"]
@@ -14,6 +14,7 @@ sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
 "ntds.dit" = ["sam"]
 carve = []
 dump = []
+vmfs = ["sam"]
 
 [profile.release]
 opt-level = "z"

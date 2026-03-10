@@ -16,6 +16,7 @@ type Des3CbcDec = cbc::Decryptor<TdesEde3>;
 /// Tag for BCRYPT_HANDLE_KEY struct ("UUUR" LE).
 const UUUR_TAG: u32 = 0x5555_5552;
 /// Tag for BCRYPT_KEY / BCRYPT_KEY81 struct ("MSSK" LE).
+#[cfg(feature = "carve")]
 const MSSK_TAG: u32 = 0x4D53_534B;
 
 // BCrypt handle field offsets (x64).

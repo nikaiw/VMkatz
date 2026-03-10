@@ -6,9 +6,9 @@
 //! No mounted filesystem, no vmkfstools, no .sbc.sf file access needed.
 //! Everything is read from the raw SCSI partition device.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VmkatzError};
 
@@ -33,7 +33,7 @@ const PB2_DESC_ADDR: u32 = 0x0180_0004;
 const ADDR_SFB: u8 = 1; // Small File Block
 const ADDR_SB: u8 = 2;  // Sub-Block
 const ADDR_PB: u8 = 3;  // Pointer Block
-const ADDR_FD: u8 = 4;  // File Descriptor
+const _ADDR_FD: u8 = 4; // File Descriptor
 const ADDR_PB2: u8 = 5; // Pointer Block v2
 const ADDR_LFB: u8 = 7; // Large File Block
 
@@ -70,8 +70,6 @@ struct PhysicalExtent {
 #[derive(Debug)]
 struct LvmLayer {
     extents: Vec<PhysicalExtent>, // sorted by logical_offset
-    volume_size: u64,
-    md_alignment: u32,
 }
 
 impl LvmLayer {
@@ -95,7 +93,7 @@ impl LvmLayer {
         let num_pe_maps = u32::from_le_bytes(hdr[0xBE..0xC2].try_into().unwrap());
         let md_alignment = u32::from_le_bytes(hdr[0xCA..0xCE].try_into().unwrap());
         let num_pes6 = u32::from_le_bytes(hdr[0xCE..0xD2].try_into().unwrap());
-        let num_volumes = u32::from_le_bytes(hdr[0x66..0x6A].try_into().unwrap());
+        let _num_volumes = u32::from_le_bytes(hdr[0x66..0x6A].try_into().unwrap());
 
         let is_lvm6 = major_version >= 6;
         let actual_num_pes = if is_lvm6 { num_pes6 } else { num_pes };
@@ -236,8 +234,6 @@ impl LvmLayer {
 
         Ok(LvmLayer {
             extents: merged,
-            volume_size,
-            md_alignment,
         })
     }
 
@@ -268,17 +264,17 @@ impl LvmLayer {
 /// Parsed FS3_Descriptor (VMFS-6 superblock).
 #[derive(Debug)]
 struct VmfsSuperblock {
-    magic: u32,
-    major_version: u32,
+    _magic: u32,
+    _major_version: u32,
     file_block_size: u64,
     sub_block_size: u32,
     fdc_cluster_group_offset: u32,
     fdc_clusters_per_group: u32,
     md_alignment: u32,
     sfb_to_lfb_shift: u16,
-    ptr_block_shift: u16,
-    sfb_addr_bits: u16,
-    label: String,
+    _ptr_block_shift: u16,
+    _sfb_addr_bits: u16,
+    _label: String,
 }
 
 impl VmfsSuperblock {
@@ -332,17 +328,17 @@ impl VmfsSuperblock {
         );
 
         Ok(VmfsSuperblock {
-            magic,
-            major_version,
+            _magic: magic,
+            _major_version: major_version,
             file_block_size,
             sub_block_size,
             fdc_cluster_group_offset,
             fdc_clusters_per_group,
             md_alignment,
             sfb_to_lfb_shift,
-            ptr_block_shift,
-            sfb_addr_bits,
-            label,
+            _ptr_block_shift: ptr_block_shift,
+            _sfb_addr_bits: sfb_addr_bits,
+            _label: label,
         })
     }
 
@@ -378,20 +374,12 @@ impl VmfsSuperblock {
         self.file_block_size.trailing_zeros()
     }
 
-    fn sub_block_size_shift(&self) -> u32 {
-        self.sub_block_size.trailing_zeros()
-    }
-
     fn ptr_block_num_ptrs(&self) -> usize {
         if self.md_alignment < 0x10000 {
             8192
         } else {
             self.md_alignment as usize >> 3
         }
-    }
-
-    fn ptr_block_num_shift(&self) -> u32 {
-        (self.ptr_block_num_ptrs() as u64).trailing_zeros()
     }
 
     /// SFB resources per cluster — needed for SFB→volume offset calculation.
@@ -410,10 +398,6 @@ struct ResFileMeta {
     cluster_group_offset: u32,
     resource_size: u32,
     cluster_group_size: u32,
-    num_resources_lo: u32,
-    num_cluster_groups: u32,
-    num_resources_hi: u32,
-    bits_per_resource: u32,
     child_meta_offset: u32,
     flags: u32,
     parent_resources_per_cluster: u32,
@@ -438,11 +422,7 @@ impl ResFileMeta {
             cluster_group_offset: u32::from_le_bytes(data[0x08..0x0C].try_into().unwrap()),
             resource_size: u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap()),
             cluster_group_size: u32::from_le_bytes(data[0x10..0x14].try_into().unwrap()),
-            num_resources_lo: u32::from_le_bytes(data[0x14..0x18].try_into().unwrap()),
-            num_cluster_groups: u32::from_le_bytes(data[0x18..0x1C].try_into().unwrap()),
-            num_resources_hi: u32::from_le_bytes(data[0x1C..0x20].try_into().unwrap()),
             flags: u32::from_le_bytes(data[0x28..0x2C].try_into().unwrap()),
-            bits_per_resource: u32::from_le_bytes(data[0x30..0x34].try_into().unwrap()),
             child_meta_offset: u32::from_le_bytes(data[0x34..0x38].try_into().unwrap()),
             parent_resources_per_cluster: u32::from_le_bytes(
                 data[0x38..0x3C].try_into().unwrap(),
@@ -452,9 +432,6 @@ impl ResFileMeta {
         })
     }
 
-    fn num_resources(&self) -> u64 {
-        ((self.num_resources_hi as u64) << 32) | self.num_resources_lo as u64
-    }
 }
 
 // ── File Descriptor ──────────────────────────────────────────────────
@@ -465,7 +442,6 @@ struct FileDescriptor {
     address: u32,
     desc_type: u32,
     file_length: u64,
-    block_size: u64,
     num_blocks: u64,
     zla: u32,
     block_offset_shift: u8,
@@ -727,7 +703,7 @@ impl Vmfs6Volume {
             u32::from_le_bytes(buf[meta_off + 0x0C..meta_off + 0x10].try_into().unwrap());
         let file_length =
             u64::from_le_bytes(buf[meta_off + 0x14..meta_off + 0x1C].try_into().unwrap());
-        let block_size =
+        let _block_size =
             u64::from_le_bytes(buf[meta_off + 0x1C..meta_off + 0x24].try_into().unwrap());
         let num_blocks =
             u64::from_le_bytes(buf[meta_off + 0x24..meta_off + 0x2C].try_into().unwrap());
@@ -751,7 +727,6 @@ impl Vmfs6Volume {
             address: addr,
             desc_type,
             file_length,
-            block_size,
             num_blocks,
             zla,
             block_offset_shift,
@@ -832,7 +807,7 @@ impl Vmfs6Volume {
             ADDR_SFB => {
                 let (cluster, resource) = parse_sfb_addr(addr);
                 let sfb_size = sb.sfb_size();
-                Some(((cluster * sfb_size + resource) << sb.file_block_size_shift()) as u64)
+                Some((cluster * sfb_size + resource) << sb.file_block_size_shift())
             }
             ADDR_LFB => {
                 let block = parse_lfb_addr(addr);
@@ -1415,14 +1390,14 @@ impl Vmfs6Volume {
                 let (cluster, resource) = parse_sfb_addr(addr);
                 if let Some(ref sfb_meta) = self.sfb_meta {
                     // Use SFB resource metadata for accurate resolution
-                    let vol_off = ((cluster * sfb_meta.resources_per_cluster as u64 + resource)
-                        << self.sb.file_block_size_shift()) as u64;
+                    let vol_off = (cluster * sfb_meta.resources_per_cluster as u64 + resource)
+                        << self.sb.file_block_size_shift();
                     Ok(Some(vol_off))
                 } else {
                     // Fallback: use sfb_size
                     let sfb_size = self.sb.sfb_size();
                     Ok(Some(
-                        ((cluster * sfb_size + resource) << self.sb.file_block_size_shift()) as u64,
+                        (cluster * sfb_size + resource) << self.sb.file_block_size_shift(),
                     ))
                 }
             }
@@ -1515,7 +1490,7 @@ impl Vmfs6Volume {
     /// Build a block map for a flat VMDK file by resolving all block pointers.
     fn build_block_map(&mut self, fd: &FileDescriptor) -> Result<Vec<Option<u64>>> {
         let file_block_size = self.sb.file_block_size;
-        let total_blocks = (fd.file_length + file_block_size - 1) / file_block_size;
+        let total_blocks = fd.file_length.div_ceil(file_block_size);
 
         log::info!(
             "Building block map: {} blocks (zla={}, {} block ptrs)",
@@ -1820,4 +1795,104 @@ pub fn open_all_vmfs6_vmdks(
     }
 
     Ok(results)
+}
+
+/// A discovered VMFS-6 device with its datastore label.
+#[derive(Debug)]
+pub struct Vmfs6Device {
+    pub path: PathBuf,
+    pub label: String,
+}
+
+/// Scan for VMFS-6 partitions by probing partition devices in `/dev/disks/`.
+///
+/// Checks each partition device (those containing `:`) for the LVM magic
+/// `0xC001D00D` at offset 0x100000, then reads the VMFS superblock label.
+pub fn list_vmfs6_devices() -> Vec<Vmfs6Device> {
+    let disks_dir = Path::new("/dev/disks");
+    if !disks_dir.is_dir() {
+        // Not on ESXi or no /dev/disks
+        return Vec::new();
+    }
+
+    let mut devices = Vec::new();
+    let entries = match fs::read_dir(disks_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Partition devices have a colon separator (e.g., naa.xxx:1)
+        // Skip vml. symlinks — they duplicate naa. devices
+        if !name_str.contains(':') || name_str.starts_with("vml.") {
+            continue;
+        }
+
+        let path = entry.path();
+        if let Some(dev) = probe_vmfs6_device(&path) {
+            devices.push(dev);
+        }
+    }
+
+    devices.sort_by(|a, b| a.path.cmp(&b.path));
+    devices
+}
+
+/// Probe a single device path for VMFS-6 LVM header and read the datastore label.
+fn probe_vmfs6_device(path: &Path) -> Option<Vmfs6Device> {
+    let mut f = File::open(path).ok()?;
+
+    // Check LVM magic at offset 0x100000
+    f.seek(SeekFrom::Start(LVM_HEADER_OFFSET)).ok()?;
+    let mut magic_buf = [0u8; 4];
+    f.read_exact(&mut magic_buf).ok()?;
+    let magic = u32::from_le_bytes(magic_buf);
+    if magic != LVM_MAGIC {
+        return None;
+    }
+
+    // Read VMFS superblock label at FS3_FS_HEADER_OFFSET
+    let label = read_vmfs_label(&mut f).unwrap_or_default();
+
+    Some(Vmfs6Device {
+        path: path.to_path_buf(),
+        label,
+    })
+}
+
+/// Read the VMFS datastore label from the superblock.
+fn read_vmfs_label(f: &mut File) -> Option<String> {
+    // The superblock is at a fixed volume offset; for single-extent volumes
+    // with data_offset at 0x1100000, the physical offset is:
+    //   data_offset + FS3_FS_HEADER_OFFSET = 0x1100000 + 0x200000 = 0x1300000
+    // But we need the LVM data_offset first. Read it from the LVM header.
+    f.seek(SeekFrom::Start(LVM_HEADER_OFFSET)).ok()?;
+    let mut lvm_buf = [0u8; 0x200];
+    f.read_exact(&mut lvm_buf).ok()?;
+
+    let magic = u32::from_le_bytes(lvm_buf[0x00..0x04].try_into().ok()?);
+    if magic != LVM_MAGIC {
+        return None;
+    }
+    // data_offset at 0x7A in the LVM header (matches main parser)
+    let data_offset = u64::from_le_bytes(lvm_buf[0x7A..0x82].try_into().ok()?);
+
+    // Superblock at data_offset + FS3_FS_HEADER_OFFSET
+    let sb_offset = data_offset + FS3_FS_HEADER_OFFSET;
+    f.seek(SeekFrom::Start(sb_offset)).ok()?;
+    let mut sb_buf = [0u8; 0x170];
+    f.read_exact(&mut sb_buf).ok()?;
+
+    let sb_magic = u32::from_le_bytes(sb_buf[0..4].try_into().ok()?);
+    if sb_magic != VMFS_MAGIC && sb_magic != VMFSL_MAGIC {
+        return None;
+    }
+
+    // Label is at offset 0x1D, 128 bytes, null-terminated
+    let label_bytes = &sb_buf[0x1D..0x9D];
+    let end = label_bytes.iter().position(|&b| b == 0).unwrap_or(label_bytes.len());
+    let label = String::from_utf8_lossy(&label_bytes[..end]).into_owned();
+    Some(label)
 }
