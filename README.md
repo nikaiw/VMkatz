@@ -17,7 +17,7 @@ Without VMkatz, the traditional workflow looks like this: exfiltrate the entire 
 
 VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows secrets - NTLM hashes, DPAPI master keys, Kerberos tickets, cached domain credentials, LSA secrets, NTDS.dit - directly from VM memory snapshots and virtual disks, **on the NAS, the hypervisor, wherever the VM files are**.
 
-A single static binary, ~5 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a `.vmsn`, `.vmdk`, or an entire VM folder. Walk away with credentials, not disk images.
+A single static binary, ~2.5 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a `.vmsn`, `.vmdk`, or an entire VM folder. Walk away with credentials, not disk images.
 
 ## What It Extracts
 
