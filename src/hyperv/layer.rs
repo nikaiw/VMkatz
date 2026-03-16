@@ -2,11 +2,8 @@
 //!
 //! Supports:
 //! - Legacy `.bin` files (Hyper-V 2008/2012): raw physical memory dump (identity mapping)
+//! - Modern `.vmrs` files (Hyper-V 2016+): native parser for HyperVStorage format
 //! - Raw memory dumps from MemProcFS pmem export or vm2dmp conversions
-//!
-//! Note: Modern `.vmrs` files (Hyper-V 2016+) use a proprietary undocumented format
-//! that can only be read via Microsoft's vmsavedstatedumpprovider.dll on Windows.
-//! For .vmrs files, convert to raw dump first using MemProcFS or the Microsoft API.
 
 use std::fs;
 use std::path::Path;

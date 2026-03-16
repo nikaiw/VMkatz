@@ -35,7 +35,7 @@ impl log::Log for SimpleLogger {
 use vmkatz::hyperv::HypervLayer;
 use vmkatz::lsass;
 use vmkatz::lsass::finder::PagefileRef;
-use vmkatz::lsass::types::Credential;
+use vmkatz::lsass::types::{Credential, KerberosKey};
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
@@ -156,7 +156,7 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
 
-    /// Show all logon sessions including those without credentials
+    /// Show all logon sessions (disables deduplication and shows empty sessions)
     #[arg(short, long, default_value_t = false)]
     all: bool,
 
@@ -349,6 +349,20 @@ fn detect_file_type(path: &Path) -> RawFileType {
 }
 
 fn main() -> anyhow::Result<()> {
+    // ESXi's BusyBox shell sets a 512KB stack limit (vs 8MB on standard Linux).
+    // The deep call chain run_lsass → run_with_layer → find_system_process →
+    // EPT scan + process walk + credential extraction overflows 512KB when
+    // processing multiple large VM snapshots sequentially.
+    // Spawn on a thread with the standard Linux 8MB stack to avoid this.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
+    let handler = builder
+        .spawn(vmkatz_main)
+        .expect("failed to spawn main thread");
+    handler.join().unwrap()
+}
+
+fn vmkatz_main() -> anyhow::Result<()> {
     // Show full help (not just error) when no arguments provided
     let args = match Args::try_parse() {
         Ok(args) => args,
@@ -365,6 +379,8 @@ fn main() -> anyhow::Result<()> {
     };
     log::set_logger(&SimpleLogger).unwrap();
     log::set_max_level(log_level);
+
+    eprintln!("[*] vmkatz v{}", env!("CARGO_PKG_VERSION"));
 
     // VMFS-6 raw device mode: read flat VMDKs directly from SCSI device
     #[cfg(feature = "vmfs")]
@@ -1025,15 +1041,7 @@ fn run_minidump(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     // Export Kerberos tickets if requested
     export_kerberos_tickets(&credentials, args);
 
-    let c = get_colors(args);
-    match args.format.as_str() {
-        "csv" => print_csv(&credentials, &args.provider),
-        "ntlm" => print_ntlm(&credentials, &args.provider),
-        "hashcat" => print_hashcat(&credentials, &args.provider),
-        "brief" => print_brief(&credentials, &args.provider),
-        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
-    }
-    report_extraction_summary(&credentials, &args.format);
+    output_credentials(&credentials, args);
 
     Ok(())
 }
@@ -1341,10 +1349,10 @@ fn snapshot_type_label(path: &Path) -> &'static str {
         .and_then(|e| e.to_str())
         .unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
-        "vmsn" | "vmem" => "VMware",
+        "vmsn" | "vmss" | "vmem" => "VMware",
         "sav" => "VirtualBox",
         "elf" => "QEMU/KVM",
-        "bin" | "raw" => "Hyper-V",
+        "vmrs" | "bin" | "raw" => "Hyper-V",
         _ => "unknown",
     }
 }
@@ -1636,6 +1644,36 @@ fn run_lsass(
                 anyhow::bail!("Hyper-V support not enabled (compile with --features hyperv)")
             }
         }
+        LsassFormat::HypervVmrs => {
+            #[cfg(feature = "hyperv")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            eprintln!("[*] Opening Hyper-V VMRS saved state: {}", input_path.display());
+                        }
+                        let layer = vmkatz::hyperv::VmrsLayer::open(input_path)
+                            .context("Failed to open VMRS saved state")?;
+                        if verbose {
+                            eprintln!(
+                                "[+] VMRS: {} MB guest physical memory",
+                                layer.phys_size() / (1024 * 1024)
+                            );
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "hyperv"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("Hyper-V support not enabled (compile with --features hyperv)")
+            }
+        }
         LsassFormat::Vmware => {
             #[cfg(feature = "vmware")]
             {
@@ -1716,6 +1754,7 @@ enum LsassFormat {
     VBox,
     QemuElf,
     HypervBin,
+    HypervVmrs,
     Vmware,
     UnsupportedDisk,
 }
@@ -1735,10 +1774,17 @@ fn detect_lsass_format(path: &Path, ext: &str, carve: bool) -> LsassFormat {
     if ext.eq_ignore_ascii_case("elf") {
         return LsassFormat::QemuElf;
     }
+    if ext.eq_ignore_ascii_case("vmrs") {
+        return LsassFormat::HypervVmrs;
+    }
     if ext.eq_ignore_ascii_case("bin") {
-        // Could be Hyper-V .bin or a raw dump — check for ELF magic
+        // Could be Hyper-V .bin or a raw dump — check for ELF/VMRS magic
         if has_elf_magic(path) {
             return LsassFormat::QemuElf;
+        }
+        #[cfg(feature = "hyperv")]
+        if vmkatz::hyperv::is_vmrs_file(path) {
+            return LsassFormat::HypervVmrs;
         }
         return LsassFormat::HypervBin;
     }
@@ -1820,15 +1866,7 @@ fn run_carve<L: PhysicalMemory>(
         anyhow::bail!("Carve mode: no credentials found");
     }
 
-    let c = get_colors(args);
-    match args.format.as_str() {
-        "csv" => print_csv(&credentials, &args.provider),
-        "ntlm" => print_ntlm(&credentials, &args.provider),
-        "hashcat" => print_hashcat(&credentials, &args.provider),
-        "brief" => print_brief(&credentials, &args.provider),
-        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
-    }
-    report_extraction_summary(&credentials, &args.format);
+    output_credentials(&credentials, args);
 
     Ok(())
 }
@@ -2128,15 +2166,7 @@ fn run_with_system<L: PhysicalMemory>(
     // Export Kerberos tickets if requested
     export_kerberos_tickets(&credentials, args);
 
-    let c = get_colors(args);
-    match args.format.as_str() {
-        "csv" => print_csv(&credentials, &args.provider),
-        "ntlm" => print_ntlm(&credentials, &args.provider),
-        "hashcat" => print_hashcat(&credentials, &args.provider),
-        "brief" => print_brief(&credentials, &args.provider),
-        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
-    }
-    report_extraction_summary(&credentials, &args.format);
+    output_credentials(&credentials, args);
 
     Ok(())
 }
@@ -2355,6 +2385,169 @@ fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::Ker
 
     // Second ticket: length = 0
     out.extend_from_slice(&0u32.to_be_bytes());
+}
+
+/// Deduplicate credentials by (username, domain, nt_hash).
+///
+/// Sessions sharing the same identity and NT hash are merged into one entry,
+/// moving data from duplicates into the first occurrence to avoid cloning.
+fn dedup_credentials(credentials: &[Credential]) -> Vec<Credential> {
+    // Track which index is the "representative" for each (user, domain, nt_hash) group.
+    // We build a map from group key → first index, and collect donor indices.
+    let no_hash = [0xFFu8; 16]; // sentinel for sessions without MSV
+
+    // Dedup key: (username_lower, domain_lower, nt_hash)
+    type DedupKey = (String, String, [u8; 16]);
+
+    // First pass: identify groups and representative indices
+    let mut repr_map: Vec<(usize, Vec<usize>)> = Vec::new(); // (repr_idx, donor_indices)
+    let mut key_to_repr: Vec<(DedupKey, usize)> = Vec::new();
+
+    for (i, cred) in credentials.iter().enumerate() {
+        let nt = cred.msv.as_ref().map(|m| m.nt_hash).unwrap_or(no_hash);
+        let key = (
+            cred.username.to_ascii_lowercase(),
+            cred.domain.to_ascii_lowercase(),
+            nt,
+        );
+
+        if let Some(pos) = key_to_repr.iter().position(|(k, _)| *k == key) {
+            repr_map[key_to_repr[pos].1].1.push(i);
+        } else {
+            let repr_idx = repr_map.len();
+            repr_map.push((i, Vec::new()));
+            key_to_repr.push((key, repr_idx));
+        }
+    }
+
+    // Second pass: build result by taking ownership where possible
+    let mut result = Vec::with_capacity(repr_map.len());
+
+    // We need to work with the original credentials; clone only the representative
+    // and merge just the unique extras from donors (DPAPI, Kerberos, CredMan).
+    for (repr_idx, donor_indices) in &repr_map {
+        let base = &credentials[*repr_idx];
+
+        // For single-entry groups (no donors), just clone the credential directly
+        if donor_indices.is_empty() {
+            result.push(Credential {
+                luid: base.luid,
+                username: base.username.clone(),
+                domain: base.domain.clone(),
+                logon_type: base.logon_type,
+                session_id: base.session_id,
+                logon_time: base.logon_time,
+                logon_server: base.logon_server.clone(),
+                sid: base.sid.clone(),
+                msv: base.msv.clone(),
+                wdigest: base.wdigest.as_ref().filter(|w| !w.password.is_empty()).cloned(),
+                kerberos: base.kerberos.as_ref().cloned(),
+                tspkg: base.tspkg.as_ref().filter(|t| !t.password.is_empty()).cloned(),
+                dpapi: base.dpapi.clone(),
+                credman: base.credman.clone(),
+                ssp: base.ssp.as_ref().filter(|s| !s.password.is_empty()).cloned(),
+                livessp: base.livessp.as_ref().filter(|l| !l.password.is_empty()).cloned(),
+                cloudap: base.cloudap.as_ref().cloned(),
+            });
+            continue;
+        }
+
+        // Multi-entry group: merge unique extras from donors
+        let mut merged = Credential {
+            luid: base.luid,
+            username: base.username.clone(),
+            domain: base.domain.clone(),
+            logon_type: base.logon_type,
+            session_id: base.session_id,
+            logon_time: base.logon_time,
+            logon_server: base.logon_server.clone(),
+            sid: base.sid.clone(),
+            msv: base.msv.clone(),
+            wdigest: base.wdigest.as_ref().filter(|w| !w.password.is_empty()).cloned(),
+            kerberos: base.kerberos.as_ref().cloned(),
+            tspkg: base.tspkg.as_ref().filter(|t| !t.password.is_empty()).cloned(),
+            dpapi: base.dpapi.clone(),
+            credman: base.credman.clone(),
+            ssp: base.ssp.as_ref().filter(|s| !s.password.is_empty()).cloned(),
+            livessp: base.livessp.as_ref().filter(|l| !l.password.is_empty()).cloned(),
+            cloudap: base.cloudap.as_ref().cloned(),
+        };
+
+        for &idx in donor_indices {
+            let donor = &credentials[idx];
+
+            // Best metadata
+            if donor.logon_time != 0 && (merged.logon_time == 0 || donor.logon_time < merged.logon_time) {
+                merged.logon_time = donor.logon_time;
+            }
+            if merged.sid.is_empty() && !donor.sid.is_empty() {
+                merged.sid.clone_from(&donor.sid);
+            }
+            if merged.logon_server.is_empty() && !donor.logon_server.is_empty() {
+                merged.logon_server.clone_from(&donor.logon_server);
+            }
+
+            // WDigest: keep first non-empty
+            if merged.wdigest.is_none() {
+                if let Some(wd) = donor.wdigest.as_ref().filter(|w| !w.password.is_empty()) {
+                    merged.wdigest = Some(wd.clone());
+                }
+            }
+
+            // Kerberos: merge unique keys, tickets, password
+            if let Some(donor_krb) = &donor.kerberos {
+                if let Some(merged_krb) = &mut merged.kerberos {
+                    if merged_krb.password.is_empty() && !donor_krb.password.is_empty() {
+                        merged_krb.password.clone_from(&donor_krb.password);
+                    }
+                    for key in &donor_krb.keys {
+                        if merged_krb.keys.iter().all(|k| k.key != key.key) {
+                            merged_krb.keys.push(KerberosKey { etype: key.etype, key: key.key.clone() });
+                        }
+                    }
+                    for ticket in &donor_krb.tickets {
+                        if merged_krb.tickets.iter().all(|t| t.service_name != ticket.service_name) {
+                            merged_krb.tickets.push(ticket.clone());
+                        }
+                    }
+                } else {
+                    merged.kerberos = Some(donor_krb.clone());
+                }
+            }
+
+            // DPAPI: collect unique by GUID
+            for dk in &donor.dpapi {
+                if !merged.dpapi.iter().any(|d| d.guid == dk.guid) {
+                    merged.dpapi.push(dk.clone());
+                }
+            }
+
+            // CredMan: collect unique by target
+            for cm in &donor.credman {
+                if !merged.credman.iter().any(|c| c.target == cm.target) {
+                    merged.credman.push(cm.clone());
+                }
+            }
+
+            // TsPkg, SSP, LiveSSP, CloudAP: keep first non-empty
+            if merged.tspkg.is_none() {
+                merged.tspkg = donor.tspkg.as_ref().filter(|t| !t.password.is_empty()).cloned();
+            }
+            if merged.ssp.is_none() {
+                merged.ssp = donor.ssp.as_ref().filter(|s| !s.password.is_empty()).cloned();
+            }
+            if merged.livessp.is_none() {
+                merged.livessp = donor.livessp.as_ref().filter(|l| !l.password.is_empty()).cloned();
+            }
+            if merged.cloudap.is_none() {
+                merged.cloudap = donor.cloudap.as_ref().cloned();
+            }
+        }
+
+        result.push(merged);
+    }
+
+    result
 }
 
 fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: bool, providers: &[String]) {
@@ -2674,6 +2867,27 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
             }
         }
     }
+}
+
+/// Apply dedup (unless --all) and print credentials in the requested format.
+fn output_credentials(credentials: &[Credential], args: &Args) {
+    let deduped;
+    let creds = if args.all {
+        credentials
+    } else {
+        deduped = dedup_credentials(credentials);
+        &deduped
+    };
+
+    let c = get_colors(args);
+    match args.format.as_str() {
+        "csv" => print_csv(creds, &args.provider),
+        "ntlm" => print_ntlm(creds, &args.provider),
+        "hashcat" => print_hashcat(creds, &args.provider),
+        "brief" => print_brief(creds, &args.provider),
+        _ => print_text(creds, c, args.all, args.verbose, &args.provider),
+    }
+    report_extraction_summary(creds, &args.format);
 }
 
 /// Report a summary of extraction results to stderr.

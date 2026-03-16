@@ -83,6 +83,13 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
             if is_elf_core(file) {
                 out.push(file.clone());
             }
+        } else if ext.eq_ignore_ascii_case("vmrs") {
+            // Hyper-V modern saved state (.vmrs)
+            if let Ok(meta) = file.metadata() {
+                if meta.len() > 1024 * 1024 {
+                    out.push(file.clone());
+                }
+            }
         } else if ext.eq_ignore_ascii_case("bin") {
             // Hyper-V legacy .bin or ELF dump with .bin extension
             if let Ok(meta) = file.metadata() {

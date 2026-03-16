@@ -198,7 +198,7 @@ pub struct MsvCredential {
 }
 
 /// WDigest credential: plaintext password.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WdigestCredential {
     pub username: String,
     pub domain: String,
@@ -206,7 +206,7 @@ pub struct WdigestCredential {
 }
 
 /// Kerberos encryption key (AES128, AES256, RC4/NTLM, DES).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KerberosKey {
     /// Kerberos encryption type (etype): 17=AES128, 18=AES256, 23=RC4, 3=DES
     pub etype: u32,
@@ -234,7 +234,7 @@ impl KerberosKey {
 }
 
 /// Kerberos credential.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KerberosCredential {
     pub username: String,
     pub domain: String,
@@ -262,7 +262,7 @@ impl std::fmt::Display for KerberosTicketType {
 }
 
 /// Extracted Kerberos ticket (TGT/TGS).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KerberosTicket {
     pub ticket_type: KerberosTicketType,
     pub service_name: Vec<String>,
@@ -285,7 +285,7 @@ pub struct KerberosTicket {
 }
 
 /// TsPkg credential.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TspkgCredential {
     pub username: String,
     pub domain: String,
@@ -293,7 +293,7 @@ pub struct TspkgCredential {
 }
 
 /// DPAPI master key cache entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DpapiCredential {
     pub guid: String,
     pub key: Vec<u8>,
@@ -301,7 +301,7 @@ pub struct DpapiCredential {
 }
 
 /// Credential Manager saved credential.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CredmanCredential {
     pub username: String,
     pub domain: String,
@@ -310,7 +310,7 @@ pub struct CredmanCredential {
 }
 
 /// SSP credential (custom SSP).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SspCredential {
     pub username: String,
     pub domain: String,
@@ -318,7 +318,7 @@ pub struct SspCredential {
 }
 
 /// LiveSSP credential (Microsoft Account).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LiveSspCredential {
     pub username: String,
     pub domain: String,
@@ -326,7 +326,7 @@ pub struct LiveSspCredential {
 }
 
 /// CloudAP credential (Azure AD).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CloudApCredential {
     pub username: String,
     pub domain: String,

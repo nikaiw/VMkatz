@@ -132,7 +132,7 @@ pub fn extract_ssp_credentials_arch(
         let domain = read_ustring(vmem, current + offsets.domain, arch).unwrap_or_default();
 
         if !username.is_empty() {
-            let password = crate::lsass::crypto::decrypt_unicode_string_password_arch(
+            let password = crate::lsass::crypto::decrypt_unicode_string_password_cfb8(
                 vmem,
                 current + offsets.password,
                 keys,

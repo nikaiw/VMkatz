@@ -1078,6 +1078,39 @@ pub fn decode_utf16_le(data: &[u8]) -> String {
 
 /// Decrypt a UNICODE_STRING password field (unified x64/x86).
 /// On x86, the buffer pointer is at +4 (4 bytes); on x64, at +8 (8 bytes).
+/// Decrypt a UNICODE_STRING password using AES-CFB-8 (for SSP provider).
+pub fn decrypt_unicode_string_password_cfb8(
+    vmem: &dyn crate::memory::VirtualMemory,
+    ustring_addr: u64,
+    keys: &CryptoKeys,
+    arch: super::types::Arch,
+) -> String {
+    let pwd_len = vmem.read_virt_u16(ustring_addr).unwrap_or(0) as usize;
+    let pwd_max_len = vmem.read_virt_u16(ustring_addr + 2).unwrap_or(0) as usize;
+    let buf_offset = match arch {
+        super::types::Arch::X64 => 8u64,
+        super::types::Arch::X86 => 4,
+    };
+    let pwd_ptr = super::types::read_ptr(vmem, ustring_addr + buf_offset, arch).unwrap_or(0);
+    if pwd_len == 0 || pwd_ptr == 0 {
+        return String::new();
+    }
+    let read_len = pwd_max_len.max(pwd_len);
+    let enc_data = match vmem.read_virt_bytes(pwd_ptr, read_len) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    // SSP uses CFB-8 for both 8-aligned and non-8-aligned blobs
+    match decrypt_aes_cfb8(&keys.aes_key, &keys.iv, &enc_data) {
+        Ok(decrypted) => {
+            // Only use Length bytes (not MaximumLength padding)
+            let usable = decrypted.len().min(pwd_len);
+            decode_utf16_le(&decrypted[..usable])
+        }
+        Err(_) => String::new(),
+    }
+}
+
 pub fn decrypt_unicode_string_password_arch(
     vmem: &dyn crate::memory::VirtualMemory,
     ustring_addr: u64,
@@ -1201,6 +1234,55 @@ fn decrypt_aes_cfb128(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
                 } else {
                     feedback[..chunk.len()].copy_from_slice(chunk);
                 }
+            }
+        }
+        _ => {
+            return Err(VmkatzError::DecryptionError(format!(
+                "Invalid AES key length: {} (expected 16 or 32)",
+                key.len()
+            )));
+        }
+    }
+    Ok(output)
+}
+
+/// AES-CFB-8 decryption (8-bit segments).
+///
+/// SSP uses CFB with 8-bit segments (CRYPT_MODE_CFB + KP_MODE_BITS=8).
+/// Each byte is decrypted individually: encrypt feedback, XOR first byte
+/// with ciphertext byte, then shift ciphertext byte into feedback.
+fn decrypt_aes_cfb8(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = vec![0u8; data.len()];
+    let mut feedback = [0u8; 16];
+    feedback.copy_from_slice(&iv[..16]);
+
+    match key.len() {
+        16 => {
+            let cipher = <Aes128 as des::cipher::KeyInit>::new(
+                GenericArray::from_slice(key),
+            );
+            for (i, &ct_byte) in data.iter().enumerate() {
+                let mut block = GenericArray::clone_from_slice(&feedback);
+                cipher.encrypt_block(&mut block);
+                output[i] = ct_byte ^ block[0];
+                // Shift feedback left by 1 byte, append ciphertext byte
+                feedback.copy_within(1.., 0);
+                feedback[15] = ct_byte;
+            }
+        }
+        32 => {
+            let cipher = <Aes256 as des::cipher::KeyInit>::new(
+                GenericArray::from_slice(key),
+            );
+            for (i, &ct_byte) in data.iter().enumerate() {
+                let mut block = GenericArray::clone_from_slice(&feedback);
+                cipher.encrypt_block(&mut block);
+                output[i] = ct_byte ^ block[0];
+                feedback.copy_within(1.., 0);
+                feedback[15] = ct_byte;
             }
         }
         _ => {
