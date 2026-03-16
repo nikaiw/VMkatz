@@ -277,6 +277,15 @@ const BLANK_LM_HEX: &str = "aad3b435b51404eeaad3b435b51404ee";
 
 const ZERO_HASH_16: [u8; 16] = [0u8; 16];
 
+/// Prefix used by decode_password_bytes for binary (non-text) passwords.
+/// Allows fmt_password to display raw hex without lossy UTF-16 re-encoding.
+const RAW_HEX_PREFIX: &str = "\x00hex:";
+
+/// Get the displayable password string, stripping internal raw-hex prefix if present.
+fn display_password(password: &str) -> &str {
+    password.strip_prefix(RAW_HEX_PREFIX).unwrap_or(password)
+}
+
 /// Format a hash with blank annotation and optional color.
 fn fmt_hash(hash: &[u8], c: &Colors) -> String {
     let h = hex::encode(hash);
@@ -302,13 +311,17 @@ fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
 /// Format a password for display: if it contains non-printable/control characters
 /// (typical of machine account random passwords), show as hex instead of garbled Unicode.
 fn fmt_password(password: &str, c: &Colors) -> String {
+    // Raw hex from decode_password_bytes (machine account / binary password)
+    if let Some(hex_str) = password.strip_prefix(RAW_HEX_PREFIX) {
+        return format!("{}(hex) {}{}", c.dim, hex_str, c.reset);
+    }
     let is_printable = password.chars().all(|ch| {
         !ch.is_control() && (ch.is_ascii_graphic() || ch.is_ascii_whitespace() || ch.is_alphanumeric())
     });
     if is_printable {
         format!("{}{}{}", c.red, password, c.reset)
     } else {
-        // Convert back to UTF-16LE bytes for hex display (machine account password)
+        // Non-printable but valid UTF-16 (e.g. CJK characters)
         let bytes: Vec<u8> = password.encode_utf16().flat_map(|w| w.to_le_bytes()).collect();
         format!("{}(hex) {}{}", c.dim, hex::encode(&bytes), c.reset)
     }
@@ -2762,7 +2775,7 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
         if should_show(providers, "wdigest") {
             if let Some(wd) = &cred.wdigest {
                 if !wd.password.is_empty() {
-                    println!("wdigest,{},{},password,{},", user, dom, csv_escape(&wd.password));
+                    println!("wdigest,{},{},password,{},", user, dom, csv_escape(display_password(&wd.password)));
                 }
             }
         }
@@ -2770,7 +2783,7 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
         if should_show(providers, "kerberos") {
             if let Some(krb) = &cred.kerberos {
                 if !krb.password.is_empty() {
-                    println!("kerberos,{},{},password,{},", user, dom, csv_escape(&krb.password));
+                    println!("kerberos,{},{},password,{},", user, dom, csv_escape(display_password(&krb.password)));
                 }
                 for key in &krb.keys {
                     println!(
@@ -2794,7 +2807,7 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
         if should_show(providers, "tspkg") {
             if let Some(ts) = &cred.tspkg {
                 if !ts.password.is_empty() {
-                    println!("tspkg,{},{},password,{},", user, dom, csv_escape(&ts.password));
+                    println!("tspkg,{},{},password,{},", user, dom, csv_escape(display_password(&ts.password)));
                 }
             }
         }
@@ -2805,7 +2818,7 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
                     println!(
                         "ssp,{},{},password,{},",
                         csv_escape(&ssp.username), csv_escape(&ssp.domain),
-                        csv_escape(&ssp.password)
+                        csv_escape(display_password(&ssp.password))
                     );
                 }
             }
@@ -2817,7 +2830,7 @@ fn print_csv(credentials: &[Credential], providers: &[String]) {
                     println!(
                         "livessp,{},{},password,{},",
                         csv_escape(&live.username), csv_escape(&live.domain),
-                        csv_escape(&live.password)
+                        csv_escape(display_password(&live.password))
                     );
                 }
             }

@@ -1103,9 +1103,8 @@ pub fn decrypt_unicode_string_password_cfb8(
     // SSP uses CFB-8 for both 8-aligned and non-8-aligned blobs
     match decrypt_aes_cfb8(&keys.aes_key, &keys.iv, &enc_data) {
         Ok(decrypted) => {
-            // Only use Length bytes (not MaximumLength padding)
             let usable = decrypted.len().min(pwd_len);
-            decode_utf16_le(&decrypted[..usable])
+            decode_password_bytes(&decrypted[..usable])
         }
         Err(_) => String::new(),
     }
@@ -1133,9 +1132,41 @@ pub fn decrypt_unicode_string_password_arch(
         Err(_) => return String::new(),
     };
     match decrypt_credential(keys, &enc_data) {
-        Ok(decrypted) => decode_utf16_le(&decrypted),
+        Ok(decrypted) => {
+            // Only use Length bytes, not MaximumLength padding
+            let usable = decrypted.len().min(pwd_len);
+            decode_password_bytes(&decrypted[..usable])
+        }
         Err(_) => String::new(),
     }
+}
+
+/// Decode decrypted password bytes: try UTF-16LE text first, fall back to raw hex.
+///
+/// Machine account passwords contain arbitrary bytes that aren't valid UTF-16LE.
+/// To avoid lossy round-trips (raw → U+FFFD → re-encoded hex), we check if the
+/// decoded text is clean; if not, we hex-encode the raw bytes directly.
+fn decode_password_bytes(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+    // Try lossless UTF-16LE decode: reject if any replacement characters appear
+    let decoded: String = char::decode_utf16(
+        data.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0),
+    )
+    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect();
+
+    // If decode was clean (no replacement chars) and text is printable, return as string
+    if !decoded.contains('\u{FFFD}') {
+        return decoded;
+    }
+
+    // Binary data (machine account password): hex-encode raw bytes directly
+    // Use \x00 prefix so fmt_password detects it as non-printable
+    format!("\x00hex:{}", hex::encode(data))
 }
 
 /// Decrypt a prefix of encrypted data, trying AES-CBC first, then optionally 3DES-CBC.
