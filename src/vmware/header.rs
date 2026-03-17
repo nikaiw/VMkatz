@@ -58,7 +58,9 @@ impl VmsnGroup {
 /// Parse all groups from a VMSN file.
 pub fn parse_vmsn(data: &[u8]) -> Result<(VmsnHeader, Vec<VmsnGroup>)> {
     let header = VmsnHeader::parse(data)?;
-    let mut groups = Vec::with_capacity(header.group_count as usize);
+    // Cap allocation to prevent OOM from forged group_count
+    let max_groups = (data.len() - HEADER_SIZE) / GROUP_SIZE;
+    let mut groups = Vec::with_capacity((header.group_count as usize).min(max_groups));
     for i in 0..header.group_count as usize {
         let start = HEADER_SIZE + i * GROUP_SIZE;
         let end = start + GROUP_SIZE;

@@ -190,7 +190,10 @@ impl VmwareLayer {
         );
 
         let tag_start = memory_group.offset as usize;
-        let tag_end = tag_start + memory_group.size as usize;
+        let tag_end = tag_start.saturating_add(memory_group.size as usize);
+        if tag_start > vmsn_data.len() {
+            return Err(VmkatzError::GroupNotFound("memory group offset beyond file"));
+        }
         let tag_data = &vmsn_data[tag_start..tag_end.min(vmsn_data.len())];
         let all_tags = tags::parse_tags(tag_data, memory_group.offset)?;
 
@@ -214,7 +217,8 @@ impl VmwareLayer {
 
         log::info!("Memory regions: {}", regions_count);
 
-        let mut regions = Vec::with_capacity(regions_count as usize);
+        // Cap allocation: regions_count comes from tag data and could be forged
+        let mut regions = Vec::with_capacity((regions_count as usize).min(4096));
         for i in 0..regions_count {
             let vmem_page = tags::find_tag(&all_tags, "regionPageNum", &[i])
                 .map(|t| {
