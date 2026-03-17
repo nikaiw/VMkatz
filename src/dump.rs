@@ -205,23 +205,23 @@ fn coalesce_pages(sorted_vas: &[u64]) -> Vec<MemoryRegion> {
     }
 
     let mut start = sorted_vas[0];
-    let mut end = start + 0x1000;
+    let mut end = start.saturating_add(0x1000);
 
     for &va in &sorted_vas[1..] {
         if va == end {
-            end += 0x1000;
+            end = end.saturating_add(0x1000);
         } else {
             regions.push(MemoryRegion {
                 start_va: start,
-                size: end - start,
+                size: end.saturating_sub(start),
             });
             start = va;
-            end = va + 0x1000;
+            end = va.saturating_add(0x1000);
         }
     }
     regions.push(MemoryRegion {
         start_va: start,
-        size: end - start,
+        size: end.saturating_sub(start),
     });
 
     regions

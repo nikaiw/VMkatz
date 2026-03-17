@@ -160,8 +160,9 @@ fn parse_vbox_for_disk(
     // Format: <HardDisk uuid="{UUID}" location="path" ...>
     let needle = format!("uuid=\"{{{}}}", parent_uuid_str);
     let idx = content.find(&needle)?;
-    // Find location attribute near this uuid
-    let region = &content[idx.saturating_sub(200)..content.len().min(idx + 500)];
+    // Find location attribute AFTER the UUID match (not before, to avoid picking
+    // a location from a different HardDisk entry earlier in the XML)
+    let region = &content[idx..content.len().min(idx + 500)];
     let loc_marker = "location=\"";
     let loc_start = region.find(loc_marker)? + loc_marker.len();
     let loc_end = region[loc_start..].find('"')? + loc_start;
