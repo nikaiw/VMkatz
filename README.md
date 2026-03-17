@@ -129,7 +129,11 @@ cargo build --release
 
 # Show all sessions including empty ones
 ./vmkatz --all snapshot.vmsn
+```
 
+### Advanced options
+
+```bash
 # Recursively scan a directory tree for all VM files
 ./vmkatz -r /vmfs/volumes/datastore1/
 
@@ -241,7 +245,7 @@ VMkatz compiles to a static musl binary that runs directly on ESXi without depen
 # Cross-compile for ESXi (musl static)
 cargo build --release --target x86_64-unknown-linux-musl
 
-# Upload (~5 MB)
+# Upload (~3 MB)
 scp target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
 
 # On ESXi 8.0+, allow non-VIB binaries (requires once)
@@ -356,20 +360,23 @@ cargo build --release --no-default-features --features "vmware vbox qemu hyperv 
 src/
 ├── main.rs              CLI dispatch, format detection, output formatting
 ├── lib.rs               Crate root — feature-gated module declarations
-├── error.rs             VmkatzError type (thiserror + anyhow)
+├── error.rs             VmkatzError type
+├── utils.rs             Endian helpers, hex, UTF-16LE decode
 ├── memory/
 │   └── reader.rs        PhysicalMemory and VirtualMemory traits
-├── pe.rs                PE header parser (exports, sections, data directories)
+├── pe/                  PE header parser (exports, sections, data directories)
 ├── minidump.rs          MDMP parser — VirtualMemory trait over minidump regions
 ├── discover.rs          Directory/recursive auto-discovery of VM files
 ├── paging/
 │   ├── mod.rs           4-level x64 page table walker (CR3 → PTE)
-│   ├── pae.rs           3-level PAE page table walker (pre-Vista x86)
+│   ├── translate.rs     Address translation core
+│   ├── entry.rs         Page table entry decoding
 │   ├── ept.rs           Extended Page Table scanner (VBS/nested Hyper-V)
+│   ├── filebacked.rs    DLL section mapping from disk
 │   └── pagefile.rs      Pagefile.sys fault resolution from disk
 ├── windows/
 │   ├── process.rs       EPROCESS discovery (System process, process enumeration)
-│   └── offsets.rs       EPROCESS offset tables (Win7 → Win11 24H2, x64 + x86 PAE)
+│   └── offsets.rs       EPROCESS offset tables (WinXP SP3 → Win11 24H2, x64 + x86 PAE)
 ├── lsass/
 │   ├── finder.rs        Main extraction orchestrator (PhysicalMemory + minidump paths)
 │   ├── crypto.rs        LSASS decryption (AES-CBC, 3DES-CBC, DES-X-CBC, RC4)
@@ -390,17 +397,30 @@ src/
 ├── vbox/                [feature: vbox] VirtualBox .sav layer
 ├── qemu/                [feature: qemu] QEMU ELF core dump layer
 ├── hyperv/              [feature: hyperv] Hyper-V .vmrs/.bin/.raw layer (native VMRS parser)
-├── sam/                 [feature: sam] SAM/LSA/DCC2 + disk format handlers
-│   ├── mod.rs           Orchestration, types, bootkey extraction
+├── sam/                 [feature: sam] SAM/LSA/DCC2 + DPAPI + disk format handlers
+│   ├── mod.rs           Orchestration, disk extraction entry point
+│   ├── hive.rs          Windows registry hive parser (regf format)
+│   ├── bootkey.rs       Bootkey extraction from SYSTEM hive
+│   ├── hashes.rs        SAM hash decryption (AES-CBC, RC4, MD5, DES)
+│   ├── lsa.rs           LSA secrets decryption (DPAPI system keys, service passwords)
+│   ├── cache.rs         Cached domain credentials (DCC2)
+│   ├── dpapi_masterkey.rs  DPAPI master key file parser (hashcat 15300/15900)
 │   ├── partition.rs     MBR/GPT partition table parser
-│   ├── ntfs_reader.rs   NTFS MFT walker (SAM/SYSTEM/SECURITY hive discovery)
+│   ├── ntfs_reader.rs   NTFS file reader (SAM/SYSTEM/SECURITY discovery)
+│   ├── ntfs_fallback.rs NTFS fallback parser (no external crate)
 │   ├── disk_fallbacks.rs Fallback hive search for non-standard layouts
 │   └── vmdk_scan.rs     Sparse VMDK descriptor + extent parser
-├── disk/
+├── disk/                Virtual disk format handlers
+│   ├── vmdk.rs          VMware sparse/flat VMDK
+│   ├── vdi.rs           VirtualBox VDI (+ differencing chain)
+│   ├── qcow2.rs         QEMU QCOW2 (+ backing files)
+│   ├── vhd.rs           Hyper-V VHD (legacy)
+│   ├── vhdx.rs          Hyper-V VHDX
+│   ├── raw.rs           Raw/block device passthrough
 │   └── vmfs.rs          [feature: vmfs] VMFS-6 raw parser (LVM → SFD → FDC → FD → data)
 └── ntds/                [feature: ntds.dit] NTDS.dit ESE database parser
-    ├── mod.rs           ESE page/B+ tree traversal, PEK decryption, hash extraction
-    └── ese.rs           JET Blue database primitives (pages, tags, columns)
+    ├── mod.rs           PEK decryption, hash extraction pipeline
+    └── ese.rs           JET Blue database primitives (pages, B+ trees, columns)
 ```
 
 ## Tested Targets
