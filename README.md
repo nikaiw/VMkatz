@@ -40,6 +40,7 @@ All 9 SSP credential providers that mimikatz implements:
 - **SAM hashes**: Local account NT/LM hashes
 - **LSA secrets**: Service account passwords, auto-logon credentials, machine account keys
 - **Cached domain credentials**: DCC2 hashes (last N domain logons)
+- **DPAPI master keys**: Hashcat-ready hashes from user master key files (`$DPAPImk$` — modes 15300/15900)
 - **NTDS.dit**: Full Active Directory hash extraction from domain controller disks, natively from the ESE database - no impacket or external tools needed
 
 ## Supported Inputs
@@ -128,6 +129,25 @@ cargo build --release
 
 # Show all sessions including empty ones
 ./vmkatz --all snapshot.vmsn
+
+# Recursively scan a directory tree for all VM files
+./vmkatz -r /vmfs/volumes/datastore1/
+
+# Filter to only snapshots or only disks in directory mode
+./vmkatz --scan snapshot /path/to/vm/
+./vmkatz --scan disk /path/to/vm/
+
+# Filter output to specific providers
+./vmkatz --provider msv,kerberos snapshot.vmsn
+
+# Skip EPT scanning (faster when VBS is not in use)
+./vmkatz --no-ept snapshot.vmsn
+
+# Verbose output (memory regions, process list, debug info)
+./vmkatz -v snapshot.vmsn
+
+# Dump with custom Windows build number
+./vmkatz --dump lsass --build 26100 -o lsass.dmp snapshot.vmsn
 ```
 
 ## Output Formats
@@ -135,8 +155,9 @@ cargo build --release
 | Format | Flag | Description |
 | --- | --- | --- |
 | `text` | `--format text` (default) | Full credential dump with session metadata |
+| `brief` | `--format brief` | Compact one-line-per-credential summary |
 | `ntlm` | `--format ntlm` | `DOMAIN\user:::hash:::` pwdump format |
-| `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), mode 2100 (DCC2) |
+| `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), mode 2100 (DCC2), mode 15300/15900 (DPAPI) |
 | `csv` | `--format csv` | Machine-readable, all fields |
 
 In `text` mode, well-known blank password hashes (`31d6cfe0...` for NTLM, `aad3b435...` for LM) are annotated with `(blank)`.
@@ -440,3 +461,5 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 - [**pypykatz**](https://github.com/skelsec/pypykatz) by Tamás Jós ([@skelsec](https://twitter.com/skelsec)) -- pure Python mimikatz reimplementation, used as cross-reference for SAM/LSA/DCC2 extraction.
 - [**Impacket**](https://github.com/fortra/impacket) by Fortra (originally Alberto Solino [@agsolino](https://twitter.com/agsolino)) -- reference implementation for NTDS.dit extraction and the pwdump output format.
 - [**Vergilius Project**](https://www.vergiliusproject.com/) -- documented Windows kernel structures used to verify EPROCESS field offsets across all supported builds (XP through Win11 24H2).
+- [**dissect.vmfs**](https://github.com/fox-it/dissect.vmfs) by Fox-IT (NCC Group) -- Python VMFS parser from the Dissect DFIR framework, used as reference for VMFS-6 on-disk structures (LVM, superblock, resource files, file descriptors).
+- [**vmfs-tools**](https://github.com/glandium/vmfs-tools) by Mike Hommey -- open-source VMFS3/5 implementation that documents core on-disk structures and address types.
