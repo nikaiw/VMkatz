@@ -299,7 +299,7 @@ fn fmt_hash(hash: &[u8], c: &Colors) -> String {
 }
 
 /// Format LM hash for pwdump output: zero → standard empty LM placeholder.
-#[cfg(feature = "ntds.dit")]
+#[cfg(feature = "sam")]
 fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
     if *hash == ZERO_HASH_16 {
         BLANK_LM_HEX.to_string()
