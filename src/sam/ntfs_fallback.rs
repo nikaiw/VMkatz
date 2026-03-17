@@ -80,6 +80,11 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     let bytes_per_sector = u16::from_le_bytes([data[0x0B], data[0x0C]]) as u64;
     let sectors_per_cluster = data[0x0D] as u64;
     let cluster_size = bytes_per_sector * sectors_per_cluster;
+    if cluster_size == 0 {
+        return Err(VmkatzError::DecryptionError(
+            "Invalid NTFS boot sector: cluster_size is 0".into(),
+        ));
+    }
 
     let mft_cluster = read_u64(data, 0x30);
     let mftmirr_cluster = read_u64(data, 0x38);
@@ -91,6 +96,11 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     } else {
         1u64 << (-raw as u32)
     } as u32;
+    if record_size == 0 {
+        return Err(VmkatzError::DecryptionError(
+            "Invalid NTFS boot sector: record_size is 0".into(),
+        ));
+    }
 
     Ok(NtfsParams {
         cluster_size,
