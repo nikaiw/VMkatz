@@ -124,7 +124,8 @@ impl QcowDisk {
 
         // Read L1 table (big-endian u64 entries)
         file.seek(SeekFrom::Start(header.l1_table_offset))?;
-        let mut l1_table = Vec::with_capacity(header.l1_size as usize);
+        // Cap pre-allocation; actual entries are read one-by-one from file
+        let mut l1_table = Vec::with_capacity((header.l1_size as usize).min(1 << 20));
         for _ in 0..header.l1_size {
             l1_table.push(read_u64_be_file(&mut file)?);
         }

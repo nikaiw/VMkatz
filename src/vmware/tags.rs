@@ -42,11 +42,11 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
         pos += name_len;
 
         let index_count = ((flags >> 6) & 3) as usize;
+        if pos + index_count * 4 > data.len() {
+            break; // Not enough data for all indices — stop parsing
+        }
         let mut indices = Vec::with_capacity(index_count);
         for _ in 0..index_count {
-            if pos + 4 > data.len() {
-                break;
-            }
             indices.push(crate::utils::read_u32_le(data, pos).unwrap_or(0));
             pos += 4;
         }
