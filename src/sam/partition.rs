@@ -82,6 +82,14 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0);
     let entry_size = crate::utils::read_u32_le(&hdr, 0x54).unwrap_or(0);
 
+    // GPT spec: entry_size is typically 128 bytes; reject invalid values
+    if !(128..=4096).contains(&entry_size) {
+        return Err(crate::error::VmkatzError::DecryptionError(format!(
+            "Invalid GPT entry size: {} (expected 128-4096)",
+            entry_size,
+        )));
+    }
+
     log::debug!(
         "GPT: entry_lba={}, num_entries={}, entry_size={}",
         entry_lba,
