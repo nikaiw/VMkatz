@@ -95,7 +95,9 @@ impl QemuElfLayer {
         let mut phys_end: u64 = 0;
 
         for i in 0..e_phnum {
-            let off = e_phoff as usize + i * e_phentsize;
+            let Some(off) = (e_phoff as usize).checked_add(i.saturating_mul(e_phentsize)) else {
+                break;
+            };
             if off + ELF64_PHDR_SIZE > data.len() {
                 break;
             }

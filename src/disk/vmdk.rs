@@ -424,6 +424,12 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
     let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap()); // gdOffset (sectors)
 
     // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt)
+    if grain_size == 0 || num_gtes_per_gt == 0 {
+        return Err(VmkatzError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid VMDK header: grain_size={}, numGTEsPerGT={}", grain_size, num_gtes_per_gt),
+        )));
+    }
     let total_grains = capacity.div_ceil(grain_size);
     let gd_entries = total_grains.div_ceil(num_gtes_per_gt as u64) as usize;
 
@@ -497,7 +503,10 @@ fn parse_extent_number(stem: &str) -> Option<u32> {
     let pos = stem.rfind("-s")?;
     let suffix = &stem[pos + 2..];
     if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-        suffix.parse().ok()
+        let num: u32 = suffix.parse().ok()?;
+        // Extent numbers are 1-based (s001, s002, ...); reject 0 to prevent underflow
+        if num == 0 { return None; }
+        Some(num)
     } else {
         None
     }

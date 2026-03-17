@@ -384,6 +384,7 @@ impl VmfsSuperblock {
 
     /// SFB resources per cluster — needed for SFB→volume offset calculation.
     fn sfb_size(&self) -> u64 {
+        if self.file_block_size == 0 { return 0x2000; }
         std::cmp::min(0x2000, 0x2000_0000u64 / self.file_block_size)
     }
 }
@@ -846,6 +847,7 @@ impl Vmfs6Volume {
     /// Compute the offset within a resource file for a given (cluster, resource) pair.
     fn resource_offset(&self, meta: &ResFileMeta, cluster: u32, resource: u32) -> u64 {
         let md = self.sb.md_alignment as u64;
+        if meta.clusters_per_group == 0 { return 0; }
         let group = cluster / meta.clusters_per_group;
         let cluster_in_group = cluster % meta.clusters_per_group;
 
@@ -865,6 +867,7 @@ impl Vmfs6Volume {
             let parent_resources_per_group = (meta.parent_clusters_per_group as u64
                 * meta.parent_resources_per_cluster as u64)
                 / meta.clusters_per_group as u64;
+            if parent_resources_per_group == 0 { return 0; }
             let parent_group = group as u64 / parent_resources_per_group;
             let parent_cluster_in_group = group as u64 % parent_resources_per_group;
 

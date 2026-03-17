@@ -434,6 +434,12 @@ impl VhdxDisk {
         // 5. Compute BAT layout
         let block_size = metadata.block_size as u64;
         let logical_sector_size = metadata.logical_sector_size as u64;
+        if block_size == 0 || logical_sector_size == 0 {
+            return Err(VmkatzError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid VHDX metadata: block_size={}, logical_sector_size={}", block_size, logical_sector_size),
+            )));
+        }
         // chunk_ratio = (2^23 * logical_sector_size) / block_size
         // 8_388_608 = 2^23 (VHDX spec §3.5.1: number of payload blocks covered
         // by one sector bitmap block, derived from sector bitmap granularity).

@@ -328,6 +328,9 @@ pub fn enumerate_processes(
         };
 
         // EPROCESS base = Flink physical address - ActiveProcessLinks offset
+        if flink_phys < offsets.active_process_links {
+            continue;
+        }
         let eprocess_phys = flink_phys - offsets.active_process_links;
 
         // Read process info

@@ -681,11 +681,11 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             Ok(creds) if !creds.is_empty() => creds,
             Ok(_) => {
                 log::info!("MSV: Standard extraction found nothing, trying physical LUID scan...");
-                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys)
+                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys, Arch::X64)
             }
             Err(e) => {
                 log::info!("MSV extraction failed: {}, trying physical scan...", e);
-                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys)
+                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys, Arch::X64)
             }
         };
         if !msv_creds.is_empty() {
@@ -857,6 +857,7 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     _msv_base: u64,
     _msv_size: u32,
     keys: &CryptoKeys,
+    arch: Arch,
 ) -> Vec<(u64, MsvCredential)> {
     let walker = PageTableWalker::new(phys);
     let mut results = Vec::new();
@@ -987,6 +988,7 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
             *vaddr,
             keys,
             &mut validated_variant,
+            arch,
         ) {
             Ok(cred) => {
                 // Check if the hash is non-zero (not empty)
@@ -1000,7 +1002,7 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
                 //   +0x00: LogonDomainName (UNICODE_STRING embedded)
                 //   +0x10: UserName (UNICODE_STRING embedded)
                 // But these are inside the encrypted blob, so read from the blob
-                let (username, domain) = crate::lsass::msv::extract_username_from_cred_blob(vmem, *vaddr, keys, Arch::X64);
+                let (username, domain) = crate::lsass::msv::extract_username_from_cred_blob(vmem, *vaddr, keys, arch);
 
                 log::info!(
                     "MSV credential (phys scan): user='{}' domain='{}' NT={}",

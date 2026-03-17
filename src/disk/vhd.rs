@@ -250,6 +250,12 @@ impl VhdDisk {
         let dyn_header = parse_dynamic_header(&mut file, footer.data_offset)?;
 
         let block_size = dyn_header.block_size;
+        if block_size == 0 {
+            return Err(VmkatzError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid VHD dynamic header: block_size=0",
+            )));
+        }
         // Bitmap: 1 bit per sector (512 bytes), rounded up to sector boundary
         let sectors_per_block = block_size / 512;
         let bitmap_bytes = sectors_per_block.div_ceil(8);

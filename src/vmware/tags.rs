@@ -71,6 +71,10 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
             data_size,
         });
 
+        // Guard against overflow: data_size must fit in remaining buffer
+        if data_size > (data.len() - pos) as u64 {
+            break;
+        }
         pos += data_size as usize;
     }
 
