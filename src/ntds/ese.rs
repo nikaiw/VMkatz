@@ -179,7 +179,9 @@ impl<'a> EseDb<'a> {
     ///
     /// Returns (offset_in_data_area, size, flags).
     fn read_tag(&self, page: &[u8], tag_idx: usize, page_flags: u32) -> (usize, usize, u8) {
-        let tag_pos = self.page_size - 4 * (tag_idx + 1);
+        let Some(tag_bytes) = (tag_idx + 1).checked_mul(4) else { return (0, 0, 0) };
+        if tag_bytes > self.page_size { return (0, 0, 0); }
+        let tag_pos = self.page_size - tag_bytes;
         if tag_pos + 4 > page.len() {
             return (0, 0, 0);
         }
@@ -761,7 +763,7 @@ impl<'a> EseDb<'a> {
         var_data_off: usize,
         lv_pgno: u32,
     ) -> Option<Vec<u8>> {
-        if col.id > last_var_id || col.id < 128 {
+        if col.id > last_var_id || col.id < 128 || last_var_id < 128 {
             return None;
         }
 

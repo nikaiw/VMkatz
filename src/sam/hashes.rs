@@ -127,18 +127,18 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<
     }
 
     // Parse username from descriptor 1 (V+0x0C)
-    let name_offset = u32_le(v, 0x0C) as usize + 0xCC;
+    let name_offset = (u32_le(v, 0x0C) as usize).saturating_add(0xCC);
     let name_length = u32_le(v, 0x10) as usize;
-    let username = if name_offset + name_length <= v.len() && name_length > 0 {
+    let username = if name_offset.checked_add(name_length).is_some_and(|end| end <= v.len()) && name_length > 0 {
         decode_utf16le(&v[name_offset..name_offset + name_length])
     } else {
         format!("RID-{}", rid)
     };
 
     // Parse LM hash (desc[13] at V+0x9C)
-    let lm_offset = u32_le(v, 0x9C) as usize + 0xCC;
+    let lm_offset = (u32_le(v, 0x9C) as usize).saturating_add(0xCC);
     let lm_length = u32_le(v, 0xA0) as usize;
-    let lm_hash = if lm_length >= 4 && lm_offset + lm_length <= v.len() {
+    let lm_hash = if lm_length >= 4 && lm_offset.checked_add(lm_length).is_some_and(|end| end <= v.len()) {
         decrypt_sam_hash(
             &v[lm_offset..lm_offset + lm_length],
             hashed_bootkey,
@@ -150,9 +150,9 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<
     };
 
     // Parse NT hash (desc[14] at V+0xA8)
-    let nt_offset = u32_le(v, 0xA8) as usize + 0xCC;
+    let nt_offset = (u32_le(v, 0xA8) as usize).saturating_add(0xCC);
     let nt_length = u32_le(v, 0xAC) as usize;
-    let nt_hash = if nt_length >= 4 && nt_offset + nt_length <= v.len() {
+    let nt_hash = if nt_length >= 4 && nt_offset.checked_add(nt_length).is_some_and(|end| end <= v.len()) {
         decrypt_sam_hash(
             &v[nt_offset..nt_offset + nt_length],
             hashed_bootkey,

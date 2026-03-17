@@ -1643,6 +1643,7 @@ pub struct Vmfs6FlatVmdk {
 impl Vmfs6FlatVmdk {
     /// Resolve a virtual position to a physical device offset.
     fn resolve_position(&self, pos: u64) -> Option<u64> {
+        if self.block_size == 0 { return None; }
         let block_idx = (pos / self.block_size) as usize;
         let offset_in_block = pos % self.block_size;
 
@@ -1656,7 +1657,7 @@ impl Vmfs6FlatVmdk {
 
 impl Read for Vmfs6FlatVmdk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.position >= self.virtual_size {
+        if self.position >= self.virtual_size || self.block_size == 0 {
             return Ok(0);
         }
 
