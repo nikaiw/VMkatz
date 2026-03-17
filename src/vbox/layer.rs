@@ -339,20 +339,37 @@ impl VBoxLayer {
         log::info!("VBox header: cbGCPhys={}", cb_gc_phys);
 
         // 2. Find the "pgm" unit by scanning for unit headers
-        let pgm_data_offset = Self::find_pgm_unit(&mut reader, file_size)?;
+        let (pgm_data_offset, pgm_version) = Self::find_pgm_unit(&mut reader, file_size)?;
         log::info!(
-            "PGM unit data starts at file offset 0x{:x}",
-            pgm_data_offset
+            "PGM unit data starts at file offset 0x{:x}, version {}",
+            pgm_data_offset,
+            pgm_version
         );
 
         // 3. Seek to PGM data and create SSM stream
         reader.seek(SeekFrom::Start(pgm_data_offset))?;
         let mut stream = SsmStream::new(reader);
 
-        // 4. Skip PGM struct fields (78 bytes for version 14)
-        stream.skip(78)?;
+        // 4. Skip PGM struct fields — size depends on saved state version
+        //    Version 14 (VBox 7.x):  78 bytes (fMappingsFixed + GCPtrMappingFixed +
+        //                             cbMappingFixed + cBalloonedPages + per-CPU fields)
+        //    Version 12-13 (VBox 5.x-6.x): 74 bytes (no cBalloonedPages)
+        //    Version 11 (pre-balloon): 70 bytes
+        //    Version <= 10: no cbRamHole/cbRam config follows
+        let pgm_struct_size = match pgm_version {
+            14.. => 78,
+            12..=13 => 74,
+            11 => 70,
+            _ => {
+                return Err(VmkatzError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported PGM saved state version {} (need >= 11, VBox 4.1+)", pgm_version),
+                )));
+            }
+        };
+        stream.skip(pgm_struct_size)?;
 
-        // 5. Read RAM config
+        // 5. Read RAM config (present in version >= 11)
         let cb_ram_hole = stream.read_u32_le()?;
         let cb_ram = stream.read_u64_le()?;
         log::info!(
@@ -542,7 +559,8 @@ impl VBoxLayer {
     }
 
     /// Scan the file for the "pgm" unit header and return the data offset.
-    fn find_pgm_unit<R: Read + Seek>(reader: &mut R, file_size: u64) -> Result<u64> {
+    /// Returns (data_offset, pgm_version).
+    fn find_pgm_unit<R: Read + Seek>(reader: &mut R, file_size: u64) -> Result<(u64, u32)> {
         let unit_magic = b"\nUnit\n\x00\x00";
 
         // Start scanning from offset 64 (after file header)
@@ -587,14 +605,16 @@ impl VBoxLayer {
                     );
 
                     if name == "pgm" {
-                        // Data starts right after the unit header
+                        // u32Version is at unit header offset 24 → hdr[16..20]
+                        let pgm_version = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
                         let data_offset = unit_offset + 8 + 36 + cb_name as u64;
                         log::info!(
-                            "Found pgm unit at offset 0x{:x}, data at 0x{:x}",
+                            "Found pgm unit at offset 0x{:x}, data at 0x{:x}, version {}",
                             unit_offset,
-                            data_offset
+                            data_offset,
+                            pgm_version
                         );
-                        return Ok(data_offset);
+                        return Ok((data_offset, pgm_version));
                     }
 
                     // Seek back to continue scanning
