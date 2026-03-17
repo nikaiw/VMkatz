@@ -996,10 +996,14 @@ fn walk_msv_list(
             find_credentials_ptr_in_entry(vmem, current, arch)
         };
 
-        if let Some(cred_ptr) = cred_ptr {
+        // Walk the PRIMARY_CREDENTIALS linked list to find the "Primary" entry,
+        // skipping "CredentialKeys" (DPAPI key material) entries.
+        let primary_ptr = cred_ptr.and_then(|p| find_primary_entry_in_chain(vmem, p, arch));
+
+        if let Some(primary_ptr) = primary_ptr {
             if !username.is_empty() {
                 if let Ok(cred) =
-                    extract_primary_credential(vmem, cred_ptr, keys, &mut validated_variant, arch)
+                    extract_primary_credential(vmem, primary_ptr, keys, &mut validated_variant, arch)
                 {
                     log::info!(
                         "MSV credential: LUID=0x{:x} user={} domain={} NT={}",
@@ -1093,15 +1097,20 @@ fn find_credentials_ptr_in_entry(vmem: &dyn VirtualMemory, entry_addr: u64, arch
     }
     // Third pass: direct inline scan — the credentials struct may be embedded
     // within the session entry itself (no pointer indirection). Search entry bytes
-    // for the ANSI_STRING signature Length=7, MaxLength=8 at 8-byte aligned offsets.
+    // for ANSI_STRING signatures at 8-byte aligned offsets:
+    //   "Primary":        Length=7,  MaxLength=8  → 07 00 08 00
+    //   "CredentialKeys": Length=14, MaxLength=15 → 0E 00 0F 00
     if let Ok(entry_data) = vmem.read_virt_bytes(entry_addr, 0x400) {
         for off in (0x28..0x400usize - 0x28).step_by(8) {
-            // Look for 07 00 08 00 pattern (ANSI_STRING {Length=7, MaxLength=8})
-            if entry_data[off] != 0x07
-                || entry_data[off + 1] != 0x00
-                || entry_data[off + 2] != 0x08
-                || entry_data[off + 3] != 0x00
-            {
+            let is_primary_sig = entry_data[off] == 0x07
+                && entry_data[off + 1] == 0x00
+                && entry_data[off + 2] == 0x08
+                && entry_data[off + 3] == 0x00;
+            let is_credkeys_sig = entry_data[off] == 0x0E
+                && entry_data[off + 1] == 0x00
+                && entry_data[off + 2] == 0x0F
+                && entry_data[off + 3] == 0x00;
+            if !is_primary_sig && !is_credkeys_sig {
                 continue;
             }
             // The KIWI_MSV1_0_PRIMARY_CREDENTIALS starts 0x08 bytes before the ANSI_STRING
@@ -1110,7 +1119,8 @@ fn find_credentials_ptr_in_entry(vmem: &dyn VirtualMemory, entry_addr: u64, arch
 
             if is_primary_credentials_struct(vmem, struct_addr, arch) {
                 log::info!(
-                    "  Found inline Primary credentials at entry+0x{:x} (0x{:x})",
+                    "  Found inline {} credentials at entry+0x{:x} (0x{:x})",
+                    if is_primary_sig { "Primary" } else { "CredentialKeys" },
                     struct_off,
                     struct_addr
                 );
@@ -1134,12 +1144,15 @@ fn find_credentials_ptr_in_entry(vmem: &dyn VirtualMemory, entry_addr: u64, arch
 ///   +ps+us: Credentials (UNICODE_STRING: encrypted data)
 ///
 /// Where ps=ptr_size, us=ustr_size, sb=str_buf_off (offset from string start to Buffer field).
+///
+/// Accepts both "Primary" (len=7) and "CredentialKeys" (len=14) ANSI_STRING names,
+/// as both are valid KIWI_MSV1_0_PRIMARY_CREDENTIALS entries chained via `next`.
 fn is_primary_credentials_struct(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch) -> bool {
     let ps = arch.ptr_size();
     let us = arch.ustr_size();
     let sb = if arch == Arch::X64 { 8u64 } else { 4 }; // offset within ANSI/UNICODE_STRING to Buffer
 
-    // Check ANSI_STRING Primary: Length should be 7 ("Primary"), MaxLength >= 7
+    // Check ANSI_STRING Primary: Length should be 7 ("Primary") or 14 ("CredentialKeys")
     let length = match vmem.read_virt_u16(ptr + ps) {
         Ok(l) => l,
         Err(_) => return false,
@@ -1148,7 +1161,7 @@ fn is_primary_credentials_struct(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch)
         Ok(l) => l,
         Err(_) => return false,
     };
-    if length != 7 || !(7..=64).contains(&max_length) {
+    if (length != 7 && length != 14) || !(length..=64).contains(&max_length) {
         return false;
     }
     // Read the buffer pointer
@@ -1159,15 +1172,18 @@ fn is_primary_credentials_struct(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch)
     if !is_valid_user_ptr(buf_ptr, arch) {
         return false;
     }
-    // Try to verify "Primary" string (may fail if paged out)
-    let string_ok = match vmem.read_virt_bytes(buf_ptr, 7) {
-        Ok(data) => data == b"Primary",
+    // Try to verify the ANSI string content (may fail if paged out)
+    let string_ok = match vmem.read_virt_bytes(buf_ptr, length as usize) {
+        Ok(data) => {
+            (length == 7 && data == b"Primary")
+                || (length == 14 && data == b"CredentialKeys")
+        }
         Err(_) => false,
     };
     if string_ok {
         return true;
     }
-    // Fallback: check structural properties even if "Primary" string is paged out
+    // Fallback: check structural properties even if the ANSI string is paged out
     let cred_off = ps + us; // Credentials UNICODE_STRING offset
     let cred_len = match vmem.read_virt_u16(ptr + cred_off) {
         Ok(l) => l as usize,
@@ -1197,6 +1213,76 @@ fn is_primary_credentials_struct(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch)
         ptr, length, max_length, cred_len, cred_max_len, cred_buf
     );
     true
+}
+
+/// Read the ANSI_STRING name from a KIWI_MSV1_0_PRIMARY_CREDENTIALS struct.
+/// Returns the name string (e.g. "Primary", "CredentialKeys") or None if unreadable.
+fn read_primary_credentials_name(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch) -> Option<String> {
+    let ps = arch.ptr_size();
+    let sb = if arch == Arch::X64 { 8u64 } else { 4 };
+
+    let length = vmem.read_virt_u16(ptr + ps).ok()? as usize;
+    if length == 0 || length > 64 {
+        return None;
+    }
+    let buf_ptr = read_ptr(vmem, ptr + ps + sb, arch).ok()?;
+    if !is_valid_user_ptr(buf_ptr, arch) {
+        return None;
+    }
+    let data = vmem.read_virt_bytes(buf_ptr, length).ok()?;
+    String::from_utf8(data).ok()
+}
+
+/// Walk the `next` chain on a KIWI_MSV1_0_PRIMARY_CREDENTIALS linked list,
+/// returning the first entry whose ANSI_STRING name is "Primary".
+/// Logs and skips "CredentialKeys" entries (DPAPI key material, not NT/LM hashes).
+fn find_primary_entry_in_chain(vmem: &dyn VirtualMemory, first_ptr: u64, arch: Arch) -> Option<u64> {
+    let mut current = first_ptr;
+    let mut visited = std::collections::HashSet::new();
+
+    while current != 0 && !visited.contains(&current) {
+        visited.insert(current);
+
+        if !is_primary_credentials_struct(vmem, current, arch) {
+            break;
+        }
+
+        match read_primary_credentials_name(vmem, current, arch) {
+            Some(name) if name == "Primary" => {
+                return Some(current);
+            }
+            Some(name) if name == "CredentialKeys" => {
+                log::info!(
+                    "  Skipping CredentialKeys entry at 0x{:x} (DPAPI key material)",
+                    current
+                );
+            }
+            Some(name) => {
+                log::debug!(
+                    "  Skipping unknown credential entry '{}' at 0x{:x}",
+                    name,
+                    current
+                );
+            }
+            None => {
+                // Name unreadable but struct passed validation — could be "Primary" with paged-out name.
+                // Fall back to original behavior: assume it's Primary.
+                log::debug!(
+                    "  Credential entry at 0x{:x} has unreadable name, assuming Primary",
+                    current
+                );
+                return Some(current);
+            }
+        }
+
+        // Follow the `next` pointer at offset 0x00
+        current = match read_ptr(vmem, current, arch) {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+    }
+
+    None
 }
 
 /// Scan the .data section of a DLL for ALL topology-valid LIST_ENTRY heads.
@@ -1417,11 +1503,15 @@ fn walk_hash_table(
                 find_credentials_ptr_in_entry(vmem, current, arch)
             };
 
-            if let Some(cred_ptr) = cred_ptr {
+            // Walk the PRIMARY_CREDENTIALS linked list to find the "Primary" entry,
+            // skipping "CredentialKeys" (DPAPI key material) entries.
+            let primary_ptr = cred_ptr.and_then(|p| find_primary_entry_in_chain(vmem, p, arch));
+
+            if let Some(primary_ptr) = primary_ptr {
                 if !username.is_empty() {
                     if let Ok(cred) = extract_primary_credential(
                         vmem,
-                        cred_ptr,
+                        primary_ptr,
                         keys,
                         &mut validated_variant,
                         arch,
@@ -1592,14 +1682,19 @@ pub fn scan_vmem_for_msv_credentials(
                 continue;
             }
 
-            // Scan for ANSI_STRING signature: Length=7 (0x0007), MaxLength=8 (0x0008)
-            // This appears at offset ps (ptr_size) from struct start.
+            // Scan for ANSI_STRING signatures at offset ps (ptr_size) from struct start:
+            //   "Primary":        Length=7  (0x0007), MaxLength=8  (0x0008)
+            //   "CredentialKeys": Length=14 (0x000E), MaxLength=15 (0x000F)
             for scan_off in (0..read_size.saturating_sub(0x28)).step_by(align) {
-                if data[scan_off] != 0x07
-                    || data[scan_off + 1] != 0x00
-                    || data[scan_off + 2] != 0x08
-                    || data[scan_off + 3] != 0x00
-                {
+                let is_primary_sig = data[scan_off] == 0x07
+                    && data[scan_off + 1] == 0x00
+                    && data[scan_off + 2] == 0x08
+                    && data[scan_off + 3] == 0x00;
+                let is_credkeys_sig = data[scan_off] == 0x0E
+                    && data[scan_off + 1] == 0x00
+                    && data[scan_off + 2] == 0x0F
+                    && data[scan_off + 3] == 0x00;
+                if !is_primary_sig && !is_credkeys_sig {
                     continue;
                 }
 
@@ -1614,20 +1709,27 @@ pub fn scan_vmem_for_msv_credentials(
                     continue;
                 }
 
+                // Walk the PRIMARY_CREDENTIALS chain to find the "Primary" entry,
+                // skipping "CredentialKeys" entries.
+                let primary_va = match find_primary_entry_in_chain(vmem, struct_va, arch) {
+                    Some(va) => va,
+                    None => continue,
+                };
+
                 candidates_found += 1;
                 log::info!(
                     "MSV vmem-scan: Primary credential candidate at VA 0x{:x}",
-                    struct_va
+                    primary_va
                 );
 
-                match extract_primary_credential(vmem, struct_va, keys, &mut validated_variant, arch) {
+                match extract_primary_credential(vmem, primary_va, keys, &mut validated_variant, arch) {
                     Ok(cred) => {
                         if looks_like_hash(&cred.nt_hash) || looks_like_hash(&cred.lm_hash) {
                             let (username, domain) =
-                                extract_username_from_cred_blob(vmem, struct_va, keys, arch);
+                                extract_username_from_cred_blob(vmem, primary_va, keys, arch);
                             log::info!(
                                 "MSV vmem-scan: extracted credential at 0x{:x}: user='{}' domain='{}' NT={}",
-                                struct_va, username, domain, hex::encode(cred.nt_hash)
+                                primary_va, username, domain, hex::encode(cred.nt_hash)
                             );
                             let msv_cred = MsvCredential {
                                 username,
@@ -1642,7 +1744,7 @@ pub fn scan_vmem_for_msv_credentials(
                     Err(e) => {
                         log::debug!(
                             "MSV vmem-scan: extraction failed at 0x{:x}: {}",
-                            struct_va, e
+                            primary_va, e
                         );
                     }
                 }

