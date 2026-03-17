@@ -459,13 +459,13 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works.
 - **Kerberos**: Kerberos credentials are frequently paged out in VM snapshots. The provider reports `paged` but the data is legitimately absent from RAM. Pagefile resolution (`--disk`) can recover some entries.
 - **Hyper-V**: Modern `.vmrs` saved states (Hyper-V 2016+) are supported via a native parser reverse-engineered from `vmsavedstatedumpprovider.dll` — no Microsoft DLL needed. Legacy `.bin`/`.raw` dumps are also supported via identity-mapped reading. VHDX/VHD disk extraction is implemented but untested. QEMU/KVM ELF core dumps are implemented but also untested.
-- **x86 (32-bit) guests**: Partial support — WinXP SP3 and Win2003 SP2 (x86 PAE) are supported for LSASS extraction. Later 32-bit versions (Vista/Win7 x86) are not yet supported.
+- **x86 (32-bit) guests**: Supported with PAE paging (default since Vista). Covers WinXP SP3 through Win10 x86. Pre-Vista (XP/2003) extracts MSV/DPAPI only; Vista+ x86 extracts all 9 SSP providers. Non-PAE 32-bit (rare, XP-only) is not supported.
 
 ## How It Works
 
 1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, Hyper-V identity map, Hyper-V VMRS key-value store with LZNT1 decompression) is abstracted behind a common `PhysicalMemory` trait.
 
-2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 13 known offset tables (WinXP SP3 through Win11 24H2, x86 PAE + x64).
+2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 18 known offset tables (WinXP SP3 through Win11 24H2, x86 PAE + x64).
 
 3. **Page table walking**: Translates virtual addresses to physical using the kernel DTB (CR3). Supports 4-level x64 page tables and 3-level PAE (pre-Vista x86). TLB cache (256-entry direct-mapped), large pages (2MB/1GB), PCID bits, and pagefile fault resolution.
 

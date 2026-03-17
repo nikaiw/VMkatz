@@ -379,9 +379,10 @@ pub fn extract_all_credentials_auto<P: PhysicalMemory>(
 }
 
 /// Determine if x86 EPROCESS offsets correspond to pre-Vista (WinXP/Win2003).
-/// Pre-Vista x86 has PID at 0x84 (WinXP) or 0x94 (Win2003), Win10 x86 has PID >= 0xB4.
+/// Pre-Vista x86 has PID at 0x84 (WinXP) or 0x94 (Win2003).
+/// Vista x86 PID is at 0x9C and uses Vista+ crypto (AES/3DES), not DES-X/RC4.
 fn is_prevista_x86(offsets: &EprocessOffsets) -> bool {
-    offsets.unique_process_id < 0xA0
+    offsets.unique_process_id < 0x98
 }
 
 /// Extract credentials from a pre-Vista 32-bit LSASS process.

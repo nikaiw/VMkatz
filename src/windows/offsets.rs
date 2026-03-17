@@ -146,6 +146,39 @@ const WIN11_24H2_X64_EPROCESS: EprocessOffsets = EprocessOffsets {
     section_base_address: 0x2B0,
 };
 
+/// Windows Vista SP2 x86 (builds 6002-6003)
+const VISTA_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
+    bitness: WindowsBitness::X86Pae,
+    directory_table_base: 0x18,
+    unique_process_id: 0x9C,
+    active_process_links: 0xA0,
+    image_file_name: 0x14C,
+    peb: 0x188,
+    section_base_address: 0x114,
+};
+
+/// Windows 7 SP1 x86 (build 7601)
+const WIN7_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
+    bitness: WindowsBitness::X86Pae,
+    directory_table_base: 0x18,
+    unique_process_id: 0xB4,
+    active_process_links: 0xB8,
+    image_file_name: 0x16C,
+    peb: 0x1A8,
+    section_base_address: 0x12C,
+};
+
+/// Windows 8 / 8.1 x86 (builds 9200-9600)
+const WIN8_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
+    bitness: WindowsBitness::X86Pae,
+    directory_table_base: 0x18,
+    unique_process_id: 0xB4,
+    active_process_links: 0xB8,
+    image_file_name: 0x170,
+    peb: 0x140,
+    section_base_address: 0x120,
+};
+
 /// Windows 10 1507-1607 x86 (builds 10240-14393)
 const WIN10_EARLY_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
     bitness: WindowsBitness::X86Pae,
@@ -228,6 +261,9 @@ pub const ALL_EPROCESS_OFFSETS: &[EprocessOffsets] = &[
     VISTA_X64_EPROCESS,        // Vista SP0-SP2
     WIN10_LATE_X86_EPROCESS,   // Win10 1703-22H2 x86
     WIN10_EARLY_X86_EPROCESS,  // Win10 1507-1607 x86
+    WIN8_X86_EPROCESS,         // Win8/8.1 x86
+    WIN7_X86_EPROCESS,         // Win7 x86
+    VISTA_X86_EPROCESS,        // Vista x86
     WIN2003_X64_EPROCESS,      // Win2003 x64
     WIN2003_X86_EPROCESS,      // Win2003 x86
     WINXP_X86_EPROCESS,        // WinXP x86
