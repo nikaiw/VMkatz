@@ -160,9 +160,9 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     all: bool,
 
-    /// Skip nested EPT scanning (faster for non-VBS VMs)
+    /// Enable nested EPT scanning (for VBS/Credential Guard VMs)
     #[arg(long, default_value_t = false)]
-    no_ept: bool,
+    ept: bool,
 
     /// Recursively scan directory for VM snapshot and disk image files
     #[arg(short, long, default_value_t = false)]
@@ -1915,12 +1915,12 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
             )
         }
         #[cfg(feature = "carve")]
-        Err(_) if args.no_ept && args.carve => {
+        Err(_) if !args.ept && args.carve => {
             eprintln!("[*] System process not found — falling back to carve mode");
             run_carve(&layer, args, pagefile, disk_path)
         }
-        Err(_) if args.no_ept => {
-            anyhow::bail!("System process not found in physical memory (EPT scan disabled with --no-ept)");
+        Err(_) if !args.ept => {
+            anyhow::bail!("System process not found in physical memory (EPT scan disabled, use --ept to enable)");
         }
         #[cfg(feature = "carve")]
         Err(_) if args.carve && layer.is_truncated() => {

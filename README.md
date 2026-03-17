@@ -144,8 +144,8 @@ cargo build --release
 # Filter output to specific providers
 ./vmkatz --provider msv,kerberos snapshot.vmsn
 
-# Skip EPT scanning (faster when VBS is not in use)
-./vmkatz --no-ept snapshot.vmsn
+# Enable EPT scanning for VBS/Credential Guard VMs
+./vmkatz --ept snapshot.vmsn
 
 # Verbose output (memory regions, process list, debug info)
 ./vmkatz -v snapshot.vmsn
