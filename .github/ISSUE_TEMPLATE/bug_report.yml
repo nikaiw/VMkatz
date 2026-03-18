@@ -1,0 +1,135 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in the details below so we can reproduce and fix the issue.
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Extraction mode
+      description: What were you trying to extract?
+      options:
+        - LSASS credentials (memory snapshot)
+        - SAM/LSA/DCC2 (virtual disk)
+        - NTDS.dit (domain controller disk)
+        - VMFS raw device (ESXi)
+        - LSASS minidump (.dmp)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: VMkatz version
+      description: Output of `vmkatz --version` or the release tag you downloaded
+      placeholder: "v1.2.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: input-format
+    attributes:
+      label: Input file format
+      options:
+        - VMware snapshot (.vmsn + .vmem)
+        - VMware suspend (.vmss + .vmem)
+        - VirtualBox saved state (.sav)
+        - QEMU ELF core dump (.elf)
+        - Hyper-V saved state (.vmrs)
+        - Hyper-V legacy (.bin)
+        - VMDK (sparse or flat)
+        - VDI
+        - QCOW2
+        - VHDX / VHD
+        - Raw disk / block device
+        - VMFS raw SCSI device
+        - Raw registry hives (SAM/SYSTEM/SECURITY)
+        - LSASS minidump (.dmp)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: guest-os
+    attributes:
+      label: Guest Windows version
+      description: The Windows version inside the VM
+      options:
+        - Windows XP / Server 2003
+        - Windows Vista / Server 2008
+        - Windows 7 / Server 2008 R2
+        - Windows 8 / Server 2012
+        - Windows 8.1 / Server 2012 R2
+        - Windows 10 (specify build in description)
+        - Windows 11 (specify build in description)
+        - Windows Server 2016
+        - Windows Server 2019
+        - Windows Server 2022
+        - Windows Server 2025
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: guest-arch
+    attributes:
+      label: Guest architecture
+      options:
+        - x64 (64-bit)
+        - x86 (32-bit)
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: host-platform
+    attributes:
+      label: Host platform
+      description: Where are you running vmkatz? Include OS and version.
+      placeholder: "ESXi 6.5, Ubuntu 22.04, Windows 11, macOS 14, etc."
+    validations:
+      required: true
+
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem (if relevant)
+      description: For ESXi — VMFS-5 or VMFS-6? (`esxcli storage filesystem list`)
+      placeholder: "VMFS-6, ext4, NTFS, etc."
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and full output
+      description: The exact command you ran and the complete output (including errors).
+      render: shell
+      placeholder: |
+        $ ./vmkatz snapshot.vmsn
+        [*] vmkatz v1.2.2
+        Error: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: file-info
+    attributes:
+      label: Input file details
+      description: |
+        Run `ls -lh` on the files you're passing to vmkatz.
+        For .vmsn: is there a matching .vmem in the same directory?
+      render: shell
+      placeholder: |
+        $ ls -lh *.vmsn *.vmem
+        -rw-r--r-- 1 root root 4.0G abc-Snapshot5.vmsn
+        -rw-r--r-- 1 root root 8.0G abc-Snapshot5.vmem
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else that might help (VBS/Credential Guard enabled, special VM config, etc.)
