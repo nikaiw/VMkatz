@@ -1,4 +1,4 @@
-name: Clippy
+name: CI
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  clippy:
+  check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,3 +20,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-features

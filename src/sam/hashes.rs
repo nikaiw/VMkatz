@@ -59,13 +59,21 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
             }
         };
 
-        match extract_user_hashes(&v_data, &hashed_bootkey, rid) {
+        // Read per-user F value for Account Control Bits (ACB flags at offset 0x38)
+        let acb_flags = user_key.value(&hive, "F").ok()
+            .filter(|f| f.len() >= 0x3C)
+            .map(|f| u32::from_le_bytes([f[0x38], f[0x39], f[0x3A], f[0x3B]]))
+            .unwrap_or(0);
+
+        match extract_user_hashes(&v_data, &hashed_bootkey, rid, acb_flags) {
             Ok(entry) => {
                 log::info!(
-                    "RID {}: user={}, NT={}",
+                    "RID {}: user={}, NT={}, flags=0x{:04x}{}",
                     rid,
                     entry.username,
-                    hex::encode(entry.nt_hash)
+                    hex::encode(entry.nt_hash),
+                    entry.acb_flags,
+                    if entry.is_disabled() { " [DISABLED]" } else { "" },
                 );
                 entries.push(entry);
             }
@@ -121,7 +129,7 @@ fn decrypt_hashed_bootkey(f: &[u8], bootkey: &[u8; 16]) -> Result<[u8; 16]> {
 }
 
 /// Extract username and hashes from a user's V value.
-fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<SamEntry> {
+fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32, acb_flags: u32) -> Result<SamEntry> {
     if v.len() < 0xCC {
         return Err(sam_err("V value too short"));
     }
@@ -168,6 +176,7 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32) -> Result<
         username,
         nt_hash,
         lm_hash,
+        acb_flags,
     })
 }
 

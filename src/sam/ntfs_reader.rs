@@ -1,5 +1,6 @@
 use std::io::{Read, Seek};
 
+use ntfs::structured_values::NtfsFileNamespace;
 use ntfs::NtfsReadSeek;
 
 use crate::error::Result;
@@ -161,8 +162,12 @@ pub(crate) fn list_directory<'n, R: Read + Seek>(
             Some(Ok(k)) => k,
             _ => continue,
         };
+        // Skip DOS 8.3 short names — always prefer the Win32 long name
+        if key.namespace() == NtfsFileNamespace::Dos {
+            continue;
+        }
         let name = key.name().to_string_lossy().to_string();
-        // Skip NTFS special entries and dedup (NTFS may list WIN8.3 short + long names)
+        // Skip NTFS special entries and dedup
         if name == "." || name == ".." || name.starts_with('$') {
             continue;
         }

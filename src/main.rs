@@ -804,6 +804,7 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Extract DPAPI master key hashes from user profiles (independent of SAM)
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         found_anything = true;
         match args.format.as_str() {
@@ -856,6 +857,7 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Also extract DPAPI master key hashes from user profiles on the same disk
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         match args.format.as_str() {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
@@ -1152,20 +1154,44 @@ fn print_ntds_brief(entries: &[vmkatz::ntds::AdHashEntry]) {
 fn print_sam_text(entries: &[vmkatz::sam::SamEntry], c: &Colors) {
     println!("\n{}[+] SAM Hashes:{}", c.green, c.reset);
     for entry in entries {
+        // Build status annotation
+        let status = sam_status_label(entry, c);
+
         if entry.lm_hash != ZERO_HASH_16 {
             println!(
-                "  RID: {:<5} {}{:<20}{}  NT:{}  LM:{}",
+                "  RID: {:<5} {}{:<20}{}  NT:{}  LM:{}{}",
                 entry.rid, c.bold, entry.username, c.reset,
                 fmt_hash(&entry.nt_hash, c),
                 fmt_hash(&entry.lm_hash, c),
+                status,
             );
         } else {
             println!(
-                "  RID: {:<5} {}{:<20}{}  NT:{}",
+                "  RID: {:<5} {}{:<20}{}  NT:{}{}",
                 entry.rid, c.bold, entry.username, c.reset,
                 fmt_hash(&entry.nt_hash, c),
+                status,
             );
         }
+    }
+}
+
+/// Build a human-readable status label for a SAM entry.
+#[cfg(feature = "sam")]
+fn sam_status_label(entry: &vmkatz::sam::SamEntry, c: &Colors) -> String {
+    let mut tags = Vec::new();
+    if entry.is_disabled() {
+        tags.push("DISABLED");
+    }
+    if entry.nt_hash == ZERO_HASH_16 {
+        tags.push("NO PASSWORD");
+    } else if hex::encode(entry.nt_hash) == BLANK_NT_HEX {
+        tags.push("BLANK PASSWORD");
+    }
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {}({}){}", c.dim, tags.join(", "), c.reset)
     }
 }
 
@@ -1263,6 +1289,27 @@ fn print_lsa_csv(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
     }
 }
 
+/// Keep only the most recent DPAPI master key per (username, sid) unless `show_all` is set.
+#[cfg(feature = "sam")]
+fn dedup_dpapi_hashes(
+    mut hashes: Vec<vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash>,
+    show_all: bool,
+) -> Vec<vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash> {
+    if show_all || hashes.len() <= 1 {
+        return hashes;
+    }
+    // Sort by (username, sid, modified DESC) so the most recent key comes first
+    hashes.sort_by(|a, b| {
+        a.username
+            .cmp(&b.username)
+            .then(a.sid.cmp(&b.sid))
+            .then(b.modified.cmp(&a.modified))
+    });
+    let mut seen = std::collections::HashSet::new();
+    hashes.retain(|h| seen.insert((h.username.clone(), h.sid.clone())));
+    hashes
+}
+
 #[cfg(feature = "sam")]
 fn print_dpapi_masterkey_csv(hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]) {
     println!("provider,username,domain,secret_type,secret,target");
@@ -1345,6 +1392,8 @@ fn print_dpapi_masterkey_text(
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
     c: &Colors,
 ) {
+    use vmkatz::lsass::types::filetime_to_string;
+
     println!(
         "\n{}[+] DPAPI Master Key Files ({} found):{}",
         c.green,
@@ -1354,6 +1403,9 @@ fn print_dpapi_masterkey_text(
     for h in hashes {
         println!("  User: {} ({})", h.username, h.sid);
         println!("    GUID    : {}", h.guid);
+        if h.modified != 0 {
+            println!("    Modified: {}", filetime_to_string(h.modified));
+        }
         let mode_desc = match h.mode {
             15300 => "3DES/SHA1, local",
             15310 => "3DES/SHA1, domain",

@@ -60,6 +60,8 @@ pub struct DpapiMasterKeyHash {
     pub hash: String,
     /// Hashcat mode (15300 or 15900).
     pub mode: u32,
+    /// NTFS modification time (Windows FILETIME, 0 if unavailable).
+    pub modified: u64,
 }
 
 /// Parse the 128-byte file header.
@@ -161,10 +163,12 @@ fn hash_name(alg: u32) -> Option<&'static str> {
 /// Parse a DPAPI master key file and generate a Hashcat hash string.
 ///
 /// Returns None if the file is not a valid DPAPI master key file.
+/// `modified` is the NTFS modification time as a Windows FILETIME (0 if unavailable).
 pub fn parse_masterkey_file(
     data: &[u8],
     username: &str,
     sid: &str,
+    modified: u64,
 ) -> Option<DpapiMasterKeyHash> {
     if data.len() < MIN_FILE_SIZE {
         return None;
@@ -238,6 +242,7 @@ pub fn parse_masterkey_file(
         guid: header.guid,
         hash: hash_str,
         mode,
+        modified,
     })
 }
 
@@ -368,7 +373,14 @@ fn scan_protect_dir<'n, R: Read + Seek>(
                 Err(_) => continue,
             };
 
-            if let Some(hash) = parse_masterkey_file(&mk_data, username, sid_name) {
+            // Read NTFS modification time as a proxy for key creation date
+            let modified = mk_file
+                .info()
+                .ok()
+                .map(|info| info.modification_time().nt_timestamp())
+                .unwrap_or(0);
+
+            if let Some(hash) = parse_masterkey_file(&mk_data, username, sid_name, modified) {
                 log::info!(
                     "DPAPI masterkey: user={} SID={} GUID={} mode={}",
                     username, sid_name, hash.guid, hash.mode
@@ -466,7 +478,7 @@ mod tests {
             *b = 0xBB;
         }
 
-        let result = parse_masterkey_file(&data, "TestUser", "S-1-5-21-111-222-333-1001");
+        let result = parse_masterkey_file(&data, "TestUser", "S-1-5-21-111-222-333-1001", 0);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.mode, 15900);
@@ -506,7 +518,7 @@ mod tests {
             *b = 0xDD;
         }
 
-        let result = parse_masterkey_file(&data, "Admin", "S-1-5-21-999-888-777-500");
+        let result = parse_masterkey_file(&data, "Admin", "S-1-5-21-999-888-777-500", 0);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.mode, 15300);

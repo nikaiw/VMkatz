@@ -38,6 +38,21 @@ pub struct SamEntry {
     pub username: String,
     pub nt_hash: [u8; 16],
     pub lm_hash: [u8; 16],
+    /// Account Control Bits from per-user F value (offset 0x38).
+    pub acb_flags: u32,
+}
+
+// Account Control Bit flags (from SAM per-user F value).
+impl SamEntry {
+    /// Account is disabled (ACB_DISABLED).
+    pub fn is_disabled(&self) -> bool {
+        self.acb_flags & 0x0001 != 0
+    }
+
+    /// Password not required (ACB_PWNOTREQ).
+    pub fn password_not_required(&self) -> bool {
+        self.acb_flags & 0x0004 != 0
+    }
 }
 
 /// Combined extraction result: SAM hashes + LSA secrets + cached credentials.
