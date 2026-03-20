@@ -37,10 +37,10 @@ All 9 SSP credential providers that mimikatz implements:
 | CloudAP | Azure AD tokens | Typically empty for local-only logon |
 
 ### From virtual disks (offline)
-- **SAM hashes**: Local account NT/LM hashes
+- **SAM hashes**: Local account NT/LM hashes with account status (disabled, blank password)
 - **LSA secrets**: Service account passwords, auto-logon credentials, machine account keys
 - **Cached domain credentials**: DCC2 hashes (last N domain logons)
-- **DPAPI master keys**: Hashcat-ready hashes from user master key files (`$DPAPImk$` — modes 15300/15900)
+- **DPAPI master keys**: Hashcat-ready hashes from user master key files (`$DPAPImk$` — modes 15300/15310/15900/15910 for local/domain users)
 - **NTDS.dit**: Full Active Directory hash extraction from domain controller disks, natively from the ESE database - no impacket or external tools needed
 
 ## Supported Inputs
@@ -169,7 +169,7 @@ cargo build --release
 | `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), mode 2100 (DCC2), mode 15300/15900 (DPAPI) |
 | `csv` | `--format csv` | Machine-readable, all fields |
 
-In `text` mode, well-known blank password hashes (`31d6cfe0...` for NTLM, `aad3b435...` for LM) are annotated with `(blank)`.
+In `text` mode, well-known blank password hashes (`31d6cfe0...` for NTLM, `aad3b435...` for LM) are annotated with `(blank)`. SAM entries show account status: `(DISABLED)`, `(NO PASSWORD)`, `(BLANK PASSWORD)`. DPAPI master keys are deduplicated to show only the most recent per user (use `--all` to see all keys).
 
 Use `--color auto|always|never` to control colored terminal output (default: `auto`, detects TTY). Colors highlight usernames, section headers, interesting hashes, and plaintext passwords.
 
