@@ -220,7 +220,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
         };
 
         if raw_data.is_empty() {
-            log::warn!("Secret '{}': decrypted to empty data", secret_name);
+            log::debug!("Secret '{}': decrypted to empty data", secret_name);
             continue;
         }
 
