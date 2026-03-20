@@ -271,11 +271,13 @@ fn read_toname_ptr(vmem: &dyn VirtualMemory, ptr_addr: u64, arch: Arch) -> Optio
     Some(s)
 }
 
+/// Maximum PRT (Primary Refresh Token) size — caps reads to prevent OOM on bogus values.
+const MAX_PRT_SIZE: u32 = 0x4000; // 16 KB
 
 /// Read PRT from cbPRT/PRT fields.
 fn read_prt(vmem: &dyn VirtualMemory, entry_addr: u64, ce: &CacheEntryOffsets, arch: Arch) -> String {
     let cb_prt = match vmem.read_virt_u32(entry_addr + ce.cb_prt) {
-        Ok(s) if s > 0 && s <= 0x4000 => s as usize,
+        Ok(s) if s > 0 && s <= MAX_PRT_SIZE => s as usize,
         _ => return String::new(),
     };
     let prt_ptr = match read_ptr(vmem, entry_addr + ce.prt, arch) {

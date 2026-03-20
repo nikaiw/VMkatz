@@ -39,6 +39,9 @@ const RAM_SAVE_FLAG_MEM_SIZE: u64 = 0x004;
 const RAM_SAVE_FLAG_PAGE: u64 = 0x008;
 const RAM_SAVE_FLAG_EOS: u64 = 0x010;
 const RAM_SAVE_FLAG_CONTINUE: u64 = 0x020;
+
+/// Mask to extract flags from the addr|flags u64 (low 12 bits, page-aligned).
+const RAM_FLAG_MASK: u64 = 0xFFF;
 const RAM_SAVE_FLAG_COMPRESS_PAGE: u64 = 0x100;
 
 /// A mapped RAM page: GPA → file offset of its 4096 bytes.
@@ -158,7 +161,7 @@ impl QemuSavevmLayer {
                     offset += 4;
 
                     if ram_section_id == Some(sid) {
-                        offset = Self::parse_ram_pages(data, offset, &ram_blocks, &block_gpa_bases, &mut pages, &mut current_block_idx, below_4g)?;
+                        offset = Self::parse_ram_pages(data, offset, &ram_blocks, &mut pages, &mut current_block_idx, below_4g)?;
                     } else {
                         // Non-RAM section part — scan forward for next recognizable marker
                         log::debug!("QEMU savevm: skipping non-RAM SECTION_PART id={} at 0x{:x}", sid, offset);
@@ -226,7 +229,7 @@ impl QemuSavevmLayer {
 
         let val = read_be_u64(data, offset);
         offset += 8;
-        let flags = val & 0xFFF;
+        let flags = val & RAM_FLAG_MASK;
 
         if flags & RAM_SAVE_FLAG_MEM_SIZE == 0 {
             return Err(io_err(format!(
@@ -234,7 +237,7 @@ impl QemuSavevmLayer {
             )));
         }
 
-        let total_ram = val & !0xFFF;
+        let total_ram = val & !RAM_FLAG_MASK;
         log::info!("QEMU savevm: total RAM = {} MB", total_ram / (1024 * 1024));
 
         // Parse block list
@@ -281,7 +284,7 @@ impl QemuSavevmLayer {
         // Read EOS
         if offset + 8 <= len {
             let eos_val = read_be_u64(data, offset);
-            if eos_val & 0xFFF == RAM_SAVE_FLAG_EOS {
+            if eos_val & RAM_FLAG_MASK == RAM_SAVE_FLAG_EOS {
                 offset += 8;
             }
         }
@@ -294,7 +297,6 @@ impl QemuSavevmLayer {
         data: &[u8],
         mut offset: usize,
         ram_blocks: &[RamBlock],
-        _block_gpa_bases: &[u64],
         pages: &mut Vec<MappedPage>,
         current_block_idx: &mut usize,
         below_4g: u64,
@@ -303,8 +305,8 @@ impl QemuSavevmLayer {
 
         while offset + 8 <= len {
             let val = read_be_u64(data, offset);
-            let flags = val & 0xFFF;
-            let addr = val & !0xFFF;
+            let flags = val & RAM_FLAG_MASK;
+            let addr = val & !RAM_FLAG_MASK;
             offset += 8;
 
             if flags & RAM_SAVE_FLAG_EOS != 0 {
@@ -389,7 +391,7 @@ impl QemuSavevmLayer {
             if data[i..i + pattern.len()] == pattern {
                 // Verify: the 8 bytes after the header should look like valid RAM flags
                 let val = u64::from_be_bytes(data[i + 5..i + 13].try_into().ok()?);
-                let flags = val & 0xFFF;
+                let flags = val & RAM_FLAG_MASK;
                 let has_page_or_zero = flags & (RAM_SAVE_FLAG_PAGE | RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_EOS) != 0;
                 if has_page_or_zero {
                     log::debug!("QEMU savevm: found RAM SECTION_PART at 0x{:x} (skipped {} bytes)", i, i - start);
