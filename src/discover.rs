@@ -30,12 +30,17 @@ pub fn discover_vm_files(dir: &Path) -> Result<VmDiscovery> {
     // Collect all files from scan directories
     let mut all_files: Vec<PathBuf> = Vec::new();
     for scan_dir in &scan_dirs {
-        if let Ok(entries) = fs::read_dir(scan_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    all_files.push(path);
+        match fs::read_dir(scan_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        all_files.push(path);
+                    }
                 }
+            }
+            Err(e) => {
+                log::debug!("Cannot read directory {}: {} (permission denied or I/O error)", scan_dir.display(), e);
             }
         }
     }
@@ -60,6 +65,17 @@ pub fn discover_vm_files(dir: &Path) -> Result<VmDiscovery> {
     })
 }
 
+/// Read file size, logging a warning on I/O error instead of silently skipping.
+fn file_size(path: &Path) -> Option<u64> {
+    match path.metadata() {
+        Ok(m) => Some(m.len()),
+        Err(e) => {
+            log::debug!("Cannot stat {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
 /// Find memory snapshot files: .vmsn+.vmem, .sav, .elf, .bin, .raw
 fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
     for file in all_files {
@@ -73,10 +89,8 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
             }
         } else if ext.eq_ignore_ascii_case("sav") {
             // VirtualBox saved state - skip empty files
-            if let Ok(meta) = file.metadata() {
-                if meta.len() > 0 {
-                    out.push(file.clone());
-                }
+            if file_size(file).unwrap_or(0) > 0 {
+                out.push(file.clone());
             }
         } else if ext.eq_ignore_ascii_case("elf") {
             // QEMU ELF core dump (from dump-guest-memory / virsh dump --memory-only)
@@ -84,26 +98,19 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
                 out.push(file.clone());
             }
         } else if ext.eq_ignore_ascii_case("vmrs") {
-            // Hyper-V modern saved state (.vmrs)
-            if let Ok(meta) = file.metadata() {
-                if meta.len() > 1024 * 1024 {
-                    out.push(file.clone());
-                }
+            // Hyper-V modern saved state (.vmrs) — skip tiny metadata-only files
+            if file_size(file).unwrap_or(0) > 1024 * 1024 {
+                out.push(file.clone());
             }
         } else if ext.eq_ignore_ascii_case("bin") {
-            // Hyper-V legacy .bin or ELF dump with .bin extension
-            if let Ok(meta) = file.metadata() {
-                // Hyper-V .bin files are VM-RAM-sized; skip tiny metadata files
-                if meta.len() > 1024 * 1024 {
-                    out.push(file.clone());
-                }
+            // Hyper-V legacy .bin or ELF dump — skip tiny metadata files
+            if file_size(file).unwrap_or(0) > 1024 * 1024 {
+                out.push(file.clone());
             }
         } else if ext.eq_ignore_ascii_case("raw") {
             // Raw memory dump (from MemProcFS export, etc.)
-            if let Ok(meta) = file.metadata() {
-                if meta.len() > 1024 * 1024 {
-                    out.push(file.clone());
-                }
+            if file_size(file).unwrap_or(0) > 1024 * 1024 {
+                out.push(file.clone());
             }
         }
     }
@@ -112,8 +119,12 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
 /// Check if a file is an ELF core dump (magic + ET_CORE). Reads only 18 bytes.
 fn is_elf_core(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = fs::File::open(path) else {
-        return false;
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::debug!("Cannot open {}: {}", path.display(), e);
+            return false;
+        }
     };
     let mut buf = [0u8; 18];
     if f.read_exact(&mut buf).is_err() {
@@ -217,13 +228,9 @@ fn discover_vdi(all_files: &[PathBuf], scan_dirs: &[PathBuf], out: &mut Vec<Path
         let mut found = false;
         for file in all_files {
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext.eq_ignore_ascii_case("vdi") && file.parent() == Some(snap_dir.as_path()) {
-                if let Ok(meta) = file.metadata() {
-                    if meta.len() > 0 {
-                        out.push(file.clone());
-                        found = true;
-                    }
-                }
+            if ext.eq_ignore_ascii_case("vdi") && file.parent() == Some(snap_dir.as_path()) && file_size(file).unwrap_or(0) > 0 {
+                out.push(file.clone());
+                found = true;
             }
         }
         if found {
@@ -298,7 +305,13 @@ fn parse_snapshot_number(stem: &str) -> Option<u32> {
 fn is_text_descriptor(path: &Path) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 21];
-    let Ok(mut f) = fs::File::open(path) else { return false };
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::debug!("Cannot open {}: {}", path.display(), e);
+            return false;
+        }
+    };
     if f.read(&mut buf).unwrap_or(0) >= 21 {
         return buf.starts_with(b"# Disk DescriptorFile");
     }
@@ -336,7 +349,10 @@ fn walk_for_vm_dirs(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<
 
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(()), // skip unreadable directories
+        Err(e) => {
+            log::debug!("Cannot read directory {}: {}", dir.display(), e);
+            return Ok(());
+        }
     };
 
     let mut has_vm_files = false;
