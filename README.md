@@ -57,7 +57,7 @@ All 9 SSP credential providers that mimikatz implements:
 | VMware virtual disks | `.vmdk` (sparse + flat) | Workstation, ESXi | Tested |
 | VirtualBox virtual disks | `.vdi` | VirtualBox | Tested |
 | QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox | Tested |
-| Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V | Untested |
+| Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V | Tested |
 | VMFS-6 raw SCSI devices | `/dev/disks/...` | ESXi datastores (bypasses file locks) | Tested |
 | LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs | Tested |
 | Raw registry hives | `SAM`, `SYSTEM`, `SECURITY` | Exported from disk or `reg save` | Tested |
@@ -464,11 +464,13 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 | ESXi 8.0 | Windows Server 2016 x64 | SAM / LSA / DCC2 (VMFS-6 raw) | PASS | Running VM |
 | ESXi 8.0 | Windows Server 2019 x64 | SAM / LSA / DCC2 (VMFS-6 raw) | PASS | Running VM |
 | ESXi 8.0 | Windows 11 x64 | SAM (VMFS-6 raw) | PASS | Running VM |
+| Hyper-V | Windows Server 2012 R2 x64 | SAM / LSA / DCC2 (`.vhdx`) | PASS | |
+| Hyper-V | Windows Server 2003 R2 x64 | SAM / LSA (`.vhdx`) | PASS | |
 
 ### Known limitations
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works.
 - **Kerberos**: Kerberos credentials are frequently paged out in VM snapshots. The provider reports `paged` but the data is legitimately absent from RAM. Pagefile resolution (`--disk`) can recover some entries.
-- **Hyper-V**: Modern `.vmrs` saved states (Hyper-V 2016+) are supported via a native parser reverse-engineered from `vmsavedstatedumpprovider.dll` — no Microsoft DLL needed. Legacy `.bin`/`.raw` dumps are also supported via identity-mapped reading. VHDX/VHD disk extraction is implemented but untested.
+- **Hyper-V**: Modern `.vmrs` saved states (Hyper-V 2016+) are supported via a native parser reverse-engineered from `vmsavedstatedumpprovider.dll` — no Microsoft DLL needed. Legacy `.bin`/`.raw` dumps are also supported via identity-mapped reading. VHDX disk extraction tested on Windows Server 2003 R2 and 2012 R2.
 - **QEMU/Proxmox savevm**: RAM pages from dirty-tracking iterations are captured; non-dirty pages return zeros. MSV credentials are often `(paged)` but Kerberos keys and DPAPI master keys are typically available. MMIO gap remapping assumes q35+UEFI layout (`below_4g=0x80000000`).
 - **BitLocker**: BitLocker-encrypted partitions are detected and reported. Disk extraction (SAM/NTDS) requires the volume to be decrypted first.
 - **x86 (32-bit) guests**: Supported with PAE paging (default since Vista). Covers WinXP SP3 through Win10 x86. Pre-Vista (XP/2003) extracts MSV/DPAPI only; Vista+ x86 extracts all 9 SSP providers. Non-PAE 32-bit (rare, XP-only) is not supported.
