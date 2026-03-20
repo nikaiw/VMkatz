@@ -4,8 +4,10 @@
 //!   `Users\{user}\AppData\Roaming\Microsoft\Protect\{SID}\{GUID}`
 //!
 //! Generates Hashcat-compatible hashes:
-//!   - Mode 15300: DPAPI masterkey v1 (3DES/SHA1)
-//!   - Mode 15900: DPAPI masterkey v2 (AES256/SHA512)
+//!   - Mode 15300: DPAPI masterkey v1, local user (3DES/SHA1, SHA1 pre-key)
+//!   - Mode 15310: DPAPI masterkey v1, domain user (3DES/SHA1, NTLM pre-key)
+//!   - Mode 15900: DPAPI masterkey v2, local user (AES256/SHA512, SHA1 pre-key)
+//!   - Mode 15910: DPAPI masterkey v2, domain user (AES256/SHA512, NTLM pre-key)
 
 use std::io::{Read, Seek};
 
@@ -209,10 +211,12 @@ pub fn parse_masterkey_file(
     // indicating a domain-joined machine where NTLM pre-key was used.
     let context = if header.domainkey_len > 0 { 2u32 } else { 1u32 };
 
-    // Hashcat mode
-    let mode = match hc_version {
-        1 => 15300,
-        2 => 15900,
+    // Hashcat mode: context 1 = local (SHA1 pre-key), context 2 = domain (NTLM pre-key)
+    let mode = match (hc_version, context) {
+        (1, 1) => 15300, // 3DES/SHA1, local
+        (1, 2) => 15310, // 3DES/SHA1, domain
+        (2, 1) => 15900, // AES256/SHA512, local
+        (2, 2) => 15910, // AES256/SHA512, domain
         _ => return None,
     };
 

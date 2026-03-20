@@ -1354,7 +1354,14 @@ fn print_dpapi_masterkey_text(
     for h in hashes {
         println!("  User: {} ({})", h.username, h.sid);
         println!("    GUID    : {}", h.guid);
-        println!("    Hashcat : mode {} ({})", h.mode, if h.mode == 15300 { "3DES/SHA1" } else { "AES256/SHA512" });
+        let mode_desc = match h.mode {
+            15300 => "3DES/SHA1, local",
+            15310 => "3DES/SHA1, domain",
+            15900 => "AES256/SHA512, local",
+            15910 => "AES256/SHA512, domain",
+            _ => "unknown",
+        };
+        println!("    Hashcat : mode {} ({})", h.mode, mode_desc);
         println!("    Hash    : {}", h.hash);
     }
 }
