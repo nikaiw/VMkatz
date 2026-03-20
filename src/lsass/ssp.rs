@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, SspCredential, read_ptr, read_ustring, is_valid_user_ptr};
+use crate::lsass::types::{Arch, SspCredential, read_ptr, read_ustring, is_valid_user_ptr, walk_list, scan_data_for_list_head};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -110,21 +110,7 @@ pub fn extract_ssp_credentials_arch(
     // Walk the linked list
     let mut results = Vec::new();
 
-    let head_flink = read_ptr(vmem, list_addr, arch)?;
-    if head_flink == 0 || head_flink == list_addr {
-        log::info!("SSP: credential list is empty");
-        return Ok(results);
-    }
-
-    let mut current = head_flink;
-    let mut visited = std::collections::HashSet::new();
-
-    loop {
-        if current == list_addr || visited.contains(&current) || current == 0 {
-            break;
-        }
-        visited.insert(current);
-
+    walk_list(vmem, list_addr, arch, |current| {
         let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
 
         // Credentials are inline UNICODE_STRINGs (not behind a pointer)
@@ -155,12 +141,8 @@ pub fn extract_ssp_credentials_arch(
                 },
             ));
         }
-
-        current = match read_ptr(vmem, current, arch) {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-    }
+        true
+    })?;
 
     let with_passwords = results
         .iter()
@@ -190,88 +172,33 @@ fn find_ssp_list_in_data(
         Arch::X86 => &SSP_OFFSETS_X86,
     };
 
-    let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::VmkatzError::PatternNotFound(".data section in msv1_0.dll".to_string())
-    })?;
-
-    let data_base = msv_base + data_sec.virtual_address as u64;
-    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
-    let data = vmem.read_virt_bytes(data_base, data_size)?;
-    let step = arch.ptr_size() as usize;
-
-    log::debug!(
-        "SSP: scanning msv1_0.dll .data for SspCredentialList: base=0x{:x} size=0x{:x} arch={:?}",
-        data_base,
-        data_size,
-        arch,
-    );
-
-    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
-        let flink = match arch {
-            Arch::X86 => super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
-            Arch::X64 => super::types::read_u64_le(&data, off).unwrap_or(0),
-        };
-        let blink = match arch {
-            Arch::X86 => super::types::read_u32_le(&data, off + step).unwrap_or(0) as u64,
-            Arch::X64 => super::types::read_u64_le(&data, off + 8).unwrap_or(0),
-        };
-
-        let list_addr = data_base + off as u64;
-
-        // Self-referencing empty list (SspCredentialList is typically empty)
-        if flink == list_addr && blink == list_addr {
-            if off < 0x1000 {
-                log::debug!(
-                    "SSP: found empty SspCredentialList candidate at 0x{:x} (self-referencing)",
-                    list_addr
-                );
-                return Ok(list_addr);
+    scan_data_for_list_head(
+        vmem, pe, msv_base, arch, 0x10000, "msv1_0.dll", 0x100000,
+        true, "SspCredentialList",
+        |flink, list_addr| {
+            let entry_flink = match read_ptr(vmem, flink, arch) {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
+                return false;
             }
-            continue;
-        }
-
-        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
-            continue;
-        }
-        // Must point to heap, not within the DLL
-        if flink >= msv_base && flink < msv_base + 0x100000 {
-            continue;
-        }
-
-        // Validate: first entry's Flink
-        let entry_flink = match read_ptr(vmem, flink, arch) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
-            continue;
-        }
-
-        // Validate: LUID at expected offset
-        let luid = match vmem.read_virt_u64(flink + offsets.luid) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if luid == 0 || luid > 0xFFFFFFFF {
-            continue;
-        }
-
-        // Validate: inline credentials — UserName UNICODE_STRING should be readable
-        let username = read_ustring(vmem, flink + offsets.username, arch).unwrap_or_default();
-        if username.is_empty() {
-            continue;
-        }
-
-        log::debug!(
-            "SSP: found SspCredentialList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
-            list_addr,
-            flink,
-            luid
-        );
-        return Ok(list_addr);
-    }
-
-    Err(crate::error::VmkatzError::PatternNotFound(
-        "SspCredentialList in msv1_0.dll .data section".to_string(),
-    ))
+            let luid = match vmem.read_virt_u64(flink + offsets.luid) {
+                Ok(l) => l,
+                Err(_) => return false,
+            };
+            if luid == 0 || luid > 0xFFFFFFFF {
+                return false;
+            }
+            let username = read_ustring(vmem, flink + offsets.username, arch).unwrap_or_default();
+            if username.is_empty() {
+                return false;
+            }
+            log::debug!(
+                "SSP: found SspCredentialList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
+                list_addr, flink, luid
+            );
+            true
+        },
+    )
 }

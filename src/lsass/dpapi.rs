@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, DpapiCredential, read_ptr, is_valid_user_ptr};
+use crate::lsass::types::{Arch, DpapiCredential, read_ptr, is_valid_user_ptr, walk_list, read_ptr_from_buf, scan_data_for_list_head};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::translate::{PageTableWalker, PaePageTableWalker};
 use crate::pe::parser::PeHeaders;
@@ -126,30 +126,12 @@ fn walk_masterkey_list(
 ) -> Result<Vec<(u64, DpapiCredential)>> {
     let mut results = Vec::new();
 
-    let head_flink = read_ptr(vmem, list_addr, arch)?;
-    if head_flink == 0 || head_flink == list_addr {
-        log::info!("DPAPI: master key cache is empty");
-        return Ok(results);
-    }
-
-    let mut current = head_flink;
-    let mut visited = std::collections::HashSet::new();
-
-    loop {
-        if current == list_addr || visited.contains(&current) || current == 0 {
-            break;
-        }
-        visited.insert(current);
-
+    walk_list(vmem, list_addr, arch, |current| {
         if let Some(cred) = read_and_decrypt_entry(vmem, current, keys, offsets) {
             results.push(cred);
         }
-
-        current = match read_ptr(vmem, current, arch) {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-    }
+        true
+    })?;
 
     log::info!("DPAPI: found {} master key cache entries", results.len());
     Ok(results)
@@ -324,53 +306,17 @@ fn find_dpapi_list_in_data(
     offsets: &DpapiOffsets,
     arch: Arch,
 ) -> Result<u64> {
-    let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
-    })?;
-
-    let data_base = lsasrv_base + data_sec.virtual_address as u64;
-    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x20000);
-    let data = vmem.read_virt_bytes(data_base, data_size)?;
-    let step = arch.ptr_size() as usize;
-
-    log::debug!(
-        "DPAPI: scanning .data for g_MasterKeyCacheList: base=0x{:x} size=0x{:x} arch={:?}",
-        data_base,
-        data_size,
-        arch,
-    );
-
-    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
-        let flink = match arch {
-            Arch::X64 => super::types::read_u64_le(&data, off).unwrap_or(0),
-            Arch::X86 => super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
-        };
-        let blink = match arch {
-            Arch::X64 => super::types::read_u64_le(&data, off + 8).unwrap_or(0),
-            Arch::X86 => super::types::read_u32_le(&data, off + step).unwrap_or(0) as u64,
-        };
-
-        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
-            continue;
-        }
-        // Entry flink should NOT point back into lsasrv.dll itself
-        if flink >= lsasrv_base && flink < lsasrv_base + 0x200000 {
-            continue;
-        }
-        let list_addr = data_base + off as u64;
-        // Skip empty (self-referencing) lists
-        if flink == list_addr && blink == list_addr {
-            continue;
-        }
-        if validate_dpapi_list_head(vmem, list_addr, lsasrv_base, offsets, arch) {
-            log::debug!("DPAPI: found g_MasterKeyCacheList at 0x{:x}", list_addr);
-            return Ok(list_addr);
-        }
-    }
-
-    Err(crate::error::VmkatzError::PatternNotFound(
-        "g_MasterKeyCacheList in lsasrv.dll .data section".to_string(),
-    ))
+    scan_data_for_list_head(
+        vmem, pe, lsasrv_base, arch, 0x20000, "lsasrv.dll", 0x200000,
+        false, "g_MasterKeyCacheList",
+        |_flink, list_addr| {
+            if validate_dpapi_list_head(vmem, list_addr, lsasrv_base, offsets, arch) {
+                log::debug!("DPAPI: found g_MasterKeyCacheList at 0x{:x}", list_addr);
+                return true;
+            }
+            false
+        },
+    )
 }
 
 /// Validate a candidate LIST_ENTRY head as g_MasterKeyCacheList.
@@ -615,17 +561,8 @@ pub fn extract_dpapi_vmem_scan(
 
         for off in (0..chunk_size.saturating_sub(min_entry)).step_by(ptr_size) {
             // Check pointer-like flink/blink at the start
-            let (flink, blink) = if arch == Arch::X64 {
-                (
-                    super::types::read_u64_le(&data, off).unwrap_or(0),
-                    super::types::read_u64_le(&data, off + 8).unwrap_or(0),
-                )
-            } else {
-                (
-                    super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
-                    super::types::read_u32_le(&data, off + 4).unwrap_or(0) as u64,
-                )
-            };
+            let flink = read_ptr_from_buf(&data, off, arch);
+            let blink = read_ptr_from_buf(&data, off + ptr_size, arch);
             if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
                 continue;
             }

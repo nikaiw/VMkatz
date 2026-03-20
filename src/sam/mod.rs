@@ -12,7 +12,7 @@ mod vmdk_scan;
 pub mod dpapi_masterkey;
 
 // Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
-pub(crate) use partition::find_ntfs_partitions;
+pub(crate) use partition::{find_ntfs_partitions, is_bitlocker_partition};
 pub(crate) use ntfs_reader::{find_entry, read_file_data, PartitionReader};
 
 use std::io::{Read, Seek};
@@ -116,7 +116,13 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
 /// Faster for batch scanning where most VMDKs are sparse or non-Windows.
 pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
     let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    let mut bitlocker_found = false;
     for &partition_offset in &partitions {
+        if is_bitlocker_partition(reader, partition_offset) {
+            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            bitlocker_found = true;
+            continue;
+        }
         log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
         match ntfs_reader::read_hive_files(reader, partition_offset) {
             Ok((sam_data, system_data, security_data)) => {
@@ -127,6 +133,11 @@ pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskS
             }
         }
     }
+    if bitlocker_found {
+        return Err(crate::error::VmkatzError::DecryptionError(
+            "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
+        ));
+    }
     Err(crate::error::VmkatzError::DecryptionError(
         "No registry hives found on NTFS partitions".to_string(),
     ))
@@ -135,8 +146,14 @@ pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskS
 /// Extract SAM hashes + LSA secrets from any Read+Seek source.
 pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
     let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {
+        if is_bitlocker_partition(reader, partition_offset) {
+            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            bitlocker_found = true;
+            continue;
+        }
         log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
         match ntfs_reader::read_hive_files(reader, partition_offset) {
             Ok((sam_data, system_data, security_data)) => {
@@ -169,7 +186,13 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
         }
         Err(e) => {
             log::info!("hbin scan failed: {}", e);
-            Err(e)
+            if bitlocker_found {
+                Err(crate::error::VmkatzError::DecryptionError(
+                    "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
+                ))
+            } else {
+                Err(e)
+            }
         }
     }
 }
@@ -177,8 +200,14 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
 /// Extract NTDS artifacts from any Read+Seek source.
 fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
     let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {
+        if is_bitlocker_partition(reader, partition_offset) {
+            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            bitlocker_found = true;
+            continue;
+        }
         log::info!(
             "Trying NTDS extraction on NTFS partition at offset 0x{:x}",
             partition_offset
@@ -197,6 +226,11 @@ fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<
         }
     }
 
+    if bitlocker_found {
+        return Err(crate::error::VmkatzError::DecryptionError(
+            "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
+        ));
+    }
     Err(crate::error::VmkatzError::DecryptionError(
         "NTDS.dit not found on readable NTFS partitions".to_string(),
     ))

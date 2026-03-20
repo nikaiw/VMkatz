@@ -7,6 +7,7 @@
 
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
+use des::cipher::generic_array::GenericArray;
 use sha2::Digest;
 
 use super::hashes::{decode_utf16le, md5_hash, rc4};
@@ -121,24 +122,24 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
                 Ok(data) if data.len() >= 4 => {
                     // Default (unnamed) value: first DWORD is minor, second is major
                     let val = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
-                    log::info!("SECURITY Policy revision: 0x{:08x}", val);
+                    log::debug!("SECURITY Policy revision: 0x{:08x}", val);
                     val
                 }
                 _ => {
-                    log::info!("PolRevision value missing or too short, assuming legacy");
+                    log::debug!("PolRevision value missing or too short, assuming legacy");
                     0
                 }
             }
         }
         Err(_) => {
-            log::info!("PolRevision key not found, assuming legacy");
+            log::debug!("PolRevision key not found, assuming legacy");
             0
         }
     };
 
     // Determine if modern (Vista+) or legacy encryption
     let is_modern = revision >= 0x0001_0006;
-    log::info!(
+    log::debug!(
         "LSA encryption scheme: {}",
         if is_modern {
             "modern (AES)"
@@ -147,13 +148,21 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
         }
     );
 
-    // Extract LSA key
-    let lsa_key = if is_modern {
-        extract_lsa_key_modern(&hive, &policy, bootkey)?
+    // Extract LSA key. Try modern first (PolEKList), fall back to legacy
+    // (PolSecretEncryptionKey). Some Windows versions (e.g. Server 2003 R2 SP2)
+    // report a modern revision but still use the legacy encryption scheme.
+    let (lsa_key, is_modern) = if is_modern {
+        match extract_lsa_key_modern(&hive, &policy, bootkey) {
+            Ok(key) => (key, true),
+            Err(e) => {
+                log::debug!("Modern LSA key extraction failed ({}), trying legacy fallback", e);
+                (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
+            }
+        }
     } else {
-        extract_lsa_key_legacy(&hive, &policy, bootkey)?
+        (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
     };
-    log::info!("LSA key: {}", hex::encode(lsa_key));
+    log::debug!("LSA key: {}", hex::encode(lsa_key));
 
     // Enumerate secrets
     let secrets_key = match policy.subkey(&hive, "Secrets") {
@@ -217,7 +226,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
 
         let parsed = parse_secret(&secret_name, &raw_data);
 
-        log::info!(
+        log::debug!(
             "Secret '{}': {} bytes decrypted",
             secret_name,
             raw_data.len()
@@ -314,11 +323,11 @@ fn extract_lsa_key_legacy(
     let salt = &enc_data[60..76];
     let encrypted = &enc_data[12..60];
 
-    // MD5 key derivation: 1000 iterations of (salt + bootkey)
+    // MD5 key derivation: MD5(bootkey + salt * 1000)
     let mut md5_input = Vec::with_capacity(16 + 16 * 1000);
+    md5_input.extend_from_slice(bootkey);
     for _ in 0..1000 {
         md5_input.extend_from_slice(salt);
-        md5_input.extend_from_slice(bootkey);
     }
     let rc4_key = md5_hash(&md5_input);
 
@@ -370,34 +379,105 @@ fn decrypt_secret_modern(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
     }
 }
 
-/// Decrypt a secret value using legacy (RC4) scheme.
+/// Decrypt a secret value using legacy DES-ECB scheme (SystemFunction005).
+///
+/// CurrVal format (pre-Vista):
+///   +0x00: u32 encryptedSecretSize
+///   +0x04: ... header/flags ...
+///   [len - encryptedSecretSize ..]: DES-ECB encrypted LSA_SECRET_XP
+///
+/// DES decryption uses 7-byte rotating segments of the 16-byte LSA key,
+/// expanded to 8-byte DES keys via transformKey ([MS-LSAD] Section 5.1.3).
+///
+/// Decrypted result is LSA_SECRET_XP: Length(4) + Version(4) + Secret(Length).
 fn decrypt_secret_legacy(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>> {
-    // Legacy secret: first 4 bytes = length, then 4 bytes padding, then encrypted data
-    if encrypted.len() < 16 {
+    if encrypted.len() < 8 {
         return Err(lsa_err("Secret value too short for legacy decryption"));
     }
 
-    let secret_len = crate::utils::read_u32_le(encrypted, 0).unwrap_or(0) as usize;
-    let cipher_data = &encrypted[12..]; // Skip length(4) + unk(4) + unk(4)
-
-    // Derive RC4 key: MD5(lsa_key[0..16] + secret_len_le_bytes * padding)
-    // Actually for legacy secrets: derive key from LSA key + salt
-    // The legacy secret structure uses first 16 bytes of lsa_key
-    let key_material = &lsa_key[..16];
-
-    let mut md5_buf = Vec::new();
-    for _ in 0..1000 {
-        md5_buf.extend_from_slice(key_material);
+    let enc_size = crate::utils::read_u32_le(encrypted, 0).unwrap_or(0) as usize;
+    if enc_size == 0 || enc_size > encrypted.len() {
+        return Err(lsa_err("Invalid encrypted secret size"));
     }
-    let rc4_key = md5_hash(&md5_buf);
 
-    let decrypted = rc4(&rc4_key, cipher_data);
+    // Ciphertext is the last enc_size bytes
+    let ciphertext = &encrypted[encrypted.len() - enc_size..];
 
-    if secret_len > 0 && secret_len <= decrypted.len() {
-        Ok(decrypted[..secret_len].to_vec())
+    // DES-ECB decrypt with rotating 7-byte key segments from the 16-byte LSA key
+    let key = &lsa_key[..16];
+    let plaintext = des_ecb_decrypt_rotating(key, ciphertext);
+
+    // Parse LSA_SECRET_XP: Length(4) + Version(4) + Secret(Length)
+    if plaintext.len() < 8 {
+        return Ok(plaintext);
+    }
+    let secret_len = crate::utils::read_u32_le(&plaintext, 0).unwrap_or(0) as usize;
+    log::debug!(
+        "LSA_SECRET_XP: len={} version={} total_decrypted={}  first_16={}",
+        secret_len,
+        crate::utils::read_u32_le(&plaintext, 4).unwrap_or(0),
+        plaintext.len(),
+        hex::encode(&plaintext[..std::cmp::min(plaintext.len(), 16)])
+    );
+    if secret_len > 0 && 8 + secret_len <= plaintext.len() {
+        Ok(plaintext[8..8 + secret_len].to_vec())
     } else {
-        Ok(decrypted)
+        Ok(plaintext)
     }
+}
+
+/// DES-ECB decryption with rotating 7-byte key segments (SystemFunction005).
+///
+/// Per impacket's `__decryptSecret`: the key cursor advances 7 bytes per block.
+/// When fewer than 7 bytes remain, the cursor wraps to `key[remaining_len:]`,
+/// skipping the bytes that were already consumed before the wrap.
+fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    let mut key_cursor = key;
+
+    for chunk in ciphertext.chunks(8) {
+        if chunk.len() < 8 {
+            break;
+        }
+        let mut des_input = [0u8; 7];
+        des_input[..std::cmp::min(7, key_cursor.len())]
+            .copy_from_slice(&key_cursor[..std::cmp::min(7, key_cursor.len())]);
+        let des_key = transform_des_key(&des_input);
+
+        let block = GenericArray::from_slice(chunk);
+        let key_ga = GenericArray::from_slice(&des_key);
+        let cipher = des::Des::new(key_ga);
+        let mut out = *block;
+        cipher.decrypt_block(&mut out);
+        plaintext.extend_from_slice(&out);
+
+        // Advance key cursor by 7
+        key_cursor = &key_cursor[std::cmp::min(7, key_cursor.len())..];
+        // When fewer than 7 bytes remain, wrap: key0 = key[len(key0):]
+        if key_cursor.len() < 7 {
+            let remaining = key_cursor.len();
+            key_cursor = &key[remaining..];
+        }
+    }
+
+    plaintext
+}
+
+/// Expand 7-byte key to 8-byte DES key ([MS-LSAD] Section 5.1.3).
+fn transform_des_key(input: &[u8; 7]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = input[0] >> 1;
+    out[1] = ((input[0] & 0x01) << 6) | (input[1] >> 2);
+    out[2] = ((input[1] & 0x03) << 5) | (input[2] >> 3);
+    out[3] = ((input[2] & 0x07) << 4) | (input[3] >> 4);
+    out[4] = ((input[3] & 0x0F) << 3) | (input[4] >> 5);
+    out[5] = ((input[4] & 0x1F) << 2) | (input[5] >> 6);
+    out[6] = ((input[5] & 0x3F) << 1) | (input[6] >> 7);
+    out[7] = input[6] & 0x7F;
+    for b in &mut out {
+        *b = (*b << 1) & 0xFE;
+    }
+    out
 }
 
 /// SHA-256 + AES-256-ECB decryption (modern LSA scheme).

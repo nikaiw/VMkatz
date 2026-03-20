@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, LiveSspCredential, read_ptr, read_ustring, is_valid_user_ptr};
+use crate::lsass::types::{Arch, LiveSspCredential, read_ptr, read_ustring, is_valid_user_ptr, walk_list};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -76,20 +76,7 @@ pub fn extract_livessp_credentials_arch(
     };
     log::info!("LiveSSP list at 0x{:x}", list_addr);
 
-    let head_flink = read_ptr(vmem, list_addr, arch)?;
-    if head_flink == 0 || head_flink == list_addr {
-        return Ok(results);
-    }
-
-    let mut current = head_flink;
-    let mut visited = std::collections::HashSet::new();
-
-    loop {
-        if current == list_addr || visited.contains(&current) || current == 0 {
-            break;
-        }
-        visited.insert(current);
-
+    walk_list(vmem, list_addr, arch, |current| {
         let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
         let supp_ptr = read_ptr(vmem, current + offsets.supp_creds, arch).unwrap_or(0);
 
@@ -108,12 +95,8 @@ pub fn extract_livessp_credentials_arch(
                 results.push((luid, LiveSspCredential { username, domain, password }));
             }
         }
-
-        current = match read_ptr(vmem, current, arch) {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-    }
+        true
+    })?;
 
     log::info!("LiveSSP: found {} entries", results.len());
     Ok(results)

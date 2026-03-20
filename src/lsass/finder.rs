@@ -504,7 +504,7 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
 
     // MSV sessions + credentials
     if let Some(msv) = &dlls.msv1_0 {
-        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(&vmem, msv.base, msv.size, build_number, arch);
+        let mut sessions = crate::lsass::msv::extract_msv_sessions(&vmem, msv.base, msv.size, build_number, arch);
         log::info!("MSV x86 sessions discovered: {}", sessions.len());
         if let Some(lsasrv_mod) = dlls.lsasrv {
             crate::lsass::msv::enrich_sessions_from_lsasrv(
@@ -513,7 +513,7 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
         }
         insert_sessions(&mut all_creds, sessions);
 
-        match crate::lsass::msv::extract_msv_credentials_arch(
+        match crate::lsass::msv::extract_msv_credentials(
             &vmem, msv.base, msv.size, &keys, build_number, arch,
         ) {
             Ok(msv_creds) => {
@@ -534,7 +534,7 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
 
     // Kerberos
     if let Some(krb) = &dlls.kerberos {
-        match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+        match crate::lsass::kerberos::extract_kerberos_credentials(
             &vmem, krb.base, krb.size, &keys, arch,
         ) {
             Ok(creds) => {
@@ -664,7 +664,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 
     // MSV sessions + enrichment
     if let Some(msv) = &dlls.msv1_0 {
-        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(&lsass_vmem, msv.base, msv.size, build_number, Arch::X64);
+        let mut sessions = crate::lsass::msv::extract_msv_sessions(&lsass_vmem, msv.base, msv.size, build_number, Arch::X64);
         log::info!("MSV sessions discovered: {}", sessions.len());
         if let Some(lsasrv_ref) = dlls.lsasrv {
             crate::lsass::msv::enrich_sessions_from_lsasrv(
@@ -676,7 +676,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 
     // MSV credentials (with physical scan fallback)
     if let Some(msv) = &dlls.msv1_0 {
-        let msv_creds = match crate::lsass::msv::extract_msv_credentials_arch(
+        let msv_creds = match crate::lsass::msv::extract_msv_credentials(
             &lsass_vmem, msv.base, msv.size, &keys, build_number, Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
@@ -725,7 +725,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 
     // Kerberos (with physical scan + key scan fallbacks)
     if let Some(krb) = &dlls.kerberos {
-        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials(
             &lsass_vmem, krb.base, krb.size, &keys, Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
@@ -1185,8 +1185,8 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
         }
 
         // Try to decrypt the password (try Win10 1607+ offset first, then older)
-        let password = crate::lsass::kerberos::extract_kerb_password(vmem, *vaddr, 0x30, keys)
-            .or_else(|_| crate::lsass::kerberos::extract_kerb_password(vmem, *vaddr, 0x28, keys))
+        let password = crate::lsass::kerberos::extract_kerb_password(vmem, *vaddr, 0x30, keys, Arch::X64)
+            .or_else(|_| crate::lsass::kerberos::extract_kerb_password(vmem, *vaddr, 0x28, keys, Arch::X64))
             .unwrap_or_default();
 
         log::info!(
@@ -1474,14 +1474,14 @@ pub fn extract_credentials_from_minidump(
 
     // MSV sessions + credentials (with vmem region scan fallback)
     if let Some(msv) = &dlls.msv1_0 {
-        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(vmem, msv.base, msv.size, effective_build, arch);
+        let mut sessions = crate::lsass::msv::extract_msv_sessions(vmem, msv.base, msv.size, effective_build, arch);
         log::info!("MSV sessions discovered: {}", sessions.len());
         crate::lsass::msv::enrich_sessions_from_lsasrv(
             vmem, lsasrv.base, lsasrv.size, &mut sessions, arch,
         );
         insert_sessions(&mut all_creds, sessions);
 
-        match crate::lsass::msv::extract_msv_credentials_arch(vmem, msv.base, msv.size, &keys, effective_build, arch) {
+        match crate::lsass::msv::extract_msv_credentials(vmem, msv.base, msv.size, &keys, effective_build, arch) {
             Ok(creds) if !creds.is_empty() => {
                 status.msv = ProviderStatus::Ok;
                 for (luid, msv_cred) in creds {
@@ -1539,7 +1539,7 @@ pub fn extract_credentials_from_minidump(
 
     // Kerberos (with vmem scan + key scan fallbacks, x64 only)
     if let Some(krb) = &dlls.kerberos {
-        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials(
             vmem, krb.base, krb.size, &keys, arch,
         ) {
             Ok(creds) if !creds.is_empty() => creds,

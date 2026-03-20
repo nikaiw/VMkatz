@@ -2,6 +2,21 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::Result;
 
+/// BitLocker OEM ID found at offset +3 in the volume boot record.
+const BITLOCKER_OEM_ID: &[u8; 8] = b"-FVE-FS-";
+
+/// Check if a partition at the given byte offset is BitLocker-encrypted.
+pub(crate) fn is_bitlocker_partition<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
+    if reader.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut vbr = [0u8; 16];
+    if reader.read_exact(&mut vbr).is_err() {
+        return false;
+    }
+    &vbr[3..11] == BITLOCKER_OEM_ID
+}
+
 /// Parse MBR/GPT and find all NTFS partitions, returning their byte offsets.
 pub(crate) fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     if reader.seek(SeekFrom::Start(0)).is_err() {

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -7,6 +8,54 @@ use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
 use crate::vmware::header::{self, PAGE_SIZE};
 use crate::vmware::tags::{self, Tag};
+
+/// File-backed memory: mmap when possible, heap-allocated Vec<u8> fallback
+/// for platforms where mmap fails (e.g. VMFS-5 on ESXi 6.5).
+enum MappedFile {
+    Mmap(Mmap),
+    Vec(Vec<u8>),
+}
+
+impl MappedFile {
+    fn len(&self) -> usize {
+        match self {
+            MappedFile::Mmap(m) => m.len(),
+            MappedFile::Vec(v) => v.len(),
+        }
+    }
+}
+
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            MappedFile::Mmap(m) => m,
+            MappedFile::Vec(v) => v,
+        }
+    }
+}
+
+/// Try to mmap a file, falling back to read() into Vec<u8> if mmap fails.
+/// This handles platforms where mmap is unsupported (VMFS-5, older ESXi kernels).
+fn map_file(file: &mut fs::File) -> Result<MappedFile> {
+    match unsafe { Mmap::map(&*file) } {
+        Ok(m) => Ok(MappedFile::Mmap(m)),
+        Err(mmap_err) => {
+            // mmap failed — fall back to reading entire file into memory
+            let size = file.metadata()?.len() as usize;
+            eprintln!(
+                "[*] mmap failed ({}), reading file into memory ({:.1} MB)...",
+                mmap_err,
+                size as f64 / (1024.0 * 1024.0)
+            );
+            let mut buf = Vec::with_capacity(size);
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.read_to_end(&mut buf)?;
+            Ok(MappedFile::Vec(buf))
+        }
+    }
+}
 
 /// A memory region mapping guest physical pages to VMEM file offsets.
 #[derive(Debug, Clone, Copy)]
@@ -21,10 +70,10 @@ pub struct MemoryRegion {
 
 /// VMware memory layer: provides physical memory access from .vmsn + .vmem files.
 pub struct VmwareLayer {
-    mmap: Mmap,
+    data: MappedFile,
     pub regions: Vec<MemoryRegion>,
     truncated: bool,
-    /// Byte offset within the mmap where guest physical memory starts.
+    /// Byte offset within the data where guest physical memory starts.
     /// Non-zero when memory is embedded in a .vmss/.vmsn file (after header/tags).
     base_offset: u64,
 }
@@ -70,70 +119,56 @@ impl VmwareLayer {
             }
         };
 
-        // Memory-map the VMEM file
-        let vmem_file = fs::File::open(&vmem_path)?;
-        let mmap = unsafe { Mmap::map(&vmem_file)? };
+        // Memory-map the VMEM file (falls back to read() on platforms without mmap)
+        let mut vmem_file = fs::File::open(&vmem_path)?;
+        let data = map_file(&mut vmem_file)?;
         log::info!(
-            "VMEM mapped: {} bytes ({} MB)",
-            mmap.len(),
-            mmap.len() / (1024 * 1024)
+            "VMEM loaded: {} bytes ({} MB)",
+            data.len(),
+            data.len() / (1024 * 1024)
         );
 
-        // When memory is embedded (no .vmem) and no region tags, find the Memory tag
-        // to determine the base offset and size of guest physical memory in the file.
-        let mut base_offset: u64 = 0;
-        let regions = if regions.is_empty() {
-            // Check for embedded Memory tag (common in .vmss suspend files)
+        // When memory is embedded in .vmsn (no separate .vmem), base_offset marks
+        // where guest physical memory data starts in the file. For separate .vmem
+        // files, pages start at file offset 0 so base_offset = 0.
+        let embedded = !path.with_extension("vmem").exists();
+        let base_offset: u64 = if embedded {
+            // Find the Memory tag to get the base offset of RAM data
             let mem_tag = all_tags.iter().find(|t| t.name == "Memory");
             if let Some(tag) = mem_tag {
-                // Read align_mask to determine memory page alignment within the file.
-                // Memory pages are aligned to (align_mask + 1) boundary after tag header.
                 let align_mask = tags::find_tag(&all_tags, "align_mask", &[0, 0])
                     .and_then(|t| {
                         let off = t.data_offset as usize;
-                        if off + 4 <= mmap.len() {
-                            Some(crate::utils::read_u32_le(&mmap, off).unwrap_or(0) as u64)
+                        if off + 4 <= data.len() {
+                            Some(crate::utils::read_u32_le(&data, off).unwrap_or(0) as u64)
                         } else {
                             None
                         }
                     })
-                    .unwrap_or(0xFFF); // default 4KB alignment
-
-                // Memory base is the tag data offset aligned up to (align_mask + 1)
-                let alignment = align_mask + 1;
-                base_offset = (tag.data_offset + align_mask) & !align_mask;
-
-                // Read actual memory size from first 4 bytes of tag data (u32 LE)
-                let mem_size = if tag.data_offset as usize + 4 <= mmap.len() {
-                    let off = tag.data_offset as usize;
-                    crate::utils::read_u32_le(&mmap, off).unwrap_or(0) as u64
-                } else {
-                    tag.data_size
-                };
-
-                let page_count = mem_size / PAGE_SIZE as u64;
-                log::info!(
-                    "Embedded memory: base_offset=0x{:x} (alignment=0x{:x}), size=0x{:x} ({} pages, {} MB)",
-                    base_offset, alignment, mem_size, page_count,
-                    (page_count * PAGE_SIZE as u64) / (1024 * 1024)
-                );
-                vec![MemoryRegion {
-                    guest_page_num: 0,
-                    vmem_page_num: 0,
-                    page_count,
-                }]
+                    .unwrap_or(0xFFF);
+                let offset = (tag.data_offset + align_mask) & !align_mask;
+                log::info!("Embedded memory base offset: 0x{:x}", offset);
+                offset
             } else {
-                let page_count = mmap.len() as u64 / PAGE_SIZE as u64;
-                log::info!(
-                    "No memory regions in VMSN, using identity mapping ({} pages)",
-                    page_count
-                );
-                vec![MemoryRegion {
-                    guest_page_num: 0,
-                    vmem_page_num: 0,
-                    page_count,
-                }]
+                0
             }
+        } else {
+            0
+        };
+        let regions = if regions.is_empty() {
+            // No region tags — create a single identity-mapped region
+            let page_count = if embedded && base_offset > 0 {
+                // Embedded: available memory = file size - base_offset
+                (data.len() as u64 - base_offset) / PAGE_SIZE as u64
+            } else {
+                data.len() as u64 / PAGE_SIZE as u64
+            };
+            log::info!("No memory regions in VMSN, using identity mapping ({} pages)", page_count);
+            vec![MemoryRegion {
+                guest_page_num: 0,
+                vmem_page_num: 0,
+                page_count,
+            }]
         } else {
             regions
         };
@@ -145,7 +180,7 @@ impl VmwareLayer {
             .max()
             .unwrap_or(0);
         let expected_size = expected_pages * PAGE_SIZE as u64 + base_offset;
-        let actual_size = mmap.len() as u64;
+        let actual_size = data.len() as u64;
         if actual_size < expected_size {
             eprintln!(
                 "[!] WARNING: VMEM file is truncated ({:.1} GB / {:.1} GB expected) — results may be incomplete",
@@ -157,7 +192,7 @@ impl VmwareLayer {
         let truncated = actual_size < expected_size;
 
         Ok(Self {
-            mmap,
+            data,
             regions,
             truncated,
             base_offset,
@@ -166,10 +201,9 @@ impl VmwareLayer {
 
     /// Parse a .vmsn file and return (regions, tags).
     fn parse_vmsn_metadata(vmsn_path: &Path) -> Result<(Vec<MemoryRegion>, Vec<Tag>)> {
-        // Memory-map instead of fs::read to avoid loading the entire multi-GB
-        // snapshot into memory — only the header/tag pages get paged in.
-        let vmsn_file = fs::File::open(vmsn_path)?;
-        let vmsn_data = unsafe { Mmap::map(&vmsn_file)? };
+        // Try mmap first, fall back to read() for platforms without mmap support.
+        let mut vmsn_file = fs::File::open(vmsn_path)?;
+        let vmsn_data = map_file(&mut vmsn_file)?;
 
         let (hdr, groups) = header::parse_vmsn(&vmsn_data)?;
         log::info!(
@@ -262,7 +296,7 @@ impl VmwareLayer {
         Ok((regions, all_tags))
     }
 
-    /// Translate a guest physical address to a byte offset in the VMEM mmap.
+    /// Translate a guest physical address to a byte offset in the VMEM data.
     fn guest_phys_to_vmem_offset(&self, phys_addr: u64) -> Result<usize> {
         let page_num = phys_addr / PAGE_SIZE as u64;
         let page_offset = phys_addr % PAGE_SIZE as u64;
@@ -296,10 +330,10 @@ impl PhysicalMemory for VmwareLayer {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<()> {
         let offset = self.guest_phys_to_vmem_offset(phys_addr)?;
         let end = offset + buf.len();
-        if end > self.mmap.len() {
+        if end > self.data.len() {
             return Err(VmkatzError::UnmappablePhysical(phys_addr));
         }
-        buf.copy_from_slice(&self.mmap[offset..end]);
+        buf.copy_from_slice(&self.data[offset..end]);
         Ok(())
     }
 

@@ -16,6 +16,57 @@ fn is_valid_kernel_flink(flink: u64, bitness: WindowsBitness) -> bool {
     }
 }
 
+/// Validate that a Flink VA can be translated to a physical address and the
+/// linked EPROCESS contains a plausible PID. This rejects stale System process
+/// remnants where the DTB points to freed/corrupted page tables.
+fn validate_flink_translation(
+    phys: &impl PhysicalMemory,
+    dtb: u64,
+    flink: u64,
+    offsets: &EprocessOffsets,
+) -> bool {
+    // Walk the first few entries of the process list to verify the page tables work.
+    // Translate flink VA → physical, read the linked EPROCESS, check it has a
+    // non-zero process name and a valid kernel-mode Flink.
+    let translate = |va: u64| -> std::result::Result<u64, ()> {
+        match offsets.bitness {
+            WindowsBitness::X64 => PageTableWalker::new(phys).translate(dtb, va).map_err(|_| ()),
+            WindowsBitness::X86Pae => PaePageTableWalker::new(phys).translate(dtb, va).map_err(|_| ()),
+        }
+    };
+
+    let flink_phys = match translate(flink) {
+        Ok(p) if p < phys.phys_size() => p,
+        _ => return false,
+    };
+
+    if flink_phys < offsets.active_process_links {
+        return false;
+    }
+    let next_eprocess = flink_phys - offsets.active_process_links;
+
+    // The next EPROCESS must have a non-zero ImageFileName
+    let mut name_buf = [0u8; 15];
+    if phys.read_phys(next_eprocess + offsets.image_file_name, &mut name_buf).is_err() {
+        return false;
+    }
+    if name_buf.iter().all(|&b| b == 0) {
+        return false;
+    }
+    // Process name must be printable ASCII
+    if !name_buf.iter().take_while(|&&b| b != 0).all(|&b| b.is_ascii_graphic() || b == b' ') {
+        return false;
+    }
+
+    // The next process's Flink must be a valid kernel VA
+    let reader = EprocessReader::new(offsets);
+    let next_flink = match reader.read_flink(phys, next_eprocess) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    is_valid_kernel_flink(next_flink, offsets.bitness)
+}
+
 /// PEB + 0x20 = ProcessParameters (RTL_USER_PROCESS_PARAMETERS*)
 const PEB_PROCESS_PARAMETERS: u64 = 0x20;
 /// RTL_USER_PROCESS_PARAMETERS + 0x60 = ImagePathName (UNICODE_STRING)
@@ -101,6 +152,19 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
                         Err(_) => continue,
                     };
                     if !is_valid_kernel_flink(flink, offsets.bitness) {
+                        continue;
+                    }
+
+                    // Validate page table walk: translate the Flink VA to physical,
+                    // then verify the linked EPROCESS is readable with a valid PID.
+                    // This catches stale EPROCESS remnants where DTB points to
+                    // freed/corrupted page tables (common in QEMU savevm snapshots).
+                    let flink_valid = validate_flink_translation(phys, dtb, flink, offsets);
+                    if !flink_valid {
+                        log::debug!(
+                            "Rejecting System candidate at 0x{:x}: Flink 0x{:x} translation produced invalid EPROCESS (DTB=0x{:x})",
+                            eprocess_phys, flink, dtb
+                        );
                         continue;
                     }
 
