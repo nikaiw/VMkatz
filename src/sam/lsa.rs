@@ -147,11 +147,19 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
         }
     );
 
-    // Extract LSA key
-    let lsa_key = if is_modern {
-        extract_lsa_key_modern(&hive, &policy, bootkey)?
+    // Extract LSA key. Try modern first (PolEKList), fall back to legacy
+    // (PolSecretEncryptionKey). Some Windows versions (e.g. Server 2003 R2 SP2)
+    // report a modern revision but still use the legacy encryption scheme.
+    let (lsa_key, is_modern) = if is_modern {
+        match extract_lsa_key_modern(&hive, &policy, bootkey) {
+            Ok(key) => (key, true),
+            Err(e) => {
+                log::info!("Modern LSA key extraction failed ({}), trying legacy fallback", e);
+                (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
+            }
+        }
     } else {
-        extract_lsa_key_legacy(&hive, &policy, bootkey)?
+        (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
     };
     log::info!("LSA key: {}", hex::encode(lsa_key));
 
