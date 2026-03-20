@@ -311,7 +311,7 @@ fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
 /// Format a password for display: if it contains non-printable/control characters
 /// (typical of machine account random passwords), show as hex instead of garbled Unicode.
 fn fmt_password(password: &str, c: &Colors) -> String {
-    // Raw hex from decode_password_bytes (machine account / binary password)
+    // Raw hex from decode_password_bytes (binary password that failed UTF-16 decode)
     if let Some(hex_str) = password.strip_prefix(RAW_HEX_PREFIX) {
         return format!("{}(hex) {}{}", c.dim, hex_str, c.reset);
     }
@@ -2676,7 +2676,7 @@ fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: b
             }
         }
         if let Some(wd) = &cred.wdigest {
-            if !wd.password.is_empty() && should_show(providers, "wdigest") {
+            if !wd.password.is_empty() && !cred.username.ends_with('$') && should_show(providers, "wdigest") {
                 println!("  {}[WDigest]{}", c.cyan, c.reset);
                 println!("    Password: {}", fmt_password(&wd.password, c));
             }
@@ -2684,7 +2684,8 @@ fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: b
         if let Some(krb) = &cred.kerberos {
             if should_show(providers, "kerberos") {
                 println!("  {}[Kerberos]{}", c.cyan, c.reset);
-                if !krb.password.is_empty() {
+                // Skip machine account passwords (binary blobs, use keys instead)
+                if !krb.password.is_empty() && !cred.username.ends_with('$') {
                     println!("    Password: {}", fmt_password(&krb.password, c));
                 }
                 // Deduplicate keys by value — show each unique key once with primary etype
@@ -2962,12 +2963,11 @@ fn report_extraction_summary(credentials: &[Credential], format: &str) {
     let with_pw = credentials
         .iter()
         .filter(|c| {
-            c.wdigest
-                .as_ref()
-                .is_some_and(|w| !w.password.is_empty())
-                || c.kerberos
-                    .as_ref()
-                    .is_some_and(|k| !k.password.is_empty())
+            // Don't count machine account passwords (binary blobs, not useful)
+            let is_machine = c.username.ends_with('$');
+            (!is_machine
+                && (c.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
+                    || c.kerberos.as_ref().is_some_and(|k| !k.password.is_empty())))
                 || c.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
         })
         .count();
