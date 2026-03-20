@@ -1292,8 +1292,19 @@ fn print_dcc2_hashcat(creds: &[vmkatz::sam::cache::CachedCredential]) {
 
 #[cfg(feature = "sam")]
 fn print_lsa_secrets(secrets: &[vmkatz::sam::lsa::LsaSecret], c: &Colors) {
+    use vmkatz::sam::lsa::LsaSecretType;
+    // Only show secrets with actionable parsed data.
+    // Skip empty service passwords and unparsed raw blobs (L$TermServ*, SAC, SCM, etc.)
+    let visible: Vec<_> = secrets.iter().filter(|s| {
+        !matches!(&s.parsed,
+            LsaSecretType::ServicePassword { password, .. } if password.is_empty()
+        ) && !matches!(&s.parsed, LsaSecretType::Raw)
+    }).collect();
+    if visible.is_empty() {
+        return;
+    }
     println!("\n{}[+] LSA Secrets:{}", c.green, c.reset);
-    for secret in secrets {
+    for secret in visible {
         println!("{}", secret);
     }
 }
