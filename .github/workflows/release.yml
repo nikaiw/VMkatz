@@ -73,6 +73,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -81,10 +86,24 @@ jobs:
       - name: Generate checksums
         run: sha256sum vmkatz-* > SHA256SUMS.txt
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "${{ github.ref_name }}" | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "## Changes since ${PREV_TAG}" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          git log --pretty=format:"- %s" "${PREV_TAG}..${{ github.ref_name }}" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
+          body_path: CHANGELOG.md
           files: |
             vmkatz-*
             SHA256SUMS.txt
