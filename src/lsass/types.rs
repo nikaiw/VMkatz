@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use crate::error::Result;
 use crate::memory::VirtualMemory;
+use crate::pe::parser::PeHeaders;
 
 /// Target architecture for LSASS extraction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -339,6 +340,121 @@ pub const LUID_SYSTEM: u64 = 0x3e7;
 pub const LUID_NETWORK_SERVICE: u64 = 0x3e4;
 pub const LUID_LOCAL_SERVICE: u64 = 0x3e5;
 pub const LUID_IUSR: u64 = 0x3e3;
+
+/// Read a pointer-sized value from a byte buffer (no virtual memory needed).
+pub(super) fn read_ptr_from_buf(data: &[u8], off: usize, arch: Arch) -> u64 {
+    match arch {
+        Arch::X86 => read_u32_le(data, off).unwrap_or(0) as u64,
+        Arch::X64 => read_u64_le(data, off).unwrap_or(0),
+    }
+}
+
+/// Walk a doubly-linked LIST_ENTRY list with cycle detection.
+///
+/// Reads head flink from `list_addr`, then visits each entry calling `process(entry_addr)`.
+/// The closure returns `true` to continue walking, `false` to stop early.
+/// Flink is always at offset 0x00 (standard LIST_ENTRY at struct start).
+pub(super) fn walk_list(
+    vmem: &dyn VirtualMemory,
+    list_addr: u64,
+    arch: Arch,
+    mut process: impl FnMut(u64) -> bool,
+) -> Result<()> {
+    let head_flink = read_ptr(vmem, list_addr, arch)?;
+    if head_flink == 0 || head_flink == list_addr {
+        return Ok(());
+    }
+    let mut current = head_flink;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if current == list_addr || visited.contains(&current) || current == 0 {
+            break;
+        }
+        visited.insert(current);
+        if !process(current) {
+            break;
+        }
+        current = match read_ptr(vmem, current, arch) {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+    }
+    Ok(())
+}
+
+/// Read the `.data` section from a PE in virtual memory.
+///
+/// Returns `(data_base_va, data_bytes)` with at most `max_size` bytes.
+pub(super) fn read_data_section(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    dll_base: u64,
+    max_size: usize,
+    dll_name: &str,
+) -> Result<(u64, Vec<u8>)> {
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        crate::error::VmkatzError::PatternNotFound(format!(".data section in {}", dll_name))
+    })?;
+    let data_base = dll_base + data_sec.virtual_address as u64;
+    let data_size = std::cmp::min(data_sec.virtual_size as usize, max_size);
+    let data = vmem.read_virt_bytes(data_base, data_size)?;
+    Ok((data_base, data))
+}
+
+/// Scan PE `.data` section for a LIST_ENTRY head matching a provider-specific validator.
+///
+/// Iterates pointer-aligned offsets, reads flink/blink, applies common filters
+/// (valid user-mode pointer, not within DLL image), then calls `validate(flink, list_addr)`.
+///
+/// When `accept_empty` is true, self-referencing entries (flink == blink == list_addr)
+/// in the first 0x1000 bytes are returned immediately (some providers store empty lists).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_data_for_list_head(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    dll_base: u64,
+    arch: Arch,
+    max_data_size: usize,
+    dll_name: &str,
+    dll_range: u64,
+    accept_empty: bool,
+    error_label: &str,
+    validate: impl Fn(u64, u64) -> bool,
+) -> Result<u64> {
+    let (data_base, data) = read_data_section(vmem, pe, dll_base, max_data_size, dll_name)?;
+    let data_size = data.len();
+    let step = arch.ptr_size() as usize;
+
+    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
+        let flink = read_ptr_from_buf(&data, off, arch);
+        let blink = read_ptr_from_buf(&data, off + step, arch);
+        let list_addr = data_base + off as u64;
+
+        // Self-referencing empty list
+        if flink == list_addr && blink == list_addr {
+            if accept_empty && off < 0x1000 {
+                return Ok(list_addr);
+            }
+            continue;
+        }
+
+        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
+            continue;
+        }
+        // Must point to heap, not within the DLL image
+        if flink >= dll_base && flink < dll_base + dll_range {
+            continue;
+        }
+
+        if validate(flink, list_addr) {
+            return Ok(list_addr);
+        }
+    }
+
+    Err(crate::error::VmkatzError::PatternNotFound(
+        format!("{} in {} .data section", error_label, dll_name),
+    ))
+}
 
 /// Fill username/domain for well-known Windows logon session LUIDs.
 /// Only overwrites empty fields to avoid clobbering MSV/WDigest-discovered names.

