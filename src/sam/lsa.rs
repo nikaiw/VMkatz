@@ -426,11 +426,19 @@ fn decrypt_secret_legacy(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
     }
 }
 
-/// DES-ECB decryption with rotating 7-byte key segments (SystemFunction005).
+/// DES-ECB decryption with rotating key segments ([MS-LSAD] Section 5.1.2).
 ///
-/// Per impacket's `__decryptSecret`: the key cursor advances 7 bytes per block.
-/// When fewer than 7 bytes remain, the cursor wraps to `key[remaining_len:]`,
-/// skipping the bytes that were already consumed before the wrap.
+/// The LSA key is consumed 7 bytes at a time to produce DES keys for each
+/// 8-byte block. When fewer than 7 bytes remain, the cursor wraps:
+///   key_cursor = full_key[remaining_len..]
+///
+/// Example with 16-byte key K[0..15]:
+///   Block 0: DES(K[0..6]),  cursor = K[7..15]  (9 remain)
+///   Block 1: DES(K[7..13]), cursor = K[14..15]  (2 remain)
+///   Block 2: wrap → K[2..15], DES(K[2..8]), cursor = K[9..15]
+///   Block 3: DES(K[9..15]), cursor empty → wrap to K[0..15]
+const DES_KEY_SEGMENT: usize = 7;
+
 fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
     let mut plaintext = Vec::with_capacity(ciphertext.len());
     let mut key_cursor = key;
@@ -439,10 +447,10 @@ fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         if chunk.len() < 8 {
             break;
         }
-        let mut des_input = [0u8; 7];
-        des_input[..std::cmp::min(7, key_cursor.len())]
-            .copy_from_slice(&key_cursor[..std::cmp::min(7, key_cursor.len())]);
-        let des_key = transform_des_key(&des_input);
+        let mut segment = [0u8; DES_KEY_SEGMENT];
+        let take = std::cmp::min(DES_KEY_SEGMENT, key_cursor.len());
+        segment[..take].copy_from_slice(&key_cursor[..take]);
+        let des_key = transform_des_key(&segment);
 
         let block = GenericArray::from_slice(chunk);
         let key_ga = GenericArray::from_slice(&des_key);
@@ -451,19 +459,17 @@ fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         cipher.decrypt_block(&mut out);
         plaintext.extend_from_slice(&out);
 
-        // Advance key cursor by 7
-        key_cursor = &key_cursor[std::cmp::min(7, key_cursor.len())..];
-        // When fewer than 7 bytes remain, wrap: key0 = key[len(key0):]
-        if key_cursor.len() < 7 {
-            let remaining = key_cursor.len();
-            key_cursor = &key[remaining..];
+        key_cursor = &key_cursor[take..];
+        if key_cursor.len() < DES_KEY_SEGMENT {
+            key_cursor = &key[key_cursor.len()..];
         }
     }
 
     plaintext
 }
 
-/// Expand 7-byte key to 8-byte DES key ([MS-LSAD] Section 5.1.3).
+/// Expand 7-byte input to 8-byte DES key by spreading bits ([MS-LSAD] Section 5.1.3).
+/// Each output byte uses 7 bits of key material + 1 parity bit (shifted left, masked 0xFE).
 fn transform_des_key(input: &[u8; 7]) -> [u8; 8] {
     let mut out = [0u8; 8];
     out[0] = input[0] >> 1;
