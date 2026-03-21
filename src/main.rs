@@ -152,6 +152,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     ccache: Option<String>,
 
+    /// Export BitLocker FVEK keys as dislocker-compatible .fvek files to a directory
+    #[arg(long, value_name = "DIR")]
+    bitlocker_fvek: Option<String>,
+
     /// Verbose output (show memory regions, process list, etc.)
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -1997,6 +2001,9 @@ fn run_carve<L: PhysicalMemory>(
 ) -> anyhow::Result<()> {
     let credentials = lsass::carve::carve_credentials(layer, pagefile, disk_path);
 
+    // BitLocker FVEK extraction runs on physical memory — works in carve mode too
+    extract_and_output_bitlocker(layer, args);
+
     if credentials.is_empty() {
         anyhow::bail!("Carve mode: no credentials found");
     }
@@ -2301,6 +2308,9 @@ fn run_with_system<L: PhysicalMemory>(
     // Export Kerberos tickets if requested
     export_kerberos_tickets(&credentials, args);
 
+    // BitLocker FVEK extraction (physical memory scan — independent of LSASS)
+    extract_and_output_bitlocker(layer, args);
+
     output_credentials(&credentials, args);
 
     Ok(())
@@ -2405,6 +2415,90 @@ fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
                 data.len()
             ),
             Err(e) => eprintln!("[!] Failed to write {}: {}", ccache_path, e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BitLocker FVEK extraction and export
+// ---------------------------------------------------------------------------
+
+/// Extract BitLocker FVEK keys from physical memory, display results, and
+/// optionally export as dislocker-compatible `.fvek` files.
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
+fn extract_and_output_bitlocker<L: PhysicalMemory>(layer: &L, args: &Args) {
+    let t_bl = std::time::Instant::now();
+    let keys = vmkatz::lsass::bitlocker::extract_bitlocker_keys(layer);
+    if keys.is_empty() {
+        log::debug!("BitLocker: no FVEK candidates found ({:?})", t_bl.elapsed());
+        return;
+    }
+    eprintln!(
+        "[+] BitLocker: {} FVEK candidate(s) found ({:?})",
+        keys.len(),
+        t_bl.elapsed()
+    );
+
+    let c = get_colors(args);
+
+    println!(
+        "\n{}[+] BitLocker FVEK ({} candidate(s)):{}\n",
+        c.green, keys.len(), c.reset
+    );
+
+    for (i, key) in keys.iter().enumerate() {
+        println!("  {}Candidate #{}{}", c.bold, i + 1, c.reset);
+        println!("    Cipher  : {}{}{}", c.yellow, key.cipher, c.reset);
+        println!("    FVEK    : {}{}{}", c.yellow, hex::encode(&key.fvek), c.reset);
+        if !key.tweak.is_empty() {
+            println!("    Tweak   : {}{}{}", c.yellow, hex::encode(&key.tweak), c.reset);
+        }
+        println!("    Pool tag: {} @ 0x{:x}", key.pool_tag, key.phys_addr);
+        println!(
+            "    Method  : 0x{:04x} ({})",
+            key.method,
+            key.key_bits()
+        );
+        println!(
+            "    Dislocker: dislocker-fuse -K fvek_{}.bin -- /dev/sdX /mnt",
+            i
+        );
+        println!();
+    }
+
+    // Export .fvek files if --bitlocker-fvek is set
+    if let Some(dir) = &args.bitlocker_fvek {
+        export_bitlocker_fvek(&keys, dir);
+    }
+}
+
+/// Write dislocker-compatible FVEK files to disk.
+fn export_bitlocker_fvek(keys: &[vmkatz::lsass::bitlocker::BitLockerKey], dir: &str) {
+    let dir_path = std::path::Path::new(dir);
+    if !dir_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir_path) {
+            eprintln!("[!] Failed to create FVEK directory {}: {}", dir, e);
+            return;
+        }
+    }
+
+    for (i, key) in keys.iter().enumerate() {
+        let filename = format!("fvek_{}.bin", i);
+        let path = dir_path.join(&filename);
+        let blob = key.to_dislocker_fvek();
+        match std::fs::write(&path, &blob) {
+            Ok(_) => eprintln!(
+                "[+] Wrote {} ({}, {} bytes)",
+                path.display(),
+                key.cipher,
+                blob.len()
+            ),
+            Err(e) => eprintln!("[!] Failed to write {}: {}", path.display(), e),
         }
     }
 }
