@@ -74,7 +74,7 @@ impl QemuSavevmLayer {
     /// Supports both regular files and block devices (LVM volumes on Proxmox).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = crate::utils::mmap_file(&file)?;
+        let mmap = crate::utils::mmap_file(&file, path)?;
 
         if mmap.len() < 16 {
             return Err(VmkatzError::InvalidMagic(0));
