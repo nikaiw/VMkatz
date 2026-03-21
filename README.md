@@ -497,3 +497,4 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 - [**Vergilius Project**](https://www.vergiliusproject.com/) -- documented Windows kernel structures used to verify EPROCESS field offsets across all supported builds (XP through Win11 24H2).
 - [**dissect.vmfs**](https://github.com/fox-it/dissect.vmfs) by Fox-IT (NCC Group) -- Python VMFS parser from the Dissect DFIR framework, used as reference for VMFS-6 on-disk structures (LVM, superblock, resource files, file descriptors).
 - [**vmfs-tools**](https://github.com/glandium/vmfs-tools) by Mike Hommey -- open-source VMFS3/5 implementation that documents core on-disk structures and address types.
+- [**volatility-kerberos**](https://github.com/airbus-cert/volatility-kerberos) by Sylvain Peyrefitte ([@citronneur](https://twitter.com/citronneur), Airbus CERT) -- Volatility 3 plugin for Kerberos ticket extraction, inspired the ticket carving approach for recovering orphaned tickets from freed LSASS memory.
