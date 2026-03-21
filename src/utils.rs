@@ -204,7 +204,7 @@ pub fn read_file_header(file: &std::fs::File, max_bytes: usize) -> std::io::Resu
 /// Open a file as MappedFile: tries mmap first, falls back to pread on failure.
 /// Handles block devices where fstat returns size 0.
 #[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
-pub fn mmap_file(file: &std::fs::File) -> std::io::Result<MappedFile> {
+pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<MappedFile> {
     use std::io::{Seek, SeekFrom};
     let mut f = file.try_clone()?;
     let size = f.seek(SeekFrom::End(0))?;
@@ -227,7 +227,8 @@ pub fn mmap_file(file: &std::fs::File) -> std::io::Result<MappedFile> {
         Ok(m) => Ok(MappedFile::Mmap(m)),
         Err(mmap_err) => {
             eprintln!(
-                "[!] mmap failed ({:.1} MB): {} — falling back to file I/O (slower)",
+                "[!] mmap failed for '{}' ({:.1} MB): {} — falling back to file I/O (slower)",
+                path.display(),
                 size as f64 / (1024.0 * 1024.0),
                 mmap_err,
             );

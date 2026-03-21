@@ -24,7 +24,7 @@ impl HypervLayer {
     /// For .bin files, optionally loads CPU state from a companion .vsv file (future).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = crate::utils::mmap_file(&file)?;
+        let mmap = crate::utils::mmap_file(&file, path)?;
         let size = mmap.len() as u64;
 
         // Sanity check: .bin files should be at least a few MB (VM RAM)

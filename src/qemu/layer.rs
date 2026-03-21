@@ -47,7 +47,7 @@ impl QemuElfLayer {
     /// Open a QEMU ELF core dump file (.elf or any extension).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = crate::utils::mmap_file(&file)?;
+        let mmap = crate::utils::mmap_file(&file, path)?;
 
         if mmap.len() < ELF64_EHDR_SIZE {
             return Err(VmkatzError::InvalidMagic(0));

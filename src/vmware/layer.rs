@@ -71,7 +71,7 @@ impl VmwareLayer {
         };
 
         let vmem_file = fs::File::open(&vmem_path)?;
-        let data = crate::utils::mmap_file(&vmem_file)?;
+        let data = crate::utils::mmap_file(&vmem_file, &vmem_path)?;
         log::info!(
             "VMEM loaded: {} bytes ({} MB)",
             data.len(),
@@ -150,7 +150,7 @@ impl VmwareLayer {
     /// Parse a .vmsn file and return (regions, tags).
     fn parse_vmsn_metadata(vmsn_path: &Path) -> Result<(Vec<MemoryRegion>, Vec<Tag>)> {
         let vmsn_file = fs::File::open(vmsn_path)?;
-        let vmsn_mapped = crate::utils::mmap_file(&vmsn_file)?;
+        let vmsn_mapped = crate::utils::mmap_file(&vmsn_file, vmsn_path)?;
 
         // For mmap: use the mapping directly. For pread fallback: read the header
         // portion (first 8 MB covers all tag structures) for slice-based parsing.
