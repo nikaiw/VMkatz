@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
@@ -1285,6 +1287,195 @@ pub fn scan_vmem_for_kerberos_keys(
     );
 
     all_key_groups
+}
+
+/// Carve orphaned Kerberos tickets from LSASS virtual memory.
+///
+/// Scans for `_KERB_TICKET_INFO` structures that are no longer reachable via the
+/// AVL tree (freed sessions, logged-out users whose memory is still resident).
+/// Returns tickets not already present in `existing_tickets`.
+pub fn carve_kerberos_tickets(
+    vmem: &dyn VirtualMemory,
+    regions: &[(u64, u64)],
+    arch: Arch,
+    existing_tickets: &[KerberosTicket],
+) -> Vec<KerberosTicket> {
+    let mut carved = Vec::new();
+    let existing_blobs: HashSet<Vec<u8>> = existing_tickets
+        .iter()
+        .map(|t| t.ticket_blob.clone())
+        .collect();
+
+    // Valid Kerberos encryption types for the ticket cipher
+    const VALID_ETYPES: [u32; 6] = [1, 3, 17, 18, 23, 24];
+
+    // Select ticket offset variants based on architecture
+    let ticket_offset_sets: &[&TicketOffsets] = match arch {
+        Arch::X64 => &[&TICKET_OFFSETS_1607, &TICKET_OFFSETS_10, &TICKET_OFFSETS_6],
+        Arch::X86 => &[&TICKET_OFFSETS_1607_X86, &TICKET_OFFSETS_10_X86],
+    };
+
+    let chunk_size: usize = 256 * 1024; // 256 KB chunks
+
+    log::info!(
+        "Kerberos ticket carving: scanning {} memory regions (arch={:?})...",
+        regions.len(),
+        arch,
+    );
+
+    let mut candidates_checked = 0u64;
+    let mut read_errors = 0u64;
+
+    for &(region_start, region_size) in regions {
+        // Skip tiny or huge regions
+        if !(0x100..=0x10_000_000).contains(&region_size) {
+            continue;
+        }
+
+        let mut offset = 0u64;
+        while offset < region_size {
+            let read_size = chunk_size.min((region_size - offset) as usize);
+            let chunk_addr = region_start + offset;
+            let chunk = match vmem.read_virt_bytes(chunk_addr, read_size) {
+                Ok(d) => d,
+                Err(_) => {
+                    read_errors += 1;
+                    offset += chunk_size as u64;
+                    continue;
+                }
+            };
+
+            // Scan for valid etype values at 8-byte aligned positions.
+            // For each hit, check if the surrounding bytes match a ticket_info struct.
+            let scan_limit = chunk.len().saturating_sub(8);
+            for i in (0..scan_limit).step_by(8) {
+                let val = u32::from_le_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
+
+                if !VALID_ETYPES.contains(&val) {
+                    continue;
+                }
+
+                // Try each ticket offset variant: if this u32 is the ticket_enc_type
+                // field, then the structure starts at (current_addr - ticket_enc_type).
+                for offsets in ticket_offset_sets {
+                    let enc_type_off = offsets.ticket_enc_type as usize;
+                    if i < enc_type_off {
+                        continue;
+                    }
+                    let local_base = i - enc_type_off;
+
+                    // Quick validation: ticket_kvno must be reasonable (1..=20)
+                    let kvno_pos = local_base + offsets.ticket_kvno as usize;
+                    if kvno_pos + 4 > chunk.len() {
+                        continue;
+                    }
+                    let kvno = u32::from_le_bytes([
+                        chunk[kvno_pos],
+                        chunk[kvno_pos + 1],
+                        chunk[kvno_pos + 2],
+                        chunk[kvno_pos + 3],
+                    ]);
+                    if kvno == 0 || kvno > 20 {
+                        continue;
+                    }
+
+                    // ticket_length must be reasonable (100..=65536)
+                    let len_pos = local_base + offsets.ticket_length as usize;
+                    if len_pos + 4 > chunk.len() {
+                        continue;
+                    }
+                    let ticket_len = u32::from_le_bytes([
+                        chunk[len_pos],
+                        chunk[len_pos + 1],
+                        chunk[len_pos + 2],
+                        chunk[len_pos + 3],
+                    ]);
+                    if !(100..=65536).contains(&ticket_len) {
+                        continue;
+                    }
+
+                    // ticket_flags (big-endian in memory) — check for sane flag bits.
+                    // Only standard Kerberos flag bits should be set (top 16 bits of swapped u32).
+                    let flags_pos = local_base + offsets.ticket_flags as usize;
+                    if flags_pos + 4 > chunk.len() {
+                        continue;
+                    }
+                    let raw_flags = u32::from_le_bytes([
+                        chunk[flags_pos],
+                        chunk[flags_pos + 1],
+                        chunk[flags_pos + 2],
+                        chunk[flags_pos + 3],
+                    ]);
+                    let flags = raw_flags.swap_bytes();
+                    // At least one standard flag must be set, and no undefined low bits
+                    // Standard flags: bits 30..22 (forwardable, forwarded, proxiable, proxy,
+                    // may-postdate, postdated, invalid, renewable, initial, pre-authent,
+                    // hw-authent, transited-policy-checked, ok-as-delegate, enc-pa-rep,
+                    // anonymous). Reject if bits 0..15 are set (undefined).
+                    if flags == 0 || (flags & 0x0000_FFFF) != 0 {
+                        continue;
+                    }
+
+                    candidates_checked += 1;
+
+                    let struct_start = chunk_addr + local_base as u64;
+
+                    // Infer ticket type from service name: krbtgt/* = TGT, else TGS
+                    // We do a quick pre-check by reading the service name pointer
+                    // before the full extraction to avoid wasted work.
+                    let ticket_type = match read_ptr(vmem, struct_start + offsets.service_name_ptr, arch) {
+                        Ok(svc_ptr) if is_valid_user_ptr(svc_ptr, arch) => {
+                            let (svc_names, _) = read_kerb_external_name(vmem, svc_ptr, arch);
+                            if svc_names.first().is_some_and(|n| n.eq_ignore_ascii_case("krbtgt")) {
+                                KerberosTicketType::Tgt
+                            } else {
+                                KerberosTicketType::Tgs
+                            }
+                        }
+                        _ => continue, // No valid service name pointer — not a real ticket struct
+                    };
+
+                    if let Some(ticket) = extract_single_ticket(
+                        vmem,
+                        struct_start,
+                        ticket_type,
+                        offsets,
+                        arch,
+                    ) {
+                        // Deduplicate against existing and already-carved tickets
+                        if existing_blobs.contains(&ticket.ticket_blob) {
+                            continue;
+                        }
+                        if carved.iter().any(|t: &KerberosTicket| t.ticket_blob == ticket.ticket_blob) {
+                            continue;
+                        }
+
+                        log::info!(
+                            "Carved Kerberos ticket: {} @ {} (etype={}, kvno={}, flags=0x{:08x}, {} bytes)",
+                            ticket.service_name.join("/"),
+                            ticket.domain_name,
+                            ticket.ticket_enc_type,
+                            ticket.ticket_kvno,
+                            ticket.ticket_flags,
+                            ticket.ticket_blob.len(),
+                        );
+                        carved.push(ticket);
+                    }
+                }
+            }
+
+            offset += chunk_size as u64;
+        }
+    }
+
+    log::info!(
+        "Kerberos ticket carving: {} tickets carved ({} candidates checked, {} read errors)",
+        carved.len(),
+        candidates_checked,
+        read_errors,
+    );
+
+    carved
 }
 
 // ---- ASN.1 DER encoding for .kirbi (KRB-CRED) ----
