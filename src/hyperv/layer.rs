@@ -10,7 +10,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::Result;
 use crate::memory::PhysicalMemory;
 
 /// Hyper-V memory layer: provides physical memory from .bin or raw dump files.
@@ -26,15 +26,8 @@ impl HypervLayer {
     /// For .bin files, optionally loads CPU state from a companion .vsv file (future).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = crate::utils::mmap_file(&file)?;
         let size = mmap.len() as u64;
-
-        if size == 0 {
-            return Err(VmkatzError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Empty memory dump file",
-            )));
-        }
 
         // Sanity check: .bin files should be at least a few MB (VM RAM)
         // Skip check for very small files (< 1MB) that are likely not memory dumps

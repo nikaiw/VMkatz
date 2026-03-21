@@ -38,11 +38,11 @@ impl std::ops::Deref for MappedFile {
 /// Try to mmap a file, falling back to read() into Vec<u8> if mmap fails.
 /// This handles platforms where mmap is unsupported (VMFS-5, older ESXi kernels).
 fn map_file(file: &mut fs::File) -> Result<MappedFile> {
-    match unsafe { Mmap::map(&*file) } {
+    match crate::utils::mmap_file(file) {
         Ok(m) => Ok(MappedFile::Mmap(m)),
         Err(mmap_err) => {
             // mmap failed — fall back to reading entire file into memory
-            let size = file.metadata()?.len() as usize;
+            let size = crate::utils::file_size(file)? as usize;
             eprintln!(
                 "[*] mmap failed ({}), reading file into memory ({:.1} MB)...",
                 mmap_err,

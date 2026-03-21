@@ -84,7 +84,7 @@ impl VmrsLayer {
     /// Open a .vmrs file and parse its structure.
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = fs::File::open(path)?;
-        let file_size = file.metadata()?.len();
+        let file_size = crate::utils::file_size(&mut file)?;
 
         if file_size < BACKUP_HEADER_OFFSET + HEADER_SIZE as u64 {
             return Err(VmkatzError::Io(std::io::Error::new(
