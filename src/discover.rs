@@ -193,28 +193,20 @@ fn discover_vmdk(dir: &Path, all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
         // No descriptor found — check for orphan extent files (-sNNN.vmdk)
         // If present, pass the first extent so VmdkDisk::open detects it as binary
         // and auto-discovers all sibling extents from the directory.
-        let mut has_extents = false;
-        let mut first_extent: Option<PathBuf> = None;
-        for file in all_files {
-            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !ext.eq_ignore_ascii_case("vmdk") {
-                continue;
-            }
-            if file.parent() != Some(dir) {
-                continue;
-            }
-            let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if is_extent_filename(stem) {
-                has_extents = true;
-                if first_extent.is_none() {
-                    first_extent = Some(file.clone());
-                }
-            }
-        }
-        if has_extents {
-            if let Some(path) = first_extent {
-                out.push(path);
-            }
+        // No descriptor found — collect orphan extent files (-sNNN.vmdk)
+        // and pass the lowest-numbered one. VmdkDisk::open_from_directory
+        // will discover all siblings from the same directory.
+        let mut extents: Vec<PathBuf> = all_files.iter()
+            .filter(|f| {
+                f.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("vmdk"))
+                    && f.parent() == Some(dir)
+                    && is_extent_filename(f.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
+            })
+            .cloned()
+            .collect();
+        extents.sort();
+        if let Some(path) = extents.into_iter().next() {
+            out.push(path);
         }
     }
 }
