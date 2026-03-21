@@ -110,7 +110,21 @@ pub fn mmap_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
             "Empty file or unreadable device",
         ));
     }
-    unsafe { memmap2::MmapOptions::new().len(size as usize).map(file) }
+    unsafe {
+        memmap2::MmapOptions::new()
+            .len(size as usize)
+            .map(file)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to memory-map file ({:.1} MB): {}",
+                        size as f64 / (1024.0 * 1024.0),
+                        e
+                    ),
+                )
+            })
+    }
 }
 
 /// Decode UTF-16LE bytes to a String without intermediate Vec<u16> allocation.
