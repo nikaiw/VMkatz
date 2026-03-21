@@ -1,4 +1,4 @@
-//! VMFS-6 self-contained raw parser — reads flat VMDK files directly from ESXi SCSI devices,
+//! VMFS-5/6 self-contained raw parser — reads flat VMDK files directly from ESXi SCSI devices,
 //! bypassing VMFS file locks on running VMs.
 //!
 //! Resolution chain: LVM → Superblock → SFD bootstrap → FDC resource → FD → Directory → File data.
@@ -261,11 +261,12 @@ impl LvmLayer {
 
 // ── VMFS Superblock ──────────────────────────────────────────────────
 
-/// Parsed FS3_Descriptor (VMFS-6 superblock).
+/// Parsed FS3_Descriptor (VMFS-5/6 superblock).
 #[derive(Debug)]
 struct VmfsSuperblock {
     _magic: u32,
     _major_version: u32,
+    is_vmfs6: bool,
     file_block_size: u64,
     sub_block_size: u32,
     fdc_cluster_group_offset: u32,
@@ -297,12 +298,7 @@ impl VmfsSuperblock {
         }
 
         let major_version = u32::from_le_bytes(buf[0x04..0x08].try_into().unwrap());
-        if major_version < 24 {
-            return Err(VmkatzError::DiskFormatError(format!(
-                "Unsupported VMFS version {} (need VMFS-6, majorVersion >= 24)",
-                major_version
-            )));
-        }
+        let is_vmfs6 = major_version >= 24;
 
         let label_bytes = &buf[0x1D..0x9D];
         let label = String::from_utf8_lossy(
@@ -320,7 +316,8 @@ impl VmfsSuperblock {
         let sfb_addr_bits = u16::from_le_bytes(buf[0x140..0x142].try_into().unwrap());
 
         log::info!(
-            "VMFS-6 '{}': blockSize=0x{:x}, mdAlign=0x{:x}, subBlockSize=0x{:x}",
+            "{} '{}': blockSize=0x{:x}, mdAlign=0x{:x}, subBlockSize=0x{:x}",
+            if is_vmfs6 { "VMFS-6" } else { "VMFS-5" },
             label,
             file_block_size,
             md_alignment,
@@ -330,6 +327,7 @@ impl VmfsSuperblock {
         Ok(VmfsSuperblock {
             _magic: magic,
             _major_version: major_version,
+            is_vmfs6,
             file_block_size,
             sub_block_size,
             fdc_cluster_group_offset,
@@ -343,27 +341,21 @@ impl VmfsSuperblock {
     }
 
     fn fd_size(&self) -> u64 {
-        2 * self.md_alignment as u64
+        if self.is_vmfs6 { 2 * self.md_alignment as u64 } else { 2048 }
     }
 
     fn fd_meta_offset(&self) -> u64 {
-        self.md_alignment as u64
+        if self.is_vmfs6 { self.md_alignment as u64 } else { 512 }
     }
 
     fn fd_data_addrs_size(&self) -> usize {
-        if self.md_alignment <= 0x1000 {
-            2560
-        } else {
-            self.md_alignment as usize >> 1
-        }
+        if !self.is_vmfs6 { return 1024; } // 256 * 4 bytes
+        if self.md_alignment <= 0x1000 { 2560 } else { self.md_alignment as usize >> 1 }
     }
 
     fn fd_max_data_addrs(&self) -> usize {
-        if self.md_alignment <= 0x1000 {
-            320
-        } else {
-            self.md_alignment as usize >> 4
-        }
+        if !self.is_vmfs6 { return 256; }
+        if self.md_alignment <= 0x1000 { 320 } else { self.md_alignment as usize >> 4 }
     }
 
     fn fd_data_addrs_offset(&self) -> usize {
@@ -375,11 +367,12 @@ impl VmfsSuperblock {
     }
 
     fn ptr_block_num_ptrs(&self) -> usize {
-        if self.md_alignment < 0x10000 {
-            8192
-        } else {
-            self.md_alignment as usize >> 3
-        }
+        if !self.is_vmfs6 { return 1024; } // 4096/4
+        if self.md_alignment < 0x10000 { 8192 } else { self.md_alignment as usize >> 3 }
+    }
+
+    fn ptr_block_page_size(&self) -> usize {
+        if self.is_vmfs6 { 0x10000 } else { 0x1000 }
     }
 
     /// SFB resources per cluster — needed for SFB→volume offset calculation.
@@ -407,32 +400,56 @@ struct ResFileMeta {
 }
 
 impl ResFileMeta {
-    fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 0x58 {
+    fn parse(data: &[u8], is_vmfs6: bool) -> Option<Self> {
+        if data.len() < 0x14 {
             return None;
         }
-        let signature = u32::from_le_bytes(data[0x20..0x24].try_into().unwrap());
-        if signature != RFMD_SIGNATURE {
-            log::warn!("Invalid rfmd signature: 0x{:08x}", signature);
-            return None;
+
+        // VMFS-6 has an rfmd signature at offset 0x20; VMFS-5 does not
+        if is_vmfs6 {
+            if data.len() < 0x58 {
+                return None;
+            }
+            let signature = u32::from_le_bytes(data[0x20..0x24].try_into().unwrap());
+            if signature != RFMD_SIGNATURE {
+                log::warn!("Invalid rfmd signature: 0x{:08x}", signature);
+                return None;
+            }
         }
+
+        let resources_per_cluster = u32::from_le_bytes(data[0x00..0x04].try_into().unwrap());
+        let clusters_per_group = u32::from_le_bytes(data[0x04..0x08].try_into().unwrap());
+        let cluster_group_offset = u32::from_le_bytes(data[0x08..0x0C].try_into().unwrap());
+        let resource_size = u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap());
+        let cluster_group_size = u32::from_le_bytes(data[0x10..0x14].try_into().unwrap());
+
+        // Extended fields only in VMFS-6
+        let (flags, child_meta_offset, parent_resources_per_cluster, parent_clusters_per_group, parent_cluster_group_size) =
+            if is_vmfs6 && data.len() >= 0x44 {
+                (
+                    u32::from_le_bytes(data[0x28..0x2C].try_into().unwrap()),
+                    u32::from_le_bytes(data[0x34..0x38].try_into().unwrap()),
+                    u32::from_le_bytes(data[0x38..0x3C].try_into().unwrap()),
+                    u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()),
+                    u32::from_le_bytes(data[0x40..0x44].try_into().unwrap()),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            };
 
         Some(ResFileMeta {
-            resources_per_cluster: u32::from_le_bytes(data[0x00..0x04].try_into().unwrap()),
-            clusters_per_group: u32::from_le_bytes(data[0x04..0x08].try_into().unwrap()),
-            cluster_group_offset: u32::from_le_bytes(data[0x08..0x0C].try_into().unwrap()),
-            resource_size: u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap()),
-            cluster_group_size: u32::from_le_bytes(data[0x10..0x14].try_into().unwrap()),
-            flags: u32::from_le_bytes(data[0x28..0x2C].try_into().unwrap()),
-            child_meta_offset: u32::from_le_bytes(data[0x34..0x38].try_into().unwrap()),
-            parent_resources_per_cluster: u32::from_le_bytes(
-                data[0x38..0x3C].try_into().unwrap(),
-            ),
-            parent_clusters_per_group: u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()),
-            parent_cluster_group_size: u32::from_le_bytes(data[0x40..0x44].try_into().unwrap()),
+            resources_per_cluster,
+            clusters_per_group,
+            cluster_group_offset,
+            resource_size,
+            cluster_group_size,
+            flags,
+            child_meta_offset,
+            parent_resources_per_cluster,
+            parent_clusters_per_group,
+            parent_cluster_group_size,
         })
     }
-
 }
 
 // ── File Descriptor ──────────────────────────────────────────────────
@@ -484,6 +501,18 @@ fn addr_type(addr: u64) -> u8 {
     (addr & 0x07) as u8
 }
 
+/// Parse VMFS-5 FB address (32-bit) → block number.
+fn parse_fb_addr_v5(addr: u64) -> u64 {
+    (addr >> 6) & 0x3FF_FFFF
+}
+
+/// Parse VMFS-5 PB/SB address (32-bit) → (cluster, resource).
+fn parse_pb_addr_v5(addr: u64) -> (u64, u64) {
+    let cluster = (addr >> 6) & 0x3F_FFFF;
+    let resource = (addr >> 28) & 0xF;
+    (cluster, resource)
+}
+
 /// Check TBZ bitmap for SFB/LFB (bits [14:7]).
 fn addr_tbz(addr: u64) -> u8 {
     ((addr >> 7) & 0xFF) as u8
@@ -500,7 +529,7 @@ struct DirEntry {
 
 // ── Main VMFS-6 Volume Handle ────────────────────────────────────────
 
-/// Self-contained VMFS-6 volume reader.
+/// Self-contained VMFS-5/6 volume reader.
 /// Reads everything from the raw SCSI device via LVM → volume offset translation.
 struct Vmfs6Volume {
     file: File,
@@ -529,7 +558,7 @@ struct Vmfs6Volume {
 }
 
 impl Vmfs6Volume {
-    /// Open a VMFS-6 volume from a raw device.
+    /// Open a VMFS-5/6 volume from a raw device.
     fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path).map_err(VmkatzError::Io)?;
 
@@ -553,7 +582,7 @@ impl Vmfs6Volume {
         // Step 4: Read FDC resource metadata from the FDC file data
         // The metadata is at offset 0 of the FDC file data
         let fdc_data = Self::read_fd_data_range(&mut file, &lvm, &sb, &fdc_fd, 0, 0x58)?;
-        let fdc_meta = ResFileMeta::parse(&fdc_data).ok_or_else(|| {
+        let fdc_meta = ResFileMeta::parse(&fdc_data, sb.is_vmfs6).ok_or_else(|| {
             VmkatzError::DiskFormatError("Cannot parse FDC resource metadata".into())
         })?;
 
@@ -651,16 +680,24 @@ impl Vmfs6Volume {
         Ok(vol)
     }
 
-    /// Compute SFD offset for VMFS-6 system file descriptors (bootstrap, before FDC is available).
+    /// Compute SFD offset for VMFS-5/6 system file descriptors (bootstrap, before FDC is available).
     fn sfd_offset(sb: &VmfsSuperblock, addr: u32) -> u64 {
         let (_, resource) = parse_fd_addr(addr);
-        let md = sb.md_alignment as u64;
-        // From dissect: cg_offset = (((mdAlignment << 10) + 0x3FFFFF) & 0xFFFFFFFFFFF00000) + fdcClusterGroupOffset
-        let cg_offset =
-            (((md << 10) + 0x3FFFFF) & 0xFFFF_FFFF_FFF0_0000) + sb.fdc_cluster_group_offset as u64;
-        let resource_size = 2 * md;
-        let resource_offset = resource as u64 * resource_size;
-        cg_offset + (sb.fdc_clusters_per_group as u64 * resource_size) + resource_offset
+        if sb.is_vmfs6 {
+            let md = sb.md_alignment as u64;
+            let cg_offset =
+                (((md << 10) + 0x3FFFFF) & 0xFFFF_FFFF_FFF0_0000) + sb.fdc_cluster_group_offset as u64;
+            let resource_size = 2 * md;
+            let resource_offset = resource as u64 * resource_size;
+            cg_offset + (sb.fdc_clusters_per_group as u64 * resource_size) + resource_offset
+        } else {
+            let fbs = sb.file_block_size;
+            let cg_offset = fbs * ((fbs + 0x3FFFFF) / fbs) + sb.fdc_cluster_group_offset as u64;
+            let cluster_header_size = 1024u64;
+            let fd_size = 2048u64;
+            let resource_offset = resource as u64 * fd_size;
+            cg_offset + (sb.fdc_clusters_per_group as u64 * cluster_header_size) + resource_offset
+        }
     }
 
     /// Read a system file descriptor by its well-known address (bootstrap path).
@@ -671,6 +708,10 @@ impl Vmfs6Volume {
         addr: u32,
     ) -> Result<FileDescriptor> {
         let vol_offset = Self::sfd_offset(sb, addr);
+        log::debug!(
+            "read_sfd(0x{:08x}): vol_offset=0x{:x}, fd_size={}",
+            addr, vol_offset, sb.fd_size()
+        );
         let phys = lvm.logical_to_physical(vol_offset).ok_or_else(|| {
             VmkatzError::DiskFormatError(format!(
                 "Cannot map SFD offset 0x{:x} to physical",
@@ -715,13 +756,19 @@ impl Vmfs6Volume {
         let addrs_off = sb.fd_data_addrs_offset();
         let max_addrs = sb.fd_max_data_addrs();
         let mut blocks = Vec::with_capacity(max_addrs);
-        for i in 0..max_addrs {
-            let off = addrs_off + i * 8;
-            if off + 8 > buf.len() {
-                break;
+        if sb.is_vmfs6 {
+            for i in 0..max_addrs {
+                let off = addrs_off + i * 8;
+                if off + 8 > buf.len() { break; }
+                blocks.push(u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()));
             }
-            let val = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-            blocks.push(val);
+        } else {
+            // VMFS-5: 32-bit block pointers
+            for i in 0..max_addrs {
+                let off = addrs_off + i * 4;
+                if off + 4 > buf.len() { break; }
+                blocks.push(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as u64);
+            }
         }
 
         Ok(FileDescriptor {
@@ -764,7 +811,8 @@ impl Vmfs6Volume {
             if fd.zla == ZLA_FILE_BLOCK || fd.zla == ZLA_SUB_BLOCK {
                 if let Some(&block_addr) = fd.blocks.get(block_num as usize) {
                     let ba_type = addr_type(block_addr);
-                    let is_tbz = (ba_type == ADDR_SFB || ba_type == ADDR_LFB) && addr_tbz(block_addr) != 0;
+                    // TBZ bits only exist in VMFS-6 64-bit addresses
+                    let is_tbz = sb.is_vmfs6 && (ba_type == ADDR_SFB || ba_type == ADDR_LFB) && addr_tbz(block_addr) != 0;
                     if block_addr != 0 && !is_tbz {
                         if let Some(vol_off) =
                             Self::resolve_block_addr_simple(sb, block_addr)
@@ -806,9 +854,15 @@ impl Vmfs6Volume {
         }
         match addr_type(addr) {
             ADDR_SFB => {
-                let (cluster, resource) = parse_sfb_addr(addr);
-                let sfb_size = sb.sfb_size();
-                Some((cluster * sfb_size + resource) << sb.file_block_size_shift())
+                if sb.is_vmfs6 {
+                    let (cluster, resource) = parse_sfb_addr(addr);
+                    let sfb_size = sb.sfb_size();
+                    Some((cluster * sfb_size + resource) << sb.file_block_size_shift())
+                } else {
+                    // VMFS-5: FB — simple block * fileBlockSize
+                    let block = parse_fb_addr_v5(addr);
+                    Some(block * sb.file_block_size)
+                }
             }
             ADDR_LFB => {
                 let block = parse_lfb_addr(addr);
@@ -851,7 +905,7 @@ impl Vmfs6Volume {
         let group = cluster / meta.clusters_per_group;
         let cluster_in_group = cluster % meta.clusters_per_group;
 
-        let cluster_header_size = 2 * md;
+        let cluster_header_size = if self.sb.is_vmfs6 { 2 * md } else { 1024 };
         let cluster_data_offset = meta.clusters_per_group as u64 * cluster_header_size;
         let cluster_size = meta.resources_per_cluster as u64 * meta.resource_size as u64;
 
@@ -873,7 +927,7 @@ impl Vmfs6Volume {
 
             meta.cluster_group_offset as u64
                 + (parent_group * meta.parent_cluster_group_size as u64)
-                + (meta.parent_clusters_per_group as u64 * 2 * md)
+                + (meta.parent_clusters_per_group as u64 * cluster_header_size)
                 + (parent_cluster_in_group * meta.cluster_group_size as u64)
                 + (cluster_in_group as u64 * cluster_size)
                 + cluster_data_offset
@@ -886,7 +940,7 @@ impl Vmfs6Volume {
         let buf = self
             .read_resource_file_data(fd, offset, 0x58)
             .ok()?;
-        ResFileMeta::parse(&buf)
+        ResFileMeta::parse(&buf, self.sb.is_vmfs6)
     }
 
     /// Read data from a resource file at a given offset within the file's data stream.
@@ -928,9 +982,9 @@ impl Vmfs6Volume {
                     continue;
                 }
 
-                // TBZ bits only apply to SFB and LFB addresses
+                // TBZ bits only exist in VMFS-6 64-bit addresses
                 let atype = addr_type(block_addr);
-                if (atype == ADDR_SFB || atype == ADDR_LFB) && addr_tbz(block_addr) != 0 {
+                if self.sb.is_vmfs6 && (atype == ADDR_SFB || atype == ADDR_LFB) && addr_tbz(block_addr) != 0 {
                     buf_pos += chunk;
                     file_pos += chunk as u64;
                     continue;
@@ -986,7 +1040,11 @@ impl Vmfs6Volume {
 
     /// Read a sub-block from the SBC resource file by its SB address.
     fn read_sub_block(&mut self, sb_addr: u64) -> Result<Vec<u8>> {
-        let (cluster, resource) = parse_pb_addr(sb_addr);
+        let (cluster, resource) = if self.sb.is_vmfs6 {
+            parse_pb_addr(sb_addr)
+        } else {
+            parse_pb_addr_v5(sb_addr)
+        };
         let sbc_meta = self.sbc_meta.as_ref().ok_or_else(|| {
             VmkatzError::DiskFormatError("SBC metadata not available for sub-block read".into())
         })?.clone();
@@ -1020,6 +1078,9 @@ impl Vmfs6Volume {
 
     /// Read directory entries from a directory file descriptor.
     fn read_directory(&mut self, dir_fd: &FileDescriptor) -> Result<Vec<DirEntry>> {
+        if !self.sb.is_vmfs6 {
+            return self.read_directory_v5(dir_fd);
+        }
         // Read the directory header (first 0x10000 bytes)
         let header_size = FS6_DIR_HEADER_BLOCK_SIZE as usize;
         // Use the full allocated block space, not just file_length — DIRENT blocks
@@ -1256,6 +1317,43 @@ impl Vmfs6Volume {
         })
     }
 
+    /// Read directory entries from a VMFS-5 directory (flat 140-byte entries).
+    fn read_directory_v5(&mut self, dir_fd: &FileDescriptor) -> Result<Vec<DirEntry>> {
+        let dir_len = dir_fd.file_length as usize;
+        if dir_len == 0 { return Ok(Vec::new()); }
+        let dir_data = self.read_resource_file_data(dir_fd, 0, dir_len.min(4 * 1024 * 1024))?;
+
+        const V5_DIR_ENTRY_SIZE: usize = 140; // 0x8C
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset + V5_DIR_ENTRY_SIZE <= dir_data.len() {
+            let data = &dir_data[offset..offset + V5_DIR_ENTRY_SIZE];
+            let entry_type = u32::from_le_bytes(data[0x00..0x04].try_into().unwrap());
+            let fd_addr = u32::from_le_bytes(data[0x04..0x08].try_into().unwrap());
+
+            if entry_type != 0 && fd_addr != 0 {
+                let name_bytes = &data[0x0C..0x8C]; // 128 bytes
+                let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(128);
+                let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
+
+                if !name.is_empty() && name != "." && name != ".." {
+                    entries.push(DirEntry { entry_type, fd_addr, name });
+                }
+            }
+            offset += V5_DIR_ENTRY_SIZE;
+        }
+
+        log::debug!(
+            "Directory V5 0x{:08x}: {} entries found",
+            dir_fd.address, entries.len()
+        );
+        for e in &entries {
+            log::debug!("  {} (type={}, fd=0x{:08x})", e.name, e.entry_type, e.fd_addr);
+        }
+
+        Ok(entries)
+    }
+
     // ── Path Navigation ──────────────────────────────────────────────
 
     /// Find a file by path within the VMFS filesystem.
@@ -1325,15 +1423,7 @@ impl Vmfs6Volume {
                     log::info!("  PB data is all zeros for block 0!");
                 }
 
-                let sfb_addr = if secondary * 8 + 8 <= pb_data.len() {
-                    u64::from_le_bytes(
-                        pb_data[secondary * 8..(secondary + 1) * 8]
-                            .try_into()
-                            .unwrap(),
-                    )
-                } else {
-                    0
-                };
+                let sfb_addr = self.read_pb_pointer(&pb_data, secondary);
 
                 if sfb_addr != 0 && block_num < 3 {
                     log::debug!("  pb[{}] = 0x{:x}", secondary, sfb_addr);
@@ -1355,21 +1445,13 @@ impl Vmfs6Volume {
                 }
                 let pb1 = self.read_pb_resource(pb1_addr)?;
 
-                let pb2_addr = if secondary * 8 + 8 <= pb1.len() {
-                    u64::from_le_bytes(pb1[secondary * 8..(secondary + 1) * 8].try_into().unwrap())
-                } else {
-                    0
-                };
+                let pb2_addr = self.read_pb_pointer(&pb1, secondary);
                 if pb2_addr == 0 {
                     return Ok(None);
                 }
                 let pb2 = self.read_pb_resource(pb2_addr)?;
 
-                let sfb_addr = if tertiary * 8 + 8 <= pb2.len() {
-                    u64::from_le_bytes(pb2[tertiary * 8..(tertiary + 1) * 8].try_into().unwrap())
-                } else {
-                    0
-                };
+                let sfb_addr = self.read_pb_pointer(&pb2, tertiary);
 
                 Ok(self.resolve_block_addr(sfb_addr)?)
             }
@@ -1382,26 +1464,30 @@ impl Vmfs6Volume {
         if addr == 0 {
             return Ok(None);
         }
-        // TBZ bits only apply to SFB and LFB addresses
+        // TBZ bits only exist in VMFS-6 64-bit addresses
         let atype = addr_type(addr);
-        if (atype == ADDR_SFB || atype == ADDR_LFB) && addr_tbz(addr) != 0 {
+        if self.sb.is_vmfs6 && (atype == ADDR_SFB || atype == ADDR_LFB) && addr_tbz(addr) != 0 {
             return Ok(None);
         }
 
         match addr_type(addr) {
             ADDR_SFB => {
-                let (cluster, resource) = parse_sfb_addr(addr);
-                if let Some(ref sfb_meta) = self.sfb_meta {
-                    // Use SFB resource metadata for accurate resolution
-                    let vol_off = (cluster * sfb_meta.resources_per_cluster as u64 + resource)
-                        << self.sb.file_block_size_shift();
-                    Ok(Some(vol_off))
+                if self.sb.is_vmfs6 {
+                    let (cluster, resource) = parse_sfb_addr(addr);
+                    if let Some(ref sfb_meta) = self.sfb_meta {
+                        let vol_off = (cluster * sfb_meta.resources_per_cluster as u64 + resource)
+                            << self.sb.file_block_size_shift();
+                        Ok(Some(vol_off))
+                    } else {
+                        let sfb_size = self.sb.sfb_size();
+                        Ok(Some(
+                            (cluster * sfb_size + resource) << self.sb.file_block_size_shift(),
+                        ))
+                    }
                 } else {
-                    // Fallback: use sfb_size
-                    let sfb_size = self.sb.sfb_size();
-                    Ok(Some(
-                        (cluster * sfb_size + resource) << self.sb.file_block_size_shift(),
-                    ))
+                    // VMFS-5: FB — simple block * fileBlockSize
+                    let block = parse_fb_addr_v5(addr);
+                    Ok(Some(block * self.sb.file_block_size))
                 }
             }
             ADDR_LFB => {
@@ -1424,7 +1510,11 @@ impl Vmfs6Volume {
     /// Read a pointer block resource (PB or PB2) by its address.
     fn read_pb_resource(&mut self, pb_addr: u64) -> Result<Vec<u8>> {
         let atype = addr_type(pb_addr);
-        let (cluster, resource) = parse_pb_addr(pb_addr);
+        let (cluster, resource) = if self.sb.is_vmfs6 {
+            parse_pb_addr(pb_addr)
+        } else {
+            parse_pb_addr_v5(pb_addr)
+        };
 
         // Determine which resource file to use
         let (meta, fd) = match atype {
@@ -1473,8 +1563,8 @@ impl Vmfs6Volume {
             fd.blocks.iter().take(2).map(|b| format!("0x{:x}", b)).collect::<Vec<_>>()
         );
 
-        // Read the pointer block page (64KB for VMFS6)
-        let page_size = 0x10000usize; // ptr_block_page_size
+        // Read the pointer block page (64KB for VMFS-6, 4KB for VMFS-5)
+        let page_size = self.sb.ptr_block_page_size();
         let data = self.read_resource_file_data(&fd, res_offset, page_size)?;
 
         let nonzero = data.iter().filter(|&&b| b != 0).count();
@@ -1486,6 +1576,19 @@ impl Vmfs6Volume {
         }
 
         Ok(data)
+    }
+
+    /// Read a pointer from PB data at the given index (8 bytes for VMFS-6, 4 bytes for VMFS-5).
+    fn read_pb_pointer(&self, pb_data: &[u8], index: usize) -> u64 {
+        if self.sb.is_vmfs6 {
+            let off = index * 8;
+            if off + 8 > pb_data.len() { return 0; }
+            u64::from_le_bytes(pb_data[off..off + 8].try_into().unwrap())
+        } else {
+            let off = index * 4;
+            if off + 4 > pb_data.len() { return 0; }
+            u32::from_le_bytes(pb_data[off..off + 4].try_into().unwrap()) as u64
+        }
     }
 
     // ── Build block map for flat VMDK ────────────────────────────────
@@ -1538,14 +1641,8 @@ impl Vmfs6Volume {
                         total_blocks as usize - base_block,
                     );
                     for secondary in 0..entries {
-                        if secondary * 8 + 8 > pb_data.len() {
-                            break;
-                        }
-                        let sfb_addr = u64::from_le_bytes(
-                            pb_data[secondary * 8..(secondary + 1) * 8]
-                                .try_into()
-                                .unwrap(),
-                        );
+                        let sfb_addr = self.read_pb_pointer(&pb_data, secondary);
+                        if sfb_addr == 0 { continue; }
                         if let Some(vol_off) = self.resolve_block_addr(sfb_addr)? {
                             if let Some(phys) = self.lvm.logical_to_physical(vol_off) {
                                 block_map[base_block + secondary] = Some(phys);
@@ -1571,14 +1668,7 @@ impl Vmfs6Volume {
                         Err(_) => continue,
                     };
                     for secondary in 0..ptrs_per_pb {
-                        if secondary * 8 + 8 > pb1.len() {
-                            break;
-                        }
-                        let pb2_addr = u64::from_le_bytes(
-                            pb1[secondary * 8..(secondary + 1) * 8]
-                                .try_into()
-                                .unwrap(),
-                        );
+                        let pb2_addr = self.read_pb_pointer(&pb1, secondary);
                         if pb2_addr == 0 {
                             continue;
                         }
@@ -1592,14 +1682,7 @@ impl Vmfs6Volume {
                             total_blocks as usize - base.min(total_blocks as usize),
                         );
                         for tertiary in 0..entries {
-                            if tertiary * 8 + 8 > pb2.len() {
-                                break;
-                            }
-                            let sfb_addr = u64::from_le_bytes(
-                                pb2[tertiary * 8..(tertiary + 1) * 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
+                            let sfb_addr = self.read_pb_pointer(&pb2, tertiary);
                             let block_idx = base + tertiary;
                             if block_idx < total_blocks as usize {
                                 if let Some(vol_off) = self.resolve_block_addr(sfb_addr)? {
@@ -1630,7 +1713,7 @@ impl Vmfs6Volume {
 
 // ── Vmfs6FlatVmdk — Read+Seek over resolved flat VMDK ────────────────
 
-/// A flat VMDK file read through VMFS-6 block resolution.
+/// A flat VMDK file read through VMFS-5/6 block resolution.
 /// Implements Read+Seek+DiskImage for integration with the VMkatz pipeline.
 pub struct Vmfs6FlatVmdk {
     file: File,
@@ -1717,7 +1800,7 @@ impl super::DiskImage for Vmfs6FlatVmdk {
 
 // ── Public API ───────────────────────────────────────────────────────
 
-/// Open a flat VMDK from a VMFS-6 raw device.
+/// Open a flat VMDK from a VMFS-5/6 raw device.
 ///
 /// # Arguments
 /// * `device_path` - Path to the raw SCSI partition device (e.g., `/vmfs/devices/disks/naa.xxx:1`)
@@ -1746,7 +1829,7 @@ pub fn open_vmfs6_vmdk(device_path: &Path, vmdk_path: &str) -> Result<Vmfs6FlatV
     })
 }
 
-/// List all VM directories and their flat VMDKs on a VMFS-6 datastore.
+/// List all VM directories and their flat VMDKs on a VMFS-5/6 datastore.
 ///
 /// Returns Vec of (vm_dir_name, flat_vmdk_name) pairs.
 pub fn list_vmfs6_vmdks(device_path: &Path) -> Result<Vec<(String, String)>> {
@@ -1778,8 +1861,8 @@ pub fn list_vmfs6_vmdks(device_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(vmdks)
 }
 
-/// Open a VMFS-6 datastore and scan all VMs for secrets.
-/// Returns a Vec of (vm_name, vmdk_name, Box<dyn DiskImage>) tuples.
+/// Open a VMFS-5/6 datastore and scan all VMs for secrets.
+/// Returns a Vec of (vm_name, vmdk_name, Vmfs6FlatVmdk) tuples.
 pub fn open_all_vmfs6_vmdks(
     device_path: &Path,
 ) -> Result<Vec<(String, String, Vmfs6FlatVmdk)>> {
@@ -1801,14 +1884,14 @@ pub fn open_all_vmfs6_vmdks(
     Ok(results)
 }
 
-/// A discovered VMFS-6 device with its datastore label.
+/// A discovered VMFS-5/6 device with its datastore label.
 #[derive(Debug)]
 pub struct Vmfs6Device {
     pub path: PathBuf,
     pub label: String,
 }
 
-/// Scan for VMFS-6 partitions by probing partition devices in `/dev/disks/`.
+/// Scan for VMFS-5/6 partitions by probing partition devices in `/dev/disks/`.
 ///
 /// Checks each partition device (those containing `:`) for the LVM magic
 /// `0xC001D00D` at offset 0x100000, then reads the VMFS superblock label.
@@ -1844,7 +1927,7 @@ pub fn list_vmfs6_devices() -> Vec<Vmfs6Device> {
     devices
 }
 
-/// Probe a single device path for VMFS-6 LVM header and read the datastore label.
+/// Probe a single device path for VMFS-5/6 LVM header and read the datastore label.
 fn probe_vmfs6_device(path: &Path) -> Option<Vmfs6Device> {
     let mut f = File::open(path).ok()?;
 
