@@ -761,6 +761,38 @@ fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow:
     Ok(())
 }
 
+/// Print DiskSecrets (SAM + LSA + cached creds) using the current output format.
+#[cfg(feature = "sam")]
+fn print_disk_secrets(secrets: &vmkatz::sam::DiskSecrets, args: &Args) {
+    let c = get_colors(args);
+
+    match args.format.as_str() {
+        "ntlm" => print_sam_ntlm(&secrets.sam_entries),
+        "csv" => print_sam_csv(&secrets.sam_entries),
+        "hashcat" => print_sam_hashcat(&secrets.sam_entries),
+        "brief" => print_sam_brief(&secrets.sam_entries),
+        _ => print_sam_text(&secrets.sam_entries, c),
+    }
+
+    if !secrets.lsa_secrets.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_lsa_csv(&secrets.lsa_secrets),
+            "hashcat" => {} // LSA secrets not applicable for hashcat
+            _ => print_lsa_secrets(&secrets.lsa_secrets, c),
+        }
+    }
+
+    export_dpapi_backup_keys(&secrets.lsa_secrets);
+
+    if !secrets.cached_credentials.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_dcc2_csv(&secrets.cached_credentials),
+            "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+            _ => print_cached_credentials(&secrets.cached_credentials, c),
+        }
+    }
+}
+
 #[cfg(feature = "sam")]
 fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(feature = "ntds.dit")]
@@ -1550,10 +1582,58 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         }
     }
 
+    // Extract BitLocker FVEK keys from memory snapshots for transparent disk decryption.
+    // This is done as a separate pass so we can pass keys to the SAM extraction phase.
+    #[cfg(all(
+        feature = "sam",
+        any(
+            feature = "vmware",
+            feature = "vbox",
+            feature = "qemu",
+            feature = "hyperv"
+        )
+    ))]
+    let bitlocker_keys: Vec<vmkatz::lsass::bitlocker::BitLockerKey> = {
+        let mut keys = Vec::new();
+        for file in &discovery.lsass_files {
+            let snapshot_keys = extract_bitlocker_keys_from_snapshot(file);
+            if !snapshot_keys.is_empty() {
+                log::info!(
+                    "BitLocker: {} FVEK candidate(s) from {}",
+                    snapshot_keys.len(),
+                    file.display()
+                );
+                keys.extend(snapshot_keys);
+            }
+        }
+        // Deduplicate by FVEK content
+        keys.sort_by(|a, b| a.fvek.cmp(&b.fvek));
+        keys.dedup_by(|a, b| a.fvek == b.fvek && a.method == b.method);
+        keys
+    };
+
     #[cfg(feature = "sam")]
     for file in &discovery.disk_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
         eprintln!("\n[*] SAM: {}", name);
+        // Try BitLocker-aware extraction if we have FVEK keys from memory
+        #[cfg(any(
+            feature = "vmware",
+            feature = "vbox",
+            feature = "qemu",
+            feature = "hyperv"
+        ))]
+        if !bitlocker_keys.is_empty() {
+            match vmkatz::sam::extract_disk_secrets_with_bitlocker(file, &bitlocker_keys) {
+                Ok(secrets) => {
+                    print_disk_secrets(&secrets, args);
+                    continue;
+                }
+                Err(e) => {
+                    log::info!("BitLocker-aware extraction failed for {}: {}", name, e);
+                }
+            }
+        }
         if let Err(e) = run_sam(file, args) {
             eprintln!("[!] {}: {:#}", name, e);
         }
@@ -2431,12 +2511,15 @@ fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
     feature = "qemu",
     feature = "hyperv"
 ))]
-fn extract_and_output_bitlocker<L: PhysicalMemory>(layer: &L, args: &Args) {
+fn extract_and_output_bitlocker<L: PhysicalMemory>(
+    layer: &L,
+    args: &Args,
+) -> Vec<vmkatz::lsass::bitlocker::BitLockerKey> {
     let t_bl = std::time::Instant::now();
     let keys = vmkatz::lsass::bitlocker::extract_bitlocker_keys(layer);
     if keys.is_empty() {
         log::debug!("BitLocker: no FVEK candidates found ({:?})", t_bl.elapsed());
-        return;
+        return keys;
     }
     eprintln!(
         "[+] BitLocker: {} FVEK candidate(s) found ({:?})",
@@ -2448,15 +2531,30 @@ fn extract_and_output_bitlocker<L: PhysicalMemory>(layer: &L, args: &Args) {
 
     println!(
         "\n{}[+] BitLocker FVEK ({} candidate(s)):{}\n",
-        c.green, keys.len(), c.reset
+        c.green,
+        keys.len(),
+        c.reset
     );
 
     for (i, key) in keys.iter().enumerate() {
         println!("  {}Candidate #{}{}", c.bold, i + 1, c.reset);
-        println!("    Cipher  : {}{}{}", c.yellow, key.cipher, c.reset);
-        println!("    FVEK    : {}{}{}", c.yellow, hex::encode(&key.fvek), c.reset);
+        println!(
+            "    Cipher  : {}{}{}",
+            c.yellow, key.cipher, c.reset
+        );
+        println!(
+            "    FVEK    : {}{}{}",
+            c.yellow,
+            hex::encode(&key.fvek),
+            c.reset
+        );
         if !key.tweak.is_empty() {
-            println!("    Tweak   : {}{}{}", c.yellow, hex::encode(&key.tweak), c.reset);
+            println!(
+                "    Tweak   : {}{}{}",
+                c.yellow,
+                hex::encode(&key.tweak),
+                c.reset
+            );
         }
         println!("    Pool tag: {} @ 0x{:x}", key.pool_tag, key.phys_addr);
         println!(
@@ -2474,6 +2572,59 @@ fn extract_and_output_bitlocker<L: PhysicalMemory>(layer: &L, args: &Args) {
     // Export .fvek files if --bitlocker-fvek is set
     if let Some(dir) = &args.bitlocker_fvek {
         export_bitlocker_fvek(&keys, dir);
+    }
+
+    keys
+}
+
+/// Extract BitLocker FVEK keys from a memory snapshot file (without full LSASS extraction).
+///
+/// Opens the snapshot in the appropriate format, scans physical memory for
+/// pool tags, and returns any FVEK candidates found.
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
+fn extract_bitlocker_keys_from_snapshot(
+    path: &Path,
+) -> Vec<vmkatz::lsass::bitlocker::BitLockerKey> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let format = detect_lsass_format(path, ext, false);
+
+    // Open the memory layer and extract BitLocker keys
+    macro_rules! try_layer {
+        ($make_layer:expr) => {
+            match $make_layer {
+                Ok(layer) => {
+                    return vmkatz::lsass::bitlocker::extract_bitlocker_keys(&layer);
+                }
+                Err(e) => {
+                    log::info!("BitLocker key extraction: failed to open {}: {}", path.display(), e);
+                    return Vec::new();
+                }
+            }
+        };
+    }
+
+    match format {
+        #[cfg(feature = "vbox")]
+        LsassFormat::VBox => try_layer!(VBoxLayer::open(path)),
+        #[cfg(feature = "qemu")]
+        LsassFormat::QemuElf => try_layer!(QemuElfLayer::open(path)),
+        #[cfg(feature = "qemu")]
+        LsassFormat::QemuSavevm => try_layer!(vmkatz::qemu::QemuSavevmLayer::open(path)),
+        #[cfg(feature = "hyperv")]
+        LsassFormat::HypervBin => try_layer!(HypervLayer::open(path)),
+        #[cfg(feature = "hyperv")]
+        LsassFormat::HypervVmrs => try_layer!(vmkatz::hyperv::VmrsLayer::open(path)),
+        #[cfg(feature = "vmware")]
+        LsassFormat::Vmware => try_layer!(VmwareLayer::open(path)),
+        _ => Vec::new(),
     }
 }
 
