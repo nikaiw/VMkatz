@@ -10,7 +10,6 @@
 use std::fs;
 use std::path::Path;
 
-use memmap2::Mmap;
 
 use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
@@ -39,7 +38,7 @@ struct LoadSegment {
 
 /// QEMU ELF core dump memory layer.
 pub struct QemuElfLayer {
-    mmap: Mmap,
+    mmap: crate::utils::MappedFile,
     segments: Vec<LoadSegment>,
     phys_end: u64,
 }
@@ -54,8 +53,14 @@ impl QemuElfLayer {
             return Err(VmkatzError::InvalidMagic(0));
         }
 
-        // Parse ELF64 header
-        let data = &mmap[..];
+        // For pread fallback: read the ELF header + program headers (first 1MB covers it)
+        let header_buf: Vec<u8>;
+        let data: &[u8] = if mmap.is_pread() {
+            header_buf = crate::utils::read_file_header(&file, 1024 * 1024)?;
+            &header_buf
+        } else {
+            mmap.as_bytes()
+        };
         if data[0..4] != ELF_MAGIC {
             return Err(VmkatzError::InvalidMagic(u32::from_le_bytes([
                 data[0], data[1], data[2], data[3],
@@ -189,7 +194,8 @@ impl PhysicalMemory for QemuElfLayer {
                 let file_off = (seg.file_offset + offset_in_seg) as usize;
                 let end = file_off + buf.len();
                 if end <= self.mmap.len() {
-                    buf.copy_from_slice(&self.mmap[file_off..end]);
+                    self.mmap.read_at(file_off, buf)
+                        .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))?;
                     return Ok(());
                 }
             }
@@ -209,7 +215,7 @@ impl PhysicalMemory for QemuElfLayer {
                 let end = file_off + to_copy;
                 if end <= self.mmap.len() {
                     let dst_start = pos as usize;
-                    buf[dst_start..dst_start + to_copy].copy_from_slice(&self.mmap[file_off..end]);
+                    let _ = self.mmap.read_at(file_off, &mut buf[dst_start..dst_start + to_copy]);
                 }
                 pos += to_copy as u64;
             } else {

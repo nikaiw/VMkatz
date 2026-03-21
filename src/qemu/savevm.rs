@@ -14,7 +14,6 @@
 use std::fs;
 use std::path::Path;
 
-use memmap2::Mmap;
 
 use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
@@ -63,7 +62,7 @@ struct RamBlock {
 
 /// QEMU savevm state memory layer.
 pub struct QemuSavevmLayer {
-    mmap: Mmap,
+    mmap: crate::utils::MappedFile,
     /// Sorted by GPA for binary search.
     pages: Vec<MappedPage>,
     /// Total physical address space (max GPA of pc.ram block).
@@ -81,7 +80,14 @@ impl QemuSavevmLayer {
             return Err(VmkatzError::InvalidMagic(0));
         }
 
-        let data = &mmap[..];
+        // parse_ram_stream needs slice access to the entire file — pread fallback
+        // would be too slow (millions of small reads). Require mmap.
+        if mmap.is_pread() {
+            return Err(io_err(
+                "QEMU savevm requires mmap support (file I/O fallback too slow for stream parsing)".to_string()
+            ));
+        }
+        let data = mmap.as_bytes();
 
         // Verify magic
         let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -441,7 +447,7 @@ impl PhysicalMemory for QemuSavevmLayer {
                 let file_off = page.file_offset as usize + offset_in_page;
                 let end = file_off + to_copy;
                 if end <= self.mmap.len() {
-                    buf[pos..pos + to_copy].copy_from_slice(&self.mmap[file_off..end]);
+                    let _ = self.mmap.read_at(file_off, &mut buf[pos..pos + to_copy]);
                 }
             }
             // Unmapped pages stay as zeros (already filled)

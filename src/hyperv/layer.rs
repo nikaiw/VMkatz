@@ -8,14 +8,12 @@
 use std::fs;
 use std::path::Path;
 
-use memmap2::Mmap;
-
-use crate::error::Result;
+use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
 
 /// Hyper-V memory layer: provides physical memory from .bin or raw dump files.
 pub struct HypervLayer {
-    mmap: Mmap,
+    mmap: crate::utils::MappedFile,
     size: u64,
 }
 
@@ -52,12 +50,13 @@ impl PhysicalMemory for HypervLayer {
             buf.fill(0);
             if phys_addr < self.size {
                 let avail = (self.size - phys_addr) as usize;
-                buf[..avail].copy_from_slice(&self.mmap[phys_addr as usize..self.size as usize]);
+                self.mmap.read_at(phys_addr as usize, &mut buf[..avail])
+                    .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))?;
             }
             return Ok(());
         }
-        buf.copy_from_slice(&self.mmap[phys_addr as usize..end as usize]);
-        Ok(())
+        self.mmap.read_at(phys_addr as usize, buf)
+            .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))
     }
 
     fn phys_size(&self) -> u64 {

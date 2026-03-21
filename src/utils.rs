@@ -97,9 +97,114 @@ pub fn file_size(file: &mut std::fs::File) -> std::io::Result<u64> {
     Ok(size)
 }
 
-/// Memory-map a file, handling block devices where fstat returns size 0.
+/// File-backed memory: mmap when available, pread fallback for platforms
+/// where mmap is unsupported (e.g. ESXi 6.5 VMkernel returns EINVAL on VMFS).
 #[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
-pub fn mmap_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+pub enum MappedFile {
+    Mmap(memmap2::Mmap),
+    /// Fallback: file handle for pread-based access.
+    /// The Vec is a read buffer used by `slice()` — grown on demand.
+    Pread {
+        file: std::sync::Mutex<std::fs::File>,
+        size: u64,
+    },
+}
+
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+impl MappedFile {
+    pub fn len(&self) -> usize {
+        match self {
+            MappedFile::Mmap(m) => m.len(),
+            MappedFile::Pread { size, .. } => *size as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read bytes at an offset into the provided buffer.
+    /// Works for both mmap (memcpy) and pread (syscall) variants.
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            MappedFile::Mmap(m) => {
+                let end = offset + buf.len();
+                if end > m.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("mmap read_at: offset=0x{:x} len={} exceeds file size {}", offset, buf.len(), m.len()),
+                    ));
+                }
+                buf.copy_from_slice(&m[offset..end]);
+                Ok(())
+            }
+            MappedFile::Pread { file, size } => {
+                let end = offset as u64 + buf.len() as u64;
+                if end > *size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("pread read_at: offset=0x{:x} len={} exceeds file size {}", offset, buf.len(), size),
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let f = file.lock().unwrap();
+                    f.read_exact_at(buf, offset as u64)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = file.lock().unwrap();
+                    f.seek(SeekFrom::Start(offset as u64))?;
+                    f.read_exact(buf)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Get a byte slice (only works for mmap variant).
+    /// Panics on Pread variant — callers that need slicing must use read_at instead.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            MappedFile::Mmap(m) => m,
+            MappedFile::Pread { .. } => panic!("as_bytes() not supported on pread fallback — use read_at()"),
+        }
+    }
+
+    /// Whether this is using the pread fallback (for logging).
+    pub fn is_pread(&self) -> bool {
+        matches!(self, MappedFile::Pread { .. })
+    }
+}
+
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Read the first `max_bytes` of a file into a Vec.
+/// Used to parse headers/tags from files where mmap is unavailable.
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+pub fn read_file_header(file: &std::fs::File, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    let size = f.seek(SeekFrom::End(0))?;
+    f.seek(SeekFrom::Start(0))?;
+    let to_read = (size as usize).min(max_bytes);
+    let mut buf = vec![0u8; to_read];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Open a file as MappedFile: tries mmap first, falls back to pread on failure.
+/// Handles block devices where fstat returns size 0.
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+pub fn mmap_file(file: &std::fs::File) -> std::io::Result<MappedFile> {
     use std::io::{Seek, SeekFrom};
     let mut f = file.try_clone()?;
     let size = f.seek(SeekFrom::End(0))?;
@@ -110,20 +215,28 @@ pub fn mmap_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
             "Empty file or unreadable device",
         ));
     }
-    unsafe {
+
+    // Try mmap first
+    let mmap_result = unsafe {
         memmap2::MmapOptions::new()
             .len(size as usize)
             .map(file)
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to memory-map file ({:.1} MB): {}",
-                        size as f64 / (1024.0 * 1024.0),
-                        e
-                    ),
-                )
+    };
+
+    match mmap_result {
+        Ok(m) => Ok(MappedFile::Mmap(m)),
+        Err(mmap_err) => {
+            eprintln!(
+                "[!] mmap failed ({:.1} MB): {} — falling back to file I/O (slower)",
+                size as f64 / (1024.0 * 1024.0),
+                mmap_err,
+            );
+            let f = file.try_clone()?;
+            Ok(MappedFile::Pread {
+                file: std::sync::Mutex::new(f),
+                size,
             })
+        }
     }
 }
 

@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-use memmap2::Mmap;
 
 use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
@@ -22,7 +21,7 @@ pub struct MemoryRegion {
 
 /// VMware memory layer: provides physical memory access from .vmsn + .vmem files.
 pub struct VmwareLayer {
-    data: Mmap,
+    data: crate::utils::MappedFile,
     pub regions: Vec<MemoryRegion>,
     truncated: bool,
     /// Byte offset within the data where guest physical memory starts.
@@ -90,11 +89,9 @@ impl VmwareLayer {
                 let align_mask = tags::find_tag(&all_tags, "align_mask", &[0, 0])
                     .and_then(|t| {
                         let off = t.data_offset as usize;
-                        if off + 4 <= data.len() {
-                            Some(crate::utils::read_u32_le(&data, off).unwrap_or(0) as u64)
-                        } else {
-                            None
-                        }
+                        let mut buf = [0u8; 4];
+                        data.read_at(off, &mut buf).ok()?;
+                        Some(u32::from_le_bytes(buf) as u64)
                     })
                     .unwrap_or(0xFFF);
                 let offset = (tag.data_offset + align_mask) & !align_mask;
@@ -153,7 +150,16 @@ impl VmwareLayer {
     /// Parse a .vmsn file and return (regions, tags).
     fn parse_vmsn_metadata(vmsn_path: &Path) -> Result<(Vec<MemoryRegion>, Vec<Tag>)> {
         let vmsn_file = fs::File::open(vmsn_path)?;
-        let vmsn_data = crate::utils::mmap_file(&vmsn_file)?;
+        let vmsn_mapped = crate::utils::mmap_file(&vmsn_file)?;
+
+        // For mmap: use the mapping directly. For pread fallback: read the header
+        // portion (first 8 MB covers all tag structures) for slice-based parsing.
+        let vmsn_data: std::borrow::Cow<[u8]> = if vmsn_mapped.is_pread() {
+            let header_bytes = crate::utils::read_file_header(&vmsn_file, 8 * 1024 * 1024)?;
+            std::borrow::Cow::Owned(header_bytes)
+        } else {
+            std::borrow::Cow::Borrowed(vmsn_mapped.as_bytes())
+        };
 
         let (hdr, groups) = header::parse_vmsn(&vmsn_data)?;
         log::info!(
@@ -279,12 +285,7 @@ impl VmwareLayer {
 impl PhysicalMemory for VmwareLayer {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<()> {
         let offset = self.guest_phys_to_vmem_offset(phys_addr)?;
-        let end = offset + buf.len();
-        if end > self.data.len() {
-            return Err(VmkatzError::UnmappablePhysical(phys_addr));
-        }
-        buf.copy_from_slice(&self.data[offset..end]);
-        Ok(())
+        self.data.read_at(offset, buf).map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))
     }
 
     fn phys_size(&self) -> u64 {
