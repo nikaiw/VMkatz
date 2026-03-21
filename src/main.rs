@@ -495,10 +495,18 @@ fn vmkatz_main() -> anyhow::Result<()> {
             || ext.eq_ignore_ascii_case("vhdx")
             || ext.eq_ignore_ascii_case("vhd");
         let is_block_device = is_block_dev(input_path);
+        // Block devices may be QEMU savevm states (LVM snapshots on Proxmox) —
+        // check magic before assuming SAM/disk mode.
+        let is_memory_snapshot = is_block_device && {
+            #[cfg(feature = "qemu")]
+            { vmkatz::qemu::is_qemu_savevm(input_path) }
+            #[cfg(not(feature = "qemu"))]
+            { false }
+        };
         #[cfg(feature = "ntds.dit")]
-        let sam_mode = args.sam || args.ntds || is_disk_ext || is_block_device;
+        let sam_mode = (args.sam || args.ntds || is_disk_ext || is_block_device) && !is_memory_snapshot;
         #[cfg(not(feature = "ntds.dit"))]
-        let sam_mode = args.sam || is_disk_ext || is_block_device;
+        let sam_mode = (args.sam || is_disk_ext || is_block_device) && !is_memory_snapshot;
         if sam_mode {
             return run_sam(input_path, &args);
         }

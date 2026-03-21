@@ -72,9 +72,24 @@ pub struct QemuSavevmLayer {
 
 impl QemuSavevmLayer {
     /// Open a QEMU savevm state file.
+    /// Supports both regular files and block devices (LVM volumes on Proxmox).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = {
+            // Mmap::map() uses fstat for size, which returns 0 for block devices.
+            // Use seek to get the real size and pass it explicitly.
+            use std::io::{Seek, SeekFrom};
+            let mut f = file.try_clone().map_err(|e| io_err(format!("clone fd: {}", e)))?;
+            let size = f.seek(SeekFrom::End(0)).map_err(|e| io_err(format!("seek: {}", e)))?;
+            if size == 0 {
+                return Err(io_err("Empty file or unreadable block device".to_string()));
+            }
+            unsafe {
+                memmap2::MmapOptions::new()
+                    .len(size as usize)
+                    .map(&file)?
+            }
+        };
 
         if mmap.len() < 16 {
             return Err(VmkatzError::InvalidMagic(0));
@@ -457,11 +472,13 @@ impl PhysicalMemory for QemuSavevmLayer {
 }
 
 /// Check if a file starts with the QEVM magic.
+/// Uses a simple read instead of mmap to work on block devices (LVM volumes).
 pub fn is_qemu_savevm(path: &Path) -> bool {
-    let Ok(f) = fs::File::open(path) else { return false };
-    let Ok(mmap) = (unsafe { Mmap::map(&f) }) else { return false };
-    if mmap.len() < 4 { return false; }
-    u32::from_be_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]) == QEVM_MAGIC
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() { return false; }
+    u32::from_be_bytes(magic) == QEVM_MAGIC
 }
 
 /// Create a VmkatzError::Io from a string message.
