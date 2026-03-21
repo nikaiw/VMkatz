@@ -444,6 +444,12 @@ impl VhdxDisk {
         // 8_388_608 = 2^23 (VHDX spec §3.5.1: number of payload blocks covered
         // by one sector bitmap block, derived from sector bitmap granularity).
         let chunk_ratio = (8_388_608 * logical_sector_size) / block_size;
+        if chunk_ratio == 0 {
+            return Err(VmkatzError::DiskFormatError(format!(
+                "Invalid VHDX chunk_ratio=0 (block_size={}, logical_sector_size={})",
+                block_size, logical_sector_size
+            )));
+        }
         let data_blocks_count = metadata.virtual_disk_size.div_ceil(block_size);
 
         // Total BAT entries include interleaved sector bitmap entries

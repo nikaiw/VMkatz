@@ -1871,6 +1871,7 @@ fn is_block_dev(path: &Path) -> bool {
     feature = "qemu",
     feature = "hyperv"
 ))]
+#[allow(dead_code)] // QemuSavevm only constructed when feature "qemu" is enabled
 enum LsassFormat {
     VBox,
     QemuElf,
