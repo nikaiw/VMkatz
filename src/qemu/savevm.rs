@@ -475,11 +475,17 @@ fn io_err(msg: String) -> VmkatzError {
 // Helpers for big-endian reads from a byte slice.
 
 fn read_be_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_be_bytes)
+        .unwrap_or(0)
 }
 
 fn read_be_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+    data.get(offset..offset + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
 }
 
 /// Read a length-prefixed string (u8 len + bytes).
