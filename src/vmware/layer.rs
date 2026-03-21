@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -9,53 +8,6 @@ use crate::memory::PhysicalMemory;
 use crate::vmware::header::{self, PAGE_SIZE};
 use crate::vmware::tags::{self, Tag};
 
-/// File-backed memory: mmap when possible, heap-allocated Vec<u8> fallback
-/// for platforms where mmap fails (e.g. VMFS-5 on ESXi 6.5).
-enum MappedFile {
-    Mmap(Mmap),
-    Vec(Vec<u8>),
-}
-
-impl MappedFile {
-    fn len(&self) -> usize {
-        match self {
-            MappedFile::Mmap(m) => m.len(),
-            MappedFile::Vec(v) => v.len(),
-        }
-    }
-}
-
-impl std::ops::Deref for MappedFile {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            MappedFile::Mmap(m) => m,
-            MappedFile::Vec(v) => v,
-        }
-    }
-}
-
-/// Try to mmap a file, falling back to read() into Vec<u8> if mmap fails.
-/// This handles platforms where mmap is unsupported (VMFS-5, older ESXi kernels).
-fn map_file(file: &mut fs::File) -> Result<MappedFile> {
-    match crate::utils::mmap_file(file) {
-        Ok(m) => Ok(MappedFile::Mmap(m)),
-        Err(mmap_err) => {
-            // mmap failed — fall back to reading entire file into memory
-            let size = crate::utils::file_size(file)? as usize;
-            eprintln!(
-                "[*] mmap failed ({}), reading file into memory ({:.1} MB)...",
-                mmap_err,
-                size as f64 / (1024.0 * 1024.0)
-            );
-            let mut buf = Vec::with_capacity(size);
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(0))?;
-            file.read_to_end(&mut buf)?;
-            Ok(MappedFile::Vec(buf))
-        }
-    }
-}
 
 /// A memory region mapping guest physical pages to VMEM file offsets.
 #[derive(Debug, Clone, Copy)]
@@ -70,7 +22,7 @@ pub struct MemoryRegion {
 
 /// VMware memory layer: provides physical memory access from .vmsn + .vmem files.
 pub struct VmwareLayer {
-    data: MappedFile,
+    data: Mmap,
     pub regions: Vec<MemoryRegion>,
     truncated: bool,
     /// Byte offset within the data where guest physical memory starts.
@@ -119,9 +71,8 @@ impl VmwareLayer {
             }
         };
 
-        // Memory-map the VMEM file (falls back to read() on platforms without mmap)
-        let mut vmem_file = fs::File::open(&vmem_path)?;
-        let data = map_file(&mut vmem_file)?;
+        let vmem_file = fs::File::open(&vmem_path)?;
+        let data = crate::utils::mmap_file(&vmem_file)?;
         log::info!(
             "VMEM loaded: {} bytes ({} MB)",
             data.len(),
@@ -201,9 +152,8 @@ impl VmwareLayer {
 
     /// Parse a .vmsn file and return (regions, tags).
     fn parse_vmsn_metadata(vmsn_path: &Path) -> Result<(Vec<MemoryRegion>, Vec<Tag>)> {
-        // Try mmap first, fall back to read() for platforms without mmap support.
-        let mut vmsn_file = fs::File::open(vmsn_path)?;
-        let vmsn_data = map_file(&mut vmsn_file)?;
+        let vmsn_file = fs::File::open(vmsn_path)?;
+        let vmsn_data = crate::utils::mmap_file(&vmsn_file)?;
 
         let (hdr, groups) = header::parse_vmsn(&vmsn_data)?;
         log::info!(
