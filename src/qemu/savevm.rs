@@ -75,21 +75,7 @@ impl QemuSavevmLayer {
     /// Supports both regular files and block devices (LVM volumes on Proxmox).
     pub fn open(path: &Path) -> Result<Self> {
         let file = fs::File::open(path)?;
-        let mmap = {
-            // Mmap::map() uses fstat for size, which returns 0 for block devices.
-            // Use seek to get the real size and pass it explicitly.
-            use std::io::{Seek, SeekFrom};
-            let mut f = file.try_clone().map_err(|e| io_err(format!("clone fd: {}", e)))?;
-            let size = f.seek(SeekFrom::End(0)).map_err(|e| io_err(format!("seek: {}", e)))?;
-            if size == 0 {
-                return Err(io_err("Empty file or unreadable block device".to_string()));
-            }
-            unsafe {
-                memmap2::MmapOptions::new()
-                    .len(size as usize)
-                    .map(&file)?
-            }
-        };
+        let mmap = crate::utils::mmap_file(&file)?;
 
         if mmap.len() < 16 {
             return Err(VmkatzError::InvalidMagic(0));

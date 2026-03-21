@@ -87,6 +87,32 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
     r
 }
 
+/// Get the real size of a file or block device.
+/// `metadata().len()` returns 0 for block devices; this uses seek instead.
+pub fn file_size(file: &mut std::fs::File) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let pos = file.stream_position()?;
+    let size = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(pos))?;
+    Ok(size)
+}
+
+/// Memory-map a file, handling block devices where fstat returns size 0.
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+pub fn mmap_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    let size = f.seek(SeekFrom::End(0))?;
+    f.seek(SeekFrom::Start(0))?;
+    if size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty file or unreadable device",
+        ));
+    }
+    unsafe { memmap2::MmapOptions::new().len(size as usize).map(file) }
+}
+
 /// Decode UTF-16LE bytes to a String without intermediate Vec<u16> allocation.
 /// NUL-terminated: stops at first U+0000. Replaces invalid surrogates with U+FFFD.
 pub fn utf16le_decode(data: &[u8]) -> String {
