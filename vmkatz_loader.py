@@ -11,14 +11,14 @@ Python is VIB-signed on ESXi, so it can execute normally.
 We parse the ELF, map segments, apply relocations, build a proper
 initial stack (argc/argv/envp/auxv), and jump to _start.
 
-Compatible with Python 3.5+ (ESXi 6.7) through 3.11+ (ESXi 8.0).
+Compatible with Python 2.7+ (ESXi 6.5) through 3.11+ (ESXi 8.0).
 
 Usage:
-    python3 vmkatz_loader.py <vmkatz-musl-binary> [vmkatz-args...]
+    python /tmp/vmkatz_loader.py /tmp/vmkatz [vmkatz-args...]
 
 Example:
-    python3 vmkatz_loader.py /tmp/vmkatz /vmfs/volumes/datastore1/VM/snapshot.vmsn
-    python3 vmkatz_loader.py /tmp/vmkatz --vmfs-list
+    python /tmp/vmkatz_loader.py /tmp/vmkatz /vmfs/volumes/datastore1/VM/snapshot.vmsn
+    python /tmp/vmkatz_loader.py /tmp/vmkatz --vmfs-list
 """
 
 import ctypes
