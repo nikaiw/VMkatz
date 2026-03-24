@@ -6,7 +6,7 @@ Bypasses execInstalledOnly (VIB protection) by loading the vmkatz static
 binary into anonymous mmap pages with PROT_EXEC. ESXi VMkernel allows
 PROT_EXEC on anonymous mappings but blocks execve on unsigned binaries.
 
-Python is VIB-signed on ESXi, so it can execute normally.
+Python is included in ESXi 6.x+ and executes regardless of VIB settings.
 
 We parse the ELF, map segments, apply relocations, build a proper
 initial stack (argc/argv/envp/auxv), and jump to _start.

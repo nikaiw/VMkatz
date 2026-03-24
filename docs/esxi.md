@@ -23,7 +23,7 @@ esxcli system settings advanced set -o /User/execInstalledOnly -i 0
 
 When `execInstalledOnly` is set to 1 (default on ESXi 7.0+), unsigned binaries cannot be executed directly. The included Python loader (`tools/vmkatz_loader.py`, bundled in the ESXi release archive) bypasses this by loading vmkatz into anonymous memory pages — ESXi allows `PROT_EXEC` on anonymous mappings while blocking `execve` on unsigned files.
 
-Python is VIB-signed on all ESXi versions and can execute normally.
+Python is included in ESXi 6.x and later (used internally by VMware hostd/CIM providers) and can execute normally regardless of VIB settings.
 
 ```bash
 # Upload both files
