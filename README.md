@@ -129,8 +129,8 @@ scp target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
 When VIB protection (`execInstalledOnly`) is enabled, use the Python loader — no need to disable the setting:
 
 ```bash
-scp vmkatz_loader.py target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
-python3 /tmp/vmkatz_loader.py /tmp/vmkatz /vmfs/volumes/datastore1/MyVM/snapshot.vmsn
+scp tools/vmkatz_loader.py target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
+python /tmp/vmkatz_loader.py /tmp/vmkatz /vmfs/volumes/datastore1/MyVM/snapshot.vmsn
 ```
 
 See [docs/esxi.md](docs/esxi.md) for VIB bypass details, VMFS raw device access, and auto-discovery.

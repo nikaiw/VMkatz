@@ -53,7 +53,11 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/vmkatz dist/vmkatz
-          tar -C dist -czf vmkatz-${{ github.ref_name }}-${{ matrix.name }}.tar.gz vmkatz
+          # Include the Python loader in the ESXi musl build
+          if [ "${{ matrix.name }}" = "esxi-x86_64" ]; then
+            cp tools/vmkatz_loader.py dist/vmkatz_loader.py
+          fi
+          tar -C dist -czf vmkatz-${{ github.ref_name }}-${{ matrix.name }}.tar.gz .
 
       - name: Archive (Windows)
         if: runner.os == 'Windows'
