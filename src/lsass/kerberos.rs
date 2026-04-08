@@ -1315,7 +1315,12 @@ pub fn carve_kerberos_tickets(
         Arch::X86 => &[&TICKET_OFFSETS_1607_X86, &TICKET_OFFSETS_10_X86],
     };
 
-    let chunk_size: usize = 256 * 1024; // 256 KB chunks
+    const CHUNK_SIZE: usize = 256 * 1024; // 256 KB chunks
+    // Overlap between consecutive chunks so a ticket struct whose enc_type is
+    // found near the start of a chunk can still access its flags field, which
+    // lives at enc_type - 0x84 (for Win10 1607+). 512 bytes covers every
+    // known TicketOffsets variant with margin.
+    const CHUNK_OVERLAP: u64 = 0x200;
 
     log::info!(
         "Kerberos ticket carving: scanning {} memory regions (arch={:?})...",
@@ -1334,21 +1339,23 @@ pub fn carve_kerberos_tickets(
 
         let mut offset = 0u64;
         while offset < region_size {
-            let read_size = chunk_size.min((region_size - offset) as usize);
+            let read_size = CHUNK_SIZE.min((region_size - offset) as usize);
             let chunk_addr = region_start + offset;
             let chunk = match vmem.read_virt_bytes(chunk_addr, read_size) {
                 Ok(d) => d,
                 Err(_) => {
                     read_errors += 1;
-                    offset += chunk_size as u64;
+                    offset += (CHUNK_SIZE as u64).saturating_sub(CHUNK_OVERLAP).max(1);
                     continue;
                 }
             };
 
-            // Scan for valid etype values at 8-byte aligned positions.
-            // For each hit, check if the surrounding bytes match a ticket_info struct.
+            // Scan every 4-byte aligned position — ticket_enc_type offsets are
+            // u32-aligned but not always 8-aligned (e.g. 0x124 for Win10 1607+
+            // x64, 0x9C for 1607 x86). An 8-byte stride would miss these on
+            // standard pool-aligned allocations.
             let scan_limit = chunk.len().saturating_sub(8);
-            for i in (0..scan_limit).step_by(8) {
+            for i in (0..scan_limit).step_by(4) {
                 let val = u32::from_le_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
 
                 if !VALID_ETYPES.contains(&val) {
@@ -1464,7 +1471,9 @@ pub fn carve_kerberos_tickets(
                 }
             }
 
-            offset += chunk_size as u64;
+            // Advance by chunk_size - overlap so struct boundaries that cross
+            // the cut-line get scanned in both chunks (deduped later).
+            offset += (CHUNK_SIZE as u64).saturating_sub(CHUNK_OVERLAP).max(1);
         }
     }
 
