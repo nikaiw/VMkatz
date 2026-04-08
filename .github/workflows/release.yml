@@ -12,23 +12,68 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Linux x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: linux-x86_64
+            build: cargo
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: esxi-x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: windows-x86_64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: macos-x86_64
+            build: cargo
+
+          # Linux aarch64 (native ARM runners)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: linux-aarch64
+            build: cargo
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            name: linux-aarch64-musl
+            build: cargo
+
+          # Linux armv7 (cross-compiled from x86_64)
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            name: linux-armv7
+            build: cross
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            name: linux-armv7-musl
+            build: cross
+
+          # Linux arm (armv5/v6, cross-compiled from x86_64)
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            name: linux-arm
+            build: cross
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+            name: linux-arm-musl
+            build: cross
+
+          # macOS
           - target: aarch64-apple-darwin
             os: macos-latest
             name: macos-aarch64
+            build: cargo
+          - target: x86_64-apple-darwin
+            os: macos-26-intel
+            name: macos-x86_64
+            build: cargo
+
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x86_64
+            build: cargo
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            name: windows-aarch64
+            build: cargo
 
     runs-on: ${{ matrix.os }}
 
@@ -41,19 +86,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools
+      - name: Install musl tools (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Install musl tools (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.build == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: ${{ matrix.build }} build --release --target ${{ matrix.target }}
 
       - name: Archive (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/vmkatz dist/vmkatz
-          tar -C dist -czf vmkatz-${{ github.ref_name }}-${{ matrix.name }}.tar.gz vmkatz
+          # Bundle the Python loader only in the ESXi musl build
+          if [ "${{ matrix.name }}" = "esxi-x86_64" ]; then
+            cp tools/vmkatz_loader.py dist/vmkatz_loader.py
+          fi
+          tar -C dist -czf vmkatz-${{ github.ref_name }}-${{ matrix.name }}.tar.gz .
 
       - name: Archive (Windows)
         if: runner.os == 'Windows'
@@ -72,6 +131,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # Only publish a release on tag pushes, not workflow_dispatch test runs
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,14 +150,21 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          # Find the previous tag
-          PREV_TAG=$(git tag --sort=-v:refname | grep -v "${{ github.ref_name }}" | head -1)
+          CURRENT_TAG="${{ github.ref_name }}"
+          # If the current tag is a prerelease (rc/beta/alpha), include previous
+          # prereleases in the history. Otherwise, skip prereleases so the
+          # changelog for a final release spans back to the last stable tag.
+          if echo "$CURRENT_TAG" | grep -qE -- "-(beta|alpha|rc)"; then
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+          else
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | grep -v -E -- "-(beta|alpha|rc)" | head -1)
+          fi
           if [ -z "$PREV_TAG" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
           fi
           echo "## Changes since ${PREV_TAG}" > CHANGELOG.md
           echo "" >> CHANGELOG.md
-          git log --pretty=format:"- %s" "${PREV_TAG}..${{ github.ref_name }}" >> CHANGELOG.md
+          git log --pretty=format:"- %s" "${PREV_TAG}..${CURRENT_TAG}" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
 
       - name: Publish GitHub Release
