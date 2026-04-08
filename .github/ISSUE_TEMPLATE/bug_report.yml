@@ -102,6 +102,15 @@ body:
       description: For ESXi — VMFS-5 or VMFS-6? (`esxcli storage filesystem list`)
       placeholder: "VMFS-6, ext4, NTFS, etc."
 
+  - type: input
+    id: esxi-vib
+    attributes:
+      label: ESXi VIB protection (if running on ESXi)
+      description: |
+        Run: `esxcli system settings advanced list -o /User/execInstalledOnly`
+        And: `vmware -v`
+      placeholder: "execInstalledOnly = 1, ESXi 8.0 Update 3"
+
   - type: textarea
     id: command
     attributes:

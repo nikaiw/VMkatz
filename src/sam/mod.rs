@@ -9,6 +9,8 @@ mod ntfs_reader;
 mod disk_fallbacks;
 mod vmdk_scan;
 
+pub mod aes_xts;
+pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
 // Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
@@ -83,6 +85,200 @@ pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMaster
 pub fn extract_ntds_artifacts(path: &Path) -> Result<NtdsArtifacts> {
     let mut disk = crate::disk::open_disk(path)?;
     extract_ntds_artifacts_from_reader(&mut disk)
+}
+
+/// Extract secrets from a disk, trying FVEK keys for BitLocker partitions.
+///
+/// When BitLocker-encrypted partitions are detected and FVEK candidates are
+/// available, each candidate is tried until one successfully decrypts a valid
+/// NTFS volume. Falls back to standard (non-BitLocker) extraction if no
+/// encrypted partition is found or no key works.
+pub fn extract_disk_secrets_with_bitlocker(
+    path: &Path,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+) -> Result<DiskSecrets> {
+    let mut disk = crate::disk::open_disk(path)?;
+    extract_secrets_with_bitlocker(&mut disk, fvek_keys)
+}
+
+/// Extract NTDS artifacts from a disk, trying FVEK keys for BitLocker partitions.
+pub fn extract_ntds_artifacts_with_bitlocker(
+    path: &Path,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+) -> Result<NtdsArtifacts> {
+    let mut disk = crate::disk::open_disk(path)?;
+    extract_ntds_with_bitlocker(&mut disk, fvek_keys)
+}
+
+/// Core BitLocker-aware extraction for SAM/LSA secrets.
+fn extract_secrets_with_bitlocker<R: Read + Seek>(
+    reader: &mut R,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+) -> Result<DiskSecrets> {
+    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+
+    for &partition_offset in &partitions {
+        // Try unencrypted first
+        if !is_bitlocker_partition(reader, partition_offset) {
+            log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
+            match ntfs_reader::read_hive_files(reader, partition_offset) {
+                Ok((sam_data, system_data, security_data)) => {
+                    return process_hive_data(sam_data, system_data, security_data);
+                }
+                Err(e) => {
+                    log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                }
+            }
+            continue;
+        }
+
+        // BitLocker-encrypted partition — try each FVEK candidate
+        eprintln!(
+            "[*] BitLocker partition at 0x{:x} — trying {} FVEK candidate(s)",
+            partition_offset,
+            fvek_keys.len()
+        );
+
+        if let Some(secrets) = try_bitlocker_fvek_candidates(
+            reader,
+            partition_offset,
+            fvek_keys,
+            |bl_reader, _offset| {
+                ntfs_reader::read_hive_files(bl_reader, 0)
+                    .and_then(|(sam, sys, sec)| process_hive_data(sam, sys, sec))
+            },
+        ) {
+            return Ok(secrets);
+        }
+    }
+
+    Err(crate::error::VmkatzError::DecryptionError(
+        "No secrets found (BitLocker-aware scan exhausted all partitions and FVEK candidates)"
+            .to_string(),
+    ))
+}
+
+/// Core BitLocker-aware extraction for NTDS artifacts.
+fn extract_ntds_with_bitlocker<R: Read + Seek>(
+    reader: &mut R,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+) -> Result<NtdsArtifacts> {
+    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+
+    for &partition_offset in &partitions {
+        if !is_bitlocker_partition(reader, partition_offset) {
+            log::info!(
+                "Trying NTDS on NTFS partition at offset 0x{:x}",
+                partition_offset
+            );
+            match ntfs_reader::read_ntds_artifacts(reader, partition_offset) {
+                Ok((ntds_data, system_data)) => {
+                    return Ok(NtdsArtifacts {
+                        ntds_data,
+                        system_data,
+                        partition_offset,
+                    });
+                }
+                Err(e) => {
+                    log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                }
+            }
+            continue;
+        }
+
+        eprintln!(
+            "[*] BitLocker partition at 0x{:x} — trying {} FVEK candidate(s) for NTDS",
+            partition_offset,
+            fvek_keys.len()
+        );
+
+        if let Some(artifacts) = try_bitlocker_fvek_candidates(
+            reader,
+            partition_offset,
+            fvek_keys,
+            |bl_reader, part_off| {
+                ntfs_reader::read_ntds_artifacts(bl_reader, 0).map(|(ntds_data, system_data)| {
+                    NtdsArtifacts {
+                        ntds_data,
+                        system_data,
+                        partition_offset: part_off,
+                    }
+                })
+            },
+        ) {
+            return Ok(artifacts);
+        }
+    }
+
+    Err(crate::error::VmkatzError::DecryptionError(
+        "NTDS.dit not found (BitLocker-aware scan exhausted)".to_string(),
+    ))
+}
+
+/// Try each FVEK candidate on a BitLocker-encrypted partition.
+///
+/// For each candidate, validates the NTFS signature after decryption,
+/// then calls `extract_fn` to perform the actual extraction.
+/// Returns the first successful result, or `None` if no key works.
+fn try_bitlocker_fvek_candidates<R, T, F>(
+    reader: &mut R,
+    partition_offset: u64,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    extract_fn: F,
+) -> Option<T>
+where
+    R: Read + Seek,
+    F: Fn(&mut bitlocker_decrypt::BitLockerReader<&mut R>, u64) -> Result<T>,
+{
+    for (i, key) in fvek_keys.iter().enumerate() {
+        let xts_key = match bitlocker_decrypt::build_xts_key(key) {
+            Some(k) => k,
+            None => {
+                log::info!(
+                    "BitLocker: skipping FVEK #{} — unsupported method 0x{:04x} ({})",
+                    i,
+                    key.method,
+                    key.cipher
+                );
+                continue;
+            }
+        };
+
+        // Validate by decrypting sector 0 and checking NTFS signature
+        let mut bl_reader =
+            bitlocker_decrypt::BitLockerReader::new(&mut *reader, partition_offset, xts_key.clone());
+
+        if !bl_reader.validate_ntfs_signature() {
+            log::info!(
+                "BitLocker: FVEK #{} ({}) — NTFS signature mismatch after decryption",
+                i,
+                key.cipher
+            );
+            continue;
+        }
+
+        eprintln!(
+            "[+] BitLocker: FVEK #{} ({}) unlocked partition at 0x{:x}",
+            i, key.cipher, partition_offset
+        );
+
+        // Re-create reader (validate consumed a seek) and extract
+        let mut bl_reader =
+            bitlocker_decrypt::BitLockerReader::new(&mut *reader, partition_offset, xts_key);
+
+        match extract_fn(&mut bl_reader, partition_offset) {
+            Ok(result) => return Some(result),
+            Err(e) => {
+                log::warn!(
+                    "BitLocker: FVEK #{} decrypted NTFS header but extraction failed: {}",
+                    i,
+                    e
+                );
+            }
+        }
+    }
+
+    None
 }
 
 /// Extract both SAM hashes and LSA secrets from a disk image.

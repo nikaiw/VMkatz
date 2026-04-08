@@ -1588,6 +1588,45 @@ pub fn extract_credentials_from_minidump(
                 assign_kerberos_key_groups(&mut all_creds, key_groups);
             }
         }
+
+        // Carve orphaned tickets from LSASS memory (freed sessions, logged-out users).
+        // Collect all already-known tickets for deduplication.
+        let existing_tickets: Vec<_> = all_creds
+            .values()
+            .filter_map(|c| c.kerberos.as_ref())
+            .flat_map(|k| k.tickets.iter().cloned())
+            .collect();
+        let carved = crate::lsass::kerberos::carve_kerberos_tickets(
+            vmem, region_ranges, arch, &existing_tickets,
+        );
+        if !carved.is_empty() {
+            log::info!("Kerberos: carved {} orphaned tickets from memory", carved.len());
+            status.kerberos = ProviderStatus::Ok;
+            // Attach carved tickets to matching credentials by domain, or to the
+            // first credential that has a kerberos entry in the same domain.
+            for ticket in carved {
+                let domain_lower = ticket.domain_name.to_lowercase();
+                let target = all_creds.values_mut().find(|c| {
+                    c.kerberos.as_ref().is_some_and(|k| {
+                        k.tickets.iter().any(|t| t.domain_name.to_lowercase() == domain_lower)
+                            || k.domain.to_lowercase() == domain_lower
+                    })
+                });
+                if let Some(cred) = target {
+                    if let Some(ref mut krb) = cred.kerberos {
+                        krb.tickets.push(ticket);
+                    }
+                } else {
+                    // No matching credential — attach to the first one with kerberos data
+                    let any_krb = all_creds.values_mut().find(|c| c.kerberos.is_some());
+                    if let Some(cred) = any_krb {
+                        if let Some(ref mut krb) = cred.kerberos {
+                            krb.tickets.push(ticket);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // DPAPI (DLL chain + vmem scan fallback)

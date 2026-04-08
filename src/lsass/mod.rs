@@ -19,6 +19,7 @@
 //!
 //! - `carve`    — Degraded extraction for truncated/raw memory (no EPROCESS traversal).
 
+pub mod bitlocker;
 #[cfg(feature = "carve")]
 pub mod carve;
 pub(crate) mod cloudap;
