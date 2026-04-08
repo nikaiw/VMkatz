@@ -150,14 +150,21 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          # Find the previous tag
-          PREV_TAG=$(git tag --sort=-v:refname | grep -v "${{ github.ref_name }}" | head -1)
+          CURRENT_TAG="${{ github.ref_name }}"
+          # If the current tag is a prerelease (rc/beta/alpha), include previous
+          # prereleases in the history. Otherwise, skip prereleases so the
+          # changelog for a final release spans back to the last stable tag.
+          if echo "$CURRENT_TAG" | grep -qE -- "-(beta|alpha|rc)"; then
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+          else
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | grep -v -E -- "-(beta|alpha|rc)" | head -1)
+          fi
           if [ -z "$PREV_TAG" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
           fi
           echo "## Changes since ${PREV_TAG}" > CHANGELOG.md
           echo "" >> CHANGELOG.md
-          git log --pretty=format:"- %s" "${PREV_TAG}..${{ github.ref_name }}" >> CHANGELOG.md
+          git log --pretty=format:"- %s" "${PREV_TAG}..${CURRENT_TAG}" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
 
       - name: Publish GitHub Release
