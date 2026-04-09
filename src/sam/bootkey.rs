@@ -164,8 +164,8 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
         let size_raw = crate::utils::read_i32_le(hive_data, pos).unwrap_or(0);
         let cell_size = size_raw.unsigned_abs() as usize;
         if !(8..=0x100000).contains(&cell_size) || pos + cell_size > hive_data.len() {
-            // Invalid cell — try next aligned position
-            pos += 8;
+            // Invalid cell — try next 4-byte aligned position (cells are 4-byte aligned)
+            pos += 4;
             continue;
         }
 

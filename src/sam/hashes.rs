@@ -342,6 +342,9 @@ pub(crate) fn md5_hash(data: &[u8]) -> [u8; 16] {
 
 /// RC4 stream cipher.
 pub(crate) fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    if key.is_empty() {
+        return data.to_vec();
+    }
     let mut s: Vec<u8> = (0..=255u8).collect();
     let mut j: u8 = 0;
     for i in 0..256 {

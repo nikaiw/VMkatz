@@ -171,8 +171,8 @@ impl<'a> Key<'a> {
             let is_inline = data_size_raw & 0x8000_0000 != 0;
             let data_size = (data_size_raw & 0x7FFF_FFFF) as usize;
 
-            if is_inline || data_size <= 4 {
-                // Data is stored inline in the data_offset field
+            if is_inline {
+                // Data is stored inline in the data_offset field (high bit set)
                 let inline_bytes = data_offset.to_le_bytes();
                 return Ok(inline_bytes[..data_size.min(4)].to_vec());
             }

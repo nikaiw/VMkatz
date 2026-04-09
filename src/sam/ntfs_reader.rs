@@ -127,10 +127,13 @@ pub(crate) fn read_file_data<R: Read + Seek>(
             const CHUNK: usize = 4096;
             while offset < buf.len() {
                 let end = (offset + CHUNK).min(buf.len());
+                // Seek to the correct position before each chunk to avoid cursor desync
+                // after a failed read_exact (which leaves the cursor in an undefined state)
+                let _ = data_value.seek(reader, std::io::SeekFrom::Start(offset as u64));
                 match data_value.read_exact(reader, &mut buf[offset..end]) {
                     Ok(()) => {}
                     Err(_) => {
-                        // Zero-fill this chunk and try to advance
+                        // Zero-fill this chunk and skip
                         buf[offset..end].fill(0);
                     }
                 }

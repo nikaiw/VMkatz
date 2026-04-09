@@ -381,8 +381,8 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
             parent_hint = Some(rest.trim_matches('"').to_string());
         }
 
-        // RW <sectors> SPARSE "<filename>"
-        if line.starts_with("RW ") {
+        // {RW|RDONLY|NOACCESS} <sectors> SPARSE "<filename>"
+        if line.starts_with("RW ") || line.starts_with("RDONLY ") || line.starts_with("NOACCESS ") {
             let parts: Vec<&str> = line.splitn(4, ' ').collect();
             if parts.len() == 4 {
                 let sectors: u64 = parts[1]
