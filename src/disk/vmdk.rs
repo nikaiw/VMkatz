@@ -19,15 +19,26 @@ struct VmdkExtent {
     file: File,
     start_sector: u64,
     capacity: u64,
+    // Sparse-only (unused when is_flat=true)
     grain_size: u64,
     num_gtes_per_gt: u32,
     gd: Vec<u32>,
+    // Flat-specific: byte offset in the file where disk data starts
+    flat_offset: u64,
+    is_flat: bool,
 }
 
 /// Parsed descriptor metadata.
 struct Descriptor {
     parent_hint: Option<String>,
-    extent_files: Vec<(u64, String)>, // (sector_count, filename)
+    extent_files: Vec<DescriptorExtent>,
+}
+
+struct DescriptorExtent {
+    sectors: u64,
+    filename: String,
+    is_flat: bool,
+    offset_sectors: u64,
 }
 
 impl VmdkDisk {
@@ -44,9 +55,13 @@ impl VmdkDisk {
         let mut extents = Vec::new();
         let mut start_sector = 0u64;
 
-        for (sector_count, filename) in &desc.extent_files {
-            let extent_path = base_dir.join(filename);
-            let ext = open_extent(&extent_path, start_sector, *sector_count)?;
+        for de in &desc.extent_files {
+            let extent_path = base_dir.join(&de.filename);
+            let ext = if de.is_flat {
+                open_flat_extent(&extent_path, start_sector, de.sectors, de.offset_sectors)?
+            } else {
+                open_extent(&extent_path, start_sector, de.sectors)?
+            };
             start_sector += ext.capacity;
             extents.push(ext);
         }
@@ -190,6 +205,25 @@ impl VmdkDisk {
             };
 
             let local_sector = virtual_sector - ext.start_sector;
+
+            // Flat extent: direct read at file_offset + local_sector * 512 + sector_off
+            if ext.is_flat {
+                let remain_in_ext = (ext.capacity - local_sector) * SECTOR_SIZE - sector_off;
+                let chunk = (remain_in_ext as usize).min(to_read - filled);
+                let data_off = ext.flat_offset + local_sector * SECTOR_SIZE + sector_off;
+                let read_ok = ext.file.seek(SeekFrom::Start(data_off)).is_ok()
+                    && ext
+                        .file
+                        .read_exact(&mut buf[filled..filled + chunk])
+                        .is_ok();
+                if !read_ok {
+                    // Truncated or sparse flat file: treat as zeros
+                    buf[filled..filled + chunk].fill(0);
+                }
+                filled += chunk;
+                continue;
+            }
+
             let grain_index = local_sector / ext.grain_size;
             let gt_index = (grain_index / ext.num_gtes_per_gt as u64) as usize;
             let gte_index = (grain_index % ext.num_gtes_per_gt as u64) as usize;
@@ -268,6 +302,40 @@ impl VmdkDisk {
         F: FnMut(u64, &[u8]) -> bool,
     {
         for ext_idx in 0..self.extents.len() {
+            // Flat extents: iterate the whole extent in fixed-size chunks since
+            // there's no grain table to skip unallocated regions.
+            if self.extents[ext_idx].is_flat {
+                const CHUNK_SECTORS: u64 = 2048; // 1 MiB
+                let start_sector = self.extents[ext_idx].start_sector;
+                let capacity = self.extents[ext_idx].capacity;
+                let flat_offset = self.extents[ext_idx].flat_offset;
+                let chunk_bytes = (CHUNK_SECTORS * SECTOR_SIZE) as usize;
+                let mut buf = vec![0u8; chunk_bytes];
+                let mut sector = 0u64;
+                while sector < capacity {
+                    let this_chunk_sectors = CHUNK_SECTORS.min(capacity - sector);
+                    let this_chunk_bytes = (this_chunk_sectors * SECTOR_SIZE) as usize;
+                    let data_off = flat_offset + sector * SECTOR_SIZE;
+                    let ok = self.extents[ext_idx]
+                        .file
+                        .seek(SeekFrom::Start(data_off))
+                        .is_ok()
+                        && self.extents[ext_idx]
+                            .file
+                            .read_exact(&mut buf[..this_chunk_bytes])
+                            .is_ok();
+                    if !ok {
+                        break;
+                    }
+                    let virtual_byte = (start_sector + sector) * SECTOR_SIZE;
+                    if !callback(virtual_byte, &buf[..this_chunk_bytes]) {
+                        return Ok(());
+                    }
+                    sector += this_chunk_sectors;
+                }
+                continue;
+            }
+
             let grain_bytes = self.extents[ext_idx].grain_size * SECTOR_SIZE;
             let num_gtes = self.extents[ext_idx].num_gtes_per_gt;
             let gd_len = self.extents[ext_idx].gd.len();
@@ -381,15 +449,52 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
             parent_hint = Some(rest.trim_matches('"').to_string());
         }
 
-        // {RW|RDONLY|NOACCESS} <sectors> SPARSE "<filename>"
+        // <access> <sectors> <type> "<filename>" [<offset>]
+        // access: RW | RDONLY | NOACCESS
+        // type: SPARSE | FLAT | VMFS | VMFSSPARSE | VMFSRAW | VMFSRDM | VMFSRDMP | ZERO
+        // Filenames may contain spaces (incl. NBSP) so split only on ASCII space for
+        // the fixed-position tokens and extract the filename from its double quotes.
         if line.starts_with("RW ") || line.starts_with("RDONLY ") || line.starts_with("NOACCESS ") {
-            let parts: Vec<&str> = line.splitn(4, ' ').collect();
-            if parts.len() == 4 {
-                let sectors: u64 = parts[1]
+            let head: Vec<&str> = line.splitn(4, ' ').collect();
+            if head.len() >= 4 {
+                let sectors: u64 = head[1]
                     .parse()
                     .map_err(|_| VmkatzError::DiskFormatError("bad VMDK extent sectors".into()))?;
-                let filename = parts[3].trim_matches('"').to_string();
-                extent_files.push((sectors, filename));
+                let ext_type = head[2];
+                // ZERO extents are virtual (no backing file) — skip for now
+                if ext_type == "ZERO" {
+                    continue;
+                }
+                // Extract filename between the first '"' and the matching '"'
+                let tail = head[3];
+                let (filename, after) = if let Some(start) = tail.find('"') {
+                    let rest = &tail[start + 1..];
+                    if let Some(end) = rest.find('"') {
+                        (rest[..end].to_string(), &rest[end + 1..])
+                    } else {
+                        (tail.trim_matches('"').to_string(), "")
+                    }
+                } else {
+                    // No quotes: fallback — filename is the entire last token
+                    (tail.to_string(), "")
+                };
+                // Flat extents: FLAT, VMFS, VMFSRAW, VMFSRDM, VMFSRDMP carry raw disk data
+                let is_flat = matches!(
+                    ext_type,
+                    "FLAT" | "VMFS" | "VMFSRAW" | "VMFSRDM" | "VMFSRDMP"
+                );
+                // Optional offset in sectors (flat extents may specify where data starts)
+                let offset_sectors: u64 = after
+                    .split_ascii_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                extent_files.push(DescriptorExtent {
+                    sectors,
+                    filename,
+                    is_flat,
+                    offset_sectors,
+                });
             }
         }
     }
@@ -451,6 +556,29 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
         grain_size,
         num_gtes_per_gt,
         gd,
+        flat_offset: 0,
+        is_flat: false,
+    })
+}
+
+/// Open a flat VMDK extent (raw disk bytes, no sparse header).
+/// `offset_sectors` is the sector offset within the file where disk data starts.
+fn open_flat_extent(
+    path: &Path,
+    start_sector: u64,
+    declared_sectors: u64,
+    offset_sectors: u64,
+) -> Result<VmdkExtent> {
+    let file = File::open(path).map_err(VmkatzError::Io)?;
+    Ok(VmdkExtent {
+        file,
+        start_sector,
+        capacity: declared_sectors,
+        grain_size: 0,
+        num_gtes_per_gt: 0,
+        gd: Vec::new(),
+        flat_offset: offset_sectors * SECTOR_SIZE,
+        is_flat: true,
     })
 }
 
