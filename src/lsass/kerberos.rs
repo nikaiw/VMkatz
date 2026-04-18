@@ -1371,7 +1371,8 @@ pub fn carve_kerberos_tickets(
                     }
                     let local_base = i - enc_type_off;
 
-                    // Quick validation: ticket_kvno must be reasonable (1..=20)
+                    // kvno: reject 0 and obvious garbage. Upper bound is loose
+                    // because krbtgt rotation can push real kvnos well past 20.
                     let kvno_pos = local_base + offsets.ticket_kvno as usize;
                     if kvno_pos + 4 > chunk.len() {
                         continue;
@@ -1382,7 +1383,7 @@ pub fn carve_kerberos_tickets(
                         chunk[kvno_pos + 2],
                         chunk[kvno_pos + 3],
                     ]);
-                    if kvno == 0 || kvno > 20 {
+                    if kvno == 0 || kvno > 1000 {
                         continue;
                     }
 
