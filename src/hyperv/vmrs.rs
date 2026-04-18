@@ -955,25 +955,17 @@ fn lznt1_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-/// Calculate the number of displacement bits for LZNT1 based on position in chunk.
+/// LZNT1 displacement bits for a given position in the uncompressed chunk.
+/// Per MS-XCA §2.4.1.1.1: 4 bits up to pos 15, then +1 bit each time pos
+/// reaches the next power of two (16, 32, 64, ...).
 fn lznt1_displacement_bits(pos_in_chunk: usize) -> u32 {
-    // The displacement size varies based on position within the uncompressed chunk:
-    // pos 0-15: not applicable (no backrefs possible)
-    // pos 16-31: 5 bits displacement
-    // pos 32-63: 6 bits
-    // pos 64-127: 7 bits
-    // ...up to 12 bits for pos >= 2048
-    if pos_in_chunk < 16 {
-        4 // minimum 4 bits for displacement
-    } else {
-        let mut bits = 4u32;
-        let mut threshold = 16usize;
-        while threshold < pos_in_chunk && bits < 12 {
-            bits += 1;
-            threshold <<= 1;
-        }
-        bits
+    let mut bits = 4u32;
+    let mut threshold = 16usize;
+    while threshold <= pos_in_chunk && bits < 12 {
+        bits += 1;
+        threshold <<= 1;
     }
+    bits
 }
 
 /// Check if a file starts with the VMRS magic.
