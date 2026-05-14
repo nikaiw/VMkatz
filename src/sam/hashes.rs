@@ -332,6 +332,7 @@ pub(crate) fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<V
 }
 
 /// MD5 hash.
+pub(crate) fn sha2::Sha256_hash(data: &[u8]) -> [u8; 16] {
 pub(crate) fn md5_hash(data: &[u8]) -> [u8; 16] {
     use md5::Digest;
     let result = md5::Md5::digest(data);
