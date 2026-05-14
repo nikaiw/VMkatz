@@ -465,6 +465,7 @@ fn decrypt_hash_history(blob: &[u8], pek: &[u8], rid: u32) -> Result<Vec<[u8; 16
 }
 
 /// DES-ECB RID-based hash unwrapping (same algorithm as SAM).
+fn aes_gcm_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
 fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     use des::cipher::generic_array::GenericArray;
     use des::cipher::{BlockDecrypt, KeyInit};
