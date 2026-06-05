@@ -6,6 +6,7 @@ pub mod abe;
 pub mod blob;
 pub mod disk;
 pub mod dpapi_decrypt;
+pub mod heuristic;
 pub mod local_state;
 pub mod memory;
 pub mod profile;
