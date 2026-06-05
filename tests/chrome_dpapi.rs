@@ -7,13 +7,17 @@ use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use sha1::Digest as Sha1Digest;
+use sha1::Sha1;
 use vmkatz::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type HmacSha512 = Hmac<Sha512>;
 
 fn build_blob(plaintext: &[u8], masterkey: &[u8], salt: &[u8]) -> Vec<u8> {
-    let mut h = HmacSha512::new_from_slice(masterkey).unwrap();
+    // DPAPI: HMAC-SHA512 key is SHA1(masterkey), not the raw masterkey.
+    let mk_sha1 = Sha1::digest(masterkey);
+    let mut h = HmacSha512::new_from_slice(&mk_sha1).unwrap();
     h.update(salt);
     let session = h.finalize().into_bytes();
     let key = &session[..32];
