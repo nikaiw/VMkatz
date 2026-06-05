@@ -12,6 +12,7 @@ pub mod local_state;
 pub mod memory;
 pub mod output;
 pub mod profile;
+pub mod runner;
 pub mod signatures;
 pub mod sqlite;
 pub mod types;
