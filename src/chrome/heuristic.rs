@@ -77,6 +77,90 @@ fn plausible(t: &PasswordTriple) -> bool {
         && !t.password.contains('\u{FFFD}')
 }
 
+#[derive(Debug, Clone)]
+pub struct CookieTriple {
+    pub host: String,
+    pub name: String,
+    pub value: String,
+}
+
+/// Scan ASCII host strings (domain-looking) followed by a cookie name and value
+/// within a small window.
+pub fn scan_heap_for_cookies(mem: &[u8]) -> Vec<CookieTriple> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < mem.len() {
+        if mem[i] == b'.' || mem[i].is_ascii_alphabetic() {
+            if let Some((host, len)) = read_ascii_domain(&mem[i..]) {
+                let mut k = i + len + 1;
+                let win_end = (k + 2048).min(mem.len());
+                let mut strs: Vec<String> = Vec::new();
+                while k < win_end && strs.len() < 4 {
+                    if let Some((s, slen)) = read_ascii_cstr(&mem[k..]) {
+                        if !s.is_empty() && s.len() < 4096 {
+                            strs.push(s);
+                        }
+                        k += slen + 1;
+                    } else {
+                        k += 1;
+                    }
+                }
+                if strs.len() >= 2 {
+                    let triple = CookieTriple {
+                        host,
+                        name: strs[0].clone(),
+                        value: strs[1].clone(),
+                    };
+                    if plausible_cookie(&triple) {
+                        out.push(triple);
+                    }
+                }
+                i += len + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn read_ascii_domain(b: &[u8]) -> Option<(String, usize)> {
+    let mut n = 0;
+    while n < b.len() && n < 256 {
+        let c = b[n];
+        if c == 0 { break; }
+        if !(c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_') {
+            return None;
+        }
+        n += 1;
+    }
+    if n < 4 { return None; }
+    let s = std::str::from_utf8(&b[..n]).ok()?.to_string();
+    if !s.contains('.') { return None; }
+    Some((s, n))
+}
+
+fn read_ascii_cstr(b: &[u8]) -> Option<(String, usize)> {
+    let mut n = 0;
+    while n < b.len() && n < 4096 {
+        let c = b[n];
+        if c == 0 { break; }
+        if c < 0x20 || c > 0x7E { return None; }
+        n += 1;
+    }
+    if n == 0 { return None; }
+    let s = std::str::from_utf8(&b[..n]).ok()?.to_string();
+    Some((s, n))
+}
+
+fn plausible_cookie(t: &CookieTriple) -> bool {
+    t.host.contains('.')
+        && t.host.len() < 256
+        && !t.name.is_empty()
+        && !t.value.is_empty()
+        && t.value.len() > 8 // cookies aren't usually 1-char
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +188,19 @@ mod tests {
         assert_eq!(r[0].url, "https://target.example/login");
         assert_eq!(r[0].username, "alice");
         assert_eq!(r[0].password, "P@ssw0rd");
+    }
+
+    #[test]
+    fn finds_cookie_triple() {
+        let mut buf = vec![0u8; 16];
+        buf.extend_from_slice(b".target.example\0");
+        buf.extend_from_slice(b"SESSION\0");
+        buf.extend_from_slice(b"AbCdEf012345XXX\0");
+        buf.extend(vec![0u8; 16]);
+        let r = scan_heap_for_cookies(&buf);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].host, ".target.example");
+        assert_eq!(r[0].name, "SESSION");
+        assert_eq!(r[0].value, "AbCdEf012345XXX");
     }
 }
