@@ -3,6 +3,7 @@ pub mod header;
 pub mod master;
 pub mod page;
 pub mod record;
+pub mod wal;
 
 pub use btree::walk_table;
 pub use header::{parse_header, DbHeader, TextEncoding};
