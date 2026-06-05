@@ -5,6 +5,7 @@
 pub mod blob;
 pub mod dpapi_decrypt;
 pub mod local_state;
+pub mod profile;
 pub mod sqlite;
 pub mod types;
 pub mod util;
