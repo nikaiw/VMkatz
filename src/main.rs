@@ -2421,6 +2421,44 @@ fn run_with_system<L: PhysicalMemory>(
 
     output_credentials(&credentials, args);
 
+    #[cfg(feature = "chrome")]
+    {
+        if args.chrome {
+            // Build a HybridKeyring from any cleartext DPAPI master keys recovered
+            // from LSASS memory, then run chrome disk extraction on --disk if provided.
+            let pairs: Vec<(String, Vec<u8>)> = credentials
+                .iter()
+                .flat_map(|c| c.dpapi.iter())
+                .map(|d| (d.guid.clone(), d.key.clone()))
+                .collect();
+            let keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
+            if !keyring.is_empty() {
+                if let Some(disk_str) = args.disk.as_deref() {
+                    let disk_path = std::path::Path::new(disk_str);
+                    match vmkatz::chrome::runner::run_disk_with_keyring(
+                        disk_path,
+                        &keyring,
+                        None::<&vmkatz::chrome::hybrid::HybridKeyring>,
+                    ) {
+                        Ok(summary) => {
+                            let out =
+                                vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                            if !out.trim().is_empty() {
+                                println!("{}", out);
+                            }
+                        }
+                        Err(e) => log::warn!("chrome (hybrid) failed: {}", e),
+                    }
+                } else {
+                    log::info!(
+                        "[chrome] {} DPAPI MKs in memory but no --disk supplied; pass --disk <vmdk> to decrypt",
+                        keyring.len()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
