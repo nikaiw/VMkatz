@@ -185,6 +185,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     carve: bool,
 
+    /// Extract browser secrets (Chromium + Firefox). Requires --features chrome at build time.
+    #[arg(long, default_value_t = false)]
+    chrome: bool,
+
     /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
     #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "DEVICE")]

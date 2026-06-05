@@ -23,3 +23,5 @@ pub mod vbox;
 #[cfg(feature = "vmware")]
 pub mod vmware;
 pub mod windows;
+#[cfg(feature = "chrome")]
+pub mod chrome;
