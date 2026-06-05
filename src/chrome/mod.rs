@@ -2,6 +2,7 @@
 //!
 //! See `docs/plans/2026-06-05-chrome-module-design.md` for full spec.
 
+pub mod sqlite;
 pub mod types;
 pub mod util;
 
