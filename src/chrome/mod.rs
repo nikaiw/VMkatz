@@ -3,6 +3,7 @@
 //! See `docs/plans/2026-06-05-chrome-module-design.md` for full spec.
 
 pub mod blob;
+pub mod disk;
 pub mod dpapi_decrypt;
 pub mod local_state;
 pub mod profile;
