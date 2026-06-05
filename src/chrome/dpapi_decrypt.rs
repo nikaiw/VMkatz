@@ -7,6 +7,7 @@ use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
+use sha1::{Digest, Sha1};
 use sha2::Sha512;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -161,11 +162,13 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
             blob.crypt_alg, blob.hmac_alg
         )));
     }
-    // Derive session key: HMAC-SHA512(key=masterkey, data=salt).
-    // First 32 bytes = AES key, next 16 = IV.
+    // Derive session key: HMAC-SHA512(key=SHA1(masterkey), data=salt).
+    // DPAPI hashes the 64-byte masterkey down to 20 bytes via SHA-1 before HMAC.
+    // First 32 bytes of the 64-byte HMAC output = AES key, next 16 = IV.
     type HmacSha512 = Hmac<Sha512>;
+    let mk_sha1 = Sha1::digest(masterkey);
     let mut h =
-        HmacSha512::new_from_slice(masterkey).map_err(|_| Error::Parse("hmac key".into()))?;
+        HmacSha512::new_from_slice(&mk_sha1).map_err(|_| Error::Parse("hmac key".into()))?;
     h.update(blob.salt);
     let session = h.finalize().into_bytes();
 
