@@ -41,6 +41,9 @@ pub enum VmkatzError {
     #[error("ELF error: {0}")]
     ElfError(String),
 
+    #[error("Parse error: {0}")]
+    Parse(String),
+
 }
 
 pub type Result<T> = std::result::Result<T, VmkatzError>;
