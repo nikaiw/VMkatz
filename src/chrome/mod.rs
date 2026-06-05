@@ -16,6 +16,8 @@ pub mod sqlite;
 pub mod types;
 pub mod util;
 
+pub mod firefox;
+
 pub use types::{
     AutofillEntry, AutofillKind, Browser, BrowserProfile, ChromeFindings, ChromeSource, Cookie,
     SavedPassword,
