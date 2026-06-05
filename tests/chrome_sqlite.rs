@@ -54,3 +54,26 @@ fn walk_logins_table_finds_alice_and_bob() {
     assert!(users.contains(&"alice".to_string()), "got {:?}", users);
     assert!(users.contains(&"bob".to_string()), "got {:?}", users);
 }
+
+#[test]
+fn wal_replay_surfaces_uncheckpointed_rows() {
+    use vmkatz::chrome::sqlite::walk_table;
+    let db = std::fs::read("tests/fixtures/chrome/sqlite/with_wal.sqlite").unwrap();
+    let wal = std::fs::read("tests/fixtures/chrome/sqlite/with_wal.sqlite-wal").unwrap();
+    let pager = Pager::open_with_wal(&db, &wal).unwrap();
+    let root = pager.root_of("logins").unwrap().unwrap();
+    let mut urls = Vec::new();
+    walk_table(&pager, root, |_, cols| {
+        if let Some(u) = cols.get(0).and_then(|c| c.as_text()) {
+            urls.push(u.to_string());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(urls.iter().any(|u| u.contains("baseline")), "got {:?}", urls);
+    assert!(
+        urls.iter().any(|u| u.contains("wal_only")),
+        "WAL replay failed; got {:?}",
+        urls
+    );
+}
