@@ -15,6 +15,7 @@ sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
 carve = []
 dump = []
 vmfs = ["sam"]
+chrome = ["sam", "dep:aes-gcm", "dep:serde_json"]
 
 [profile.release]
 opt-level = "z"
@@ -37,3 +38,5 @@ anyhow = "1"
 hex = "0.4"
 log = "0.4"
 memchr = "2"
+aes-gcm = { version = "0.10", optional = true }
+serde_json = { version = "1", optional = true }
