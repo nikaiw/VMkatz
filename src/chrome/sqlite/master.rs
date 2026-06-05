@@ -1,3 +1,4 @@
+use super::btree::walk_table;
 use super::page::Pager;
 use crate::error::Result;
 
@@ -11,12 +12,39 @@ pub struct MasterEntry {
 }
 
 impl<'a> Pager<'a> {
-    /// Walks page 1 as the sqlite_master table B-tree leaf, returns table entries.
-    /// (Small DBs keep sqlite_master entirely in page 1's leaf. For now we error if
-    /// sqlite_master spans an interior node — extended in Task 4.)
+    /// Walk sqlite_master (root page 1) and return every `table` entry.
     pub fn list_tables(&self) -> Result<Vec<MasterEntry>> {
-        // Implemented in Task 3 once the record decoder exists; the full walk lives in
-        // src/chrome/sqlite/btree.rs (Task 4).
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        walk_table(self, 1, |_rowid, cols| {
+            // sqlite_master columns: type, name, tbl_name, rootpage, sql
+            if cols.len() < 5 {
+                return Ok(());
+            }
+            let kind = cols[0].as_text().unwrap_or("").to_string();
+            let name = cols[1].as_text().unwrap_or("").to_string();
+            let tbl_name = cols[2].as_text().unwrap_or("").to_string();
+            let rootpage = cols[3].as_int().unwrap_or(0);
+            let sql = cols[4].as_text().unwrap_or("").to_string();
+            if kind == "table" {
+                out.push(MasterEntry {
+                    kind,
+                    name,
+                    tbl_name,
+                    rootpage,
+                    sql,
+                });
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Look up a table by name and return its root page number, if any.
+    pub fn root_of(&self, table: &str) -> Result<Option<u32>> {
+        let tables = self.list_tables()?;
+        Ok(tables
+            .iter()
+            .find(|t| t.name == table)
+            .map(|t| t.rootpage as u32))
     }
 }
