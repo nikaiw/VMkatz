@@ -126,6 +126,12 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     Some(ProfileKeys { v10, v20 })
 }
 
+/// SQLite type affinity can land a v10/v11/v20 blob in a TEXT column. Treat both
+/// when scanning row columns for the encrypted value.
+fn is_chrome_blob(b: &[u8]) -> bool {
+    matches!(classify(b), BlobScheme::V10 | BlobScheme::V11 | BlobScheme::V20)
+}
+
 /// Try v10/v11 then v20 against `blob`; return plaintext + which scheme produced it
 /// so callers can tag the source (`DiskDpapi` vs `DiskAbe`).
 fn decrypt_value(blob: &[u8], keys: &ProfileKeys) -> Option<(Vec<u8>, ChromeSource)> {
@@ -151,6 +157,7 @@ fn derive_v10_key<R: MasterkeyResolver>(raw: &[u8], mkr: &R) -> Option<[u8; 32]>
     let blob = parse_blob(&raw[5..]).ok()?;
     let mk = mkr.resolve(&blob.mk_guid_str)?;
     let pt = decrypt_blob(&blob, &mk).ok()?;
+    // pt is CBC plaintext with PKCS#7 padding; the v10 key is the first 32 bytes.
     if pt.len() < 32 {
         return None;
     }
@@ -175,12 +182,15 @@ fn extract_logins(
         None => return Ok(()),
     };
     walk_table(&pager, root, |_rid, cols| {
-        // logins schema (positional, Chrome >= 90):
-        //   0: origin_url TEXT, 1: action_url TEXT, 2: username_element TEXT,
-        //   3: username_value TEXT, 4: password_element TEXT, 5: password_value BLOB, ...
         let url = cols.get(0).and_then(Value::as_text).unwrap_or("").to_string();
         let username = cols.get(3).and_then(Value::as_text).unwrap_or("").to_string();
-        let blob = cols.get(5).and_then(Value::as_blob).unwrap_or(&[]);
+        // Chrome stores the encrypted password as BLOB in the schema, but SQLite type
+        // affinity can land it as TEXT. Match by v10/v11/v20 prefix across both.
+        let blob: &[u8] = cols.iter().find_map(|c| match c {
+            Value::Blob(b) if is_chrome_blob(b) => Some(b.as_slice()),
+            Value::Text(t) if is_chrome_blob(t.as_bytes()) => Some(t.as_bytes()),
+            _ => None,
+        }).unwrap_or(&[]);
         if let Some((pt, source)) = decrypt_value(blob, keys) {
             let password = String::from_utf8_lossy(&pt).into_owned();
             out.passwords.push(SavedPassword {
@@ -236,7 +246,11 @@ fn extract_cookies(
             .find(|s| !s.is_empty() && !s.contains('.') && !s.starts_with('/'))
             .unwrap_or("")
             .to_string();
-        let blob = cols.iter().find_map(Value::as_blob).unwrap_or(&[]);
+        let blob: &[u8] = cols.iter().find_map(|c| match c {
+            Value::Blob(b) if is_chrome_blob(b) => Some(b.as_slice()),
+            Value::Text(t) if is_chrome_blob(t.as_bytes()) => Some(t.as_bytes()),
+            _ => None,
+        }).unwrap_or(&[]);
         let exp_us = cols
             .iter()
             .filter_map(Value::as_int)
