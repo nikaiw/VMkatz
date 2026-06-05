@@ -189,6 +189,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     chrome: bool,
 
+    /// Emit chrome findings as JSON instead of pretty text.
+    #[arg(long, default_value_t = false)]
+    chrome_json: bool,
+
     /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
     #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "DEVICE")]
@@ -859,6 +863,25 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
             "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
             _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    #[cfg(feature = "chrome")]
+    {
+        if args.chrome {
+            match vmkatz::chrome::runner::run_disk(input_path) {
+                Ok(summary) => {
+                    if !summary.profiles.is_empty() || !summary.findings.is_empty() {
+                        found_anything = true;
+                    }
+                    let out =
+                        vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                    if !out.trim().is_empty() {
+                        println!("{}", out);
+                    }
+                }
+                Err(e) => log::warn!("chrome extraction failed: {}", e),
+            }
         }
     }
 
