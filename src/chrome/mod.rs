@@ -9,6 +9,7 @@ pub mod dpapi_decrypt;
 pub mod local_state;
 pub mod memory;
 pub mod profile;
+pub mod signatures;
 pub mod sqlite;
 pub mod types;
 pub mod util;
