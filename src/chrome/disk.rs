@@ -32,18 +32,26 @@ impl MasterkeyResolver for std::collections::HashMap<String, Vec<u8>> {
 /// Per-profile decryption keys, derived from `Local State`.
 struct ProfileKeys {
     v10: [u8; 32],
+    v20: Option<[u8; 32]>,
 }
 
-/// Top-level entrypoint. Discovers profiles, derives per-profile keys via `mk_resolver`,
-/// extracts passwords/cookies/autofill, returns ChromeFindings.
-pub fn extract_from_disk<T: FileTree, R: MasterkeyResolver>(
+/// Top-level entrypoint. Discovers profiles, derives per-profile keys via
+/// `user_resolver` (and optionally `system_resolver` for ABE/v20), extracts
+/// passwords/cookies/autofill, returns ChromeFindings.
+pub fn extract_from_disk<T, R, S>(
     tree: &mut T,
-    mk_resolver: &R,
-) -> Result<ChromeFindings> {
+    user_resolver: &R,
+    system_resolver: Option<&S>,
+) -> Result<ChromeFindings>
+where
+    T: FileTree,
+    R: MasterkeyResolver,
+    S: MasterkeyResolver,
+{
     let mut out = ChromeFindings::default();
     let profiles = discover_chromium(tree)?;
     for p in profiles {
-        match per_profile(&p, mk_resolver) {
+        match per_profile(&p, user_resolver, system_resolver) {
             Ok(mut findings) => {
                 out.passwords.append(&mut findings.passwords);
                 out.cookies.append(&mut findings.cookies);
@@ -57,9 +65,13 @@ pub fn extract_from_disk<T: FileTree, R: MasterkeyResolver>(
     Ok(out)
 }
 
-fn per_profile<R: MasterkeyResolver>(p: &DiscoveredProfile, mkr: &R) -> Result<ChromeFindings> {
+fn per_profile<R: MasterkeyResolver, S: MasterkeyResolver>(
+    p: &DiscoveredProfile,
+    user_resolver: &R,
+    system_resolver: Option<&S>,
+) -> Result<ChromeFindings> {
     let mut out = ChromeFindings::default();
-    let keys = match derive_keys(p, mkr) {
+    let keys = match derive_keys(p, user_resolver, system_resolver) {
         Some(k) => k,
         None => return Ok(out),
     };
@@ -70,7 +82,6 @@ fn per_profile<R: MasterkeyResolver>(p: &DiscoveredProfile, mkr: &R) -> Result<C
             p.artifacts.login_data_wal.as_deref(),
             &keys,
             &p.profile,
-            ChromeSource::DiskDpapi,
             &mut out,
         )?;
     }
@@ -80,7 +91,6 @@ fn per_profile<R: MasterkeyResolver>(p: &DiscoveredProfile, mkr: &R) -> Result<C
             p.artifacts.cookies_wal.as_deref(),
             &keys,
             &p.profile,
-            ChromeSource::DiskDpapi,
             &mut out,
         )?;
     }
@@ -97,12 +107,39 @@ fn per_profile<R: MasterkeyResolver>(p: &DiscoveredProfile, mkr: &R) -> Result<C
     Ok(out)
 }
 
-fn derive_keys<R: MasterkeyResolver>(p: &DiscoveredProfile, mkr: &R) -> Option<ProfileKeys> {
+fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
+    p: &DiscoveredProfile,
+    user_resolver: &R,
+    system_resolver: Option<&S>,
+) -> Option<ProfileKeys> {
     let ls_bytes = p.artifacts.local_state.as_ref()?;
     let ls_str = std::str::from_utf8(ls_bytes).ok()?;
     let ls = local_state::parse(ls_str).ok()?;
-    let v10 = derive_v10_key(ls.encrypted_key.as_deref()?, mkr)?;
-    Some(ProfileKeys { v10 })
+    let v10 = derive_v10_key(ls.encrypted_key.as_deref()?, user_resolver)?;
+    let v20 = if let (Some(appb), Some(sys)) =
+        (ls.app_bound_encrypted_key.as_deref(), system_resolver)
+    {
+        crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys).ok()
+    } else {
+        None
+    };
+    Some(ProfileKeys { v10, v20 })
+}
+
+/// Try v10/v11 then v20 against `blob`; return plaintext + which scheme produced it
+/// so callers can tag the source (`DiskDpapi` vs `DiskAbe`).
+fn decrypt_value(blob: &[u8], keys: &ProfileKeys) -> Option<(Vec<u8>, ChromeSource)> {
+    match classify(blob) {
+        BlobScheme::V10 | BlobScheme::V11 => {
+            decrypt_v10(blob, &keys.v10).ok().map(|pt| (pt, ChromeSource::DiskDpapi))
+        }
+        BlobScheme::V20 => keys
+            .v20
+            .as_ref()
+            .and_then(|k| crate::chrome::abe::decrypt_v20(blob, k).ok())
+            .map(|pt| (pt, ChromeSource::DiskAbe)),
+        BlobScheme::Unknown => None,
+    }
 }
 
 /// Strip "DPAPI" prefix, run the masterkey chain via the resolver, decrypt blob,
@@ -127,7 +164,6 @@ fn extract_logins(
     wal: Option<&[u8]>,
     keys: &ProfileKeys,
     profile: &BrowserProfile,
-    src: ChromeSource,
     out: &mut ChromeFindings,
 ) -> Result<()> {
     let pager = match wal {
@@ -145,17 +181,15 @@ fn extract_logins(
         let url = cols.get(0).and_then(Value::as_text).unwrap_or("").to_string();
         let username = cols.get(3).and_then(Value::as_text).unwrap_or("").to_string();
         let blob = cols.get(5).and_then(Value::as_blob).unwrap_or(&[]);
-        if matches!(classify(blob), BlobScheme::V10 | BlobScheme::V11) {
-            if let Ok(pt) = decrypt_v10(blob, &keys.v10) {
-                let password = String::from_utf8_lossy(&pt).into_owned();
-                out.passwords.push(SavedPassword {
-                    profile: profile.clone(),
-                    url,
-                    username,
-                    password,
-                    source: src.clone(),
-                });
-            }
+        if let Some((pt, source)) = decrypt_value(blob, keys) {
+            let password = String::from_utf8_lossy(&pt).into_owned();
+            out.passwords.push(SavedPassword {
+                profile: profile.clone(),
+                url,
+                username,
+                password,
+                source,
+            });
         }
         Ok(())
     })
@@ -166,7 +200,6 @@ fn extract_cookies(
     wal: Option<&[u8]>,
     keys: &ProfileKeys,
     profile: &BrowserProfile,
-    src: ChromeSource,
     out: &mut ChromeFindings,
 ) -> Result<()> {
     let pager = match wal {
@@ -208,21 +241,19 @@ fn extract_cookies(
             .iter()
             .filter_map(Value::as_int)
             .find(|n| *n > 10_000_000_000_000_000);
-        if matches!(classify(blob), BlobScheme::V10 | BlobScheme::V11) {
-            if let Ok(pt) = decrypt_v10(blob, &keys.v10) {
-                let value = strip_cookie_prefix(&pt);
-                out.cookies.push(Cookie {
-                    profile: profile.clone(),
-                    host,
-                    name,
-                    value,
-                    path,
-                    expires: exp_us.and_then(chrome_time_to_unix),
-                    http_only: false,
-                    secure: false,
-                    source: src.clone(),
-                });
-            }
+        if let Some((pt, source)) = decrypt_value(blob, keys) {
+            let value = strip_cookie_prefix(&pt);
+            out.cookies.push(Cookie {
+                profile: profile.clone(),
+                host,
+                name,
+                value,
+                path,
+                expires: exp_us.and_then(chrome_time_to_unix),
+                http_only: false,
+                secure: false,
+                source,
+            });
         }
         Ok(())
     })
@@ -298,7 +329,7 @@ mod tests {
     fn empty_disk_yields_empty_findings() {
         let mut t = EmptyTree;
         let kr: HashMap<String, Vec<u8>> = HashMap::new();
-        let f = extract_from_disk(&mut t, &kr).unwrap();
+        let f = extract_from_disk(&mut t, &kr, None::<&HashMap<String, Vec<u8>>>).unwrap();
         assert!(f.is_empty());
     }
 

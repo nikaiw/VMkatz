@@ -2,6 +2,7 @@
 //!
 //! See `docs/plans/2026-06-05-chrome-module-design.md` for full spec.
 
+pub mod abe;
 pub mod blob;
 pub mod disk;
 pub mod dpapi_decrypt;
