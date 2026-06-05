@@ -1,5 +1,9 @@
 use std::fmt;
 
+#[cfg(feature = "chrome")]
+use serde::Serialize;
+
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Browser {
     Chrome,
@@ -24,6 +28,7 @@ impl fmt::Display for Browser {
     }
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub enum ChromeSource {
     Memory { pid: u32, process: String },
@@ -32,6 +37,7 @@ pub enum ChromeSource {
     HybridMemKey { mk_guid: String },
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub struct BrowserProfile {
     pub browser: Browser,
@@ -40,6 +46,7 @@ pub struct BrowserProfile {
     pub path: String,
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub struct SavedPassword {
     pub profile: BrowserProfile,
@@ -49,6 +56,7 @@ pub struct SavedPassword {
     pub source: ChromeSource,
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub struct Cookie {
     pub profile: BrowserProfile,
@@ -62,6 +70,7 @@ pub struct Cookie {
     pub source: ChromeSource,
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub enum AutofillKind {
     FormField,
@@ -69,6 +78,7 @@ pub enum AutofillKind {
     Address,
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub struct AutofillEntry {
     pub profile: BrowserProfile,
@@ -77,6 +87,7 @@ pub struct AutofillEntry {
     pub source: ChromeSource,
 }
 
+#[cfg_attr(feature = "chrome", derive(Serialize))]
 #[derive(Debug, Default, Clone)]
 pub struct ChromeFindings {
     pub passwords: Vec<SavedPassword>,
