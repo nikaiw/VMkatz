@@ -64,3 +64,14 @@ $ vmkatz --disk disk.vmdk snapshot.vmsn
 Memory snapshots only capture physical RAM. Credentials that were paged to disk at snapshot time appear as `(paged out)`. The `--disk` flag reads pagefile.sys from the VM's virtual disk to resolve these.
 
 In **directory mode**, this happens automatically: VMkatz discovers both the snapshot and the disk image, and resolves paged memory without manual flags.
+
+## Browser secrets discovery (`--chrome`)
+Requires a build with `--features chrome`. Discovers Chromium and Firefox profiles per user and reports artifact presence. Plaintext decryption is partial; see the README note.
+
+```
+$ vmkatz --chrome disk.vmdk
+[+] Chrome: 2 user(s), 3 profile(s)
+  user1\Chrome\Default        Login Data  Cookies  Web Data  Local State
+  user1\Edge\Default          Login Data  Cookies  Local State
+  user2\Firefox\xxxx.default  logins.json key4.db
+```

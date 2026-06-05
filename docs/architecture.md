@@ -85,3 +85,7 @@ src/
     ├── mod.rs           PEK decryption, hash extraction pipeline
     └── ese.rs           JET Blue database primitives (pages, B+ trees, columns)
 ```
+
+## Chrome module (optional)
+
+Extracts browser secrets (passwords, cookies, autofill) from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera) and Firefox. Gated by the `chrome` Cargo feature (not in the default set) and the `--chrome` runtime flag; depends on `sam` for NTFS and DPAPI primitives. Combines three vectors: a pattern scan over `chrome.exe`/`msedge.exe`/`brave.exe` process memory, a full DPAPI chain on disk-resident SQLite (`Login Data`, `Cookies`, `Web Data`), and a hybrid path that reuses cleartext DPAPI master keys already lifted from LSASS. App-Bound Encryption (`v20` prefix, Chrome v127+) is handled in both disk and memory paths. Current status is partial — profile discovery and artifact enumeration land, but disk masterkey derivation and Firefox NSS decrypt are still in progress. See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md) for the full spec.

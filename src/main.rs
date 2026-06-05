@@ -90,6 +90,7 @@ use vmkatz::windows::process;
         vmkatz --dump lsass snapshot.vmsn           Dump LSASS as minidump for pypykatz\n  \
         vmkatz --dump lsass -o out.dmp snap.vmsn    Dump with custom output filename\n  \
         vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
+        vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
 )]
 struct Args {

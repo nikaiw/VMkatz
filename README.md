@@ -150,11 +150,25 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `carve` | Degraded extraction from partial/truncated memory | Yes |
 | `dump` | Process memory dump as minidump | Yes |
 | `vmfs` | VMFS-5/6 raw parser for ESXi SCSI devices. Requires `sam` | Yes |
+| `chrome` | Browser secrets extraction (Chromium + Firefox). Requires `sam` | No |
 
 ```bash
 cargo build --release                                              # Full build
 cargo build --release --no-default-features --features vmware      # VMware only
 cargo build --release --no-default-features --features "sam ntds.dit"  # Disk only
+cargo build --release --features chrome                            # Add chrome module
+```
+
+## Browser secrets (optional, partial)
+
+The optional `chrome` module discovers browser profiles (Chrome, Edge, Brave, Vivaldi, Opera, and Firefox) on a disk image and reports per-user artifact presence — `Login Data`, `Cookies`, `Web Data`, `Local State`, and Firefox `logins.json` / `key4.db`. It is gated by the `chrome` Cargo feature at build time and the `--chrome` runtime flag. Full DPAPI-chain decryption to plaintext is a work in progress: the disk path locates and parses the encrypted blobs, but masterkey derivation from on-disk DPAPI material is not yet wired through, and the Firefox NSS decrypt path is a scaffold. Expect discovery + artifact metadata, not plaintext passwords, in this release.
+
+```bash
+# Discover Chromium + Firefox profiles and artifacts on a disk
+./vmkatz --chrome disk.vmdk
+
+# JSON output for tooling
+./vmkatz --chrome --chrome-json disk.vmdk
 ```
 
 ## Documentation
