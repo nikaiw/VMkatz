@@ -35,6 +35,77 @@ pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
     })
 }
 
+/// Same as `run_disk` but takes a `MasterkeyResolver` to actually decrypt blobs.
+/// Returns ChromeFindings populated with decrypted passwords/cookies/autofill.
+pub fn run_disk_with_keyring<R: crate::chrome::disk::MasterkeyResolver>(
+    disk_path: &Path,
+    user_resolver: &R,
+    system_resolver: Option<&R>,
+) -> Result<DiscoverySummary> {
+    let profiles = discover_profiles(disk_path)?;
+    let mut tree = ArtifactsTree { profiles: &profiles };
+    let findings = crate::chrome::disk::extract_from_disk(&mut tree, user_resolver, system_resolver)
+        .unwrap_or_default();
+    Ok(DiscoverySummary { profiles, findings })
+}
+
+/// Build a `HybridKeyring` from any iterator of `(guid, masterkey_bytes)` pairs —
+/// typically sourced from LSASS DPAPI extraction (`Credential.dpapi`).
+pub fn keyring_from_pairs<I, S>(pairs: I) -> crate::chrome::hybrid::HybridKeyring
+where
+    I: IntoIterator<Item = (S, Vec<u8>)>,
+    S: Into<String>,
+{
+    let mut kr = crate::chrome::hybrid::HybridKeyring::new();
+    for (g, k) in pairs {
+        kr.insert(g.into(), k);
+    }
+    kr
+}
+
+/// In-memory FileTree backed by already-discovered ProfileArtifacts. Lets the
+/// orchestrator (`extract_from_disk`) decrypt without re-walking NTFS.
+struct ArtifactsTree<'a> {
+    profiles: &'a [DiscoveredProfile],
+}
+
+impl<'a> crate::chrome::profile::FileTree for ArtifactsTree<'a> {
+    fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
+        if p == "Users" {
+            let mut users: Vec<String> = self.profiles.iter().map(|d| d.profile.user.clone()).collect();
+            users.sort();
+            users.dedup();
+            return Ok(users);
+        }
+        for d in self.profiles {
+            let browser_root = d.profile.path.rsplit_once('\\').map(|(parent, _)| parent).unwrap_or("");
+            if p == browser_root {
+                return Ok(vec![d.profile.profile_name.clone()]);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn read_file(&mut self, p: &str) -> Result<Option<Vec<u8>>> {
+        for d in self.profiles {
+            let prof_path = &d.profile.path;
+            let browser_root = prof_path.rsplit_once('\\').map(|(parent, _)| parent).unwrap_or("");
+            if p == format!("{}\\Local State", browser_root) {
+                return Ok(d.artifacts.local_state.clone());
+            }
+            if p == format!("{}\\Login Data", prof_path) { return Ok(d.artifacts.login_data.clone()); }
+            if p == format!("{}\\Login Data-wal", prof_path) { return Ok(d.artifacts.login_data_wal.clone()); }
+            if p == format!("{}\\Network\\Cookies", prof_path) { return Ok(d.artifacts.cookies.clone()); }
+            if p == format!("{}\\Network\\Cookies-wal", prof_path) { return Ok(d.artifacts.cookies_wal.clone()); }
+            if p == format!("{}\\Cookies", prof_path) { return Ok(d.artifacts.cookies.clone()); }
+            if p == format!("{}\\Cookies-wal", prof_path) { return Ok(d.artifacts.cookies_wal.clone()); }
+            if p == format!("{}\\Web Data", prof_path) { return Ok(d.artifacts.web_data.clone()); }
+            if p == format!("{}\\Web Data-wal", prof_path) { return Ok(d.artifacts.web_data_wal.clone()); }
+        }
+        Ok(None)
+    }
+}
+
 fn discover_profiles(disk_path: &Path) -> Result<Vec<DiscoveredProfile>> {
     let mut disk = crate::disk::open_disk(disk_path)?;
 
@@ -126,8 +197,24 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
             s.push_str("[Chrome] no profiles found\n");
         } else {
             for p in &summary.profiles {
+                let mk_guid = p
+                    .artifacts
+                    .local_state
+                    .as_ref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| crate::chrome::local_state::parse(s).ok())
+                    .and_then(|ls| ls.encrypted_key)
+                    .and_then(|raw| {
+                        if raw.len() < 5 || &raw[..5] != b"DPAPI" {
+                            return None;
+                        }
+                        crate::chrome::dpapi_decrypt::parse_blob(&raw[5..])
+                            .ok()
+                            .map(|b| b.mk_guid_str)
+                    })
+                    .unwrap_or_else(|| "?".into());
                 s.push_str(&format!(
-                    "[Chrome] {}/{} ({})\n  artifacts: local_state={} login_data={} cookies={} web_data={}\n  path: {}\n",
+                    "[Chrome] {}/{} ({})\n  artifacts: local_state={} login_data={} cookies={} web_data={}\n  mk_guid: {}\n  path: {}\n",
                     p.profile.user,
                     p.profile.profile_name,
                     p.profile.browser,
@@ -135,6 +222,7 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
                     p.artifacts.login_data.as_ref().map(|v| v.len()).unwrap_or(0),
                     p.artifacts.cookies.as_ref().map(|v| v.len()).unwrap_or(0),
                     p.artifacts.web_data.as_ref().map(|v| v.len()).unwrap_or(0),
+                    mk_guid,
                     p.profile.path,
                 ));
             }
