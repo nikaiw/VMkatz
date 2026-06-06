@@ -194,6 +194,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     chrome_json: bool,
 
+    /// Extra password candidate to try when decrypting user DPAPI masterkey
+    /// files (repeatable). Useful when the password isn't in LSA — e.g. you
+    /// got it from cracking, pivoting, or just know it's a vuln-lab default.
+    #[arg(long, value_name = "PASSWORD")]
+    chrome_password: Vec<String>,
+
     /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
     #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "DEVICE")]
@@ -682,7 +688,11 @@ fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow:
                 }
                 #[cfg(feature = "chrome")]
                 if args.chrome {
-                    match vmkatz::chrome::runner::run_reader(&mut disk, &secrets) {
+                    match vmkatz::chrome::runner::run_reader(
+                        &mut disk,
+                        &secrets,
+                        &args.chrome_password,
+                    ) {
                         Ok(summary) => {
                             let out = vmkatz::chrome::runner::render_summary(
                                 &summary,
@@ -885,7 +895,10 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(feature = "chrome")]
     {
         if args.chrome {
-            match vmkatz::chrome::runner::run_disk(input_path) {
+            match vmkatz::chrome::runner::run_disk_with_passwords(
+                input_path,
+                &args.chrome_password,
+            ) {
                 Ok(summary) => {
                     if !summary.profiles.is_empty() || !summary.findings.is_empty() {
                         found_anything = true;
@@ -2451,8 +2464,11 @@ fn run_with_system<L: PhysicalMemory>(
                 // Also build disk-side keyrings (user MK from NT hash, SYSTEM MK from DPAPI_SYSTEM)
                 // and compose them with the memory keyring so a miss in one falls back to the other.
                 let (disk_user_kr, disk_sys_kr) =
-                    vmkatz::chrome::runner::build_keyrings_from_disk(disk_path)
-                        .unwrap_or_else(|e| {
+                    vmkatz::chrome::runner::build_keyrings_from_disk_with_passwords(
+                        disk_path,
+                        &args.chrome_password,
+                    )
+                    .unwrap_or_else(|e| {
                             log::info!("[chrome] disk keyrings unavailable: {}", e);
                             (
                                 vmkatz::chrome::hybrid::HybridKeyring::new(),

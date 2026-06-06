@@ -33,12 +33,16 @@ pub struct DiscoverySummary {
 /// Reader-based variant for callers that already have a disk reader open (e.g.
 /// the VMFS-backed flat-VMDK flow on ESXi). Skips the `disk::open_disk` call and
 /// uses caller-supplied SAM/LSA secrets instead of re-extracting them.
+///
+/// `extra_passwords` are tried in addition to every LSA-recovered plaintext when
+/// decrypting user DPAPI masterkey files.
 pub fn run_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     secrets: &crate::sam::DiskSecrets,
+    extra_passwords: &[String],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles_in_reader(reader)?;
-    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets);
+    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets, extra_passwords);
     log::info!(
         "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
         user_kr.len(),
@@ -52,10 +56,20 @@ pub fn run_reader<R: std::io::Read + std::io::Seek>(
 }
 
 pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
+    run_disk_with_passwords(disk_path, &[])
+}
+
+/// Same as `run_disk` but supplies extra password candidates to try when
+/// decrypting user MK files (in addition to LSA-recovered plaintext).
+pub fn run_disk_with_passwords(
+    disk_path: &Path,
+    extra_passwords: &[String],
+) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles(disk_path)?;
-    // Try the full on-disk DPAPI chain: SAM NT hashes + LSA DPAPI_SYSTEM derive
-    // the user/system masterkey keyrings. On any failure, log and return discovery-only.
-    let (user_kr, system_kr) = match build_keyrings_from_disk(disk_path) {
+    let (user_kr, system_kr) = match build_keyrings_from_disk_with_passwords(
+        disk_path,
+        extra_passwords,
+    ) {
         Ok(p) => p,
         Err(e) => {
             log::info!("[chrome] disk-only keyrings unavailable: {}", e);
@@ -362,17 +376,26 @@ fn is_version_dir(name: &str) -> bool {
 pub fn build_keyrings_from_disk(
     disk_path: &Path,
 ) -> Result<(HybridKeyring, HybridKeyring)> {
+    build_keyrings_from_disk_with_passwords(disk_path, &[])
+}
+
+pub fn build_keyrings_from_disk_with_passwords(
+    disk_path: &Path,
+    extra_passwords: &[String],
+) -> Result<(HybridKeyring, HybridKeyring)> {
     let secrets = crate::sam::extract_disk_secrets(disk_path)?;
     let mut disk = crate::disk::open_disk(disk_path)?;
-    Ok(build_keyrings_with_secrets(&mut disk, &secrets))
+    Ok(build_keyrings_with_secrets(&mut disk, &secrets, extra_passwords))
 }
 
 /// Reader-based + already-extracted-secrets variant of `build_keyrings_from_disk`.
 /// Use this when SAM/LSA were extracted from the same reader (e.g. VMFS path).
+/// `extra_passwords` are tried in addition to LSA-recovered plaintext.
 /// Never errors; returns empty keyrings on any failure.
 fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
     secrets: &crate::sam::DiskSecrets,
+    extra_passwords: &[String],
 ) -> (HybridKeyring, HybridKeyring) {
     let mut nt_hash_by_rid: HashMap<u32, [u8; 16]> = HashMap::new();
     for entry in &secrets.sam_entries {
@@ -390,9 +413,9 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     });
 
     // Collect every plaintext password available in LSA — `DefaultPassword`
-    // (auto-logon) plus every `_SC_*` service-account password. Admins often
-    // reuse credentials, so any of these can unlock a user MK file.
-    let mut password_candidates: Vec<String> = Vec::new();
+    // (auto-logon) plus every `_SC_*` service-account password — plus any
+    // caller-supplied candidates (`--chrome-password`).
+    let mut password_candidates: Vec<String> = extra_passwords.to_vec();
     for s in &secrets.lsa_secrets {
         match &s.parsed {
             crate::sam::lsa::LsaSecretType::DefaultPassword { password } => {
