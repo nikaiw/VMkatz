@@ -169,12 +169,30 @@ pub fn extract_crypto_keys(
         log::debug!("  hAesKey global at: 0x{:x}", aes_addr);
 
         // Read IV (16 bytes directly from the global)
-        let iv: [u8; 16] = match vmem.read_virt_bytes(iv_addr, 16) {
+        let iv_raw: [u8; 16] = match vmem.read_virt_bytes(iv_addr, 16) {
             Ok(v) => match v.try_into() {
                 Ok(arr) => arr,
                 Err(_) => continue,
             },
             Err(_) => continue,
+        };
+        // The IV global's page can be paged out — reads return zeros and
+        // silently corrupt the first CBC block of every cred decrypt. Detect
+        // and recover by scanning .data for a non-zero, high-entropy candidate.
+        let iv: [u8; 16] = if iv_raw.iter().all(|&b| b == 0) {
+            log::info!(
+                "IV global at 0x{:x} is all zeros (page paged out); scanning .data for fallback",
+                iv_addr
+            );
+            match recover_iv_from_data(vmem, &pe, lsasrv_base, des_addr) {
+                Some(real_iv) => real_iv,
+                None => {
+                    log::warn!("IV recovery failed; skipping this offset set");
+                    continue;
+                }
+            }
+        } else {
+            iv_raw
         };
         log::debug!("  IV: {}", hex::encode(iv));
 
@@ -325,6 +343,63 @@ fn extract_crypto_keys_data_fallback(
         des_key,
         aes_key,
     })
+}
+
+/// Best-effort IV recovery when the LEA-resolved IV global is paged out.
+/// Reads the entire .data section and searches for plausible 16-byte IV
+/// candidates (non-zero, non-pointer, high entropy), preferring those near
+/// the BCrypt handle pointer at `anchor_va`. Returns None if all pages around
+/// any plausible candidate are also paged out.
+fn recover_iv_from_data(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    lsasrv_base: u64,
+    anchor_va: u64,
+) -> Option<[u8; 16]> {
+    let data_sec = pe.find_section(".data")?;
+    let data_base = lsasrv_base + data_sec.virtual_address as u64;
+    let data_size = data_sec.virtual_size as usize;
+    let data = vmem.read_virt_bytes(data_base, data_size).ok()?;
+
+    let anchor_off = anchor_va.checked_sub(data_base)? as usize;
+    let max_radius = data_size.max(anchor_off + 1);
+
+    // Walk outward from the anchor in 8-byte steps; first plausible candidate wins.
+    for radius in (0..max_radius).step_by(8) {
+        for sign in [1isize, -1] {
+            let off_signed = anchor_off as isize + sign * radius as isize;
+            if off_signed < 0 || off_signed as usize + 16 > data_size {
+                continue;
+            }
+            let off = off_signed as usize;
+            let candidate = &data[off..off + 16];
+            if candidate.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let v0 = super::types::read_u64_le(candidate, 0).unwrap_or(0);
+            if v0 > 0x10000 && (v0 >> 48 == 0 || v0 >> 48 == 0xFFFF) && v0 & 0x7 == 0 {
+                continue;
+            }
+            let v1 = super::types::read_u64_le(candidate, 8).unwrap_or(0);
+            if v1 > 0x10000 && (v1 >> 48 == 0 || v1 >> 48 == 0xFFFF) && v1 & 0x7 == 0 {
+                continue;
+            }
+            if count_unique_bytes(candidate) < 8 {
+                continue;
+            }
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(candidate);
+            log::info!(
+                "IV recovered at .data+0x{:x} (radius {}): {}",
+                off, radius, hex::encode(iv)
+            );
+            return Some(iv);
+        }
+        if radius == 0 {
+            // Both signs at radius 0 are the same point; don't double-check.
+        }
+    }
+    None
 }
 
 /// Find the InitializationVector in .data near the BCrypt handle globals.
