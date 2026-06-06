@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::chrome::abe_keys::BrowserKeyMap;
 use crate::chrome::hybrid::HybridKeyring;
 use crate::chrome::output::{render, Format};
 use crate::chrome::profile::{discover_chromium, DiscoveredProfile};
@@ -30,7 +31,7 @@ pub struct DiscoverySummary {
 /// paths to enumerate browser profiles. Returns the discovery summary; callers
 /// pretty-print or JSON-serialize via [`render_summary`].
 pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
-    let profiles = discover_profiles(disk_path)?;
+    let (profiles, key_map) = discover_profiles(disk_path)?;
     // Try the full on-disk DPAPI chain: SAM NT hashes + LSA DPAPI_SYSTEM derive
     // the user/system masterkey keyrings. On any failure, log and return discovery-only.
     let (user_kr, system_kr) = match build_keyrings_from_disk(disk_path) {
@@ -50,7 +51,7 @@ pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
     );
     let mut tree = ArtifactsTree { profiles: &profiles };
     let findings =
-        crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr))
+        crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr), &key_map)
             .unwrap_or_default();
     Ok(DiscoverySummary { profiles, findings })
 }
@@ -66,10 +67,15 @@ where
     U: crate::chrome::disk::MasterkeyResolver,
     S: crate::chrome::disk::MasterkeyResolver,
 {
-    let profiles = discover_profiles(disk_path)?;
+    let (profiles, key_map) = discover_profiles(disk_path)?;
     let mut tree = ArtifactsTree { profiles: &profiles };
-    let findings = crate::chrome::disk::extract_from_disk(&mut tree, user_resolver, system_resolver)
-        .unwrap_or_default();
+    let findings = crate::chrome::disk::extract_from_disk(
+        &mut tree,
+        user_resolver,
+        system_resolver,
+        &key_map,
+    )
+    .unwrap_or_default();
     Ok(DiscoverySummary { profiles, findings })
 }
 
@@ -130,7 +136,7 @@ impl<'a> crate::chrome::profile::FileTree for ArtifactsTree<'a> {
     }
 }
 
-fn discover_profiles(disk_path: &Path) -> Result<Vec<DiscoveredProfile>> {
+fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, BrowserKeyMap)> {
     let mut disk = crate::disk::open_disk(disk_path)?;
 
     // Reuse the sam partition scanner: handles MBR + GPT + BitLocker detection.
@@ -158,23 +164,30 @@ fn discover_profiles(disk_path: &Path) -> Result<Vec<DiscoveredProfile>> {
                 continue;
             }
         };
-        let mut tree = crate::chrome::profile::NtfsTree {
-            ntfs: &ntfs,
-            reader: &mut part_reader,
+        let profiles = {
+            let mut tree = crate::chrome::profile::NtfsTree {
+                ntfs: &ntfs,
+                reader: &mut part_reader,
+            };
+            match discover_chromium(&mut tree) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(format!("discover at 0x{:x}: {}", part_offset, e));
+                    continue;
+                }
+            }
         };
-        match discover_chromium(&mut tree) {
-            Ok(profiles) if !profiles.is_empty() => return Ok(profiles),
-            Ok(_) => {
-                // NTFS parsed but no Chromium profiles on this partition; try next.
-                log::info!(
-                    "[chrome] no profiles on NTFS partition at 0x{:x}",
-                    part_offset
-                );
-            }
-            Err(e) => {
-                last_err = Some(format!("discover at 0x{:x}: {}", part_offset, e));
-            }
+        if profiles.is_empty() {
+            log::info!(
+                "[chrome] no profiles on NTFS partition at 0x{:x}",
+                part_offset
+            );
+            continue;
         }
+        // We have profiles on this partition; opportunistically scan the same
+        // partition for elevation_service.exe binaries to build a fresh key map.
+        let key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
+        return Ok((profiles, key_map));
     }
 
     if let Some(msg) = last_err {
@@ -182,7 +195,138 @@ fn discover_profiles(disk_path: &Path) -> Result<Vec<DiscoveredProfile>> {
     }
     // No profiles found is not an error — return empty list so the caller can
     // print a friendly "no profiles found" message.
-    Ok(Vec::new())
+    Ok((Vec::new(), BrowserKeyMap::fallback()))
+}
+
+/// Browser-specific elevation_service.exe locations to probe. Each tuple is
+/// `(browser_label, parent_dir, exe_filename)`. The `Application` subdirectory
+/// under `parent_dir` holds versioned subdirs (e.g. `135.0.7049.115`); we walk
+/// each version subdir looking for `exe_filename`.
+const ELEVATION_PATHS: &[(&str, &str, &str)] = &[
+    (
+        "chrome",
+        r"Program Files\Google\Chrome\Application",
+        "elevation_service.exe",
+    ),
+    (
+        "chrome",
+        r"Program Files (x86)\Google\Chrome\Application",
+        "elevation_service.exe",
+    ),
+    (
+        "brave",
+        r"Program Files\BraveSoftware\Brave-Browser\Application",
+        "brave_browser_elevation_service.exe",
+    ),
+    (
+        "brave",
+        r"Program Files (x86)\BraveSoftware\Brave-Browser\Application",
+        "brave_browser_elevation_service.exe",
+    ),
+    (
+        "vivaldi",
+        r"Program Files\Vivaldi\Application",
+        "elevation_service.exe",
+    ),
+    (
+        "vivaldi",
+        r"Program Files (x86)\Vivaldi\Application",
+        "elevation_service.exe",
+    ),
+    (
+        "opera",
+        r"Program Files\Opera",
+        "elevation_service.exe",
+    ),
+    (
+        "opera",
+        r"Program Files (x86)\Opera",
+        "elevation_service.exe",
+    ),
+];
+
+/// Walk known browser install dirs on an already-open NTFS partition, looking
+/// for `elevation_service.exe` (or Brave's variant). Returns a merged keymap.
+/// Falls back to Chrome 135 hardcoded keys if no binary is found.
+fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
+    ntfs: &ntfs::Ntfs,
+    reader: &mut R,
+) -> BrowserKeyMap {
+    let root = match ntfs.root_directory(reader) {
+        Ok(r) => r,
+        Err(_) => return BrowserKeyMap::fallback(),
+    };
+    let mut merged = BrowserKeyMap {
+        entries: Vec::new(),
+        fallback: false,
+    };
+    for (browser, parent_dir, exe_name) in ELEVATION_PATHS {
+        let app_dir = match crate::sam::navigate_to_dir(ntfs, &root, reader, parent_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let version_entries = match crate::sam::list_directory(ntfs, &app_dir, reader) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for (ver_name, is_dir) in version_entries {
+            if !is_dir || !is_version_dir(&ver_name) {
+                continue;
+            }
+            let ver_dir = match crate::sam::find_entry(ntfs, &app_dir, reader, &ver_name) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let exe_file = match crate::sam::find_entry(ntfs, &ver_dir, reader, exe_name) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let exe_bytes = match crate::sam::read_file_data(&exe_file, reader) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = BrowserKeyMap::from_pe_or_fallback(&exe_bytes);
+            if parsed.fallback {
+                log::info!(
+                    "[chrome] {} {}\\{} parse miss (using fallback)",
+                    browser,
+                    parent_dir,
+                    ver_name
+                );
+                continue;
+            }
+            log::info!(
+                "[chrome] extracted {} ABE keys from {} {}\\{}\\{}",
+                parsed.entries.len(),
+                browser,
+                parent_dir,
+                ver_name,
+                exe_name
+            );
+            let pre = merged.entries.len();
+            let added = merged.merge(parsed);
+            if !added && pre > 0 {
+                log::info!(
+                    "[chrome] {} keys overlap existing slots, keeping first match",
+                    browser
+                );
+            }
+        }
+    }
+    if merged.entries.is_empty() {
+        log::info!("[chrome] no elevation_service.exe found, using Chrome 135 fallback keys");
+        return BrowserKeyMap::fallback();
+    }
+    merged
+}
+
+/// Is `name` a dotted-decimal version directory like `135.0.7049.115`?
+fn is_version_dir(name: &str) -> bool {
+    !name.is_empty()
+        && name.contains('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Walk the disk, decrypt every accessible DPAPI masterkey file using SAM- and

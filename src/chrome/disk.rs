@@ -3,6 +3,7 @@
 //! Walks profile discovery, derives per-profile v10/v11 keys from `Local State`
 //! using a caller-provided masterkey resolver, decrypts SQLite blobs.
 
+use crate::chrome::abe_keys::BrowserKeyMap;
 use crate::chrome::blob::{classify, BlobScheme};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::chrome::local_state;
@@ -42,6 +43,7 @@ pub fn extract_from_disk<T, R, S>(
     tree: &mut T,
     user_resolver: &R,
     system_resolver: Option<&S>,
+    key_map: &BrowserKeyMap,
 ) -> Result<ChromeFindings>
 where
     T: FileTree,
@@ -51,7 +53,7 @@ where
     let mut out = ChromeFindings::default();
     let profiles = discover_chromium(tree)?;
     for p in profiles {
-        match per_profile(&p, user_resolver, system_resolver) {
+        match per_profile(&p, user_resolver, system_resolver, key_map) {
             Ok(mut findings) => {
                 out.passwords.append(&mut findings.passwords);
                 out.cookies.append(&mut findings.cookies);
@@ -69,9 +71,10 @@ fn per_profile<R: MasterkeyResolver, S: MasterkeyResolver>(
     p: &DiscoveredProfile,
     user_resolver: &R,
     system_resolver: Option<&S>,
+    key_map: &BrowserKeyMap,
 ) -> Result<ChromeFindings> {
     let mut out = ChromeFindings::default();
-    let keys = match derive_keys(p, user_resolver, system_resolver) {
+    let keys = match derive_keys(p, user_resolver, system_resolver, key_map) {
         Some(k) => k,
         None => return Ok(out),
     };
@@ -111,6 +114,7 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     p: &DiscoveredProfile,
     user_resolver: &R,
     system_resolver: Option<&S>,
+    key_map: &BrowserKeyMap,
 ) -> Option<ProfileKeys> {
     let ls_bytes = p.artifacts.local_state.as_ref()?;
     let ls_str = std::str::from_utf8(ls_bytes).ok()?;
@@ -119,7 +123,12 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     let v20 = if let (Some(appb), Some(sys)) =
         (ls.app_bound_encrypted_key.as_deref(), system_resolver)
     {
-        match crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys) {
+        match crate::chrome::abe::unwrap_app_bound_with_resolvers(
+            appb,
+            user_resolver,
+            sys,
+            key_map,
+        ) {
             Ok(k) => Some(k),
             Err(e) => {
                 log::info!("[chrome] {} v20 unwrap failed: {}", p.profile.path, e);
@@ -354,7 +363,8 @@ mod tests {
     fn empty_disk_yields_empty_findings() {
         let mut t = EmptyTree;
         let kr: HashMap<String, Vec<u8>> = HashMap::new();
-        let f = extract_from_disk(&mut t, &kr, None::<&HashMap<String, Vec<u8>>>).unwrap();
+        let km = BrowserKeyMap::fallback();
+        let f = extract_from_disk(&mut t, &kr, None::<&HashMap<String, Vec<u8>>>, &km).unwrap();
         assert!(f.is_empty());
     }
 
