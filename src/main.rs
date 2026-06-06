@@ -2424,37 +2424,49 @@ fn run_with_system<L: PhysicalMemory>(
     #[cfg(feature = "chrome")]
     {
         if args.chrome {
-            // Build a HybridKeyring from any cleartext DPAPI master keys recovered
-            // from LSASS memory, then run chrome disk extraction on --disk if provided.
+            // Collect cleartext DPAPI master keys from LSASS memory.
             let pairs: Vec<(String, Vec<u8>)> = credentials
                 .iter()
                 .flat_map(|c| c.dpapi.iter())
                 .map(|d| (d.guid.clone(), d.key.clone()))
                 .collect();
-            let keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
-            if !keyring.is_empty() {
-                if let Some(disk_str) = args.disk.as_deref() {
-                    let disk_path = std::path::Path::new(disk_str);
-                    match vmkatz::chrome::runner::run_disk_with_keyring(
-                        disk_path,
-                        &keyring,
-                        None::<&vmkatz::chrome::hybrid::HybridKeyring>,
-                    ) {
-                        Ok(summary) => {
-                            let out =
-                                vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                            if !out.trim().is_empty() {
-                                println!("{}", out);
-                            }
+            let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
+            if let Some(disk_str) = args.disk.as_deref() {
+                let disk_path = std::path::Path::new(disk_str);
+                // Also build disk-side keyrings (user MK from NT hash, SYSTEM MK from DPAPI_SYSTEM)
+                // and compose them with the memory keyring so a miss in one falls back to the other.
+                let (disk_user_kr, disk_sys_kr) =
+                    vmkatz::chrome::runner::build_keyrings_from_disk(disk_path)
+                        .unwrap_or_else(|e| {
+                            log::info!("[chrome] disk keyrings unavailable: {}", e);
+                            (
+                                vmkatz::chrome::hybrid::HybridKeyring::new(),
+                                vmkatz::chrome::hybrid::HybridKeyring::new(),
+                            )
+                        });
+                let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
+                    primary: &mem_keyring,
+                    fallback: &disk_user_kr,
+                };
+                match vmkatz::chrome::runner::run_disk_with_keyring(
+                    disk_path,
+                    &user_resolver,
+                    Some(&disk_sys_kr),
+                ) {
+                    Ok(summary) => {
+                        let out =
+                            vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                        if !out.trim().is_empty() {
+                            println!("{}", out);
                         }
-                        Err(e) => log::warn!("chrome (hybrid) failed: {}", e),
                     }
-                } else {
-                    log::info!(
-                        "[chrome] {} DPAPI MKs in memory but no --disk supplied; pass --disk <vmdk> to decrypt",
-                        keyring.len()
-                    );
+                    Err(e) => log::warn!("chrome (hybrid) failed: {}", e),
                 }
+            } else if !mem_keyring.is_empty() {
+                log::info!(
+                    "[chrome] {} DPAPI MKs in memory but no --disk supplied; pass --disk <vmdk> to decrypt",
+                    mem_keyring.len()
+                );
             }
         }
     }
