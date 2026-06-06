@@ -2461,29 +2461,30 @@ fn run_with_system<L: PhysicalMemory>(
             let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
             if let Some(disk_str) = args.disk.as_deref() {
                 let disk_path = std::path::Path::new(disk_str);
-                // Also build disk-side keyrings (user MK from NT hash, SYSTEM MK from DPAPI_SYSTEM)
-                // and compose them with the memory keyring so a miss in one falls back to the other.
-                let (disk_user_kr, disk_sys_kr) =
-                    vmkatz::chrome::runner::build_keyrings_from_disk_with_passwords(
-                        disk_path,
-                        &args.chrome_password,
-                    )
-                    .unwrap_or_else(|e| {
-                            log::info!("[chrome] disk keyrings unavailable: {}", e);
-                            (
-                                vmkatz::chrome::hybrid::HybridKeyring::new(),
-                                vmkatz::chrome::hybrid::HybridKeyring::new(),
-                            )
-                        });
-                let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
-                    primary: &mem_keyring,
-                    fallback: &disk_user_kr,
-                };
-                match vmkatz::chrome::runner::run_disk_with_keyring(
-                    disk_path,
-                    &user_resolver,
-                    Some(&disk_sys_kr),
-                ) {
+                // Open the disk ONCE and share the handle across SAM extraction,
+                // keyring construction and chrome discovery — opening twice can
+                // race against external filesystem locks (e.g. ESXi system
+                // datastores) and fail the whole hybrid flow with EBUSY.
+                let result: Result<_, anyhow::Error> = (|| {
+                    let mut disk = vmkatz::disk::open_disk(disk_path)?;
+                    let secrets = vmkatz::sam::extract_secrets_from_reader(&mut disk)?;
+                    let (disk_user_kr, disk_sys_kr) =
+                        vmkatz::chrome::runner::build_keyrings_from_reader(
+                            &mut disk,
+                            &secrets,
+                            &args.chrome_password,
+                        );
+                    let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
+                        primary: &mem_keyring,
+                        fallback: &disk_user_kr,
+                    };
+                    Ok(vmkatz::chrome::runner::run_reader_with_keyring(
+                        &mut disk,
+                        &user_resolver,
+                        Some(&disk_sys_kr),
+                    )?)
+                })();
+                match result {
                     Ok(summary) => {
                         let out =
                             vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);

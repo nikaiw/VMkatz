@@ -114,6 +114,43 @@ where
     Ok(DiscoverySummary { profiles, findings })
 }
 
+/// Reader-based variant: caller owns the disk handle, we only borrow it. Used
+/// by the hybrid path (lsass mem + disk) so the same File handle services both
+/// keyring building and chrome discovery, avoiding a second `open()` that can
+/// race against external filesystem locks (e.g. ESXi system datastores).
+pub fn run_reader_with_keyring<R, U, S>(
+    reader: &mut R,
+    user_resolver: &U,
+    system_resolver: Option<&S>,
+) -> Result<DiscoverySummary>
+where
+    R: std::io::Read + std::io::Seek,
+    U: crate::chrome::disk::MasterkeyResolver,
+    S: crate::chrome::disk::MasterkeyResolver,
+{
+    let (profiles, key_map) = discover_profiles_in_reader(reader)?;
+    let mut tree = ArtifactsTree { profiles: &profiles };
+    let findings = crate::chrome::disk::extract_from_disk(
+        &mut tree,
+        user_resolver,
+        system_resolver,
+        &key_map,
+    )
+    .unwrap_or_default();
+    Ok(DiscoverySummary { profiles, findings })
+}
+
+/// Reader-based variant of `build_keyrings_from_disk_with_passwords` — the
+/// caller already has a disk reader and pre-extracted secrets. Used by the
+/// hybrid path so we open the disk once and share the handle.
+pub fn build_keyrings_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    secrets: &crate::sam::DiskSecrets,
+    extra_passwords: &[String],
+) -> (HybridKeyring, HybridKeyring) {
+    build_keyrings_with_secrets(reader, secrets, extra_passwords)
+}
+
 /// Build a `HybridKeyring` from any iterator of `(guid, masterkey_bytes)` pairs —
 /// typically sourced from LSASS DPAPI extraction (`Credential.dpapi`).
 pub fn keyring_from_pairs<I, S>(pairs: I) -> crate::chrome::hybrid::HybridKeyring
