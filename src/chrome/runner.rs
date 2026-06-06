@@ -8,8 +8,10 @@
 //! Memory orchestration is also a follow-up — wiring `PhysicalMemory` to a
 //! `ProcessSource` is non-trivial and not in this task.
 
+use std::collections::HashMap;
 use std::path::Path;
 
+use crate::chrome::hybrid::HybridKeyring;
 use crate::chrome::output::{render, Format};
 use crate::chrome::profile::{discover_chromium, DiscoveredProfile};
 use crate::chrome::types::ChromeFindings;
@@ -29,10 +31,28 @@ pub struct DiscoverySummary {
 /// pretty-print or JSON-serialize via [`render_summary`].
 pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
     let profiles = discover_profiles(disk_path)?;
-    Ok(DiscoverySummary {
-        profiles,
-        findings: ChromeFindings::default(),
-    })
+    // Try the full on-disk DPAPI chain: SAM NT hashes + LSA DPAPI_SYSTEM derive
+    // the user/system masterkey keyrings. On any failure, log and return discovery-only.
+    let (user_kr, system_kr) = match build_keyrings_from_disk(disk_path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::info!("[chrome] disk-only keyrings unavailable: {}", e);
+            return Ok(DiscoverySummary {
+                profiles,
+                findings: ChromeFindings::default(),
+            });
+        }
+    };
+    log::info!(
+        "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
+        user_kr.len(),
+        system_kr.len()
+    );
+    let mut tree = ArtifactsTree { profiles: &profiles };
+    let findings =
+        crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr))
+            .unwrap_or_default();
+    Ok(DiscoverySummary { profiles, findings })
 }
 
 /// Same as `run_disk` but takes a `MasterkeyResolver` to actually decrypt blobs.
@@ -159,6 +179,214 @@ fn discover_profiles(disk_path: &Path) -> Result<Vec<DiscoveredProfile>> {
     // No profiles found is not an error — return empty list so the caller can
     // print a friendly "no profiles found" message.
     Ok(Vec::new())
+}
+
+/// Walk the disk, decrypt every accessible DPAPI masterkey file using SAM- and
+/// LSA-derived pre-keys, and return `(user_keyring, system_keyring)`. Logs the
+/// count of master keys decrypted from each context.
+///
+/// This is the "no memory snapshot" path: we extract SAM hashes + LSA secrets
+/// (`extract_disk_secrets`), then walk every user's Protect directory and the
+/// `S-1-5-18` Protect directory, decrypting each MK file with the matching
+/// pre-key. Failed MKs are skipped with an info log so a single bad file
+/// doesn't abort the whole walk.
+pub fn build_keyrings_from_disk(
+    disk_path: &Path,
+) -> Result<(HybridKeyring, HybridKeyring)> {
+    // 1. Pull SAM hashes + LSA secrets via the existing extraction pipeline.
+    //    This handles BitLocker, fallback scans, etc.
+    let secrets = crate::sam::extract_disk_secrets(disk_path)?;
+
+    // Build RID -> NT hash map (user MK decryption keys by RID).
+    let mut nt_hash_by_rid: HashMap<u32, [u8; 16]> = HashMap::new();
+    for entry in &secrets.sam_entries {
+        nt_hash_by_rid.insert(entry.rid, entry.nt_hash);
+    }
+
+    // Pull DPAPI_SYSTEM machine_key for the SYSTEM masterkey context.
+    let dpapi_machine_key = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
+        crate::sam::lsa::LsaSecretType::DpapiSystem { machine_key, .. } => Some(*machine_key),
+        _ => None,
+    });
+
+    log::info!(
+        "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={}",
+        secrets.sam_entries.len(),
+        dpapi_machine_key.is_some()
+    );
+
+    // 2. Reopen the disk and walk every NTFS partition for MK files.
+    let mut disk = crate::disk::open_disk(disk_path)?;
+    let partitions = crate::sam::find_ntfs_partitions(&mut disk).unwrap_or_default();
+
+    let mut user_kr = HybridKeyring::new();
+    let mut system_kr = HybridKeyring::new();
+
+    for &part_offset in &partitions {
+        if crate::sam::is_bitlocker_partition(&mut disk, part_offset) {
+            continue;
+        }
+        let mut part_reader = crate::sam::PartitionReader::new(&mut disk, part_offset);
+        let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let root = match ntfs.root_directory(&mut part_reader) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // System masterkeys: Windows\System32\Microsoft\Protect\S-1-5-18\<guid>
+        if let Some(mk) = &dpapi_machine_key {
+            decrypt_mks_in_protect(
+                &ntfs,
+                &root,
+                &mut part_reader,
+                "Windows\\System32\\Microsoft\\Protect",
+                |sid, file_bytes| {
+                    if sid == "S-1-5-18" {
+                        crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, mk).ok()
+                    } else {
+                        None
+                    }
+                },
+                &mut system_kr,
+                "system",
+            );
+        }
+
+        // User masterkeys: Users\<user>\AppData\Roaming\Microsoft\Protect\<SID>\<guid>
+        let users_dir =
+            match crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Users") {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+        let user_entries =
+            match crate::sam::list_directory(&ntfs, &users_dir, &mut part_reader) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+        for (user_name, is_dir) in user_entries {
+            if !is_dir {
+                continue;
+            }
+            let lower = user_name.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "public" | "default" | "default user" | "all users" | "desktop.ini"
+            ) {
+                continue;
+            }
+            let protect_path =
+                format!("{}\\AppData\\Roaming\\Microsoft\\Protect", user_name);
+
+            decrypt_mks_in_protect(
+                &ntfs,
+                &users_dir,
+                &mut part_reader,
+                &protect_path,
+                |sid, file_bytes| {
+                    let rid: u32 = sid.rsplit('-').next()?.parse().ok()?;
+                    let nt_hash = nt_hash_by_rid.get(&rid)?;
+                    crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                        file_bytes, nt_hash, sid,
+                    )
+                    .ok()
+                },
+                &mut user_kr,
+                &user_name,
+            );
+        }
+
+        // First partition that yielded any MKs wins; stop scanning.
+        if !user_kr.is_empty() || !system_kr.is_empty() {
+            break;
+        }
+    }
+
+    Ok((user_kr, system_kr))
+}
+
+/// Walk `Protect\<SID>\<GUID>` under `base_dir`. For each MK file, call
+/// `decrypt_fn(sid, bytes)`; on success, insert the cleartext key into `out`
+/// under its file-name GUID. Failures log at info level and continue.
+fn decrypt_mks_in_protect<'n, R, F>(
+    ntfs: &'n ntfs::Ntfs,
+    base_dir: &ntfs::NtfsFile<'n>,
+    reader: &mut R,
+    protect_path: &str,
+    mut decrypt_fn: F,
+    out: &mut HybridKeyring,
+    label: &str,
+) where
+    R: std::io::Read + std::io::Seek,
+    F: FnMut(&str, &[u8]) -> Option<Vec<u8>>,
+{
+    let protect_dir = match crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let sids = match crate::sam::list_directory(ntfs, &protect_dir, reader) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for (sid, is_sid_dir) in sids {
+        if !is_sid_dir || !sid.starts_with("S-1-5-") {
+            continue;
+        }
+        let sid_dir = match crate::sam::find_entry(ntfs, &protect_dir, reader, &sid) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let mk_entries = match crate::sam::list_directory(ntfs, &sid_dir, reader) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for (mk_name, is_mk_dir) in mk_entries {
+            if is_mk_dir || !is_mk_guid(&mk_name) {
+                continue;
+            }
+            let mk_file = match crate::sam::find_entry(ntfs, &sid_dir, reader, &mk_name) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mk_data = match crate::sam::read_file_data(&mk_file, reader) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            match decrypt_fn(&sid, &mk_data) {
+                Some(clear) => {
+                    log::info!(
+                        "[chrome] decrypted {} MK: SID={} GUID={}",
+                        label, sid, mk_name
+                    );
+                    out.insert(mk_name.to_lowercase(), clear);
+                }
+                None => {
+                    log::info!(
+                        "[chrome] MK decrypt failed: ctx={} SID={} GUID={}",
+                        label, sid, mk_name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 36-char `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` GUID filename check.
+fn is_mk_guid(name: &str) -> bool {
+    if name.len() != 36 {
+        return false;
+    }
+    let b = name.as_bytes();
+    b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
 }
 
 /// Render a discovery summary for stdout / JSON.

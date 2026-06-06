@@ -10,7 +10,7 @@ vmware = ["dep:memmap2"]
 vbox = []
 qemu = ["dep:memmap2"]
 hyperv = ["dep:memmap2"]
-sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
+sam = ["dep:ntfs", "dep:md-5", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
 "ntds.dit" = ["sam"]
 carve = []
 dump = []
@@ -43,3 +43,4 @@ serde_json = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
