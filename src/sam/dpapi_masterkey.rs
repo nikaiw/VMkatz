@@ -24,6 +24,7 @@ use crate::error::{Result, VmkatzError};
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type TdesCbcDec = cbc::Decryptor<TdesEde3>;
 type HmacSha1 = Hmac<Sha1>;
+type HmacSha512 = Hmac<Sha512>;
 
 /// Maximum allowed PBKDF2 rounds — prevents pathological inputs from
 /// burning CPU forever. Real-world MK files use 4k–8k rounds.
@@ -235,11 +236,33 @@ fn sid_utf16le_with_nul(sid: &str) -> Vec<u8> {
     bytes
 }
 
-/// Compute the 20-byte DPAPI pre-key for a local-account user MK:
+/// Compute the 20-byte DPAPI pre-key for a domain user (NTLM-hash path):
 ///   `HMAC-SHA1(key = nt_hash, msg = UTF-16LE(SID + "\0"))`.
+///
+/// For LOCAL accounts on Win10+, the canonical chain uses the actual password
+/// (`HMAC-SHA1(SHA1(UTF-16LE password), sid_utf16)`) — see [`user_local_prekey_pw`].
 fn user_local_prekey(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
     let msg = sid_utf16le_with_nul(sid);
     let mut mac = HmacSha1::new_from_slice(nt_hash)
+        .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
+    mac.update(&msg);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&tag);
+    Ok(out)
+}
+
+/// Compute the 20-byte DPAPI pre-key for a local-account user MK from a known password:
+///   `HMAC-SHA1(key = SHA1(UTF-16LE password), msg = UTF-16LE(SID + "\0"))`.
+fn user_local_prekey_pw(password: &str, sid: &str) -> Result<[u8; 20]> {
+    use sha1::{Digest, Sha1};
+    let pwd_utf16: Vec<u8> = password
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let pwd_sha1 = Sha1::digest(&pwd_utf16);
+    let msg = sid_utf16le_with_nul(sid);
+    let mut mac = HmacSha1::new_from_slice(&pwd_sha1)
         .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
     mac.update(&msg);
     let tag = mac.finalize().into_bytes();
@@ -267,18 +290,20 @@ pub fn decrypt_masterkey_with_prekey(
     }
     let plaintext = match (mk.alg_crypt, mk.alg_hash) {
         (CALG_AES_256, CALG_SHA_512) => {
-            // PBKDF2-HMAC-SHA512 -> 48 bytes = 32 AES key + 16 IV.
-            let mut derived = [0u8; 48];
-            pbkdf2::pbkdf2_hmac::<Sha512>(pre_key, &mk.salt, mk.rounds, &mut derived);
-            let aes_key = &derived[..32];
-            let iv = &derived[32..48];
+            // DPAPI's MK derivation is NOT standard PBKDF2 — Microsoft uses an
+            // XOR-accumulator-feedback variant where each iteration's PRF input is
+            // the accumulated XOR (not the previous round's output). Standard
+            // PBKDF2 from the `pbkdf2` crate produces a different (wrong) key.
+            let derived = dpapi_derive_key_sha512(pre_key, &mk.salt, 48, mk.rounds);
+            let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
+            let iv: [u8; 16] = derived[32..48].try_into().unwrap();
             if mk.ciphertext.len() % 16 != 0 {
                 return Err(VmkatzError::DecryptionError(
                     "AES MK ciphertext not block-aligned".into(),
                 ));
             }
             let mut buf = mk.ciphertext.clone();
-            let cipher = Aes256CbcDec::new(aes_key.into(), iv.into());
+            let cipher = Aes256CbcDec::new((&aes_key).into(), (&iv).into());
             cipher
                 .decrypt_padded_mut::<NoPadding>(&mut buf)
                 .map_err(|_| {
@@ -287,9 +312,8 @@ pub fn decrypt_masterkey_with_prekey(
             buf
         }
         (CALG_3DES, CALG_SHA1) => {
-            // PBKDF2-HMAC-SHA1 -> 32 bytes = 24 3DES key + 8 IV.
-            let mut derived = [0u8; 32];
-            pbkdf2::pbkdf2_hmac::<Sha1>(pre_key, &mk.salt, mk.rounds, &mut derived);
+            // DPAPI MK derivation variant (see above) using SHA-1.
+            let derived = dpapi_derive_key_sha1(pre_key, &mk.salt, 32, mk.rounds);
             let des3_key = &derived[..24];
             let iv = &derived[24..32];
             if mk.ciphertext.len() % 8 != 0 {
@@ -319,7 +343,114 @@ pub fn decrypt_masterkey_with_prekey(
             "decrypted MK plaintext shorter than 64 bytes".into(),
         ));
     }
-    Ok(plaintext[..64].to_vec())
+    // Cleartext layout per impacket dpapi.py MasterKey.decrypt:
+    //   hmacSalt(16) || hmac(hash_size) || ... || decryptedKey(64)
+    // Verify HMAC before trusting the result; on mismatch the pre-key was wrong
+    // and the "decrypted" bytes are garbage.
+    let hash_size = match mk.alg_hash {
+        CALG_SHA_512 => 64,
+        CALG_SHA1 => 20,
+        _ => 0,
+    };
+    // Cleartext layout per impacket dpapi.py MasterKey.decrypt:
+    //   hmacSalt(16) || hmac(hash_size) || ... || decryptedKey(64)
+    // HMAC-verify before trusting the result; wrong pre-key → all-garbage decrypt.
+    if hash_size > 0 && plaintext.len() >= 16 + hash_size + 64 {
+        let hmac_salt = &plaintext[..16];
+        let stored_hmac = &plaintext[16..16 + hash_size];
+        let decrypted_key = &plaintext[plaintext.len() - 64..];
+        let ok = match mk.alg_hash {
+            CALG_SHA_512 => verify_mk_hmac_sha512(pre_key, hmac_salt, decrypted_key, stored_hmac),
+            CALG_SHA1 => verify_mk_hmac_sha1(pre_key, hmac_salt, decrypted_key, stored_hmac),
+            _ => false,
+        };
+        if !ok {
+            return Err(VmkatzError::DecryptionError(
+                "MK HMAC verification failed (wrong pre-key)".into(),
+            ));
+        }
+    }
+    Ok(plaintext[plaintext.len() - 64..].to_vec())
+}
+
+/// DPAPI's masterkey-file key-derivation function. Microsoft uses a non-standard
+/// PBKDF2 variant where each iteration's PRF input is the accumulated XOR rather
+/// than the previous round's PRF output. Standard PBKDF2 (RFC 2898) produces a
+/// different key and will fail to decrypt real DPAPI files.
+///
+/// Algorithm (matching impacket's MasterKey.deriveKey):
+///   for each output block:
+///     U_1 = HMAC(passphrase, salt || INT(i))    where i = 1, 2, ...
+///     acc = U_1
+///     for r in 1..count:
+///       acc = acc XOR HMAC(passphrase, acc)
+///     append acc to output
+fn dpapi_derive_key_sha512(passphrase: &[u8], salt: &[u8], keylen: usize, count: u32) -> Vec<u8> {
+    use hmac::Mac;
+    let mut out: Vec<u8> = Vec::with_capacity(keylen);
+    let mut block_i: u32 = 1;
+    while out.len() < keylen {
+        let mut h = HmacSha512::new_from_slice(passphrase).expect("HMAC-SHA512 key");
+        h.update(salt);
+        h.update(&block_i.to_be_bytes());
+        let mut acc = h.finalize().into_bytes().to_vec();
+        for _ in 1..count {
+            let mut h = HmacSha512::new_from_slice(passphrase).expect("HMAC-SHA512 key");
+            h.update(&acc);
+            let next = h.finalize().into_bytes();
+            for (a, n) in acc.iter_mut().zip(next.iter()) {
+                *a ^= *n;
+            }
+        }
+        out.extend_from_slice(&acc);
+        block_i += 1;
+    }
+    out.truncate(keylen);
+    out
+}
+
+fn dpapi_derive_key_sha1(passphrase: &[u8], salt: &[u8], keylen: usize, count: u32) -> Vec<u8> {
+    use hmac::Mac;
+    let mut out: Vec<u8> = Vec::with_capacity(keylen);
+    let mut block_i: u32 = 1;
+    while out.len() < keylen {
+        let mut h = HmacSha1::new_from_slice(passphrase).expect("HMAC-SHA1 key");
+        h.update(salt);
+        h.update(&block_i.to_be_bytes());
+        let mut acc = h.finalize().into_bytes().to_vec();
+        for _ in 1..count {
+            let mut h = HmacSha1::new_from_slice(passphrase).expect("HMAC-SHA1 key");
+            h.update(&acc);
+            let next = h.finalize().into_bytes();
+            for (a, n) in acc.iter_mut().zip(next.iter()) {
+                *a ^= *n;
+            }
+        }
+        out.extend_from_slice(&acc);
+        block_i += 1;
+    }
+    out.truncate(keylen);
+    out
+}
+
+fn verify_mk_hmac_sha512(pre_key: &[u8], salt: &[u8], mk: &[u8], stored: &[u8]) -> bool {
+    use hmac::Mac;
+    let mut h1 = match HmacSha512::new_from_slice(pre_key) { Ok(h) => h, Err(_) => return false };
+    h1.update(salt);
+    let key2 = h1.finalize().into_bytes();
+    let mut h2 = match HmacSha512::new_from_slice(&key2) { Ok(h) => h, Err(_) => return false };
+    h2.update(mk);
+    h2.finalize().into_bytes().as_slice() == stored
+}
+
+fn verify_mk_hmac_sha1(pre_key: &[u8], salt: &[u8], mk: &[u8], stored: &[u8]) -> bool {
+    use hmac::Mac;
+    let mut h1 = match HmacSha1::new_from_slice(pre_key) { Ok(h) => h, Err(_) => return false };
+    h1.update(salt);
+    let key2 = h1.finalize().into_bytes();
+    let mut h2 = match HmacSha1::new_from_slice(&key2) { Ok(h) => h, Err(_) => return false };
+    h2.update(mk);
+    h2.finalize().into_bytes().as_slice() == stored
 }
 
 /// Decrypt a user DPAPI masterkey file (local-account, mode 15900 or 15300).
@@ -333,6 +464,17 @@ pub fn decrypt_local_user_masterkey(
     sid: &str,
 ) -> Result<Vec<u8>> {
     let pre_key = user_local_prekey(nt_hash, sid)?;
+    decrypt_masterkey_with_prekey(file_bytes, &pre_key)
+}
+
+/// Decrypt a user DPAPI masterkey file using a known cleartext password
+/// (typically sourced from LSA `DefaultPassword` or a memory snapshot).
+pub fn decrypt_local_user_masterkey_pw(
+    file_bytes: &[u8],
+    password: &str,
+    sid: &str,
+) -> Result<Vec<u8>> {
+    let pre_key = user_local_prekey_pw(password, sid)?;
     decrypt_masterkey_with_prekey(file_bytes, &pre_key)
 }
 
@@ -721,31 +863,40 @@ mod tests {
 
     #[test]
     fn decrypt_user_local_aes_roundtrip() {
-        // Synthesize: known NT hash + SID -> pre-key -> PBKDF2 -> AES-CBC encrypt.
+        use hmac::Mac;
+        // Synthesize a Win10+ local user MK file: known NT hash + SID -> pre-key ->
+        // DPAPI-variant key derive -> AES-CBC encrypt -> assemble file -> decrypt.
         let nt_hash: [u8; 16] = [
             0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0,
             0x89, 0xc0,
         ];
         let sid = "S-1-5-21-1111-2222-3333-1001";
         let salt = [0xA5u8; 16];
-        let rounds: u32 = 200; // keep tests fast
+        let rounds: u32 = 200;
 
-        // Derive the same pre-key the decryption path will compute.
         let pre_key = user_local_prekey(&nt_hash, sid).unwrap();
-        let mut derived = [0u8; 48];
-        pbkdf2::pbkdf2_hmac::<Sha512>(&pre_key, &salt, rounds, &mut derived);
-        let mut aes_key = [0u8; 32];
-        aes_key.copy_from_slice(&derived[..32]);
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(&derived[32..48]);
+        let derived = dpapi_derive_key_sha512(&pre_key, &salt, 48, rounds);
+        let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
+        let iv: [u8; 16] = derived[32..48].try_into().unwrap();
 
-        // 144-byte cleartext: [0..64] is the MK we want back, rest is junk.
-        let mut cleartext = vec![0u8; 144];
-        for (i, b) in cleartext.iter_mut().enumerate() {
-            *b = i as u8;
-        }
+        // Cleartext layout: hmacSalt(16) || hmac(64) || padding || masterkey(64).
+        // Make a 144-byte cleartext whose MK is the last 64 bytes and whose HMAC
+        // matches the impacket verifier.
+        let mk_bytes: [u8; 64] = [0xC3u8; 64];
+        let hmac_salt: [u8; 16] = [0x77u8; 16];
+        let mut k1 = HmacSha512::new_from_slice(&pre_key).unwrap();
+        k1.update(&hmac_salt);
+        let key2 = k1.finalize().into_bytes();
+        let mut k2 = HmacSha512::new_from_slice(&key2).unwrap();
+        k2.update(&mk_bytes);
+        let stored_hmac = k2.finalize().into_bytes();
+        let mut cleartext = Vec::with_capacity(144);
+        cleartext.extend_from_slice(&hmac_salt);
+        cleartext.extend_from_slice(&stored_hmac);  // 64 bytes
+        cleartext.extend_from_slice(&mk_bytes);     // 64 bytes
+        assert_eq!(cleartext.len(), 144);
+
         let cipher = aes_cbc_encrypt(&aes_key, &iv, &cleartext);
-
         let file = build_mk_file(
             2,
             "aaaabbbb-cccc-dddd-eeee-ffff00001111",
@@ -759,11 +910,12 @@ mod tests {
 
         let mk = decrypt_local_user_masterkey(&file, &nt_hash, sid).expect("decrypt");
         assert_eq!(mk.len(), 64);
-        assert_eq!(&mk[..], &cleartext[..64]);
+        assert_eq!(&mk[..], &mk_bytes[..]);
     }
 
     #[test]
     fn decrypt_system_aes_roundtrip() {
+        use hmac::Mac;
         let machine_key: [u8; 20] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
@@ -771,19 +923,25 @@ mod tests {
         let salt = [0x5Au8; 16];
         let rounds: u32 = 200;
 
-        let mut derived = [0u8; 48];
-        pbkdf2::pbkdf2_hmac::<Sha512>(&machine_key, &salt, rounds, &mut derived);
-        let mut aes_key = [0u8; 32];
-        aes_key.copy_from_slice(&derived[..32]);
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(&derived[32..48]);
+        let derived = dpapi_derive_key_sha512(&machine_key, &salt, 48, rounds);
+        let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
+        let iv: [u8; 16] = derived[32..48].try_into().unwrap();
 
-        let mut cleartext = vec![0u8; 144];
-        for (i, b) in cleartext.iter_mut().enumerate() {
-            *b = (i ^ 0x5A) as u8;
-        }
+        let mk_bytes: [u8; 64] = [0x9Au8; 64];
+        let hmac_salt: [u8; 16] = [0x3Bu8; 16];
+        let mut k1 = HmacSha512::new_from_slice(&machine_key).unwrap();
+        k1.update(&hmac_salt);
+        let key2 = k1.finalize().into_bytes();
+        let mut k2 = HmacSha512::new_from_slice(&key2).unwrap();
+        k2.update(&mk_bytes);
+        let stored_hmac = k2.finalize().into_bytes();
+        let mut cleartext = Vec::with_capacity(144);
+        cleartext.extend_from_slice(&hmac_salt);
+        cleartext.extend_from_slice(&stored_hmac);
+        cleartext.extend_from_slice(&mk_bytes);
+        assert_eq!(cleartext.len(), 144);
+
         let cipher = aes_cbc_encrypt(&aes_key, &iv, &cleartext);
-
         let file = build_mk_file(
             2,
             "11112222-3333-4444-5555-666677778888",
@@ -797,7 +955,7 @@ mod tests {
 
         let mk = decrypt_system_masterkey(&file, &machine_key).expect("decrypt");
         assert_eq!(mk.len(), 64);
-        assert_eq!(&mk[..], &cleartext[..64]);
+        assert_eq!(&mk[..], &mk_bytes[..]);
     }
 
     #[test]

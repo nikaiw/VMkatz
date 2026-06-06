@@ -3,7 +3,7 @@
 //! Walks profile discovery, derives per-profile v10/v11 keys from `Local State`
 //! using a caller-provided masterkey resolver, decrypts SQLite blobs.
 
-use crate::chrome::blob::{classify, decrypt_v10, BlobScheme};
+use crate::chrome::blob::{classify, BlobScheme};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::chrome::local_state;
 use crate::chrome::profile::{discover_chromium, DiscoveredProfile, FileTree};
@@ -135,10 +135,15 @@ fn is_chrome_blob(b: &[u8]) -> bool {
 /// Try v10/v11 then v20 against `blob`; return plaintext + which scheme produced it
 /// so callers can tag the source (`DiskDpapi` vs `DiskAbe`).
 fn decrypt_value(blob: &[u8], keys: &ProfileKeys) -> Option<(Vec<u8>, ChromeSource)> {
+    decrypt_value_aad(blob, keys, &[])
+}
+
+/// Same as `decrypt_value` but allows binding to AAD (e.g. cookie host).
+fn decrypt_value_aad(blob: &[u8], keys: &ProfileKeys, aad: &[u8]) -> Option<(Vec<u8>, ChromeSource)> {
     match classify(blob) {
-        BlobScheme::V10 | BlobScheme::V11 => {
-            decrypt_v10(blob, &keys.v10).ok().map(|pt| (pt, ChromeSource::DiskDpapi))
-        }
+        BlobScheme::V10 | BlobScheme::V11 => crate::chrome::blob::decrypt_v10_aad(blob, &keys.v10, aad)
+            .ok()
+            .map(|pt| (pt, ChromeSource::DiskDpapi)),
         BlobScheme::V20 => keys
             .v20
             .as_ref()
@@ -186,10 +191,8 @@ fn extract_logins(
         let username = cols.get(3).and_then(Value::as_text).unwrap_or("").to_string();
         // Chrome stores the encrypted password as BLOB in the schema, but SQLite type
         // affinity can land it as TEXT. Match by v10/v11/v20 prefix across both.
-        let blob: &[u8] = cols.iter().find_map(|c| match c {
-            Value::Blob(b) if is_chrome_blob(b) => Some(b.as_slice()),
-            Value::Text(t) if is_chrome_blob(t.as_bytes()) => Some(t.as_bytes()),
-            _ => None,
+        let blob: &[u8] = cols.iter().find_map(|c| {
+            c.as_bytes().filter(|b| is_chrome_blob(b))
         }).unwrap_or(&[]);
         if let Some((pt, source)) = decrypt_value(blob, keys) {
             let password = String::from_utf8_lossy(&pt).into_owned();
@@ -246,16 +249,18 @@ fn extract_cookies(
             .find(|s| !s.is_empty() && !s.contains('.') && !s.starts_with('/'))
             .unwrap_or("")
             .to_string();
-        let blob: &[u8] = cols.iter().find_map(|c| match c {
-            Value::Blob(b) if is_chrome_blob(b) => Some(b.as_slice()),
-            Value::Text(t) if is_chrome_blob(t.as_bytes()) => Some(t.as_bytes()),
-            _ => None,
+        let blob: &[u8] = cols.iter().find_map(|c| {
+            c.as_bytes().filter(|b| is_chrome_blob(b))
         }).unwrap_or(&[]);
         let exp_us = cols
             .iter()
             .filter_map(Value::as_int)
             .find(|n| *n > 10_000_000_000_000_000);
-        if let Some((pt, source)) = decrypt_value(blob, keys) {
+        // Modern Chrome cookies bind ciphertext to host via AES-GCM AAD. Try empty
+        // AAD first (older versions), then host-as-AAD if that fails.
+        let decrypted = decrypt_value(blob, keys)
+            .or_else(|| decrypt_value_aad(blob, keys, host.as_bytes()));
+        if let Some((pt, source)) = decrypted {
             let value = strip_cookie_prefix(&pt);
             out.cookies.push(Cookie {
                 profile: profile.clone(),
