@@ -207,16 +207,27 @@ pub fn build_keyrings_from_disk(
         nt_hash_by_rid.insert(entry.rid, entry.nt_hash);
     }
 
-    // Pull DPAPI_SYSTEM machine_key for the SYSTEM masterkey context.
-    let dpapi_machine_key = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
-        crate::sam::lsa::LsaSecretType::DpapiSystem { machine_key, .. } => Some(*machine_key),
+    // DPAPI_SYSTEM has two 20-byte halves: user_key + machine_key. The S-1-5-18
+    // SYSTEM masterkey files (Windows\System32\Microsoft\Protect\S-1-5-18\) are
+    // encrypted under the user_key half (yes, despite the SYSTEM context — the
+    // naming is a quirk of the DPAPI design).
+    let dpapi_system_user_key = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
+        crate::sam::lsa::LsaSecretType::DpapiSystem { user_key, .. } => Some(*user_key),
+        _ => None,
+    });
+
+    // LSA `DefaultPassword` is the auto-logon plaintext — when present, it's the
+    // actual password to use for the Win10+ local-user DPAPI chain.
+    let default_password = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
+        crate::sam::lsa::LsaSecretType::DefaultPassword { password } => Some(password.clone()),
         _ => None,
     });
 
     log::info!(
-        "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={}",
+        "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={} DefaultPassword={}",
         secrets.sam_entries.len(),
-        dpapi_machine_key.is_some()
+        dpapi_system_user_key.is_some(),
+        default_password.is_some()
     );
 
     // 2. Reopen the disk and walk every NTFS partition for MK files.
@@ -241,7 +252,7 @@ pub fn build_keyrings_from_disk(
         };
 
         // System masterkeys: Windows\System32\Microsoft\Protect\S-1-5-18\<guid>
-        if let Some(mk) = &dpapi_machine_key {
+        if let Some(mk) = &dpapi_system_user_key {
             decrypt_mks_in_protect(
                 &ntfs,
                 &root,
@@ -291,6 +302,15 @@ pub fn build_keyrings_from_disk(
                 &mut part_reader,
                 &protect_path,
                 |sid, file_bytes| {
+                    // Try LSA DefaultPassword first (works for Win10+ local users).
+                    if let Some(pw) = default_password.as_deref() {
+                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
+                            file_bytes, pw, sid,
+                        ) {
+                            return Some(k);
+                        }
+                    }
+                    // Fallback: NT-hash direct chain (works for DOMAIN users).
                     let rid: u32 = sid.rsplit('-').next()?.parse().ok()?;
                     let nt_hash = nt_hash_by_rid.get(&rid)?;
                     crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
@@ -359,6 +379,9 @@ fn decrypt_mks_in_protect<'n, R, F>(
                 Ok(d) => d,
                 Err(_) => continue,
             };
+            if mk_name == "990bb548-efb7-4229-9d08-56d44a3b40e8" {
+                log::info!("[trace] vmware edge MK: {}", hex::encode(&mk_data));
+            }
             match decrypt_fn(&sid, &mk_data) {
                 Some(clear) => {
                     log::info!(
@@ -429,24 +452,8 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
             s.push_str("[Chrome] no profiles found\n");
         } else {
             for p in &summary.profiles {
-                let mk_guid = p
-                    .artifacts
-                    .local_state
-                    .as_ref()
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| crate::chrome::local_state::parse(s).ok())
-                    .and_then(|ls| ls.encrypted_key)
-                    .and_then(|raw| {
-                        if raw.len() < 5 || &raw[..5] != b"DPAPI" {
-                            return None;
-                        }
-                        crate::chrome::dpapi_decrypt::parse_blob(&raw[5..])
-                            .ok()
-                            .map(|b| b.mk_guid_str)
-                    })
-                    .unwrap_or_else(|| "?".into());
                 s.push_str(&format!(
-                    "[Chrome] {}/{} ({})\n  artifacts: local_state={} login_data={} cookies={} web_data={}\n  mk_guid: {}\n  path: {}\n",
+                    "[Chrome] {}/{} ({})\n  artifacts: local_state={} login_data={} cookies={} web_data={}\n  path: {}\n",
                     p.profile.user,
                     p.profile.profile_name,
                     p.profile.browser,
@@ -454,7 +461,6 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
                     p.artifacts.login_data.as_ref().map(|v| v.len()).unwrap_or(0),
                     p.artifacts.cookies.as_ref().map(|v| v.len()).unwrap_or(0),
                     p.artifacts.web_data.as_ref().map(|v| v.len()).unwrap_or(0),
-                    mk_guid,
                     p.profile.path,
                 ));
             }
