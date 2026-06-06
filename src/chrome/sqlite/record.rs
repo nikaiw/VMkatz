@@ -5,7 +5,10 @@ pub enum Value {
     Null,
     Int(i64),
     Real(f64),
-    Text(String),
+    /// Raw bytes from a TEXT-affinity column. SQLite does not enforce UTF-8 on
+    /// TEXT columns; Chromium stores v10/v20-prefixed binary cookie ciphertext
+    /// in a "TEXT" column here. UTF-8 conversion is lazy via `as_text`.
+    Text(Vec<u8>),
     Blob(Vec<u8>),
 }
 
@@ -117,19 +120,28 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         t if t >= 13 && t % 2 == 1 => {
             let n = ((t - 13) / 2) as usize;
             need(b, n)?;
-            let s = String::from_utf8_lossy(&b[..n]).into_owned();
-            (Value::Text(s), n)
+            (Value::Text(b[..n].to_vec()), n)
         }
         _ => return Err(Error::Parse(format!("bad serial type {}", serial_type))),
     })
 }
 
 impl Value {
+    /// UTF-8 decode of a TEXT column. Returns None if bytes aren't valid UTF-8 (Chromium
+    /// stores binary ciphertext in some TEXT columns — use `text_bytes`/`as_bytes` then).
     pub fn as_text(&self) -> Option<&str> {
-        if let Value::Text(s) = self { Some(s) } else { None }
+        if let Value::Text(b) = self { std::str::from_utf8(b).ok() } else { None }
     }
     pub fn as_blob(&self) -> Option<&[u8]> {
         if let Value::Blob(b) = self { Some(b) } else { None }
+    }
+    /// Raw bytes for either a TEXT or BLOB column. Useful when a TEXT column
+    /// holds binary data (e.g. Chromium cookies).
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Text(b) | Value::Blob(b) => Some(b),
+            _ => None,
+        }
     }
     pub fn as_int(&self) -> Option<i64> {
         if let Value::Int(i) = self { Some(*i) } else { None }
