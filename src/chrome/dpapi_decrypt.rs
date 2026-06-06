@@ -162,9 +162,13 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
             blob.crypt_alg, blob.hmac_alg
         )));
     }
-    // Derive session key: HMAC-SHA512(key=SHA1(masterkey), data=salt).
-    // DPAPI hashes the 64-byte masterkey down to 20 bytes via SHA-1 before HMAC.
-    // First 32 bytes of the 64-byte HMAC output = AES key, next 16 = IV.
+    // DPAPI BLOB session-key derivation (per impacket dpapi.py DPAPI_BLOB.decrypt):
+    //   keyHash    = SHA1(masterkey)
+    //   sessionKey = HMAC-SHA512(keyHash, salt)
+    //   derivedKey = sessionKey  (no further transform for SHA-512/AES-256)
+    //   AES-256-CBC decrypt with key=derivedKey[:32] and IV = ALL ZEROS
+    // The IV is NOT derived from sessionKey bytes — that's the masterkey-FILE
+    // convention, which uses a different (PBKDF2) derivation entirely.
     type HmacSha512 = Hmac<Sha512>;
     let mk_sha1 = Sha1::digest(masterkey);
     let mut h =
@@ -173,12 +177,12 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
     let session = h.finalize().into_bytes();
 
     let key = &session[..32];
-    let iv = &session[32..48];
+    let iv = [0u8; 16];
     if blob.cipher_text.len() % 16 != 0 {
         return Err(Error::Parse("dpapi ciphertext not block-aligned".into()));
     }
     let mut buf = blob.cipher_text.to_vec();
-    let cipher = Aes256CbcDec::new(key.into(), iv.into());
+    let cipher = Aes256CbcDec::new(key.into(), (&iv).into());
     let pt = cipher
         .decrypt_padded_mut::<NoPadding>(&mut buf)
         .map_err(|_| Error::Parse("dpapi aes decrypt".into()))?;

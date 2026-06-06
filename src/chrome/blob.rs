@@ -1,5 +1,5 @@
 use crate::error::{Result, VmkatzError as Error};
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,7 +23,14 @@ pub fn classify(blob: &[u8]) -> BlobScheme {
 }
 
 /// Decrypt v10/v11 blob with a 32-byte AES-GCM key.
+/// `aad` is the optional Additional Authenticated Data; Chrome cookies may bind to
+/// the host string starting at some versions, while passwords use empty AAD.
 pub fn decrypt_v10(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    decrypt_v10_aad(blob, key, &[])
+}
+
+/// Same as `decrypt_v10` but with explicit AAD.
+pub fn decrypt_v10_aad(blob: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 3 + 12 + 16 {
         return Err(Error::Parse("v10 blob too short".into()));
     }
@@ -31,7 +38,7 @@ pub fn decrypt_v10(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     let ct = &blob[15..];
     let cipher = Aes256Gcm::new(key.into());
     cipher
-        .decrypt(Nonce::from_slice(nonce), ct)
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
         .map_err(|_| Error::Parse("v10 GCM auth fail".into()))
 }
 

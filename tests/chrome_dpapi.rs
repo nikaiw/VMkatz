@@ -15,17 +15,17 @@ type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type HmacSha512 = Hmac<Sha512>;
 
 fn build_blob(plaintext: &[u8], masterkey: &[u8], salt: &[u8]) -> Vec<u8> {
-    // DPAPI: HMAC-SHA512 key is SHA1(masterkey), not the raw masterkey.
+    // DPAPI BLOB: HMAC-SHA512 key is SHA1(masterkey); IV is ALL ZEROS (not session bytes).
     let mk_sha1 = Sha1::digest(masterkey);
     let mut h = HmacSha512::new_from_slice(&mk_sha1).unwrap();
     h.update(salt);
     let session = h.finalize().into_bytes();
     let key = &session[..32];
-    let iv = &session[32..48];
+    let iv = [0u8; 16];
     assert_eq!(plaintext.len() % 16, 0, "test plaintext must be block-aligned");
     let mut buf = vec![0u8; plaintext.len()];
     buf[..plaintext.len()].copy_from_slice(plaintext);
-    let cipher = Aes256CbcEnc::new(key.into(), iv.into());
+    let cipher = Aes256CbcEnc::new(key.into(), (&iv).into());
     let ct = cipher
         .encrypt_padded_mut::<NoPadding>(&mut buf, plaintext.len())
         .unwrap()
