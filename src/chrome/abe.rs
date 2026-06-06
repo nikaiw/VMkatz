@@ -20,30 +20,9 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 
+use crate::chrome::abe_keys::BrowserKeyMap;
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::error::{Result, VmkatzError as Error};
-
-/// Static AES-256-GCM keys extracted from Google Chrome's `elevation_service.exe`
-/// (v135.0.7049.115). The keys live in a std::map keyed by a "version" byte that
-/// prefixes the encrypted blob. The XOR-load in the elevator code is a control-flow
-/// obfuscation; the bytes that get XOR'd into zero-init memory ARE the AES key.
-///
-/// Source layout (each 56-byte block at `unk_1401EC040` in the binary):
-///   [version: u8] + 15 bytes padding/metadata + [aes_key: 32 bytes] + 8 bytes
-pub const CHROME_KEY_V1: [u8; 32] = [
-    0xB3, 0x1C, 0x6E, 0x24, 0x1A, 0xC8, 0x46, 0x72, 0x8D, 0xA9, 0xC1, 0xFA, 0xC4, 0x93, 0x66, 0x51,
-    0xCF, 0xFB, 0x94, 0x4D, 0x14, 0x3A, 0xB8, 0x16, 0x27, 0x6B, 0xCC, 0x6D, 0xA0, 0x28, 0x47, 0x87,
-];
-
-pub const CHROME_KEY_V2: [u8; 32] = [
-    0xE9, 0x8F, 0x37, 0xD7, 0xF4, 0xE1, 0xFA, 0x43, 0x3D, 0x19, 0x30, 0x4D, 0xC2, 0x25, 0x80, 0x42,
-    0x09, 0x0E, 0x2D, 0x1D, 0x7E, 0xEA, 0x76, 0x70, 0xD4, 0x1F, 0x73, 0x8D, 0x08, 0x72, 0x96, 0x60,
-];
-
-pub const CHROME_KEY_V3: [u8; 32] = [
-    0xCC, 0xF8, 0xA1, 0xCE, 0xC5, 0x66, 0x05, 0xB8, 0x51, 0x75, 0x52, 0xBA, 0x1A, 0x2D, 0x06, 0x1C,
-    0x03, 0xA2, 0x9E, 0x90, 0x27, 0x4F, 0xB2, 0xFC, 0xF5, 0x9B, 0xA4, 0xB7, 0x5C, 0x39, 0x23, 0x90,
-];
 
 /// Strip "APPB", run the two DPAPI layers via caller closures, then unwrap the
 /// flag-byte-driven inner blob to return the 32-byte v20 AES-GCM key.
@@ -51,6 +30,7 @@ pub fn unwrap_app_bound_key<FU, FS>(
     appb: &[u8],
     decrypt_user: FU,
     decrypt_system: FS,
+    key_map: &BrowserKeyMap,
 ) -> Result<[u8; 32]>
 where
     FU: FnOnce(&[u8]) -> Result<Vec<u8>>,
@@ -62,12 +42,21 @@ where
     let inner = &appb[4..];
     let layer1 = decrypt_user(inner)?;
     let layer2 = decrypt_system(&layer1)?;
-    decrypt_aes_encrypted_key(&layer2)
+    decrypt_aes_encrypted_key(&layer2, key_map)
+}
+
+/// Convenience wrapper: same as `decrypt_aes_encrypted_key` but uses the
+/// hardcoded Chrome 135 fallback keys.
+pub fn decrypt_aes_encrypted_key_with_fallback(aes_encrypted_key: &[u8]) -> Result<[u8; 32]> {
+    decrypt_aes_encrypted_key(aes_encrypted_key, &BrowserKeyMap::fallback())
 }
 
 /// Given the output of the two DPAPI layers, parse the `<flag><nonce><ct><tag>`
 /// envelope and AES-256-GCM-decrypt to recover the 32-byte v20 key.
-pub fn decrypt_aes_encrypted_key(aes_encrypted_key: &[u8]) -> Result<[u8; 32]> {
+pub fn decrypt_aes_encrypted_key(
+    aes_encrypted_key: &[u8],
+    key_map: &BrowserKeyMap,
+) -> Result<[u8; 32]> {
     // Layout (after SYSTEM-DPAPI decrypt, post-PKCS#7-strip):
     //   header_len(u32 LE) || flag(u8) || install_path((header_len - 1) bytes)
     //   cipher_len(u32 LE) || cipher(cipher_len bytes)
@@ -84,15 +73,12 @@ pub fn decrypt_aes_encrypted_key(aes_encrypted_key: &[u8]) -> Result<[u8; 32]> {
     // The version byte indexes a static AES-256-GCM key embedded in elevation_service.exe.
     if cipher.len() == 61 {
         let version = cipher[0];
-        let key = match version {
-            1 => &CHROME_KEY_V1,
-            2 => &CHROME_KEY_V2,
-            3 => &CHROME_KEY_V3,
-            _ => return Err(Error::Parse(format!("Chrome ABE version {} unknown", version))),
-        };
+        let key = key_map
+            .resolve(version)
+            .ok_or_else(|| Error::Parse(format!("Chrome ABE version {} unknown", version)))?;
         let nonce = &cipher[1..13];
         let ct = &cipher[13..];
-        let gcm = Aes256Gcm::new(key.into());
+        let gcm = Aes256Gcm::new((&key).into());
         let pt = gcm
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|_| Error::Parse("Chrome ABE inner GCM auth fail".into()))?;
@@ -202,6 +188,7 @@ pub fn unwrap_app_bound_with_resolvers<R, S>(
     appb: &[u8],
     user_resolver: &R,
     system_resolver: &S,
+    key_map: &BrowserKeyMap,
 ) -> Result<[u8; 32]>
 where
     R: crate::chrome::disk::MasterkeyResolver,
@@ -226,6 +213,7 @@ where
                 .ok_or_else(|| Error::Parse(format!("ABE layer2 MK {} missing", parsed.mk_guid_str)))?;
             decrypt_blob(&parsed, &mk)
         },
+        key_map,
     )
 }
 
@@ -237,7 +225,12 @@ mod tests {
 
     #[test]
     fn rejects_non_appb() {
-        let r = unwrap_app_bound_key(b"NOPE", |_| Ok(vec![0u8; 32]), |_| Ok(vec![0u8; 32]));
+        let r = unwrap_app_bound_key(
+            b"NOPE",
+            |_| Ok(vec![0u8; 32]),
+            |_| Ok(vec![0u8; 32]),
+            &BrowserKeyMap::fallback(),
+        );
         assert!(r.is_err());
     }
 
@@ -260,7 +253,7 @@ mod tests {
     fn edge_flag2_raw_key_roundtrip() {
         let v20_key = [0xC4u8; 32];
         let blob = build_edge_aes_encrypted_key(&v20_key, b"C:\\Program Files\\Microsoft\\Edge");
-        let recovered = decrypt_aes_encrypted_key(&blob).unwrap();
+        let recovered = decrypt_aes_encrypted_key_with_fallback(&blob).unwrap();
         assert_eq!(recovered, v20_key);
     }
 
@@ -278,6 +271,7 @@ mod tests {
             &appb,
             |_| Ok(b"opaque_system_dpapi_blob".to_vec()),
             move |_| Ok(aes_key_clone),
+            &BrowserKeyMap::fallback(),
         )
         .unwrap();
         assert_eq!(key, v20_key);
