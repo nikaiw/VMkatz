@@ -119,7 +119,13 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     let v20 = if let (Some(appb), Some(sys)) =
         (ls.app_bound_encrypted_key.as_deref(), system_resolver)
     {
-        crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys).ok()
+        match crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                log::info!("[chrome] {} v20 unwrap failed: {}", p.profile.path, e);
+                None
+            }
+        }
     } else {
         None
     };

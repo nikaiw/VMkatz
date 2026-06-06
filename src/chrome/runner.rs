@@ -207,12 +207,16 @@ pub fn build_keyrings_from_disk(
         nt_hash_by_rid.insert(entry.rid, entry.nt_hash);
     }
 
-    // DPAPI_SYSTEM has two 20-byte halves: user_key + machine_key. The S-1-5-18
-    // SYSTEM masterkey files (Windows\System32\Microsoft\Protect\S-1-5-18\) are
-    // encrypted under the user_key half (yes, despite the SYSTEM context — the
-    // naming is a quirk of the DPAPI design).
-    let dpapi_system_user_key = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
-        crate::sam::lsa::LsaSecretType::DpapiSystem { user_key, .. } => Some(*user_key),
+    // DPAPI_SYSTEM has two 20-byte halves. Both are used:
+    //  - `Protect\S-1-5-18\<GUID>` (machine-context SYSTEM MK)  → user_key half
+    //  - `Protect\S-1-5-18\User\<GUID>` (user-context SYSTEM MK) → machine_key half
+    // The naming is a Microsoft quirk. Chrome's elevation_service.exe wraps the
+    // v20 app-bound key with a user-context SYSTEM MK, so both halves are needed
+    // for full ABE decryption.
+    let dpapi_system = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
+        crate::sam::lsa::LsaSecretType::DpapiSystem { user_key, machine_key } => {
+            Some((*user_key, *machine_key))
+        }
         _ => None,
     });
 
@@ -226,7 +230,7 @@ pub fn build_keyrings_from_disk(
     log::info!(
         "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={} DefaultPassword={}",
         secrets.sam_entries.len(),
-        dpapi_system_user_key.is_some(),
+        dpapi_system.is_some(),
         default_password.is_some()
     );
 
@@ -251,19 +255,22 @@ pub fn build_keyrings_from_disk(
             Err(_) => continue,
         };
 
-        // System masterkeys: Windows\System32\Microsoft\Protect\S-1-5-18\<guid>
-        if let Some(mk) = &dpapi_system_user_key {
+        // System masterkeys live in Windows\System32\Microsoft\Protect\S-1-5-18\
+        // (machine-context, pre-key = DPAPI_SYSTEM.user_key) and a `User\` subdir
+        // (user-context for SYSTEM, pre-key = DPAPI_SYSTEM.machine_key — confusing
+        // but verified empirically on Win10).
+        if let Some((user_key, machine_key)) = &dpapi_system {
             decrypt_mks_in_protect(
                 &ntfs,
                 &root,
                 &mut part_reader,
                 "Windows\\System32\\Microsoft\\Protect",
-                |sid, file_bytes| {
-                    if sid == "S-1-5-18" {
-                        crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, mk).ok()
-                    } else {
-                        None
+                |sid, sub, file_bytes| {
+                    if sid != "S-1-5-18" {
+                        return None;
                     }
+                    let pre_key = if sub.is_empty() { user_key } else { machine_key };
+                    crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
                 },
                 &mut system_kr,
                 "system",
@@ -301,7 +308,7 @@ pub fn build_keyrings_from_disk(
                 &users_dir,
                 &mut part_reader,
                 &protect_path,
-                |sid, file_bytes| {
+                |sid, _sub, file_bytes| {
                     // Try LSA DefaultPassword first (works for Win10+ local users).
                     if let Some(pw) = default_password.as_deref() {
                         if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
@@ -345,7 +352,7 @@ fn decrypt_mks_in_protect<'n, R, F>(
     label: &str,
 ) where
     R: std::io::Read + std::io::Seek,
-    F: FnMut(&str, &[u8]) -> Option<Vec<u8>>,
+    F: FnMut(&str, &str, &[u8]) -> Option<Vec<u8>>,
 {
     let protect_dir = match crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) {
         Ok(d) => d,
@@ -367,33 +374,62 @@ fn decrypt_mks_in_protect<'n, R, F>(
             Ok(e) => e,
             Err(_) => continue,
         };
-        for (mk_name, is_mk_dir) in mk_entries {
-            if is_mk_dir || !is_mk_guid(&mk_name) {
-                continue;
+        // Collect MK files in this SID dir AND in its optional `User\` subdir.
+        // The `User\` subdir under S-1-5-18 holds user-context MKs used by SYSTEM
+        // processes — Chrome's elevation_service.exe wraps the v20 key with one.
+        let mut mks_to_try: Vec<(String, String)> = Vec::new();
+        for (name, is_dir) in &mk_entries {
+            if !is_dir && is_mk_guid(name) {
+                mks_to_try.push((name.clone(), String::new()));
             }
-            let mk_file = match crate::sam::find_entry(ntfs, &sid_dir, reader, &mk_name) {
-                Ok(f) => f,
-                Err(_) => continue,
+        }
+        if let Ok(user_sub) = crate::sam::find_entry(ntfs, &sid_dir, reader, "User") {
+            if let Ok(user_entries) = crate::sam::list_directory(ntfs, &user_sub, reader) {
+                for (name, is_dir) in user_entries {
+                    if !is_dir && is_mk_guid(&name) {
+                        mks_to_try.push((name, "User".to_string()));
+                    }
+                }
+            }
+        }
+        for (mk_name, sub) in mks_to_try {
+            let mk_file = if sub.is_empty() {
+                match crate::sam::find_entry(ntfs, &sid_dir, reader, &mk_name) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                }
+            } else {
+                let user_sub = match crate::sam::find_entry(ntfs, &sid_dir, reader, &sub) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                match crate::sam::find_entry(ntfs, &user_sub, reader, &mk_name) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                }
             };
             let mk_data = match crate::sam::read_file_data(&mk_file, reader) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            if mk_name == "990bb548-efb7-4229-9d08-56d44a3b40e8" {
-                log::info!("[trace] vmware edge MK: {}", hex::encode(&mk_data));
-            }
-            match decrypt_fn(&sid, &mk_data) {
+            match decrypt_fn(&sid, &sub, &mk_data) {
                 Some(clear) => {
                     log::info!(
-                        "[chrome] decrypted {} MK: SID={} GUID={}",
-                        label, sid, mk_name
+                        "[chrome] decrypted {} MK: SID={}{} GUID={}",
+                        label,
+                        sid,
+                        if sub.is_empty() { "".into() } else { format!("/{}", sub) },
+                        mk_name
                     );
                     out.insert(mk_name.to_lowercase(), clear);
                 }
                 None => {
                     log::info!(
-                        "[chrome] MK decrypt failed: ctx={} SID={} GUID={}",
-                        label, sid, mk_name
+                        "[chrome] MK decrypt failed: ctx={} SID={}{} GUID={}",
+                        label,
+                        sid,
+                        if sub.is_empty() { "".into() } else { format!("/{}", sub) },
+                        mk_name
                     );
                 }
             }
