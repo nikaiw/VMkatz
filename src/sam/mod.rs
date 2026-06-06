@@ -14,10 +14,10 @@ pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
 // Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
-pub(crate) use partition::{find_ntfs_partitions, is_bitlocker_partition};
-pub(crate) use ntfs_reader::{find_entry, read_file_data, PartitionReader};
+pub use partition::{find_ntfs_partitions, is_bitlocker_partition};
+pub use ntfs_reader::{find_entry, read_file_data, PartitionReader};
 #[cfg(feature = "chrome")]
-pub(crate) use ntfs_reader::{list_directory, navigate_to_dir};
+pub use ntfs_reader::{list_directory, navigate_to_dir};
 
 use std::io::{Read, Seek};
 use std::path::Path;
