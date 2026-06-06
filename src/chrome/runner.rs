@@ -30,6 +30,27 @@ pub struct DiscoverySummary {
 /// first non-BitLocker NTFS partition, and walks the standard Windows user-profile
 /// paths to enumerate browser profiles. Returns the discovery summary; callers
 /// pretty-print or JSON-serialize via [`render_summary`].
+/// Reader-based variant for callers that already have a disk reader open (e.g.
+/// the VMFS-backed flat-VMDK flow on ESXi). Skips the `disk::open_disk` call and
+/// uses caller-supplied SAM/LSA secrets instead of re-extracting them.
+pub fn run_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    secrets: &crate::sam::DiskSecrets,
+) -> Result<DiscoverySummary> {
+    let (profiles, key_map) = discover_profiles_in_reader(reader)?;
+    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets);
+    log::info!(
+        "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
+        user_kr.len(),
+        system_kr.len()
+    );
+    let mut tree = ArtifactsTree { profiles: &profiles };
+    let findings =
+        crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr), &key_map)
+            .unwrap_or_default();
+    Ok(DiscoverySummary { profiles, findings })
+}
+
 pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles(disk_path)?;
     // Try the full on-disk DPAPI chain: SAM NT hashes + LSA DPAPI_SYSTEM derive
@@ -138,9 +159,13 @@ impl<'a> crate::chrome::profile::FileTree for ArtifactsTree<'a> {
 
 fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, BrowserKeyMap)> {
     let mut disk = crate::disk::open_disk(disk_path)?;
+    discover_profiles_in_reader(&mut disk)
+}
 
-    // Reuse the sam partition scanner: handles MBR + GPT + BitLocker detection.
-    let partitions = crate::sam::find_ntfs_partitions(&mut disk).unwrap_or_default();
+fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
+    disk: &mut R,
+) -> Result<(Vec<DiscoveredProfile>, BrowserKeyMap)> {
+    let partitions = crate::sam::find_ntfs_partitions(disk).unwrap_or_default();
     if partitions.is_empty() {
         return Err(crate::error::VmkatzError::Parse(
             "no NTFS partitions found on disk".into(),
@@ -149,14 +174,14 @@ fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, Browse
 
     let mut last_err: Option<String> = None;
     for &part_offset in &partitions {
-        if crate::sam::is_bitlocker_partition(&mut disk, part_offset) {
+        if crate::sam::is_bitlocker_partition(disk, part_offset) {
             log::info!(
                 "[chrome] partition at 0x{:x} is BitLocker, skipping",
                 part_offset
             );
             continue;
         }
-        let mut part_reader = crate::sam::PartitionReader::new(&mut disk, part_offset);
+        let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
         let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
             Ok(n) => n,
             Err(e) => {
@@ -184,8 +209,6 @@ fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, Browse
             );
             continue;
         }
-        // We have profiles on this partition; opportunistically scan the same
-        // partition for elevation_service.exe binaries to build a fresh key map.
         let key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
         return Ok((profiles, key_map));
     }
@@ -193,8 +216,6 @@ fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, Browse
     if let Some(msg) = last_err {
         log::info!("[chrome] discovery: {}", msg);
     }
-    // No profiles found is not an error — return empty list so the caller can
-    // print a friendly "no profiles found" message.
     Ok((Vec::new(), BrowserKeyMap::fallback()))
 }
 
@@ -341,22 +362,26 @@ fn is_version_dir(name: &str) -> bool {
 pub fn build_keyrings_from_disk(
     disk_path: &Path,
 ) -> Result<(HybridKeyring, HybridKeyring)> {
-    // 1. Pull SAM hashes + LSA secrets via the existing extraction pipeline.
-    //    This handles BitLocker, fallback scans, etc.
     let secrets = crate::sam::extract_disk_secrets(disk_path)?;
+    let mut disk = crate::disk::open_disk(disk_path)?;
+    Ok(build_keyrings_with_secrets(&mut disk, &secrets))
+}
 
-    // Build RID -> NT hash map (user MK decryption keys by RID).
+/// Reader-based + already-extracted-secrets variant of `build_keyrings_from_disk`.
+/// Use this when SAM/LSA were extracted from the same reader (e.g. VMFS path).
+/// Never errors; returns empty keyrings on any failure.
+fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
+    disk: &mut R,
+    secrets: &crate::sam::DiskSecrets,
+) -> (HybridKeyring, HybridKeyring) {
     let mut nt_hash_by_rid: HashMap<u32, [u8; 16]> = HashMap::new();
     for entry in &secrets.sam_entries {
         nt_hash_by_rid.insert(entry.rid, entry.nt_hash);
     }
 
-    // DPAPI_SYSTEM has two 20-byte halves. Both are used:
-    //  - `Protect\S-1-5-18\<GUID>` (machine-context SYSTEM MK)  → user_key half
-    //  - `Protect\S-1-5-18\User\<GUID>` (user-context SYSTEM MK) → machine_key half
-    // The naming is a Microsoft quirk. Chrome's elevation_service.exe wraps the
-    // v20 app-bound key with a user-context SYSTEM MK, so both halves are needed
-    // for full ABE decryption.
+    // DPAPI_SYSTEM halves used per subpath:
+    //  - `Protect\S-1-5-18\<GUID>` (machine-context)  → user_key
+    //  - `Protect\S-1-5-18\User\<GUID>` (user-context) → machine_key
     let dpapi_system = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
         crate::sam::lsa::LsaSecretType::DpapiSystem { user_key, machine_key } => {
             Some((*user_key, *machine_key))
@@ -364,32 +389,41 @@ pub fn build_keyrings_from_disk(
         _ => None,
     });
 
-    // LSA `DefaultPassword` is the auto-logon plaintext — when present, it's the
-    // actual password to use for the Win10+ local-user DPAPI chain.
-    let default_password = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
-        crate::sam::lsa::LsaSecretType::DefaultPassword { password } => Some(password.clone()),
-        _ => None,
-    });
+    // Collect every plaintext password available in LSA — `DefaultPassword`
+    // (auto-logon) plus every `_SC_*` service-account password. Admins often
+    // reuse credentials, so any of these can unlock a user MK file.
+    let mut password_candidates: Vec<String> = Vec::new();
+    for s in &secrets.lsa_secrets {
+        match &s.parsed {
+            crate::sam::lsa::LsaSecretType::DefaultPassword { password } => {
+                password_candidates.push(password.clone());
+            }
+            crate::sam::lsa::LsaSecretType::ServicePassword { password, .. } => {
+                password_candidates.push(password.clone());
+            }
+            _ => {}
+        }
+    }
+    password_candidates.sort();
+    password_candidates.dedup();
 
     log::info!(
-        "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={} DefaultPassword={}",
+        "[chrome] disk secrets: {} SAM entries, DPAPI_SYSTEM={} password_candidates={}",
         secrets.sam_entries.len(),
         dpapi_system.is_some(),
-        default_password.is_some()
+        password_candidates.len()
     );
 
-    // 2. Reopen the disk and walk every NTFS partition for MK files.
-    let mut disk = crate::disk::open_disk(disk_path)?;
-    let partitions = crate::sam::find_ntfs_partitions(&mut disk).unwrap_or_default();
+    let partitions = crate::sam::find_ntfs_partitions(disk).unwrap_or_default();
 
     let mut user_kr = HybridKeyring::new();
     let mut system_kr = HybridKeyring::new();
 
     for &part_offset in &partitions {
-        if crate::sam::is_bitlocker_partition(&mut disk, part_offset) {
+        if crate::sam::is_bitlocker_partition(disk, part_offset) {
             continue;
         }
-        let mut part_reader = crate::sam::PartitionReader::new(&mut disk, part_offset);
+        let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
         let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
             Ok(n) => n,
             Err(_) => continue,
@@ -453,8 +487,8 @@ pub fn build_keyrings_from_disk(
                 &mut part_reader,
                 &protect_path,
                 |sid, _sub, file_bytes| {
-                    // Try LSA DefaultPassword first (works for Win10+ local users).
-                    if let Some(pw) = default_password.as_deref() {
+                    // Try every plaintext password from LSA (Win10+ local user chain).
+                    for pw in &password_candidates {
                         if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
                             file_bytes, pw, sid,
                         ) {
@@ -480,7 +514,7 @@ pub fn build_keyrings_from_disk(
         }
     }
 
-    Ok((user_kr, system_kr))
+    (user_kr, system_kr)
 }
 
 /// Walk `Protect\<SID>\<GUID>` under `base_dir`. For each MK file, call

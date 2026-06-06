@@ -680,6 +680,21 @@ fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow:
                         _ => print_cached_credentials(&secrets.cached_credentials, c),
                     }
                 }
+                #[cfg(feature = "chrome")]
+                if args.chrome {
+                    match vmkatz::chrome::runner::run_reader(&mut disk, &secrets) {
+                        Ok(summary) => {
+                            let out = vmkatz::chrome::runner::render_summary(
+                                &summary,
+                                args.chrome_json,
+                            );
+                            if !out.trim().is_empty() {
+                                println!("{}", out);
+                            }
+                        }
+                        Err(e) => log::warn!("chrome (vmfs) failed: {}", e),
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[!] Extraction failed for {}: {}", vmdk, e);
