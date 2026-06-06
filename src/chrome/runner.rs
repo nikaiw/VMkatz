@@ -57,11 +57,15 @@ pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
 
 /// Same as `run_disk` but takes a `MasterkeyResolver` to actually decrypt blobs.
 /// Returns ChromeFindings populated with decrypted passwords/cookies/autofill.
-pub fn run_disk_with_keyring<R: crate::chrome::disk::MasterkeyResolver>(
+pub fn run_disk_with_keyring<U, S>(
     disk_path: &Path,
-    user_resolver: &R,
-    system_resolver: Option<&R>,
-) -> Result<DiscoverySummary> {
+    user_resolver: &U,
+    system_resolver: Option<&S>,
+) -> Result<DiscoverySummary>
+where
+    U: crate::chrome::disk::MasterkeyResolver,
+    S: crate::chrome::disk::MasterkeyResolver,
+{
     let profiles = discover_profiles(disk_path)?;
     let mut tree = ArtifactsTree { profiles: &profiles };
     let findings = crate::chrome::disk::extract_from_disk(&mut tree, user_resolver, system_resolver)
