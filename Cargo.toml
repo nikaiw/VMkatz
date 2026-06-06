@@ -1,3 +1,8 @@
+[[bin]]
+name = "extract_file"
+path = "tools/extract_file.rs"
+required-features = ["chrome"]
+
 [package]
 name = "vmkatz"
 version = "1.4.1"

@@ -23,12 +23,26 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::error::{Result, VmkatzError as Error};
 
-/// Public/known static AES-256-GCM key from Google Chrome's `elevation_service.exe`
-/// for `flag = 1` (Chrome v127+). Sourced from open reverse-engineering writeups
-/// (e.g. `runassu/chrome_v20_decryption`).
-pub const CHROME_FLAG1_KEY: [u8; 32] = [
+/// Static AES-256-GCM keys extracted from Google Chrome's `elevation_service.exe`
+/// (v135.0.7049.115). The keys live in a std::map keyed by a "version" byte that
+/// prefixes the encrypted blob. The XOR-load in the elevator code is a control-flow
+/// obfuscation; the bytes that get XOR'd into zero-init memory ARE the AES key.
+///
+/// Source layout (each 56-byte block at `unk_1401EC040` in the binary):
+///   [version: u8] + 15 bytes padding/metadata + [aes_key: 32 bytes] + 8 bytes
+pub const CHROME_KEY_V1: [u8; 32] = [
     0xB3, 0x1C, 0x6E, 0x24, 0x1A, 0xC8, 0x46, 0x72, 0x8D, 0xA9, 0xC1, 0xFA, 0xC4, 0x93, 0x66, 0x51,
-    0xCF, 0xFB, 0x94, 0x49, 0x82, 0x18, 0x42, 0x66, 0x42, 0xD2, 0xB4, 0xE2, 0x4F, 0xB1, 0x0E, 0x4F,
+    0xCF, 0xFB, 0x94, 0x4D, 0x14, 0x3A, 0xB8, 0x16, 0x27, 0x6B, 0xCC, 0x6D, 0xA0, 0x28, 0x47, 0x87,
+];
+
+pub const CHROME_KEY_V2: [u8; 32] = [
+    0xE9, 0x8F, 0x37, 0xD7, 0xF4, 0xE1, 0xFA, 0x43, 0x3D, 0x19, 0x30, 0x4D, 0xC2, 0x25, 0x80, 0x42,
+    0x09, 0x0E, 0x2D, 0x1D, 0x7E, 0xEA, 0x76, 0x70, 0xD4, 0x1F, 0x73, 0x8D, 0x08, 0x72, 0x96, 0x60,
+];
+
+pub const CHROME_KEY_V3: [u8; 32] = [
+    0xCC, 0xF8, 0xA1, 0xCE, 0xC5, 0x66, 0x05, 0xB8, 0x51, 0x75, 0x52, 0xBA, 0x1A, 0x2D, 0x06, 0x1C,
+    0x03, 0xA2, 0x9E, 0x90, 0x27, 0x4F, 0xB2, 0xFC, 0xF5, 0x9B, 0xA4, 0xB7, 0x5C, 0x39, 0x23, 0x90,
 ];
 
 /// Strip "APPB", run the two DPAPI layers via caller closures, then unwrap the
@@ -58,19 +72,40 @@ pub fn decrypt_aes_encrypted_key(aes_encrypted_key: &[u8]) -> Result<[u8; 32]> {
     //   header_len(u32 LE) || flag(u8) || install_path((header_len - 1) bytes)
     //   cipher_len(u32 LE) || cipher(cipher_len bytes)
     // PKCS#7 padding to a 16-byte boundary follows.
-    let (_header, cipher, flag) = parse_aes_encrypted_key_struct(aes_encrypted_key)?;
+    let (_header, cipher, _flag) = parse_aes_encrypted_key_struct(aes_encrypted_key)?;
 
-    // Edge flag=2: cipher is the raw 32-byte v20 key (no inner encryption).
-    // Chrome flag=2: cipher is 61 bytes = version(1) + nonce(12) + ct(32) + tag(16)
-    // encrypted under a Chrome-version-specific static key, AAD = header bytes.
-    if flag == 2 && cipher.len() == 32 {
+    // Edge (Microsoft) stores the v20 key inline as 32 raw bytes — no inner crypto.
+    if cipher.len() == 32 {
         let mut key = [0u8; 32];
         key.copy_from_slice(cipher);
         return Ok(key);
     }
+    // Chrome (Google) inner format: version(1) || nonce(12) || ct(32) || tag(16) = 61 bytes.
+    // The version byte indexes a static AES-256-GCM key embedded in elevation_service.exe.
+    if cipher.len() == 61 {
+        let version = cipher[0];
+        let key = match version {
+            1 => &CHROME_KEY_V1,
+            2 => &CHROME_KEY_V2,
+            3 => &CHROME_KEY_V3,
+            _ => return Err(Error::Parse(format!("Chrome ABE version {} unknown", version))),
+        };
+        let nonce = &cipher[1..13];
+        let ct = &cipher[13..];
+        let gcm = Aes256Gcm::new(key.into());
+        let pt = gcm
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(|_| Error::Parse("Chrome ABE inner GCM auth fail".into()))?;
+        if pt.len() != 32 {
+            return Err(Error::Parse(format!("Chrome ABE pt_len={} (want 32)", pt.len())));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&pt);
+        return Ok(out);
+    }
     Err(Error::Parse(format!(
-        "ABE flag={} cipher_len={} not yet supported (flag-2 Chrome static key, flag-3 ChaCha20 key, etc.)",
-        flag, cipher.len()
+        "ABE cipher_len={} unsupported (need 32 = Edge raw key or 61 = Chrome wrapped)",
+        cipher.len()
     )))
 }
 

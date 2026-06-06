@@ -7,13 +7,13 @@ use crate::error::Result;
 use super::ntfs_fallback;
 
 /// Wraps a Read+Seek with a partition offset.
-pub(crate) struct PartitionReader<'a, R: Read + Seek> {
+pub struct PartitionReader<'a, R: Read + Seek> {
     inner: &'a mut R,
     offset: u64,
 }
 
 impl<'a, R: Read + Seek> PartitionReader<'a, R> {
-    pub(crate) fn new(inner: &'a mut R, offset: u64) -> Self {
+    pub fn new(inner: &'a mut R, offset: u64) -> Self {
         Self { inner, offset }
     }
 
@@ -51,7 +51,7 @@ impl<R: Read + Seek> Seek for PartitionReader<'_, R> {
 }
 
 /// Find a directory entry by name (case-insensitive).
-pub(crate) fn find_entry<'n, R: Read + Seek>(
+pub fn find_entry<'n, R: Read + Seek>(
     ntfs: &'n ntfs::Ntfs,
     dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
@@ -96,7 +96,7 @@ pub(crate) fn find_entry<'n, R: Read + Seek>(
 /// Read file data ($DATA attribute) into a Vec<u8>.
 /// Uses resilient reads — on I/O errors, zero-fills the failing chunk and continues.
 /// This allows extraction from live/in-use block devices.
-pub(crate) fn read_file_data<R: Read + Seek>(
+pub fn read_file_data<R: Read + Seek>(
     file: &ntfs::NtfsFile,
     reader: &mut R,
 ) -> Result<Vec<u8>> {
@@ -145,7 +145,7 @@ pub(crate) fn read_file_data<R: Read + Seek>(
 }
 
 /// List all file/directory names in a directory.
-pub(crate) fn list_directory<'n, R: Read + Seek>(
+pub fn list_directory<'n, R: Read + Seek>(
     _ntfs: &'n ntfs::Ntfs,
     dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
@@ -183,7 +183,7 @@ pub(crate) fn list_directory<'n, R: Read + Seek>(
 }
 
 /// Navigate to a directory by path components.
-pub(crate) fn navigate_to_dir<'n, R: Read + Seek>(
+pub fn navigate_to_dir<'n, R: Read + Seek>(
     ntfs: &'n ntfs::Ntfs,
     root: &ntfs::NtfsFile<'n>,
     reader: &mut R,

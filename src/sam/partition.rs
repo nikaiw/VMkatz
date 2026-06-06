@@ -6,7 +6,7 @@ use crate::error::Result;
 const BITLOCKER_OEM_ID: &[u8; 8] = b"-FVE-FS-";
 
 /// Check if a partition at the given byte offset is BitLocker-encrypted.
-pub(crate) fn is_bitlocker_partition<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
+pub fn is_bitlocker_partition<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
     if reader.seek(SeekFrom::Start(offset)).is_err() {
         return false;
     }
@@ -18,7 +18,7 @@ pub(crate) fn is_bitlocker_partition<R: Read + Seek>(reader: &mut R, offset: u64
 }
 
 /// Parse MBR/GPT and find all NTFS partitions, returning their byte offsets.
-pub(crate) fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
+pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     if reader.seek(SeekFrom::Start(0)).is_err() {
         return Err(crate::error::VmkatzError::DecryptionError(
             "Cannot seek to MBR (I/O error)".to_string(),
