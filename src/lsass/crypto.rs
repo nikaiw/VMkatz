@@ -346,45 +346,43 @@ fn extract_crypto_keys_data_fallback(
 }
 
 /// Best-effort IV recovery when the LEA-resolved IV global is paged out.
-/// Reads the entire .data section and searches for plausible 16-byte IV
-/// candidates (non-zero, non-pointer, high entropy), preferring those near
-/// the BCrypt handle pointer at `anchor_va`. Returns None if all pages around
-/// any plausible candidate are also paged out.
+/// Searches a bounded window of .data around the BCrypt handle pointer for a
+/// plausible 16-byte IV (non-zero, non-pointer, non-UTF-16-string, high
+/// entropy). Empirically the IV lives within ~0x100 bytes of the handle on
+/// every observed build, so we cap the search at IV_SEARCH_RADIUS to avoid
+/// picking up unrelated strings deep in .data.
 fn recover_iv_from_data(
     vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
     lsasrv_base: u64,
     anchor_va: u64,
 ) -> Option<[u8; 16]> {
+    // 2 KiB: every observed IV-vs-handle delta has been <= 0x60 bytes; 0x800
+    // gives a comfortable margin while keeping the search local enough to
+    // reject unrelated globals (string literals, lookup tables, etc).
+    const IV_SEARCH_RADIUS: usize = 0x800;
+
     let data_sec = pe.find_section(".data")?;
     let data_base = lsasrv_base + data_sec.virtual_address as u64;
     let data_size = data_sec.virtual_size as usize;
     let data = vmem.read_virt_bytes(data_base, data_size).ok()?;
 
     let anchor_off = anchor_va.checked_sub(data_base)? as usize;
-    let max_radius = data_size.max(anchor_off + 1);
 
     // Walk outward from the anchor in 8-byte steps; first plausible candidate wins.
-    for radius in (0..max_radius).step_by(8) {
+    for radius in (0..=IV_SEARCH_RADIUS).step_by(8) {
         for sign in [1isize, -1] {
+            // Skip the duplicate at radius 0.
+            if radius == 0 && sign == -1 {
+                continue;
+            }
             let off_signed = anchor_off as isize + sign * radius as isize;
             if off_signed < 0 || off_signed as usize + 16 > data_size {
                 continue;
             }
             let off = off_signed as usize;
             let candidate = &data[off..off + 16];
-            if candidate.iter().all(|&b| b == 0) {
-                continue;
-            }
-            let v0 = super::types::read_u64_le(candidate, 0).unwrap_or(0);
-            if v0 > 0x10000 && (v0 >> 48 == 0 || v0 >> 48 == 0xFFFF) && v0 & 0x7 == 0 {
-                continue;
-            }
-            let v1 = super::types::read_u64_le(candidate, 8).unwrap_or(0);
-            if v1 > 0x10000 && (v1 >> 48 == 0 || v1 >> 48 == 0xFFFF) && v1 & 0x7 == 0 {
-                continue;
-            }
-            if count_unique_bytes(candidate) < 8 {
+            if !looks_like_iv(candidate) {
                 continue;
             }
             let mut iv = [0u8; 16];
@@ -395,11 +393,44 @@ fn recover_iv_from_data(
             );
             return Some(iv);
         }
-        if radius == 0 {
-            // Both signs at radius 0 are the same point; don't double-check.
-        }
     }
     None
+}
+
+/// Heuristic: a real DPAPI IV is 16 random-looking bytes — non-zero, not a
+/// pointer pair, not a UTF-16 string, and reasonably high entropy.
+fn looks_like_iv(candidate: &[u8]) -> bool {
+    if candidate.len() != 16 || candidate.iter().all(|&b| b == 0) {
+        return false;
+    }
+    // Pointer-shaped qword: heap address with canonical-form high bits and
+    // 8-byte alignment.
+    let looks_like_ptr = |q: u64| -> bool {
+        q > 0x10000 && (q >> 48 == 0 || q >> 48 == 0xFFFF) && q & 0x7 == 0
+    };
+    let v0 = super::types::read_u64_le(candidate, 0).unwrap_or(0);
+    let v1 = super::types::read_u64_le(candidate, 8).unwrap_or(0);
+    if looks_like_ptr(v0) || looks_like_ptr(v1) {
+        return false;
+    }
+    // UTF-16-LE ASCII: every odd byte is 0x00 and even bytes are printable.
+    // 8 odd positions; if >= 6 of them are 0x00 with printable evens, it's a
+    // string fragment, not random bytes.
+    let mut odd_zeros = 0;
+    let mut printable_evens = 0;
+    for i in 0..8 {
+        if candidate[2 * i + 1] == 0 {
+            odd_zeros += 1;
+        }
+        if (0x20..=0x7e).contains(&candidate[2 * i]) {
+            printable_evens += 1;
+        }
+    }
+    if odd_zeros >= 6 && printable_evens >= 6 {
+        return false;
+    }
+    // Entropy check: at least 8 distinct byte values.
+    count_unique_bytes(candidate) >= 8
 }
 
 /// Find the InitializationVector in .data near the BCrypt handle globals.
