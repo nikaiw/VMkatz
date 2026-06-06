@@ -11,7 +11,25 @@
 
 use std::io::{Read, Seek};
 
+use aes::Aes256;
+use cbc::cipher::block_padding::NoPadding;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use des::TdesEde3;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use sha2::Sha512;
+
 use crate::error::{Result, VmkatzError};
+
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type TdesCbcDec = cbc::Decryptor<TdesEde3>;
+type HmacSha1 = Hmac<Sha1>;
+
+/// Maximum allowed PBKDF2 rounds — prevents pathological inputs from
+/// burning CPU forever. Real-world MK files use 4k–8k rounds.
+const MAX_PBKDF2_ROUNDS: u32 = 10_000_000;
+/// Minimum cleartext masterkey blob size (64 MK + 64 HMAC = 128, padding may extend).
+const MIN_DECRYPTED_LEN: usize = 64;
 
 /// CryptoAPI algorithm identifiers (wincrypt.h).
 const CALG_3DES: u32 = 0x6603;
@@ -158,6 +176,173 @@ fn hash_name(alg: u32) -> Option<&'static str> {
         CALG_SHA_512 => Some("sha512"),
         _ => None,
     }
+}
+
+/// Parsed MK section fields needed to actually decrypt the masterkey.
+/// Public face of the private `MasterKeySection` so external callers can
+/// drive `decrypt_masterkey_with_prekey` without re-parsing the file.
+#[derive(Debug, Clone)]
+pub struct MasterKeyDecryptInput {
+    pub salt: [u8; 16],
+    pub rounds: u32,
+    pub alg_hash: u32,
+    pub alg_crypt: u32,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Extract the MK section from a full masterkey file. Returns `None` if the
+/// file is malformed, the algorithms aren't supported, or required fields are
+/// missing. Validates the same invariants as `parse_masterkey_file`.
+pub fn extract_mk_section(file_bytes: &[u8]) -> Option<MasterKeyDecryptInput> {
+    if file_bytes.len() < MIN_FILE_SIZE {
+        return None;
+    }
+    let header = parse_header(file_bytes).ok()?;
+    if header.version == 0 || header.version > 2 {
+        return None;
+    }
+    if header.masterkey_len < 32 || header.masterkey_len > 1024 {
+        return None;
+    }
+    let mk_start = 0x80usize;
+    let mk_end = mk_start + header.masterkey_len as usize;
+    if mk_end > file_bytes.len() {
+        return None;
+    }
+    let mk = parse_masterkey_section(&file_bytes[mk_start..mk_end]).ok()?;
+    // Validate alg pair is one we can dispatch on.
+    let (_c, _h) = (cipher_name(mk.alg_crypt)?, hash_name(mk.alg_hash)?);
+    if mk.ciphertext.is_empty() || mk.rounds == 0 || mk.rounds > MAX_PBKDF2_ROUNDS {
+        return None;
+    }
+    Some(MasterKeyDecryptInput {
+        salt: mk.salt,
+        rounds: mk.rounds,
+        alg_hash: mk.alg_hash,
+        alg_crypt: mk.alg_crypt,
+        ciphertext: mk.ciphertext,
+    })
+}
+
+/// Encode a SID into the UTF-16LE byte form DPAPI expects: each codepoint
+/// little-endian, followed by a trailing NUL widechar.
+fn sid_utf16le_with_nul(sid: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = sid
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    bytes.extend_from_slice(&[0u8, 0u8]);
+    bytes
+}
+
+/// Compute the 20-byte DPAPI pre-key for a local-account user MK:
+///   `HMAC-SHA1(key = nt_hash, msg = UTF-16LE(SID + "\0"))`.
+fn user_local_prekey(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
+    let msg = sid_utf16le_with_nul(sid);
+    let mut mac = HmacSha1::new_from_slice(nt_hash)
+        .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
+    mac.update(&msg);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&tag);
+    Ok(out)
+}
+
+/// Decrypt a DPAPI masterkey file given an already-derived 20-byte pre-key.
+///
+/// Dispatches between AES-256/SHA-512 (modern, hashcat mode 15900) and
+/// 3DES/SHA-1 (legacy, mode 15300) based on the file's `alg_crypt`/`alg_hash`.
+/// Returns the 64-byte cleartext masterkey.
+pub fn decrypt_masterkey_with_prekey(
+    file_bytes: &[u8],
+    pre_key: &[u8],
+) -> Result<Vec<u8>> {
+    let mk = extract_mk_section(file_bytes).ok_or_else(|| {
+        VmkatzError::DecryptionError("malformed or unsupported DPAPI MK file".into())
+    })?;
+    if mk.ciphertext.len() < 64 {
+        return Err(VmkatzError::DecryptionError(
+            "MK ciphertext shorter than 64 bytes".into(),
+        ));
+    }
+    let plaintext = match (mk.alg_crypt, mk.alg_hash) {
+        (CALG_AES_256, CALG_SHA_512) => {
+            // PBKDF2-HMAC-SHA512 -> 48 bytes = 32 AES key + 16 IV.
+            let mut derived = [0u8; 48];
+            pbkdf2::pbkdf2_hmac::<Sha512>(pre_key, &mk.salt, mk.rounds, &mut derived);
+            let aes_key = &derived[..32];
+            let iv = &derived[32..48];
+            if mk.ciphertext.len() % 16 != 0 {
+                return Err(VmkatzError::DecryptionError(
+                    "AES MK ciphertext not block-aligned".into(),
+                ));
+            }
+            let mut buf = mk.ciphertext.clone();
+            let cipher = Aes256CbcDec::new(aes_key.into(), iv.into());
+            cipher
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|_| {
+                    VmkatzError::DecryptionError("AES-256-CBC MK decrypt failed".into())
+                })?;
+            buf
+        }
+        (CALG_3DES, CALG_SHA1) => {
+            // PBKDF2-HMAC-SHA1 -> 32 bytes = 24 3DES key + 8 IV.
+            let mut derived = [0u8; 32];
+            pbkdf2::pbkdf2_hmac::<Sha1>(pre_key, &mk.salt, mk.rounds, &mut derived);
+            let des3_key = &derived[..24];
+            let iv = &derived[24..32];
+            if mk.ciphertext.len() % 8 != 0 {
+                return Err(VmkatzError::DecryptionError(
+                    "3DES MK ciphertext not block-aligned".into(),
+                ));
+            }
+            let mut buf = mk.ciphertext.clone();
+            let cipher = TdesCbcDec::new(des3_key.into(), iv.into());
+            cipher
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|_| {
+                    VmkatzError::DecryptionError("3DES-CBC MK decrypt failed".into())
+                })?;
+            buf
+        }
+        _ => {
+            return Err(VmkatzError::DecryptionError(format!(
+                "unsupported MK alg pair: crypt=0x{:x} hash=0x{:x}",
+                mk.alg_crypt, mk.alg_hash
+            )));
+        }
+    };
+
+    if plaintext.len() < MIN_DECRYPTED_LEN {
+        return Err(VmkatzError::DecryptionError(
+            "decrypted MK plaintext shorter than 64 bytes".into(),
+        ));
+    }
+    Ok(plaintext[..64].to_vec())
+}
+
+/// Decrypt a user DPAPI masterkey file (local-account, mode 15900 or 15300).
+///
+/// `nt_hash` is the user's 16-byte NT hash from SAM.
+/// `sid` is the user's SID (e.g. `"S-1-5-21-...-1000"`).
+/// Returns the 64-byte cleartext masterkey.
+pub fn decrypt_local_user_masterkey(
+    file_bytes: &[u8],
+    nt_hash: &[u8; 16],
+    sid: &str,
+) -> Result<Vec<u8>> {
+    let pre_key = user_local_prekey(nt_hash, sid)?;
+    decrypt_masterkey_with_prekey(file_bytes, &pre_key)
+}
+
+/// Decrypt a SYSTEM DPAPI masterkey file (S-1-5-18) using the LSA
+/// `DPAPI_SYSTEM` machine half (20 bytes).
+pub fn decrypt_system_masterkey(
+    file_bytes: &[u8],
+    dpapi_system_machine_key: &[u8; 20],
+) -> Result<Vec<u8>> {
+    decrypt_masterkey_with_prekey(file_bytes, dpapi_system_machine_key)
 }
 
 /// Parse a DPAPI master key file and generate a Hashcat hash string.
@@ -486,6 +671,133 @@ mod tests {
         assert_eq!(hash.sid, "S-1-5-21-111-222-333-1001");
         assert!(hash.hash.starts_with("$DPAPImk$2*1*S-1-5-21-111-222-333-1001*aes256*sha512*8000*"));
         assert!(hash.hash.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); // salt hex (16 bytes = 32 hex chars)
+    }
+
+    /// Build a synthetic MK file: 128-byte header + 32-byte MK sub-header +
+    /// `ciphertext`. Returns the full file bytes.
+    fn build_mk_file(
+        version: u32,
+        guid: &str,
+        section_version: u32,
+        salt: &[u8; 16],
+        rounds: u32,
+        alg_hash: u32,
+        alg_crypt: u32,
+        ciphertext: &[u8],
+    ) -> Vec<u8> {
+        let mk_sec_len = 32 + ciphertext.len();
+        let mut data = vec![0u8; 128 + mk_sec_len];
+        data[..4].copy_from_slice(&version.to_le_bytes());
+        for (i, ch) in guid.chars().enumerate() {
+            let o = 0x0C + i * 2;
+            data[o] = ch as u8;
+            data[o + 1] = 0;
+        }
+        data[0x60..0x68].copy_from_slice(&(mk_sec_len as u64).to_le_bytes());
+        // backupkey/credhist/domainkey = 0 (already zeroed)
+
+        let m = 0x80usize;
+        data[m..m + 4].copy_from_slice(&section_version.to_le_bytes());
+        data[m + 4..m + 20].copy_from_slice(salt);
+        data[m + 0x14..m + 0x18].copy_from_slice(&rounds.to_le_bytes());
+        data[m + 0x18..m + 0x1C].copy_from_slice(&alg_hash.to_le_bytes());
+        data[m + 0x1C..m + 0x20].copy_from_slice(&alg_crypt.to_le_bytes());
+        data[m + 0x20..m + 0x20 + ciphertext.len()].copy_from_slice(ciphertext);
+        data
+    }
+
+    /// AES-256-CBC encrypt without padding for test fixture generation.
+    fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], pt: &[u8]) -> Vec<u8> {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        type Enc = cbc::Encryptor<aes::Aes256>;
+        assert_eq!(pt.len() % 16, 0);
+        let mut buf = pt.to_vec();
+        let n = buf.len();
+        Enc::new(key.into(), iv.into())
+            .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, n)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn decrypt_user_local_aes_roundtrip() {
+        // Synthesize: known NT hash + SID -> pre-key -> PBKDF2 -> AES-CBC encrypt.
+        let nt_hash: [u8; 16] = [
+            0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0,
+            0x89, 0xc0,
+        ];
+        let sid = "S-1-5-21-1111-2222-3333-1001";
+        let salt = [0xA5u8; 16];
+        let rounds: u32 = 200; // keep tests fast
+
+        // Derive the same pre-key the decryption path will compute.
+        let pre_key = user_local_prekey(&nt_hash, sid).unwrap();
+        let mut derived = [0u8; 48];
+        pbkdf2::pbkdf2_hmac::<Sha512>(&pre_key, &salt, rounds, &mut derived);
+        let mut aes_key = [0u8; 32];
+        aes_key.copy_from_slice(&derived[..32]);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&derived[32..48]);
+
+        // 144-byte cleartext: [0..64] is the MK we want back, rest is junk.
+        let mut cleartext = vec![0u8; 144];
+        for (i, b) in cleartext.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let cipher = aes_cbc_encrypt(&aes_key, &iv, &cleartext);
+
+        let file = build_mk_file(
+            2,
+            "aaaabbbb-cccc-dddd-eeee-ffff00001111",
+            2,
+            &salt,
+            rounds,
+            CALG_SHA_512,
+            CALG_AES_256,
+            &cipher,
+        );
+
+        let mk = decrypt_local_user_masterkey(&file, &nt_hash, sid).expect("decrypt");
+        assert_eq!(mk.len(), 64);
+        assert_eq!(&mk[..], &cleartext[..64]);
+    }
+
+    #[test]
+    fn decrypt_system_aes_roundtrip() {
+        let machine_key: [u8; 20] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+        ];
+        let salt = [0x5Au8; 16];
+        let rounds: u32 = 200;
+
+        let mut derived = [0u8; 48];
+        pbkdf2::pbkdf2_hmac::<Sha512>(&machine_key, &salt, rounds, &mut derived);
+        let mut aes_key = [0u8; 32];
+        aes_key.copy_from_slice(&derived[..32]);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&derived[32..48]);
+
+        let mut cleartext = vec![0u8; 144];
+        for (i, b) in cleartext.iter_mut().enumerate() {
+            *b = (i ^ 0x5A) as u8;
+        }
+        let cipher = aes_cbc_encrypt(&aes_key, &iv, &cleartext);
+
+        let file = build_mk_file(
+            2,
+            "11112222-3333-4444-5555-666677778888",
+            2,
+            &salt,
+            rounds,
+            CALG_SHA_512,
+            CALG_AES_256,
+            &cipher,
+        );
+
+        let mk = decrypt_system_masterkey(&file, &machine_key).expect("decrypt");
+        assert_eq!(mk.len(), 64);
+        assert_eq!(&mk[..], &cleartext[..64]);
     }
 
     #[test]
