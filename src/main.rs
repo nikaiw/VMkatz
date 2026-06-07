@@ -200,6 +200,15 @@ struct Args {
     #[arg(long, value_name = "PASSWORD")]
     chrome_password: Vec<String>,
 
+    /// Also scan running chrome.exe / msedge.exe / brave.exe process memory
+    /// for cookies and saved passwords (ChromeKatz-style). Uses heuristic
+    /// pattern matching, so the disk-side decrypt is more reliable; this
+    /// flag is best used when the disk path is unavailable or when you want
+    /// in-flight values that haven't been persisted yet (e.g. Edge's recent
+    /// memory-resident password disclosures).
+    #[arg(long, default_value_t = false)]
+    chrome_process_scan: bool,
+
     /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
     #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "DEVICE")]
@@ -578,6 +587,20 @@ fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool
         }
     }
     false
+}
+
+/// Merge `extra` findings into `dst` in place. Used to fold in-process scan
+/// results into the disk-side `DiscoverySummary` so the renderer emits one
+/// document. Profiles aren't merged here — in-process findings get
+/// per-record `ChromeSource::Memory { pid, … }` tagging instead.
+#[cfg(feature = "chrome")]
+fn merge_findings(
+    dst: &mut vmkatz::chrome::types::ChromeFindings,
+    mut extra: vmkatz::chrome::types::ChromeFindings,
+) {
+    dst.passwords.append(&mut extra.passwords);
+    dst.cookies.append(&mut extra.cookies);
+    dst.autofill.append(&mut extra.autofill);
 }
 
 /// Run the hybrid chrome flow: open the disk once, extract SAM/LSA secrets +
@@ -2491,6 +2514,24 @@ fn run_with_system<L: PhysicalMemory>(
                 .map(|d| (d.guid.clone(), d.key.clone()))
                 .collect();
             let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
+
+            // In-process scan: walk every chromium browser/utility process,
+            // dump its mapped userland through the page-table walker, and run
+            // the heuristic password / cookie scans on the bytes. Opt-in
+            // via `--chrome-process-scan` because the heuristic produces
+            // noisy results; the disk-side decrypt is the high-fidelity path.
+            let mem_findings = if args.chrome_process_scan {
+                match vmkatz::chrome::process_scan::scan_chromium_processes(layer, &processes) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::warn!("chrome (in-process scan) failed: {}", e);
+                        Default::default()
+                    }
+                }
+            } else {
+                Default::default()
+            };
+
             if let Some(disk_str) = args.disk.as_deref() {
                 let disk_path = std::path::Path::new(disk_str);
                 match run_chrome_hybrid(
@@ -2498,7 +2539,8 @@ fn run_with_system<L: PhysicalMemory>(
                     &mem_keyring,
                     &args.chrome_password,
                 ) {
-                    Ok(summary) => {
+                    Ok(mut summary) => {
+                        merge_findings(&mut summary.findings, mem_findings);
                         let out =
                             vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
                         if !out.trim().is_empty() {
@@ -2507,11 +2549,26 @@ fn run_with_system<L: PhysicalMemory>(
                     }
                     Err(e) => log::warn!("chrome (hybrid) failed: {}", e),
                 }
-            } else if !mem_keyring.is_empty() {
-                log::info!(
-                    "[chrome] {} DPAPI MKs in memory but no --disk supplied; pass --disk <vmdk> to decrypt",
-                    mem_keyring.len()
-                );
+            } else {
+                // No disk supplied: emit just the in-process scan, plus an
+                // info line if DPAPI MKs are sitting in memory unused.
+                if !mem_findings.is_empty() {
+                    let summary = vmkatz::chrome::runner::DiscoverySummary {
+                        profiles: Vec::new(),
+                        findings: mem_findings,
+                    };
+                    let out =
+                        vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                    if !out.trim().is_empty() {
+                        println!("{}", out);
+                    }
+                }
+                if !mem_keyring.is_empty() {
+                    log::info!(
+                        "[chrome] {} DPAPI MKs in memory but no --disk supplied; pass --disk <vmdk> to decrypt cookies/passwords from disk too",
+                        mem_keyring.len()
+                    );
+                }
             }
         }
     }
