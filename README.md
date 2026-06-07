@@ -159,17 +159,53 @@ cargo build --release --no-default-features --features "sam ntds.dit"  # Disk on
 cargo build --release --features chrome                            # Add chrome module
 ```
 
-## Browser secrets (optional, partial)
+## Browser secrets (optional)
 
-The optional `chrome` module discovers browser profiles (Chrome, Edge, Brave, Vivaldi, Opera, and Firefox) on a disk image and reports per-user artifact presence — `Login Data`, `Cookies`, `Web Data`, `Local State`, and Firefox `logins.json` / `key4.db`. It is gated by the `chrome` Cargo feature at build time and the `--chrome` runtime flag. Full DPAPI-chain decryption to plaintext is a work in progress: the disk path locates and parses the encrypted blobs, but masterkey derivation from on-disk DPAPI material is not yet wired through, and the Firefox NSS decrypt path is a scaffold. Expect discovery + artifact metadata, not plaintext passwords, in this release.
+The optional `chrome` module extracts saved passwords, cookies, and autofill
+entries from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera)
+and Firefox. It is gated by the `chrome` Cargo feature at build time and the
+`--chrome` runtime flag, and depends on the `sam` feature for NTFS + DPAPI
+primitives. Three decryption paths are supported:
+
+- **Disk-only** — given a disk image, the module walks each user's `Protect`
+  directory, decrypts every masterkey file (Win10+ password-derived chain;
+  legacy NT-hash chain for domain users), pulls `DPAPI_SYSTEM` from
+  `SECURITY` for the SYSTEM-context MKs, then decrypts each Chromium SQLite
+  artifact end-to-end. Both Chrome v10 (`os_crypt.encrypted_key`) and v20
+  App-Bound Encryption (Chrome ≥127, `app_bound_encrypted_key`) are handled.
+- **Hybrid (memory + disk)** — when a memory snapshot is also supplied, the
+  cleartext masterkeys extracted from LSASS are merged with the disk-side
+  keyring via `ComposedResolver`. This unlocks profiles whose user password
+  isn't in LSA secrets, and recovers v20 keys that depend on
+  SYSTEM-context-user MKs which only the elevation service can produce.
+- **Memory-only** — limited; without disk access the encrypted SQLite files
+  are unreadable, so this path is mostly useful for pivoting MKs to a later
+  disk-mode run.
+
+Use `--chrome-password <pw>` (repeatable) to inject extra password candidates
+when the user's plaintext isn't in LSA (cracked offline, pivoted, known lab
+default). The v20 ABE static keys are auto-extracted from the install's
+`elevation_service.exe` PE; a Chrome 135 fallback ships in-tree so older
+binaries still decrypt.
 
 ```bash
-# Discover Chromium + Firefox profiles and artifacts on a disk
+# Disk-only: full decrypt where the user pwd is in LSA secrets
 ./vmkatz --chrome disk.vmdk
 
-# JSON output for tooling
+# Disk-only with extra password candidates
+./vmkatz --chrome --chrome-password vagrant disk.vmdk
+
+# Hybrid mem+disk: best yield for v20 ABE cookies
+./vmkatz --chrome --disk disk.vmdk snapshot.vmsn
+
+# Structured output for tooling
 ./vmkatz --chrome --chrome-json disk.vmdk
 ```
+
+Status: Chromium decrypt (v10 + v20) is complete and validated on Win10,
+Win11 22H2/24H2/25H2, Win Server 2019/2022/2025. Firefox NSS plaintext
+decrypt is a scaffold — profile discovery works, but plaintext requires an
+NSS link that is not yet wired through.
 
 ## Documentation
 
