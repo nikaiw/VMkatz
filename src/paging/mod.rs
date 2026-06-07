@@ -4,4 +4,6 @@ pub mod ept;
 pub mod filebacked;
 #[cfg(feature = "sam")]
 pub mod pagefile;
+#[cfg(feature = "chrome")]
+pub mod regions;
 pub mod translate;
