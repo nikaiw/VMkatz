@@ -95,21 +95,33 @@ flag; depends on `sam` for NTFS and DPAPI primitives.
 
 ```
 src/chrome/
-├── runner.rs        CLI orchestration: disk-only / hybrid / reader-based entrypoints
-├── profile.rs       NTFS-walking profile + artifact discovery
-├── disk.rs          per-profile SQLite decrypt + key derivation orchestrator
-├── local_state.rs   parse Chrome/Edge "Local State" JSON for encrypted_key + ABE blob
-├── dpapi_decrypt.rs DPAPI blob parser + AES-256-CBC / HMAC-SHA512 primitive
-├── abe.rs           v20 App-Bound Encryption chain (two DPAPI layers + flag-keyed AES-GCM)
-├── abe_keys.rs      auto-extract Chrome ABE static keys from elevation_service.exe
-├── blob.rs          shared blob-shape helpers (v10 DPAPI prefix, v20 APPB header)
-├── memory.rs        memory-side pattern + key-ring helpers
-├── hybrid.rs        ComposedResolver: mem keyring → disk keyring fallback
-├── heuristic.rs     candidate-validation heuristics (SQLite shape, key-byte sanity)
-├── firefox.rs       Firefox profile discovery (NSS decrypt is a scaffold)
-├── sqlite/          minimal embedded SQLite reader (no rusqlite dep)
-├── output.rs        pretty + JSON renderers
-└── types.rs         Browser/Profile/Finding domain types
+├── runner.rs         CLI orchestration: disk-only / hybrid / reader-based entrypoints
+├── profile.rs        NTFS-walking profile + artifact discovery
+├── disk.rs           per-profile SQLite decrypt + key derivation orchestrator
+├── local_state.rs    parse Chrome/Edge "Local State" JSON for encrypted_key + ABE blob
+├── dpapi_decrypt.rs  DPAPI blob parser + AES-256-CBC / HMAC-SHA512 primitive
+├── abe.rs            v20 App-Bound Encryption chain (two DPAPI layers + flag-keyed AES-GCM)
+├── abe_keys.rs       auto-extract Chrome ABE static keys from elevation_service.exe
+├── blob.rs           shared blob-shape helpers (v10 DPAPI prefix, v20 APPB header)
+├── memory.rs         memory-side pattern + key-ring helpers
+├── hybrid.rs         ComposedResolver: mem keyring → disk keyring fallback
+├── heuristic.rs      candidate-validation heuristics (SQLite shape, key-byte sanity,
+│                     plus the in-process URL/cookie scanners gated by TLD allowlist)
+├── process_scan.rs   ChromeKatz-style in-process scanner: enumerate chromium PIDs,
+│                     dump each mapped region via the page-walk enumerator, run
+│                     heuristic password/cookie matchers, tag findings with
+│                     ChromeSource::Memory { pid, process }
+├── cookie_monster.rs CanonicalCookie struct layouts (Chrome 124/130/130-PB, Edge 130
+│                     and Edge 130-PB), OptimizedString reader, RB-tree walker;
+│                     waiting for the per-version locator signature
+├── firefox.rs        Firefox profile discovery (NSS decrypt is a scaffold)
+├── sqlite/           minimal embedded SQLite reader (no rusqlite dep)
+├── output.rs         pretty + JSON renderers
+└── types.rs          Browser/Profile/Finding domain types
+
+src/paging/regions.rs    page-walk top-down enumerator of mapped userland regions
+                         (chrome feature only); used by process_scan to feed pattern
+                         matchers without brute-forcing the 128 TiB address space
 ```
 
 The chain stitches three layers:
@@ -139,6 +151,30 @@ mem-extracted (LSASS DPAPI cache) and disk-extracted keyrings, then picks
 the one whose decrypted output validates against the expected layer shape.
 This is defensive: `decrypt_blob` has no HMAC verify, so wrong MKs silently
 produce garbage that is only caught by the next layer's parse.
+
+### In-process memory scan (opt-in)
+
+The `--chrome-process-scan` flag enables a fourth extraction vector that
+runs alongside the disk path: for every running `chrome.exe` / `msedge.exe`
+/ `brave.exe` / `vivaldi.exe` / `opera.exe` in the snapshot,
+`paging::regions::enumerate_user_regions` walks the process's page tables
+top-down to enumerate every mapped 4 KiB page in the canonical low half,
+`ProcessMemory` reads those pages via the existing DTB + page-table
+walker, and `heuristic::scan_heap_for_passwords` / `_cookies` pattern-match
+the resulting bytes for `https://` UTF-16 + username/password triples and
+ASCII cookie tuples. Hits are tagged `ChromeSource::Memory { pid, process }`
+and merged into the same `ChromeFindings` the disk path produces.
+
+The vector is opt-in because the heuristic produces noise — `plausible_cookie`
+gates on a small TLD allowlist and an RFC 6265 token-shape cookie name to
+trim the worst false-positive classes, but the in-process scan still hits
+debug strings, URL templates and HTTP cache entries. Its real value is
+catching what isn't on disk yet: in-flight session cookies, autofill state,
+and (for Edge ≤ 147) the full plaintext password vault that Edge keeps
+mapped for the whole browser session. The struct layouts in
+`cookie_monster.rs` (`CanonicalCookieChrome130`, `…Edge130Pb`, etc.) are
+ready for the upcoming per-Chrome-version locator signature that will
+replace the heuristic with structured `CookieMonster` walking.
 
 See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md)
 for the full design spec.

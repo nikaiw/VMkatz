@@ -16,6 +16,13 @@
 //!   the elevation service produces and only LSASS retains.
 //! - **VMFS reader** ([`runner::run_reader`]): used by the ESXi VMFS-6 raw
 //!   reader so SAM extraction and chrome discovery share one disk handle.
+//! - **In-process scan** ([`process_scan::scan_chromium_processes`]):
+//!   opt-in via `--chrome-process-scan`. Walks every chromium process's
+//!   mapped userland through the page-table region enumerator and runs
+//!   heuristic pattern matchers for `https://` URL/username/password
+//!   triples and ASCII cookie tuples. Picks up in-flight secrets that
+//!   never reach disk — including the plaintext password vault Edge ≤ 147
+//!   keeps mapped for the whole session. Inspired by Meckazin/ChromeKatz.
 //!
 //! ## Module layout
 //!
@@ -45,6 +52,15 @@
 //!   `ChromeFindings`.
 //! - [`firefox`] — Firefox profile discovery (NSS plaintext decrypt is a
 //!   scaffold).
+//! - [`process_scan`] — `--chrome-process-scan` orchestrator: enumerate
+//!   chromium processes, dump each one's mapped userland through the
+//!   page-walk region enumerator, run the [`heuristic`] scanners, tag
+//!   findings with `ChromeSource::Memory { pid, process }`.
+//! - [`cookie_monster`] — ported `CanonicalCookie` struct layouts +
+//!   `OptimizedString` reader + `std::map` RB-tree walker from
+//!   `ChromeKatz/CookieKatz/Memory.h`. Waiting for the per-Chrome-version
+//!   locator signature that will replace the heuristic scan with
+//!   structured `CookieMonster` traversal.
 //!
 //! See [`docs/plans/2026-06-05-chrome-module-design.md`](../../docs/plans/2026-06-05-chrome-module-design.md)
 //! for the original design spec.
