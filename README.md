@@ -165,19 +165,33 @@ The optional `chrome` module extracts saved passwords, cookies, and autofill
 entries from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera)
 and Firefox. It is gated by the `chrome` Cargo feature at build time and the
 `--chrome` runtime flag, and depends on the `sam` feature for NTFS + DPAPI
-primitives. Three decryption paths are supported:
+primitives. Four extraction vectors are supported:
 
-- **Disk-only** — given a disk image, the module walks each user's `Protect`
-  directory, decrypts every masterkey file (Win10+ password-derived chain;
-  legacy NT-hash chain for domain users), pulls `DPAPI_SYSTEM` from
-  `SECURITY` for the SYSTEM-context MKs, then decrypts each Chromium SQLite
-  artifact end-to-end. Both Chrome v10 (`os_crypt.encrypted_key`) and v20
-  App-Bound Encryption (Chrome ≥127, `app_bound_encrypted_key`) are handled.
+- **Disk-only DPAPI chain** — given a disk image, the module walks each
+  user's `Protect` directory, decrypts every masterkey file (Win10+
+  password-derived chain; legacy NT-hash chain for domain users), pulls
+  `DPAPI_SYSTEM` from `SECURITY` for the SYSTEM-context MKs, then decrypts
+  each Chromium SQLite artifact end-to-end. Both Chrome v10
+  (`os_crypt.encrypted_key`) and v20 App-Bound Encryption (Chrome ≥127,
+  `app_bound_encrypted_key`) are handled.
 - **Hybrid (memory + disk)** — when a memory snapshot is also supplied, the
   cleartext masterkeys extracted from LSASS are merged with the disk-side
   keyring via `ComposedResolver`. This unlocks profiles whose user password
   isn't in LSA secrets, and recovers v20 keys that depend on
   SYSTEM-context-user MKs which only the elevation service can produce.
+- **In-process memory scan** (`--chrome-process-scan`, opt-in) — walks every
+  chrome.exe / msedge.exe / brave.exe in the snapshot, dumps each process's
+  mapped userland through the page-table walker, and runs heuristic
+  pattern matchers for `https://` URLs followed by username/password pairs
+  and ASCII cookie domains. ChromeKatz-style; this is the lever that
+  recovers what's *in flight* in browser memory — including the plaintext
+  passwords Edge ≤ 147 holds in memory for the whole session ([Rønning,
+  April 2026](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means)).
+  Results are heuristic and noisy; the disk-side path remains the
+  high-fidelity reference. The precise per-Chrome-version `CookieMonster`
+  locator (next iteration) will replace the heuristic with structured
+  extraction; `src/chrome/cookie_monster.rs` already carries the matching
+  `CanonicalCookie` struct layouts.
 - **Memory-only** — limited; without disk access the encrypted SQLite files
   are unreadable, so this path is mostly useful for pivoting MKs to a later
   disk-mode run.
@@ -198,6 +212,9 @@ binaries still decrypt.
 # Hybrid mem+disk: best yield for v20 ABE cookies
 ./vmkatz --chrome --disk disk.vmdk snapshot.vmsn
 
+# Hybrid + ChromeKatz-style in-process scan of chrome.exe / msedge.exe
+./vmkatz --chrome --chrome-process-scan --disk disk.vmdk snapshot.vmsn
+
 # Structured output for tooling
 ./vmkatz --chrome --chrome-json disk.vmdk
 ```
@@ -206,6 +223,13 @@ Status: Chromium decrypt (v10 + v20) is complete and validated on Win10,
 Win11 22H2/24H2/25H2, Win Server 2019/2022/2025. Firefox NSS plaintext
 decrypt is a scaffold — profile discovery works, but plaintext requires an
 NSS link that is not yet wired through.
+
+What we deliberately do *not* implement: the live `IElevator` COM-interface
+abuse and the debugger-based App-Bound Encryption bypasses (VoidStealer,
+xaitax/Chrome-App-Bound-Encryption-Decryption). Both require a live
+execution context inside a running Windows host; vmkatz is an offline
+forensic tool, so we work the other side of the same problem — disk DPAPI
+chain + memory snapshot reads.
 
 ## Documentation
 
@@ -223,3 +247,6 @@ NSS link that is not yet wired through.
 - [**dissect.vmfs**](https://github.com/fox-it/dissect.vmfs) by Fox-IT (NCC Group) -- Python VMFS parser from the Dissect DFIR framework, used as reference for VMFS on-disk structures.
 - [**vmfs-tools**](https://github.com/glandium/vmfs-tools) by Mike Hommey -- open-source VMFS3/5 implementation that documents core on-disk structures and address types.
 - [**volatility-kerberos**](https://github.com/airbus-cert/volatility-kerberos) by Sylvain Peyrefitte ([@citronneur](https://twitter.com/citronneur), Airbus CERT) -- Volatility 3 Kerberos plugin, inspired the ticket carving approach for recovering orphaned tickets from freed LSASS memory.
+- [**ChromeKatz**](https://github.com/Meckazin/ChromeKatz) by Meckazin -- the inspiration for the chrome module's in-process scan. The `CanonicalCookie` struct layouts in `src/chrome/cookie_monster.rs` (Chrome 124 / Chrome 130 / Edge / Edge 130, with the ProcessBoundString cookie value variant) are ported from `CookieKatz/Memory.h`; the upcoming per-version locator signature will replace our current heuristic scan.
+- [**Chrome-App-Bound-Encryption-Decryption**](https://github.com/xaitax/Chrome-App-Bound-Encryption-Decryption) by xaitax -- reference for the Chrome ≥ 127 v20 App-Bound Encryption format. Our offline implementation works disk-side via `elevation_service.exe` PE pattern-scanning rather than the live syscall-based reflective hollowing the project uses, but the format/version notes were invaluable cross-references.
+- [**DonPAPI**](https://github.com/login-securite/DonPAPI) and [**dploot**](https://github.com/zblurx/dploot) -- DPAPI remote dumping tools; surveyed for the masterkey decryption chain order and the LSA-context-vs-machine-context `DPAPI_SYSTEM` halves used per `Protect\S-1-5-18\` subdirectory.

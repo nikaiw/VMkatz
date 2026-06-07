@@ -108,6 +108,35 @@ $ vmkatz --chrome --disk windows.vmdk snapshot.vmsn
 [+] Chrome findings: 1 password, 83 cookies, 0 autofill
 ```
 
+### In-process scan (`--chrome-process-scan`, opt-in)
+
+Walks every running `chrome.exe` / `msedge.exe` / `brave.exe` in the
+snapshot, dumps each one's mapped userland through the page-table walker,
+and runs heuristic pattern matchers for `https://` URL + username/password
+triples and ASCII cookie tuples. Hits are tagged with the originating PID
+and process image, and merged into the same `ChromeFindings` document
+the disk path produces:
+
+```
+$ vmkatz --chrome --chrome-process-scan --disk windows.vmdk snapshot.vmsn
+[INFO] [chrome-mem] PID 5688 msedge.exe (115 MiB): +68 passwords, +12345 cookies
+[INFO] [chrome-mem] PID 7732 msedge.exe (7 MiB): +0 passwords, +1654 cookies
+[INFO] [chrome-mem] scanned 5 chromium processes
+...
+```
+
+This is the lever that recovers in-flight values and the plaintext
+password vault Edge ≤ 147 keeps mapped for the whole session — see
+[Rønning's April 2026 disclosure](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means).
+
+The scan is heuristic-driven (TLD allowlist + RFC 6265 token-shape cookie
+names) and noisy; the disk DPAPI path remains the high-fidelity source.
+The upcoming per-Chrome-version `CookieMonster` locator signature will
+replace the heuristic with structured walking of the in-process cookie
+store; the `CanonicalCookie` struct layouts that signature work targets
+already live in `src/chrome/cookie_monster.rs` (ported from
+[ChromeKatz](https://github.com/Meckazin/ChromeKatz)).
+
 ### JSON output
 
 For tooling integration, pretty text becomes a single JSON document
