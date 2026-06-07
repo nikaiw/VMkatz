@@ -8,6 +8,11 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 | VMware Workstation | Windows 10 22H2 x64 | LSASS + pagefile (`.vmsn` + `.vmdk`) | PASS | Resolves paged-out credentials |
 | VMware Workstation | Windows 10 22H2 x64 | SAM / LSA / DCC2 (`.vmdk`) | PASS | |
 | VMware Workstation | Windows 10 22H2 x64 | Folder mode | PASS | Auto-discovers `.vmsn` + `.vmdk` |
+| VMware Workstation | Windows 10 22H2 x64 | Chrome v10 + v20 ABE (hybrid) | PASS | 83 cookies + 1 password |
+| Proxmox 8 | Windows 11 25H2 x64 | Chrome v20 ABE (hybrid LVM + QEMU dump) | PASS | 15 cookies, IV recovery triggered |
+| Proxmox 8 | Windows 11 24H2 x64 | Chrome v20 ABE (hybrid LVM + QEMU dump) | PASS | 52 cookies per VM (fleet) |
+| ESXi 8.0 | Windows 11 24H2 x64 | Chrome v20 ABE (disk-only flat `.vmdk`) | PASS | 18 / 29 cookies on Acronis / RedTeam workstations |
+| ESXi 8.0 | Windows 11 24H2 x64 | Chrome v20 ABE (hybrid archived `.vmsn` + base) | PASS | 6-8 cookies on archived snapshots |
 | VirtualBox | Windows 10 22H2 x64 | LSASS (`.sav`) | PASS | |
 | VirtualBox | Windows 10 22H2 x64 | LSASS + pagefile (`.sav` + `.vdi`) | PASS | |
 | VirtualBox | Windows 10 22H2 x64 | SAM / LSA / DCC2 (`.vdi`) | PASS | |

@@ -88,4 +88,57 @@ src/
 
 ## Chrome module (optional)
 
-Extracts browser secrets (passwords, cookies, autofill) from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera) and Firefox. Gated by the `chrome` Cargo feature (not in the default set) and the `--chrome` runtime flag; depends on `sam` for NTFS and DPAPI primitives. Combines three vectors: a pattern scan over `chrome.exe`/`msedge.exe`/`brave.exe` process memory, a full DPAPI chain on disk-resident SQLite (`Login Data`, `Cookies`, `Web Data`), and a hybrid path that reuses cleartext DPAPI master keys already lifted from LSASS. App-Bound Encryption (`v20` prefix, Chrome v127+) is handled in both disk and memory paths. Current status is partial — profile discovery and artifact enumeration land, but disk masterkey derivation and Firefox NSS decrypt are still in progress. See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md) for the full spec.
+Extracts browser secrets (passwords, cookies, autofill) from Chromium-family
+browsers (Chrome, Edge, Brave, Vivaldi, Opera) and Firefox. Gated by the
+`chrome` Cargo feature (not in the default set) and the `--chrome` runtime
+flag; depends on `sam` for NTFS and DPAPI primitives.
+
+```
+src/chrome/
+├── runner.rs        CLI orchestration: disk-only / hybrid / reader-based entrypoints
+├── profile.rs       NTFS-walking profile + artifact discovery
+├── disk.rs          per-profile SQLite decrypt + key derivation orchestrator
+├── local_state.rs   parse Chrome/Edge "Local State" JSON for encrypted_key + ABE blob
+├── dpapi_decrypt.rs DPAPI blob parser + AES-256-CBC / HMAC-SHA512 primitive
+├── abe.rs           v20 App-Bound Encryption chain (two DPAPI layers + flag-keyed AES-GCM)
+├── abe_keys.rs      auto-extract Chrome ABE static keys from elevation_service.exe
+├── blob.rs          shared blob-shape helpers (v10 DPAPI prefix, v20 APPB header)
+├── memory.rs        memory-side pattern + key-ring helpers
+├── hybrid.rs        ComposedResolver: mem keyring → disk keyring fallback
+├── heuristic.rs     candidate-validation heuristics (SQLite shape, key-byte sanity)
+├── firefox.rs       Firefox profile discovery (NSS decrypt is a scaffold)
+├── sqlite/          minimal embedded SQLite reader (no rusqlite dep)
+├── output.rs        pretty + JSON renderers
+└── types.rs         Browser/Profile/Finding domain types
+```
+
+The chain stitches three layers:
+
+- **DPAPI masterkey decryption** — for user MKs, `sam::dpapi_masterkey` runs
+  the Win10+ password-derived chain (PBKDF2-SHA512 with Microsoft's
+  XOR-feedback variant) over every plaintext in LSA secrets plus the
+  caller-supplied `--chrome-password` list. For SYSTEM-context MKs, both
+  halves of `DPAPI_SYSTEM` are read from `SECURITY` and applied to the
+  matching subdirectory of `Protect\S-1-5-18\` (machine half for `\User\`,
+  user half for the root).
+- **Chrome v10** — the `os_crypt.encrypted_key` field in `Local State` is a
+  DPAPI blob whose plaintext is the per-install AES-256-GCM key used to
+  decrypt every row in `Login Data`/`Cookies`/`Web Data` whose value starts
+  with `v10`.
+- **Chrome v20 (App-Bound Encryption, Chrome ≥127)** — `app_bound_encrypted_key`
+  is wrapped three times: user-context DPAPI blob → SYSTEM-context DPAPI
+  blob → a flag-byte-driven AES-256-GCM envelope. The flag selects which
+  static key (auto-extracted from the install's `elevation_service.exe` PE
+  via pattern scan; Chrome 135 fallback ships in-tree) unwraps the final
+  32-byte v20 key. Cookies whose ciphertext starts with `v20` use this key
+  with the same AES-GCM scheme.
+
+When hybrid mode is used (`--disk` + memory snapshot), `unwrap_app_bound_with_resolvers`
+collects every candidate MK for each layer's GUID across both the
+mem-extracted (LSASS DPAPI cache) and disk-extracted keyrings, then picks
+the one whose decrypted output validates against the expected layer shape.
+This is defensive: `decrypt_blob` has no HMAC verify, so wrong MKs silently
+produce garbage that is only caught by the next layer's parse.
+
+See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md)
+for the full design spec.
