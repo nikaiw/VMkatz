@@ -580,6 +580,38 @@ fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool
     false
 }
 
+/// Run the hybrid chrome flow: open the disk once, extract SAM/LSA secrets +
+/// build disk-side DPAPI keyrings, combine them with the mem-side keyring, and
+/// run chrome discovery + decrypt — all sharing the same file handle.
+///
+/// Opening the disk twice (separate `open_disk()` calls for the SAM step and
+/// the discovery step) can race against external filesystem locks (e.g. ESXi
+/// system datastores) and fail the whole hybrid flow with EBUSY, even when the
+/// first open succeeded.
+#[cfg(feature = "chrome")]
+fn run_chrome_hybrid(
+    disk_path: &Path,
+    mem_keyring: &vmkatz::chrome::hybrid::HybridKeyring,
+    extra_passwords: &[String],
+) -> anyhow::Result<vmkatz::chrome::runner::DiscoverySummary> {
+    let mut disk = vmkatz::disk::open_disk(disk_path)?;
+    let secrets = vmkatz::sam::extract_secrets_from_reader(&mut disk)?;
+    let (disk_user_kr, disk_sys_kr) = vmkatz::chrome::runner::build_keyrings_from_reader(
+        &mut disk,
+        &secrets,
+        extra_passwords,
+    );
+    let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
+        primary: mem_keyring,
+        fallback: &disk_user_kr,
+    };
+    Ok(vmkatz::chrome::runner::run_reader_with_keyring(
+        &mut disk,
+        &user_resolver,
+        Some(&disk_sys_kr),
+    )?)
+}
+
 /// List available VMFS-6 devices and their flat VMDKs.
 #[cfg(feature = "vmfs")]
 fn run_vmfs_list(device_filter: Option<&str>) -> anyhow::Result<()> {
@@ -2461,30 +2493,11 @@ fn run_with_system<L: PhysicalMemory>(
             let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
             if let Some(disk_str) = args.disk.as_deref() {
                 let disk_path = std::path::Path::new(disk_str);
-                // Open the disk ONCE and share the handle across SAM extraction,
-                // keyring construction and chrome discovery — opening twice can
-                // race against external filesystem locks (e.g. ESXi system
-                // datastores) and fail the whole hybrid flow with EBUSY.
-                let result: Result<_, anyhow::Error> = (|| {
-                    let mut disk = vmkatz::disk::open_disk(disk_path)?;
-                    let secrets = vmkatz::sam::extract_secrets_from_reader(&mut disk)?;
-                    let (disk_user_kr, disk_sys_kr) =
-                        vmkatz::chrome::runner::build_keyrings_from_reader(
-                            &mut disk,
-                            &secrets,
-                            &args.chrome_password,
-                        );
-                    let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
-                        primary: &mem_keyring,
-                        fallback: &disk_user_kr,
-                    };
-                    Ok(vmkatz::chrome::runner::run_reader_with_keyring(
-                        &mut disk,
-                        &user_resolver,
-                        Some(&disk_sys_kr),
-                    )?)
-                })();
-                match result {
+                match run_chrome_hybrid(
+                    disk_path,
+                    &mem_keyring,
+                    &args.chrome_password,
+                ) {
                     Ok(summary) => {
                         let out =
                             vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
