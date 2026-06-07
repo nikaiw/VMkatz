@@ -108,34 +108,41 @@ $ vmkatz --chrome --disk windows.vmdk snapshot.vmsn
 [+] Chrome findings: 1 password, 83 cookies, 0 autofill
 ```
 
-### In-process scan (`--chrome-process-scan`, opt-in)
+### In-process discovery (`--chrome-process-scan`, opt-in)
 
 Walks every running `chrome.exe` / `msedge.exe` / `brave.exe` in the
-snapshot, dumps each one's mapped userland through the page-table walker,
-and runs heuristic pattern matchers for `https://` URL + username/password
-triples and ASCII cookie tuples. Hits are tagged with the originating PID
-and process image, and merged into the same `ChromeFindings` document
-the disk path produces:
+snapshot through the page-table region enumerator and logs each
+process's PID, image and resident memory size. Pair with `-v` to see
+the discovery lines:
 
 ```
-$ vmkatz --chrome --chrome-process-scan --disk windows.vmdk snapshot.vmsn
-[INFO] [chrome-mem] PID 5688 msedge.exe (115 MiB): +68 passwords, +12345 cookies
-[INFO] [chrome-mem] PID 7732 msedge.exe (7 MiB): +0 passwords, +1654 cookies
-[INFO] [chrome-mem] scanned 5 chromium processes
-...
+$ vmkatz -v --chrome --chrome-process-scan --disk windows.vmdk snapshot.vmsn
+[INFO] [chrome-mem] PID 5688 msedge.exe (115 MiB mapped userland) — discovery only; structured CookieMonster walking is queued behind per-Chrome-version locator signatures
+[INFO] [chrome-mem] PID 7732 msedge.exe (7 MiB mapped userland) — discovery only; ...
+[INFO] [chrome-mem] PID 8372 msedge.exe (23 MiB mapped userland) — discovery only; ...
+[INFO] [chrome-mem] discovered 5 chromium process(es); no in-memory cookies/passwords emitted (heuristic was structurally unreliable, signature locator pending)
 ```
 
-This is the lever that recovers in-flight values and the plaintext
-password vault Edge ≤ 147 keeps mapped for the whole session — see
-[Rønning's April 2026 disclosure](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means).
+The flag's `findings` output is intentionally empty today: an earlier
+heuristic-based extractor (search for `https://` UTF-16 plus the next
+two strings; search for ASCII domains plus the next four strings) was
+removed because chrome process memory is filled with minified-JavaScript
+string tables and chrome.dll constants that look syntactically identical
+to cookie or credential data once isolated from their structural context.
+The triples it produced were dominated by URL-path-fragment usernames
+(`internal/`, `api/v1/`) and JS-token cookie values (`Symbol&&Symbol.`,
+`||void 0===t||t`) — every filter pass either still leaked thousands of
+false positives or rejected real cookies too.
 
-The scan is heuristic-driven (TLD allowlist + RFC 6265 token-shape cookie
-names) and noisy; the disk DPAPI path remains the high-fidelity source.
-The upcoming per-Chrome-version `CookieMonster` locator signature will
-replace the heuristic with structured walking of the in-process cookie
-store; the `CanonicalCookie` struct layouts that signature work targets
-already live in `src/chrome/cookie_monster.rs` (ported from
-[ChromeKatz](https://github.com/Meckazin/ChromeKatz)).
+The proper fix is the per-Chrome-version `CookieMonster` locator
+signature ChromeKatz uses: pattern-match the destructor in chrome.dll,
+resolve the vtable, scan the heap for objects with that vtable, then
+walk the `std::map` red-black tree to read each `CanonicalCookie`. The
+[struct layouts in `src/chrome/cookie_monster.rs`](https://github.com/nikaiw/VMkatz/blob/dev/src/chrome/cookie_monster.rs)
+are ready; only the locator pattern is missing. Once it lands the same
+flag will return real cookies and the plaintext passwords Edge ≤ 147
+keeps mapped for the whole session ([Rønning, April
+2026](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means)).
 
 ### JSON output
 

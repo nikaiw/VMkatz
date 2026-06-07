@@ -179,19 +179,25 @@ primitives. Four extraction vectors are supported:
   keyring via `ComposedResolver`. This unlocks profiles whose user password
   isn't in LSA secrets, and recovers v20 keys that depend on
   SYSTEM-context-user MKs which only the elevation service can produce.
-- **In-process memory scan** (`--chrome-process-scan`, opt-in) — walks every
-  chrome.exe / msedge.exe / brave.exe in the snapshot, dumps each process's
-  mapped userland through the page-table walker, and runs heuristic
-  pattern matchers for `https://` URLs followed by username/password pairs
-  and ASCII cookie domains. ChromeKatz-style; this is the lever that
-  recovers what's *in flight* in browser memory — including the plaintext
-  passwords Edge ≤ 147 holds in memory for the whole session ([Rønning,
-  April 2026](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means)).
-  Results are heuristic and noisy; the disk-side path remains the
-  high-fidelity reference. The precise per-Chrome-version `CookieMonster`
-  locator (next iteration) will replace the heuristic with structured
-  extraction; `src/chrome/cookie_monster.rs` already carries the matching
-  `CanonicalCookie` struct layouts.
+- **In-process discovery** (`--chrome-process-scan`, opt-in) — walks every
+  chrome.exe / msedge.exe / brave.exe in the snapshot through the
+  page-table region enumerator and logs each process's PID, image and
+  mapped userland size. Currently a discovery-only signal ("a browser was
+  active when the snapshot was taken; here's how much RAM it had
+  touched"); structured cookie / password extraction is queued behind
+  per-Chrome-version `CookieMonster` locator signatures (the
+  `CanonicalCookie` struct layouts are already in
+  `src/chrome/cookie_monster.rs`, only the locator pattern is missing).
+  An earlier heuristic-based extractor was retired because chrome process
+  memory contains huge amounts of minified-JavaScript string tables and
+  chrome.dll auth-flow constants that look syntactically identical to
+  cookie or credential data once isolated from their structural context —
+  every filter pass either still leaked thousands of false positives
+  (which the user would have to triage) or rejected real cookies too. The
+  upcoming locator-signature path will recover what's in flight in
+  browser memory accurately — including the plaintext passwords Edge ≤
+  147 holds in memory for the whole session ([Rønning, April
+  2026](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means)).
 - **Memory-only** — limited; without disk access the encrypted SQLite files
   are unreadable, so this path is mostly useful for pivoting MKs to a later
   disk-mode run.
@@ -212,8 +218,8 @@ binaries still decrypt.
 # Hybrid mem+disk: best yield for v20 ABE cookies
 ./vmkatz --chrome --disk disk.vmdk snapshot.vmsn
 
-# Hybrid + ChromeKatz-style in-process scan of chrome.exe / msedge.exe
-./vmkatz --chrome --chrome-process-scan --disk disk.vmdk snapshot.vmsn
+# Hybrid + chromium process discovery (logs each running browser PID+size)
+./vmkatz -v --chrome --chrome-process-scan --disk disk.vmdk snapshot.vmsn
 
 # Structured output for tooling
 ./vmkatz --chrome --chrome-json disk.vmdk

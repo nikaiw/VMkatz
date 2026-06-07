@@ -152,29 +152,42 @@ the one whose decrypted output validates against the expected layer shape.
 This is defensive: `decrypt_blob` has no HMAC verify, so wrong MKs silently
 produce garbage that is only caught by the next layer's parse.
 
-### In-process memory scan (opt-in)
+### In-process discovery (opt-in)
 
-The `--chrome-process-scan` flag enables a fourth extraction vector that
-runs alongside the disk path: for every running `chrome.exe` / `msedge.exe`
-/ `brave.exe` / `vivaldi.exe` / `opera.exe` in the snapshot,
-`paging::regions::enumerate_user_regions` walks the process's page tables
-top-down to enumerate every mapped 4 KiB page in the canonical low half,
-`ProcessMemory` reads those pages via the existing DTB + page-table
-walker, and `heuristic::scan_heap_for_passwords` / `_cookies` pattern-match
-the resulting bytes for `https://` UTF-16 + username/password triples and
-ASCII cookie tuples. Hits are tagged `ChromeSource::Memory { pid, process }`
-and merged into the same `ChromeFindings` the disk path produces.
+The `--chrome-process-scan` flag walks every running `chrome.exe` /
+`msedge.exe` / `brave.exe` / `vivaldi.exe` / `opera.exe` in the snapshot
+through `paging::regions::enumerate_user_regions` (page-table top-down
+traversal of the canonical low half) and reads each region via
+`ProcessMemory`. Currently it emits one info-level log line per process
+("PID/image/MiB mapped") and a discovery total; no entries are written
+into `ChromeFindings`.
 
-The vector is opt-in because the heuristic produces noise — `plausible_cookie`
-gates on a small TLD allowlist and an RFC 6265 token-shape cookie name to
-trim the worst false-positive classes, but the in-process scan still hits
-debug strings, URL templates and HTTP cache entries. Its real value is
-catching what isn't on disk yet: in-flight session cookies, autofill state,
-and (for Edge ≤ 147) the full plaintext password vault that Edge keeps
-mapped for the whole browser session. The struct layouts in
-`cookie_monster.rs` (`CanonicalCookieChrome130`, `…Edge130Pb`, etc.) are
-ready for the upcoming per-Chrome-version locator signature that will
-replace the heuristic with structured `CookieMonster` walking.
+The flag previously merged heuristic password / cookie hits from
+`heuristic::scan_heap_for_passwords` / `_cookies` into the disk-side
+findings. That path was retired because chrome process memory is filled
+with minified-JavaScript string tables and chrome.dll auth-flow
+constants that look syntactically identical to cookie or credential
+bytes once isolated from their structural context. On VMware Win10 with
+Edge browsing live the heuristic emitted ~99k "cookies" — top hosts
+included real domains the user had visited (americanexpress.com,
+youtube.com, apartments.com) but individual rows were dominated by
+UUID-prefixed hostnames, JS-token cookie names (`typeof`,
+`viz.mojom.GpuHostMessageHeader`) and minified-JS values
+(`Symbol&&Symbol.`, `||void 0===t||t`). Every filter tightening pass
+either still leaked thousands of false positives or rejected real
+cookies too — so the honest choice is to ship discovery only and let
+the next iteration replace it with structured walking.
+
+The struct layouts in `cookie_monster.rs` (`CanonicalCookieChrome`,
+`CanonicalCookieChrome130`, `CanonicalCookieEdge130`, plus the
+`ProcessBoundString` variants for Chrome 130+ in-memory cookie value
+encryption) are ready for the per-Chrome-version `CookieMonster` locator
+signature: pattern-match the destructor in chrome.dll, resolve the
+vtable from the resulting code address, scan the heap for objects whose
+first qword equals that vtable, walk the `std::map` red-black tree from
+the resulting CookieMonster. Until that signature work lands, the disk
+DPAPI chain remains the high-fidelity reference and the only
+structurally-reliable extractor.
 
 See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md)
 for the full design spec.
