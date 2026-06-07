@@ -1,29 +1,41 @@
-//! In-process scanner for chromium browser secrets.
+//! In-process chromium memory scanner.
 //!
-//! Enumerates every chrome.exe / msedge.exe / brave.exe process in a memory
-//! snapshot, classifies each (browser vs network-service vs other), walks
-//! that process's mapped userland pages via the page-table-based region
-//! enumerator, and runs the existing heuristic password/cookie scanners
-//! over the collected bytes.
+//! Enumerates every chrome.exe / msedge.exe / brave.exe / vivaldi.exe /
+//! opera.exe in a memory snapshot, walks the process's mapped userland
+//! through the page-walk region enumerator, and reports per-process
+//! statistics (PID, image name, resident memory size) so an analyst knows
+//! a browser was active when the snapshot was taken.
 //!
-//! When this scan is enabled (hybrid mode with both `--disk` and a memory
-//! snapshot), its findings are merged with the disk-side findings under a
-//! single [`crate::chrome::types::ChromeFindings`]. Each result is tagged
-//! `ChromeSource::Memory { pid, process }` so the source is visible in the
-//! output renderers.
+//! Earlier iterations of this scanner also ran the
+//! [`crate::chrome::heuristic`] ASCII / UTF-16 pattern matchers on the
+//! collected bytes and merged hits into the disk-side findings. Validation
+//! showed the heuristic produces structurally-unreliable triples: chrome
+//! process memory contains huge amounts of minified-JavaScript string
+//! tables, embedded HTML, and chrome.dll auth-flow constants that look
+//! syntactically identical to cookie or credential bytes once isolated
+//! from their structural context. With no way to distinguish a real
+//! `CanonicalCookie` instance from a string table entry that *happens* to
+//! pair a domain with an alphanumeric token, every filter we tried either
+//! still leaked thousands of false positives or rejected real cookies
+//! too.
 //!
-//! Per-version `CanonicalCookie` struct decoding (`cookie_monster::read_cookie`)
-//! is not yet driven here — locating CookieMonster instances precisely
-//! requires per-Chrome-major-version byte signatures that are queued as a
-//! follow-up. Today's scanner uses the existing
-//! [`crate::chrome::heuristic`] ASCII / UTF-16 patterns which work across
-//! versions but produce flatter cookie / password records.
+//! The correct fix is the per-Chrome-version `CookieMonster` locator
+//! signature ChromeKatz uses — pattern-match the destructor in chrome.dll,
+//! resolve the vtable, scan the heap for objects with that vtable, then
+//! walk the `std::map` red-black tree to read each `CanonicalCookie`. The
+//! struct layouts that signature work produces are already in
+//! [`crate::chrome::cookie_monster`]. Until that locator lands, this
+//! module deliberately ships *no* heuristic memory cookie or password
+//! extraction — emitting only a discovery list ("browser is running, this
+//! is the PID and how much RAM it has touched") is more honest than
+//! pretending to recover credentials from cell tower auth-flow noise.
+//!
+//! When the flag is set, the discovery summary is logged at info level
+//! and an empty [`ChromeFindings`] is returned so the downstream merge
+//! step doesn't grow false positives.
 
-use crate::chrome::heuristic::{scan_heap_for_cookies, scan_heap_for_passwords};
 use crate::chrome::memory::is_chromium_image;
-use crate::chrome::types::{
-    Browser, BrowserProfile, ChromeFindings, ChromeSource, Cookie, SavedPassword,
-};
+use crate::chrome::types::ChromeFindings;
 use crate::error::Result;
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::regions::enumerate_user_regions;
@@ -40,54 +52,51 @@ const MAX_BYTES_PER_PROCESS: usize = 1024 * 1024 * 1024;
 /// scan budget.
 const MAX_BYTES_PER_REGION: usize = 64 * 1024 * 1024;
 
-/// Run the in-process chromium scan across every chrome.exe / msedge.exe
-/// / brave.exe / vivaldi.exe / opera.exe in `processes`. Reads each
-/// process's mapped userland through `phys` + the process DTB and runs
-/// both the password (`https://` UTF-16) and cookie (ASCII-domain) scans
-/// on it.
-///
-/// We don't yet read process command lines, so every chromium process is
-/// treated as if it could hold either kind of secret. In practice the
-/// main browser process holds passwords and the network-service utility
-/// holds cookies — scanning renderers is wasted work, but they don't
-/// contain the patterns we look for so they yield zero false positives.
-/// Per-role gating via PEB ProcessParameters → CommandLine is a follow-up.
+/// Walk every chromium process in `processes`, read its mapped userland,
+/// and emit one info-level log line per process describing what was
+/// found. Returns an empty [`ChromeFindings`] because the heuristic
+/// extractors were retired (see the module docstring). The function
+/// remains as the host for the future signature-based locator: once
+/// `cookie_monster.rs` has per-Chrome-version patterns wired in, real
+/// cookie / password findings will be returned here.
 pub fn scan_chromium_processes<P: PhysicalMemory>(
     phys: &P,
     processes: &[Process],
 ) -> Result<ChromeFindings> {
-    let mut findings = ChromeFindings::default();
     let mut scanned = 0;
     for proc in processes {
         if !is_chromium_image(&proc.name) {
             continue;
         }
-        let buf = match collect_process_memory(phys, proc.dtb) {
-            Ok(b) => b,
+        let mib = match collect_process_memory(phys, proc.dtb) {
+            Ok(b) => b.len() / 1024 / 1024,
             Err(e) => {
                 log::info!(
-                    "[chrome-mem] PID {} {} heap read failed: {}",
-                    proc.pid, proc.name, e
+                    "[chrome-mem] PID {} {} region scan failed: {}",
+                    proc.pid,
+                    proc.name,
+                    e
                 );
                 continue;
             }
         };
-        let mib = buf.len() / 1024 / 1024;
-        let pw_before = findings.passwords.len();
-        let cookie_before = findings.cookies.len();
-        harvest(proc.pid as u32, &proc.name, &buf, &mut findings);
         log::info!(
-            "[chrome-mem] PID {} {} ({} MiB): +{} passwords, +{} cookies",
+            "[chrome-mem] PID {} {} ({} MiB mapped userland) — \
+             discovery only; structured CookieMonster walking is queued \
+             behind per-Chrome-version locator signatures",
             proc.pid,
             proc.name,
-            mib,
-            findings.passwords.len() - pw_before,
-            findings.cookies.len() - cookie_before,
+            mib
         );
         scanned += 1;
     }
-    log::info!("[chrome-mem] scanned {} chromium processes", scanned);
-    Ok(findings)
+    log::info!(
+        "[chrome-mem] discovered {} chromium process(es); no in-memory \
+         cookies/passwords emitted (heuristic was structurally unreliable, \
+         signature locator pending)",
+        scanned
+    );
+    Ok(ChromeFindings::default())
 }
 
 /// Collect every mapped userland page in a process's address space into a
@@ -119,54 +128,4 @@ fn collect_process_memory<P: PhysicalMemory>(phys: &P, dtb: u64) -> Result<Vec<u
         }
     }
     Ok(out)
-}
-
-fn browser_from_image(image: &str) -> Browser {
-    let lower = image.to_ascii_lowercase();
-    match lower.as_str() {
-        "msedge.exe" => Browser::Edge,
-        "brave.exe" => Browser::Brave,
-        "opera.exe" => Browser::Opera,
-        "vivaldi.exe" => Browser::Vivaldi,
-        _ => Browser::Chrome,
-    }
-}
-
-fn memory_profile(pid: u32, image: &str) -> BrowserProfile {
-    BrowserProfile {
-        browser: browser_from_image(image),
-        user: String::new(),
-        profile_name: String::new(),
-        path: format!("memory:pid={}", pid),
-    }
-}
-
-fn harvest(pid: u32, image: &str, mem: &[u8], out: &mut ChromeFindings) {
-    let profile = memory_profile(pid, image);
-    let src = ChromeSource::Memory {
-        pid,
-        process: image.to_string(),
-    };
-    for t in scan_heap_for_passwords(mem) {
-        out.passwords.push(SavedPassword {
-            profile: profile.clone(),
-            url: t.url,
-            username: t.username,
-            password: t.password,
-            source: src.clone(),
-        });
-    }
-    for c in scan_heap_for_cookies(mem) {
-        out.cookies.push(Cookie {
-            profile: profile.clone(),
-            host: c.host,
-            name: c.name,
-            value: c.value,
-            path: "/".into(),
-            expires: None,
-            http_only: false,
-            secure: false,
-            source: src.clone(),
-        });
-    }
 }

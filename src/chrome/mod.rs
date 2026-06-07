@@ -16,13 +16,16 @@
 //!   the elevation service produces and only LSASS retains.
 //! - **VMFS reader** ([`runner::run_reader`]): used by the ESXi VMFS-6 raw
 //!   reader so SAM extraction and chrome discovery share one disk handle.
-//! - **In-process scan** ([`process_scan::scan_chromium_processes`]):
+//! - **In-process discovery** ([`process_scan::scan_chromium_processes`]):
 //!   opt-in via `--chrome-process-scan`. Walks every chromium process's
-//!   mapped userland through the page-table region enumerator and runs
-//!   heuristic pattern matchers for `https://` URL/username/password
-//!   triples and ASCII cookie tuples. Picks up in-flight secrets that
-//!   never reach disk — including the plaintext password vault Edge ≤ 147
-//!   keeps mapped for the whole session. Inspired by Meckazin/ChromeKatz.
+//!   mapped userland through the page-table region enumerator and logs a
+//!   discovery summary (PID, image, MiB resident). Earlier iterations
+//!   merged heuristic password/cookie hits into the disk findings; that
+//!   path was removed because chrome process memory contains too much
+//!   minified-JS string-table data that pattern-matches as cookies
+//!   without being one. Structured `CookieMonster` walking via per-
+//!   Chrome-version locator signatures is the queued follow-up; the
+//!   `CanonicalCookie` struct layouts ([`cookie_monster`]) are ready.
 //!
 //! ## Module layout
 //!
@@ -54,13 +57,14 @@
 //!   scaffold).
 //! - [`process_scan`] — `--chrome-process-scan` orchestrator: enumerate
 //!   chromium processes, dump each one's mapped userland through the
-//!   page-walk region enumerator, run the [`heuristic`] scanners, tag
-//!   findings with `ChromeSource::Memory { pid, process }`.
+//!   page-walk region enumerator, log a discovery summary. Returns an
+//!   empty [`types::ChromeFindings`] today; in-memory cookie/password
+//!   extraction is queued behind the per-Chrome-version locator
+//!   signature in `cookie_monster.rs`.
 //! - [`cookie_monster`] — ported `CanonicalCookie` struct layouts +
 //!   `OptimizedString` reader + `std::map` RB-tree walker from
 //!   `ChromeKatz/CookieKatz/Memory.h`. Waiting for the per-Chrome-version
-//!   locator signature that will replace the heuristic scan with
-//!   structured `CookieMonster` traversal.
+//!   locator signature that will populate the in-memory extraction path.
 //!
 //! See [`docs/plans/2026-06-05-chrome-module-design.md`](../../docs/plans/2026-06-05-chrome-module-design.md)
 //! for the original design spec.

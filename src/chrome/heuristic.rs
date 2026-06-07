@@ -68,13 +68,138 @@ fn read_utf16le_until_nul(mem: &[u8], at: usize, max_chars: usize) -> Option<Str
     Some(String::from_utf16_lossy(&units))
 }
 
+/// Hosts that appear in chrome/edge auth-flow string tables but are *not*
+/// real saved-credential URLs. The heuristic finds `https://...` strings
+/// anywhere in memory; without filtering these we get thousands of
+/// false-positive triples whose "URL" is a Microsoft/Xbox auth endpoint
+/// and whose "username" / "password" are whatever bytes happened to
+/// follow in the DLL.
+/// Hosts that appear in chrome/edge auth-flow and internal-API string
+/// tables but are *not* real saved-credential URLs. The heuristic finds
+/// `https://...` strings anywhere in memory; without filtering these we
+/// get thousands of false-positive triples whose "URL" is a
+/// Microsoft/Xbox/Apple auth endpoint or an Edge-internal API and whose
+/// "username" / "password" are whatever bytes happened to follow.
+const AUTH_NOISE_HOSTS: &[&str] = &[
+    "login.microsoft.com",
+    "login.microsoftonline.com",
+    "login.windows.net",
+    "login.live.com",
+    "xsts.auth.xboxlive.com",
+    "user.auth.xboxlive.com",
+    "device.login.microsoftonline.com",
+    "accounts.google.com",
+    "oauth.googleusercontent.com",
+    "appleid.apple.com",
+];
+
+/// Host suffixes that flag the URL as an internal Microsoft / chrome.dll
+/// API endpoint rather than a user-saved credential URL.
+const NOISE_HOST_SUFFIXES: &[&str] = &[
+    ".cdp.microsoft.com",          // Edge CDP / Connected Device Platform
+    ".edgesv.microsoft.com",       // Edge service backend
+    ".windows.com",                // generic MS svcs that show up in strings
+    ".microsoftonline.com",        // AAD / Office 365 backend
+    ".live.com",                   // Xbox / Live backends
+    ".googleusercontent.com",      // Google CDN / OAuth content
+    ".gstatic.com",                // Google static asset CDN
+    ".chrome.com",                 // Chrome telemetry / sync
+    "chromewebstore.googleapis.com",
+    "clients.google.com",
+    "update.googleapis.com",
+];
+
+fn url_host(url: &str) -> &str {
+    let s = url.strip_prefix("https://").unwrap_or(url);
+    s.split('/').next().unwrap_or(s)
+}
+
+fn host_is_auth_noise(url: &str) -> bool {
+    let host = url_host(url);
+    if AUTH_NOISE_HOSTS.iter().any(|h| host == *h) {
+        return true;
+    }
+    NOISE_HOST_SUFFIXES.iter().any(|suf| host.ends_with(suf))
+}
+
+/// Username heuristic: real saved usernames are email addresses or
+/// alphanumeric handles. They never contain `/` (that's a URL path
+/// fragment), never start with `http`, and aren't pure CJK noise.
+fn looks_like_username(s: &str) -> bool {
+    if s.len() < 3 || s.len() > 128 {
+        return false;
+    }
+    // URL fragments captured after a null terminator: `internal/`,
+    // `api/v1/`, etc. Real usernames never contain `/`.
+    if s.contains('/') {
+        return false;
+    }
+    if s.starts_with("http://") || s.starts_with("https://") || s.contains("://") {
+        return false;
+    }
+    // 80%+ ASCII to reject CJK / random-bytes-as-UTF-16 noise.
+    let ascii_count = s.chars().filter(|c| c.is_ascii()).count();
+    if ascii_count * 100 / s.chars().count().max(1) < 80 {
+        return false;
+    }
+    // Real usernames are email-shaped or alphanumeric handles. Require at
+    // least 3 alphanumeric chars to drop pure-punctuation strings.
+    let alnum = s.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    if alnum < 3 {
+        return false;
+    }
+    // Email shape (`a@b.c` with a TLD-shaped tail) or all-tokenchars
+    // identifier (letters / digits / `_-.+`). Reject anything else.
+    let is_email = s.contains('@')
+        && s.matches('@').count() == 1
+        && s.split_once('@')
+            .map(|(local, domain)| !local.is_empty() && domain.contains('.'))
+            .unwrap_or(false);
+    let is_handle = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'));
+    is_email || is_handle
+}
+
+fn looks_like_password(s: &str) -> bool {
+    if s.len() < 6 || s.len() > 128 {
+        return false;
+    }
+    // Real saved passwords aren't URLs or URL fragments.
+    if s.contains("://") || s.starts_with('/') || s.starts_with("http") {
+        return false;
+    }
+    // 80%+ ASCII to reject CJK / random-bytes-as-UTF-16 noise.
+    let ascii_count = s.chars().filter(|c| c.is_ascii()).count();
+    if ascii_count * 100 / s.chars().count().max(1) < 80 {
+        return false;
+    }
+    // Real passwords contain at least one letter and one digit OR
+    // special character — pure-letter "passwords" of length 6+ in
+    // process memory are overwhelmingly debug strings, function names,
+    // or HTTP method tokens.
+    let has_letter = s.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit_or_special = s
+        .chars()
+        .any(|c| c.is_ascii_digit() || (c.is_ascii_punctuation() && c != '/'));
+    if !has_letter || !has_digit_or_special {
+        return false;
+    }
+    // No whitespace inside the value — real passwords occasionally have
+    // spaces, but those are very rare and indistinguishable from a
+    // function-arg-style "arg1 arg2" capture; better to drop them.
+    !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn plausible(t: &PasswordTriple) -> bool {
     t.url.starts_with("https://")
         && t.url.len() < 2048
-        && !t.username.is_empty() && t.username.len() < 256
-        && !t.password.is_empty() && t.password.len() < 256
+        && !t.url.contains('\u{FFFD}')
+        && !host_is_auth_noise(&t.url)
         && !t.username.contains('\u{FFFD}')
         && !t.password.contains('\u{FFFD}')
+        && looks_like_username(&t.username)
+        && looks_like_password(&t.password)
 }
 
 #[derive(Debug, Clone)]
@@ -84,10 +209,14 @@ pub struct CookieTriple {
     pub value: String,
 }
 
-/// Scan ASCII host strings (domain-looking) followed by a cookie name and value
-/// within a small window.
+/// Scan ASCII host strings (domain-looking) followed by a cookie name and
+/// value within a small window. Dedupes by `(host, name, value)` because
+/// chrome.dll's string tables hold many copies of the same config key
+/// triples (telemetry enum values, AAD scope names, etc).
 pub fn scan_heap_for_cookies(mem: &[u8]) -> Vec<CookieTriple> {
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     let mut i = 0usize;
     while i < mem.len() {
         if mem[i] == b'.' || mem[i].is_ascii_alphabetic() {
@@ -112,7 +241,14 @@ pub fn scan_heap_for_cookies(mem: &[u8]) -> Vec<CookieTriple> {
                         value: strs[1].clone(),
                     };
                     if plausible_cookie(&triple) {
-                        out.push(triple);
+                        let key = (
+                            triple.host.clone(),
+                            triple.name.clone(),
+                            triple.value.clone(),
+                        );
+                        if seen.insert(key) {
+                            out.push(triple);
+                        }
                     }
                 }
                 i += len + 1;
@@ -175,8 +311,26 @@ fn host_has_common_tld(host: &str) -> bool {
     COMMON_TLDS.iter().any(|t| *t == tld)
 }
 
+/// Returns true if `s` contains any substring that strongly suggests it's
+/// a URL or domain fragment rather than a cookie name or value (`.com`,
+/// `.net`, `://`, etc.). Used to drop heuristic captures where the
+/// `read_ascii_cstr` loop walked past a struct boundary and concatenated
+/// a UUID with a domain.
+fn contains_url_fragment(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("://") {
+        return true;
+    }
+    for tld in [".com", ".net", ".org", ".io", ".co.", ".edu", ".gov", ".de.", ".fr.", ".uk.", ".cn"] {
+        if lower.contains(tld) {
+            return true;
+        }
+    }
+    false
+}
+
 fn looks_like_cookie_name(s: &str) -> bool {
-    if s.is_empty() || s.len() > 96 {
+    if s.len() < 2 || s.len() > 48 {
         return false;
     }
     // Cookie names per RFC 6265: token characters
@@ -187,19 +341,57 @@ fn looks_like_cookie_name(s: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
-    s.bytes().all(|b| {
+    if !s.bytes().all(|b| {
         b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~' | b'#' | b'$')
-    })
+    }) {
+        return false;
+    }
+    // Reject UUID-or-domain-fragment shapes. Real cookie names never
+    // embed `.com`-shaped fragments; if we see one, the heuristic
+    // walked past a struct boundary.
+    !contains_url_fragment(s)
+}
+
+fn looks_like_cookie_value(s: &str) -> bool {
+    if s.len() < 8 || s.len() > 4096 {
+        return false;
+    }
+    if contains_url_fragment(s) {
+        return false;
+    }
+    // Real cookie values are session IDs, base64 / hex / URL-encoded
+    // payloads, JWTs, etc. They almost always mix at least two of
+    // {letter, digit, special-char} — pure-letter values of length 8+
+    // are overwhelmingly debug strings or function names.
+    let has_letter = s.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = s.chars().any(|c| c.is_ascii_digit());
+    let has_special = s
+        .chars()
+        .any(|c| c.is_ascii_punctuation() && !matches!(c, '/' | '\\'));
+    let classes = [has_letter, has_digit, has_special]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    classes >= 2
+}
+
+fn host_for_noise_check(host: &str) -> &str {
+    host.trim_start_matches('.')
+}
+
+fn cookie_host_is_noise(host: &str) -> bool {
+    let h = host_for_noise_check(host);
+    AUTH_NOISE_HOSTS.iter().any(|n| h == *n)
+        || NOISE_HOST_SUFFIXES.iter().any(|suf| h.ends_with(suf))
 }
 
 fn plausible_cookie(t: &CookieTriple) -> bool {
     t.host.contains('.')
         && t.host.len() < 256
         && host_has_common_tld(&t.host)
+        && !cookie_host_is_noise(&t.host)
         && looks_like_cookie_name(&t.name)
-        && !t.value.is_empty()
-        && t.value.len() > 8
-        && t.value.len() < 8192
+        && looks_like_cookie_value(&t.value)
 }
 
 #[cfg(test)]
