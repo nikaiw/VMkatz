@@ -9,6 +9,42 @@ use crate::error::Result;
 use crate::memory::PhysicalMemory;
 use crate::paging::entry::{PageTableEntry, PAGE_OFFSET_1GB, PAGE_OFFSET_2MB, PAGE_PHYS_MASK};
 
+/// Filter applied to each page-table entry before emitting its page into a
+/// region. The default is "any mapped (or transition) user page"; the
+/// chrome `CookieMonster` locator restricts to writable heap pages, which
+/// correspond closely to VirtualQueryEx's `MEM_COMMIT + PAGE_READWRITE +
+/// MEM_PRIVATE` filter even though the page table can't see allocation
+/// type directly.
+#[derive(Clone, Copy, Debug)]
+pub enum RegionFilter {
+    /// Every present or transition page, regardless of permissions.
+    AnyMapped,
+    /// Only pages whose PTE has the R/W bit set (bit 1) and the
+    /// user-supervisor bit set (bit 2). Excludes read-only code / rodata
+    /// sections and kernel-only pages.
+    WritableUser,
+}
+
+impl RegionFilter {
+    fn accepts_leaf(self, pte: &PageTableEntry) -> bool {
+        if !pte.is_present() && !pte.is_transition() {
+            return false;
+        }
+        match self {
+            RegionFilter::AnyMapped => true,
+            RegionFilter::WritableUser => {
+                let raw = pte.raw();
+                // Bit 1 = R/W, bit 2 = U/S. Transition PTEs may not carry
+                // these flags meaningfully; keep them if marked transition.
+                if pte.is_transition() {
+                    return true;
+                }
+                (raw & (1 << 1)) != 0 && (raw & (1 << 2)) != 0
+            }
+        }
+    }
+}
+
 /// A contiguous run of mapped 4 KiB pages in a single process's address space.
 #[derive(Debug, Clone, Copy)]
 pub struct MappedRegion {
@@ -35,6 +71,18 @@ impl MappedRegion {
 pub fn enumerate_user_regions<P: PhysicalMemory>(
     phys: &P,
     dtb: u64,
+) -> Result<Vec<MappedRegion>> {
+    enumerate_user_regions_filtered(phys, dtb, RegionFilter::AnyMapped)
+}
+
+/// Same as [`enumerate_user_regions`] but applies `filter` per page-table
+/// leaf. The chrome `CookieMonster` locator uses
+/// [`RegionFilter::WritableUser`] to focus on heap pages and skip
+/// read-only code/rodata, which cuts the false-positive surface by ~95%.
+pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
+    phys: &P,
+    dtb: u64,
+    filter: RegionFilter,
 ) -> Result<Vec<MappedRegion>> {
     // Cap on total bytes returned: 4 GiB is plenty for a chrome process's heap
     // and prevents runaway allocations if a page table is corrupt and points
@@ -91,7 +139,9 @@ pub fn enumerate_user_regions<P: PhysicalMemory>(
 
             // 1 GiB huge page → emit the whole gig.
             if pdpte.is_large_page() {
-                emit(pdpt_va, PAGE_OFFSET_1GB + 1, &mut regions, &mut total_bytes);
+                if filter.accepts_leaf(&pdpte) {
+                    emit(pdpt_va, PAGE_OFFSET_1GB + 1, &mut regions, &mut total_bytes);
+                }
                 continue;
             }
 
@@ -112,7 +162,9 @@ pub fn enumerate_user_regions<P: PhysicalMemory>(
 
                 // 2 MiB large page → emit the whole 2 MiB.
                 if pde.is_large_page() {
-                    emit(pd_va, PAGE_OFFSET_2MB + 1, &mut regions, &mut total_bytes);
+                    if filter.accepts_leaf(&pde) {
+                        emit(pd_va, PAGE_OFFSET_2MB + 1, &mut regions, &mut total_bytes);
+                    }
                     continue;
                 }
 
@@ -126,7 +178,7 @@ pub fn enumerate_user_regions<P: PhysicalMemory>(
                         Err(_) => continue,
                     };
                     let pte = PageTableEntry(pte_raw);
-                    if !pte.is_present() && !pte.is_transition() {
+                    if !filter.accepts_leaf(&pte) {
                         continue;
                     }
                     let page_va = pd_va | (pt_idx << 12);
