@@ -153,12 +153,53 @@ fn read_ascii_cstr(b: &[u8]) -> Option<(String, usize)> {
     Some((s, n))
 }
 
+/// Common TLDs accepted by the in-process cookie heuristic. The list is
+/// intentionally narrow — it's a structural anti-noise filter rather than a
+/// real public-suffix check. Anything past these is dropped along with the
+/// many false-positive "domain-shaped" strings that turn up in process
+/// memory (function names, paths, debug strings, etc).
+const COMMON_TLDS: &[&str] = &[
+    "com", "org", "net", "io", "gov", "edu", "mil", "co", "us", "uk", "de",
+    "fr", "es", "it", "ru", "cn", "jp", "kr", "in", "br", "ca", "au", "nl",
+    "se", "no", "fi", "dk", "pl", "ch", "at", "be", "ie", "info", "biz",
+    "me", "tv", "app", "dev", "ai", "tech", "online", "site", "shop",
+    "store", "blog", "news", "cloud",
+];
+
+fn host_has_common_tld(host: &str) -> bool {
+    let host = host.trim_start_matches('.').to_ascii_lowercase();
+    let Some(last_dot) = host.rfind('.') else {
+        return false;
+    };
+    let tld = &host[last_dot + 1..];
+    COMMON_TLDS.iter().any(|t| *t == tld)
+}
+
+fn looks_like_cookie_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 96 {
+        return false;
+    }
+    // Cookie names per RFC 6265: token characters
+    // (alphanumeric plus `! # $ % & ' * + - . ^ _ ` | ~`). We require the
+    // first byte to be a letter or underscore to avoid matching version
+    // numbers and ID-shaped strings.
+    let first = s.as_bytes()[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    s.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~' | b'#' | b'$')
+    })
+}
+
 fn plausible_cookie(t: &CookieTriple) -> bool {
     t.host.contains('.')
         && t.host.len() < 256
-        && !t.name.is_empty()
+        && host_has_common_tld(&t.host)
+        && looks_like_cookie_name(&t.name)
         && !t.value.is_empty()
-        && t.value.len() > 8 // cookies aren't usually 1-char
+        && t.value.len() > 8
+        && t.value.len() < 8192
 }
 
 #[cfg(test)]
@@ -177,7 +218,7 @@ mod tests {
     #[test]
     fn finds_triple() {
         let mut buf = vec![0u8; 64];
-        buf.extend(utf16("https://target.example/login"));
+        buf.extend(utf16("https://target.com/login"));
         buf.extend(vec![0u8; 16]);
         buf.extend(utf16("alice"));
         buf.extend(vec![0u8; 16]);
@@ -185,7 +226,7 @@ mod tests {
         buf.extend(vec![0u8; 64]);
         let r = scan_heap_for_passwords(&buf);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].url, "https://target.example/login");
+        assert_eq!(r[0].url, "https://target.com/login");
         assert_eq!(r[0].username, "alice");
         assert_eq!(r[0].password, "P@ssw0rd");
     }
@@ -193,13 +234,13 @@ mod tests {
     #[test]
     fn finds_cookie_triple() {
         let mut buf = vec![0u8; 16];
-        buf.extend_from_slice(b".target.example\0");
+        buf.extend_from_slice(b".target.com\0");
         buf.extend_from_slice(b"SESSION\0");
         buf.extend_from_slice(b"AbCdEf012345XXX\0");
         buf.extend(vec![0u8; 16]);
         let r = scan_heap_for_cookies(&buf);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].host, ".target.example");
+        assert_eq!(r[0].host, ".target.com");
         assert_eq!(r[0].name, "SESSION");
         assert_eq!(r[0].value, "AbCdEf012345XXX");
     }

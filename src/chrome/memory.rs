@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn memory_extract_finds_cookie_in_network_process() {
         let mut heap = vec![0u8; 16];
-        heap.extend_from_slice(b".t.example\0");
+        heap.extend_from_slice(b".t.com\0");
         heap.extend_from_slice(b"SESSION\0");
         heap.extend_from_slice(b"AbCdEf012345\0");
         heap.extend(vec![0u8; 16]);
@@ -221,7 +221,7 @@ mod tests {
         };
         let f = extract_from_memory(&mut src).unwrap();
         assert_eq!(f.cookies.len(), 1);
-        assert_eq!(f.cookies[0].host, ".t.example");
+        assert_eq!(f.cookies[0].host, ".t.com");
         assert_eq!(f.cookies[0].name, "SESSION");
     }
 }
