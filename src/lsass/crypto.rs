@@ -429,6 +429,15 @@ fn looks_like_iv(candidate: &[u8]) -> bool {
     if odd_zeros >= 6 && printable_evens >= 6 {
         return false;
     }
+    // Structured-data check: two consecutive pointer-like qwords usually share
+    // most of their high bytes. If bytes 1..8 of the first half equal bytes
+    // 9..16 of the second half (i.e. only byte 0 and byte 8 differ), this is
+    // almost certainly a pointer table, not a random IV. Observed on Win7-x64
+    // where the data fallback picked up two adjacent pointers as an "IV".
+    let halves_match_outside_first_byte = candidate[1..8] == candidate[9..16];
+    if halves_match_outside_first_byte {
+        return false;
+    }
     // Entropy check: at least 8 distinct byte values.
     count_unique_bytes(candidate) >= 8
 }
@@ -450,26 +459,11 @@ fn find_iv_near_handles(
     for off in (search_start..search_end).step_by(8) {
         let candidate = &data[off..off + 16];
 
-        // IV should be non-zero
-        if candidate.iter().all(|&b| b == 0) {
+        // Single source of truth: same heuristics as the paged-out recovery
+        // path — zero / pointer / UTF-16-string / structured / low-entropy
+        // candidates are rejected.
+        if !looks_like_iv(candidate) {
             continue;
-        }
-
-        // Check that the first 8 bytes don't look like a pointer
-        let val = super::types::read_u64_le(candidate, 0).unwrap_or(0);
-        if val > 0x10000 && (val >> 48 == 0 || val >> 48 == 0xFFFF) && val & 0x7 == 0 {
-            continue; // looks like a pointer, skip
-        }
-
-        // Check that the second 8 bytes don't look like a pointer either
-        let val2 = super::types::read_u64_le(candidate, 8).unwrap_or(0);
-        if val2 > 0x10000 && (val2 >> 48 == 0 || val2 >> 48 == 0xFFFF) && val2 & 0x7 == 0 {
-            continue;
-        }
-
-        // Good candidate - should have some entropy (not repeating pattern)
-        if count_unique_bytes(candidate) < 4 {
-            continue; // too uniform
         }
 
         log::debug!(
