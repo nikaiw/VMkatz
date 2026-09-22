@@ -1,13 +1,14 @@
 //! Process memory dump in Windows minidump format.
 //!
 //! Produces minidump files compatible with pypykatz and other analysis tools.
-//! Writes 3 streams: SystemInfoStream, ModuleListStream, Memory64ListStream.
+//! Writes 4 streams: SystemInfoStream, ModuleListStream, MemoryInfoListStream,
+//! and Memory64ListStream.
 
 use std::collections::BTreeSet;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::lsass::finder::{DiskPathRef, PagefileRef};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::entry::{PageTableEntry, PAGE_PHYS_MASK};
@@ -22,6 +23,14 @@ const MINIDUMP_VERSION: u32 = 0x0000_A793;
 const STREAM_TYPE_SYSTEM_INFO: u32 = 7;
 const STREAM_TYPE_MODULE_LIST: u32 = 4;
 const STREAM_TYPE_MEMORY64_LIST: u32 = 9;
+const STREAM_TYPE_MEMORY_INFO_LIST: u32 = 16;
+const MINIDUMP_WITH_FULL_MEMORY: u64 = 0x0000_0002;
+const MINIDUMP_WITH_FULL_MEMORY_INFO: u64 = 0x0000_0800;
+const MEMORY_INFO_ENTRY_SIZE: u32 = 48;
+const PAGE_READWRITE: u32 = 0x04;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_PRIVATE: u32 = 0x20000;
+const MEM_IMAGE: u32 = 0x1000000;
 const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 
@@ -29,6 +38,14 @@ const VER_PLATFORM_WIN32_NT: u32 = 2;
 struct MemoryRegion {
     start_va: u64,
     size: u64,
+}
+
+/// MemoryInfoList entry synthesized from captured pages and PEB modules.
+struct MemoryInfoRegion {
+    start_va: u64,
+    size: u64,
+    allocation_base: u64,
+    memory_type: u32,
 }
 
 /// Dump a process's virtual memory as a Windows minidump (.dmp) file.
@@ -227,7 +244,50 @@ fn coalesce_pages(sorted_vas: &[u64]) -> Vec<MemoryRegion> {
     regions
 }
 
-/// Write the minidump file with 3 streams.
+/// Split captured ranges at module boundaries so image and private pages have
+/// separate MemoryInfoList entries. The snapshot has no VAD information, so
+/// allocation and protection details cannot be reconstructed exactly.
+fn memory_info_regions(
+    regions: &[MemoryRegion],
+    modules: &[LoadedModule],
+) -> Vec<MemoryInfoRegion> {
+    let mut info = Vec::new();
+    for region in regions {
+        let end = region.start_va.saturating_add(region.size);
+        let mut boundaries = vec![region.start_va, end];
+        for module in modules {
+            let module_end = module.base.saturating_add(module.size as u64);
+            if module.base > region.start_va && module.base < end {
+                boundaries.push(module.base);
+            }
+            if module_end > region.start_va && module_end < end {
+                boundaries.push(module_end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for pair in boundaries.windows(2) {
+            let start_va = pair[0];
+            let size = pair[1] - start_va;
+            let module = modules
+                .iter()
+                .find(|m| start_va >= m.base && start_va < m.base.saturating_add(m.size as u64));
+            info.push(MemoryInfoRegion {
+                start_va,
+                size,
+                allocation_base: module.map_or(start_va, |m| m.base),
+                memory_type: if module.is_some() {
+                    MEM_IMAGE
+                } else {
+                    MEM_PRIVATE
+                },
+            });
+        }
+    }
+    info
+}
+
+/// Write the minidump file with 4 streams.
 fn write_minidump(
     output_path: &Path,
     vmem: &dyn VirtualMemory,
@@ -237,12 +297,13 @@ fn write_minidump(
 ) -> Result<()> {
     let file = std::fs::File::create(output_path).map_err(VmkatzError::Io)?;
     let mut w = BufWriter::new(file);
+    let memory_info = memory_info_regions(regions, modules);
 
     // === Layout computation ===
     let header_size = 32u32;
-    let dir_size = 3u32 * 12;
+    let dir_size = 4u32 * 12;
 
-    let sysinfo_rva = header_size + dir_size; // 0x44
+    let sysinfo_rva = header_size + dir_size;
     let sysinfo_size = 56u32;
 
     // CSD version string (empty MINIDUMP_STRING: Length=0 + null terminator)
@@ -265,8 +326,12 @@ fn write_minidump(
         name_entries.push((rva, utf16));
     }
 
+    // MemoryInfoListStream: 16-byte header + N * 48-byte entries
+    let meminfo_rva = names_base + names_offset;
+    let meminfo_size = 16 + memory_info.len() as u32 * MEMORY_INFO_ENTRY_SIZE;
+
     // Memory64ListStream
-    let mem64_rva = names_base + names_offset;
+    let mem64_rva = meminfo_rva + meminfo_size;
     let mem64_header = 16u64; // NumberOfMemoryRanges(8) + BaseRva(8)
     let mem64_descs = regions.len() as u64 * 16;
     let mem64_list_size = mem64_header + mem64_descs;
@@ -275,13 +340,13 @@ fn write_minidump(
     // === MINIDUMP_HEADER (32 bytes) ===
     w.write_all(&MINIDUMP_SIGNATURE.to_le_bytes())?;
     w.write_all(&MINIDUMP_VERSION.to_le_bytes())?;
-    w.write_all(&3u32.to_le_bytes())?; // NumberOfStreams
+    w.write_all(&4u32.to_le_bytes())?; // NumberOfStreams
     w.write_all(&header_size.to_le_bytes())?; // StreamDirectoryRva (dir follows header)
     w.write_all(&0u32.to_le_bytes())?; // CheckSum
     w.write_all(&0u32.to_le_bytes())?; // TimeDateStamp
-    w.write_all(&2u64.to_le_bytes())?; // Flags = MiniDumpWithFullMemory
+    w.write_all(&(MINIDUMP_WITH_FULL_MEMORY | MINIDUMP_WITH_FULL_MEMORY_INFO).to_le_bytes())?;
 
-    // === MINIDUMP_DIRECTORY[3] (36 bytes) ===
+    // === MINIDUMP_DIRECTORY[4] (48 bytes) ===
     w.write_all(&STREAM_TYPE_SYSTEM_INFO.to_le_bytes())?;
     w.write_all(&sysinfo_size.to_le_bytes())?;
     w.write_all(&sysinfo_rva.to_le_bytes())?;
@@ -289,6 +354,10 @@ fn write_minidump(
     w.write_all(&STREAM_TYPE_MODULE_LIST.to_le_bytes())?;
     w.write_all(&modlist_data_size.to_le_bytes())?;
     w.write_all(&modlist_rva.to_le_bytes())?;
+
+    w.write_all(&STREAM_TYPE_MEMORY_INFO_LIST.to_le_bytes())?;
+    w.write_all(&meminfo_size.to_le_bytes())?;
+    w.write_all(&meminfo_rva.to_le_bytes())?;
 
     w.write_all(&STREAM_TYPE_MEMORY64_LIST.to_le_bytes())?;
     w.write_all(&(mem64_list_size as u32).to_le_bytes())?;
@@ -336,6 +405,23 @@ fn write_minidump(
             w.write_all(&ch.to_le_bytes())?;
         }
         w.write_all(&0u16.to_le_bytes())?; // Null terminator
+    }
+
+    // === MemoryInfoListStream ===
+    w.write_all(&16u32.to_le_bytes())?; // SizeOfHeader
+    w.write_all(&MEMORY_INFO_ENTRY_SIZE.to_le_bytes())?; // SizeOfEntry
+    w.write_all(&(memory_info.len() as u64).to_le_bytes())?;
+    for region in &memory_info {
+        w.write_all(&region.start_va.to_le_bytes())?; // BaseAddress
+        w.write_all(&region.allocation_base.to_le_bytes())?;
+        // Page tables do not retain the original VirtualQuery protection.
+        w.write_all(&PAGE_READWRITE.to_le_bytes())?; // AllocationProtect (approximate)
+        w.write_all(&0u32.to_le_bytes())?; // Alignment
+        w.write_all(&region.size.to_le_bytes())?; // RegionSize
+        w.write_all(&MEM_COMMIT.to_le_bytes())?;
+        w.write_all(&PAGE_READWRITE.to_le_bytes())?; // Protect (approximate)
+        w.write_all(&region.memory_type.to_le_bytes())?;
+        w.write_all(&0u32.to_le_bytes())?; // Alignment
     }
 
     // === Memory64ListStream ===
