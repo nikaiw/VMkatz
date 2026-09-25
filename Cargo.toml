@@ -5,7 +5,7 @@ required-features = ["chrome"]
 
 [package]
 name = "vmkatz"
-version = "1.4.5-beta.1"
+version = "1.4.6-beta.1"
 edition = "2024"
 license = "MIT"
 
