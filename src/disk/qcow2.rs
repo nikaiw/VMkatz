@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{VmkatzError, Result};
 use super::{read_u32_be_file, read_u64_be_file};
+use crate::error::{Result, VmkatzError};
 
 /// Maximum number of L2 tables kept in cache.
 /// Each cached table holds `cluster_size / 8` entries of 8 bytes each,
@@ -31,7 +31,7 @@ pub struct QcowDisk {
     l1_table: Vec<u64>,
     disk_size: u64,
     cursor: u64,
-    parent: Option<Box<QcowDisk>>,
+    parent: Option<Box<Self>>,
     /// Cache of L2 tables keyed by their on-disk byte offset.
     /// Each value is the full L2 table decoded as big-endian u64 entries.
     l2_cache: HashMap<u64, Vec<u64>>,
@@ -43,8 +43,6 @@ struct QcowHeader {
     backing_file_size: u32,
     cluster_bits: u32,
     disk_size: u64,
-    #[allow(dead_code)]
-    encryption_method: u32,
     l1_size: u32,
     l1_table_offset: u64,
 }
@@ -60,8 +58,7 @@ fn parse_header(file: &mut File) -> Result<QcowHeader> {
     let version = read_u32_be_file(file)?;
     if version != 2 && version != 3 {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Unsupported QCOW2 version: {}",
-            version
+            "Unsupported QCOW2 version: {version}"
         )));
     }
 
@@ -72,8 +69,7 @@ fn parse_header(file: &mut File) -> Result<QcowHeader> {
     // Sanity check cluster_bits (typically 9..24, default 16 = 64KB)
     if !(9..=24).contains(&cluster_bits) {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Invalid QCOW2 cluster_bits: {}",
-            cluster_bits
+            "Invalid QCOW2 cluster_bits: {cluster_bits}"
         )));
     }
 
@@ -82,8 +78,7 @@ fn parse_header(file: &mut File) -> Result<QcowHeader> {
 
     if encryption_method != 0 {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Encrypted QCOW2 not supported (method={})",
-            encryption_method
+            "Encrypted QCOW2 not supported (method={encryption_method})"
         )));
     }
 
@@ -96,7 +91,6 @@ fn parse_header(file: &mut File) -> Result<QcowHeader> {
         backing_file_size,
         cluster_bits,
         disk_size,
-        encryption_method,
         l1_size,
         l1_table_offset,
     })
@@ -133,20 +127,19 @@ impl QcowDisk {
         // Open backing file if present
         let parent = if header.backing_file_offset != 0 && header.backing_file_size > 0 {
             file.seek(SeekFrom::Start(header.backing_file_offset))?;
-            let mut name_buf = vec![0u8; header.backing_file_size as usize];
-            file.read_exact(&mut name_buf)?;
+            let name_buf = super::read_exact_alloc(&mut file, u64::from(header.backing_file_size))?;
             let backing_name = String::from_utf8_lossy(&name_buf).into_owned();
 
             let backing_path = resolve_backing_path(path, &backing_name);
-            log::debug!("QCOW2: backing file: {:?}", backing_path);
-            Some(Box::new(QcowDisk::open(&backing_path)?))
+            log::debug!("QCOW2: backing file: {}", backing_path.display());
+            Some(Box::new(Self::open(&backing_path)?))
         } else {
             None
         };
 
         let l2_entries = (cluster_size / 8) as usize;
 
-        Ok(QcowDisk {
+        Ok(Self {
             file,
             cluster_bits,
             cluster_size,
@@ -206,11 +199,7 @@ impl QcowDisk {
     /// Look up a single L2 entry, reading and caching the entire L2 table on miss.
     /// `l2_table_offset` is the on-disk byte offset of the L2 table.
     /// `l2_idx` is the index within that table.
-    fn cached_l2_lookup(
-        &mut self,
-        l2_table_offset: u64,
-        l2_idx: usize,
-    ) -> std::io::Result<u64> {
+    fn cached_l2_lookup(&mut self, l2_table_offset: u64, l2_idx: usize) -> std::io::Result<u64> {
         // Fast path: table already cached.
         if let Some(table) = self.l2_cache.get(&l2_table_offset) {
             return Ok(table[l2_idx]);
@@ -317,7 +306,9 @@ fn resolve_backing_path(image_path: &Path, backing_name: &str) -> std::path::Pat
     if backing.is_absolute() {
         backing.to_path_buf()
     } else {
-        let base_dir = image_path.parent().unwrap_or(std::path::Path::new("."));
+        let base_dir = image_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         base_dir.join(backing)
     }
 }

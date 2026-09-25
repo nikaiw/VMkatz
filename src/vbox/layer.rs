@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
 
 const PAGE_SIZE: usize = 4096;
@@ -55,7 +55,7 @@ struct SsmStream<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> SsmStream<R> {
-    fn new(reader: R) -> Self {
+    const fn new(reader: R) -> Self {
         Self {
             reader,
             buf: Vec::new(),
@@ -94,7 +94,7 @@ impl<R: Read + Seek> SsmStream<R> {
         if hdr_byte & 0xE0 != 0x80 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Invalid SSM record header: 0x{:02x}", hdr_byte),
+                format!("Invalid SSM record header: 0x{hdr_byte:02x}"),
             ));
         }
 
@@ -108,10 +108,19 @@ impl<R: Read + Seek> SsmStream<R> {
                 self.done = true;
             }
             SSM_REC_RAW => {
-                let size = self.read_varlen_size()? as usize;
+                // `size` is an untrusted varint (up to ~4 GiB). Grow the buffer as
+                // bytes actually arrive rather than pre-allocating `size`, so a
+                // bogus record length can't force a huge allocation up front.
+                let size = u64::from(self.read_varlen_size()?);
                 let start = self.buf.len();
-                self.buf.resize(start + size, 0);
-                self.reader.read_exact(&mut self.buf[start..start + size])?;
+                let n = self.reader.by_ref().take(size).read_to_end(&mut self.buf)?;
+                if n as u64 != size {
+                    self.buf.truncate(start);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSM_REC_RAW record truncated",
+                    ));
+                }
             }
             SSM_REC_LZF => {
                 let size = self.read_varlen_size()? as usize;
@@ -125,9 +134,21 @@ impl<R: Read + Seek> SsmStream<R> {
                 let mut uncomp_units = [0u8; 1];
                 self.reader.read_exact(&mut uncomp_units)?;
                 let uncomp_size = uncomp_units[0] as usize * 1024;
+                // comp_size is untrusted (varint - 1); size the read against the
+                // stream instead of pre-allocating it.
                 let comp_size = size - 1;
-                let mut compressed = vec![0u8; comp_size];
-                self.reader.read_exact(&mut compressed)?;
+                let mut compressed = Vec::new();
+                let n = self
+                    .reader
+                    .by_ref()
+                    .take(comp_size as u64)
+                    .read_to_end(&mut compressed)?;
+                if n != comp_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSM_REC_LZF record truncated",
+                    ));
+                }
                 let decompressed = lzf_decompress(&compressed, uncomp_size)?;
                 self.buf.extend_from_slice(&decompressed);
             }
@@ -143,7 +164,7 @@ impl<R: Read + Seek> SsmStream<R> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Unknown SSM record type: {}", rec_type),
+                    format!("Unknown SSM record type: {rec_type}"),
                 ));
             }
         }
@@ -159,39 +180,39 @@ impl<R: Read + Seek> SsmStream<R> {
 
         if b0 < 0x80 {
             // 1 byte: 0-127
-            return Ok(b0 as u32);
+            return Ok(u32::from(b0));
         }
 
         if b0 < 0xC0 {
             // 0x80-0xBF: 2-byte (VBox relaxed UTF-8)
             self.reader.read_exact(&mut b)?;
             let b1 = b[0];
-            return Ok((((b0 & 0x3F) as u32) << 6) | (b1 & 0x3F) as u32);
+            return Ok((u32::from(b0 & 0x3F) << 6) | u32::from(b1 & 0x3F));
         }
 
         if b0 < 0xE0 {
             // 0xC0-0xDF: 2-byte standard UTF-8
             self.reader.read_exact(&mut b)?;
             let b1 = b[0];
-            return Ok((((b0 & 0x1F) as u32) << 6) | (b1 & 0x3F) as u32);
+            return Ok((u32::from(b0 & 0x1F) << 6) | u32::from(b1 & 0x3F));
         }
 
         if b0 < 0xF0 {
             // 0xE0-0xEF: 3-byte
             let mut b2 = [0u8; 2];
             self.reader.read_exact(&mut b2)?;
-            return Ok((((b0 & 0x0F) as u32) << 12)
-                | (((b2[0] & 0x3F) as u32) << 6)
-                | (b2[1] & 0x3F) as u32);
+            return Ok((u32::from(b0 & 0x0F) << 12)
+                | (u32::from(b2[0] & 0x3F) << 6)
+                | u32::from(b2[1] & 0x3F));
         }
 
         // 0xF0-0xF7: 4-byte
         let mut b3 = [0u8; 3];
         self.reader.read_exact(&mut b3)?;
-        Ok((((b0 & 0x07) as u32) << 18)
-            | (((b3[0] & 0x3F) as u32) << 12)
-            | (((b3[1] & 0x3F) as u32) << 6)
-            | (b3[2] & 0x3F) as u32)
+        Ok((u32::from(b0 & 0x07) << 18)
+            | (u32::from(b3[0] & 0x3F) << 12)
+            | (u32::from(b3[1] & 0x3F) << 6)
+            | u32::from(b3[2] & 0x3F))
     }
 
     /// Read exactly `n` bytes from the logical stream.
@@ -371,14 +392,12 @@ impl VBoxLayer {
         }
 
         let cb_gc_phys = header[45];
-        log::info!("VBox header: cbGCPhys={}", cb_gc_phys);
+        log::info!("VBox header: cbGCPhys={cb_gc_phys}");
 
         // 2. Find the "pgm" unit by scanning for unit headers
         let (pgm_data_offset, pgm_version) = Self::find_pgm_unit(&mut reader, file_size)?;
         log::info!(
-            "PGM unit data starts at file offset 0x{:x}, version {}",
-            pgm_data_offset,
-            pgm_version
+            "PGM unit data starts at file offset 0x{pgm_data_offset:x}, version {pgm_version}"
         );
 
         // 3. Seek to PGM data and create SSM stream
@@ -398,7 +417,9 @@ impl VBoxLayer {
             _ => {
                 return Err(VmkatzError::Io(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    format!("Unsupported PGM saved state version {} (need >= 11, VBox 4.1+)", pgm_version),
+                    format!(
+                        "Unsupported PGM saved state version {pgm_version} (need >= 11, VBox 4.1+)"
+                    ),
                 )));
             }
         };
@@ -425,20 +446,15 @@ impl VBoxLayer {
             let _dev = stream.read_strz()?;
             let _inst = stream.read_u32_le()?;
             let _reg = stream.read_u8()?;
-            let _desc = stream.read_strz()?;
-            let _gcphys = stream.read_u64_le()?;
-            let _cb = stream.read_u64_le()?;
+            let desc = stream.read_strz()?;
+            let gcphys = stream.read_u64_le()?;
+            let cb = stream.read_u64_le()?;
             rom_count += 1;
             log::debug!(
-                "ROM range {}: id={} desc='{}' gcphys=0x{:x} size=0x{:x}",
-                rom_count,
-                id,
-                _desc,
-                _gcphys,
-                _cb
+                "ROM range {rom_count}: id={id} desc='{desc}' gcphys=0x{gcphys:x} size=0x{cb:x}"
             );
         }
-        log::info!("Skipped {} ROM range declarations", rom_count);
+        log::info!("Skipped {rom_count} ROM range declarations");
 
         // 7. Skip MMIO2 range declarations
         let mut mmio2_count = 0u32;
@@ -450,18 +466,12 @@ impl VBoxLayer {
             let _dev = stream.read_strz()?;
             let _inst = stream.read_u32_le()?;
             let _reg = stream.read_u8()?;
-            let _desc = stream.read_strz()?;
-            let _cb = stream.read_u64_le()?;
+            let desc = stream.read_strz()?;
+            let cb = stream.read_u64_le()?;
             mmio2_count += 1;
-            log::debug!(
-                "MMIO2 range {}: id={} desc='{}' size=0x{:x}",
-                mmio2_count,
-                id,
-                _desc,
-                _cb
-            );
+            log::debug!("MMIO2 range {mmio2_count}: id={id} desc='{desc}' size=0x{cb:x}");
         }
-        log::info!("Skipped {} MMIO2 range declarations", mmio2_count);
+        log::info!("Skipped {mmio2_count} MMIO2 range declarations");
 
         // 8. Process page records - collect RAM pages
         let mut page_data: Vec<u8> = Vec::new();
@@ -482,7 +492,7 @@ impl VBoxLayer {
             let base_type = type_byte & 0x7F;
 
             match base_type {
-                PGM_RAM_ZERO => {
+                PGM_RAM_ZERO | PGM_RAM_BALLOONED => {
                     if has_addr {
                         gpa = stream.read_u64_le()?;
                     }
@@ -516,16 +526,7 @@ impl VBoxLayer {
                     }
                     mmio2_pages += 1;
                 }
-                PGM_ROM_VIRGIN => {
-                    if has_addr {
-                        stream.read_u8()?;
-                        stream.read_u32_le()?;
-                    }
-                    stream.read_u8()?; // protection
-                    stream.skip(PAGE_SIZE)?;
-                    rom_pages += 1;
-                }
-                PGM_ROM_SHW_RAW => {
+                PGM_ROM_VIRGIN | PGM_ROM_SHW_RAW => {
                     if has_addr {
                         stream.read_u8()?;
                         stream.read_u32_le()?;
@@ -542,18 +543,10 @@ impl VBoxLayer {
                     stream.read_u8()?; // protection
                     rom_pages += 1;
                 }
-                PGM_RAM_BALLOONED => {
-                    if has_addr {
-                        gpa = stream.read_u64_le()?;
-                    }
-                    page_map.insert(gpa, u32::MAX);
-                    gpa += PAGE_SIZE as u64;
-                    zero_count += 1;
-                }
                 _ => {
                     return Err(VmkatzError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Unknown PGM page type: 0x{:02x}", base_type),
+                        format!("Unknown PGM page type: 0x{base_type:02x}"),
                     )));
                 }
             }
@@ -577,8 +570,7 @@ impl VBoxLayer {
         let phys_end = page_map
             .keys()
             .max()
-            .map(|&max_gpa| max_gpa + PAGE_SIZE as u64)
-            .unwrap_or(cb_ram);
+            .map_or(cb_ram, |&max_gpa| max_gpa + PAGE_SIZE as u64);
 
         log::info!(
             "Physical address space end: 0x{:x} ({} MB)",
@@ -644,10 +636,7 @@ impl VBoxLayer {
                         let pgm_version = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
                         let data_offset = unit_offset + 8 + 36 + cb_name as u64;
                         log::info!(
-                            "Found pgm unit at offset 0x{:x}, data at 0x{:x}, version {}",
-                            unit_offset,
-                            data_offset,
-                            pgm_version
+                            "Found pgm unit at offset 0x{unit_offset:x}, data at 0x{data_offset:x}, version {pgm_version}"
                         );
                         return Ok((data_offset, pgm_version));
                     }

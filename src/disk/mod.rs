@@ -17,6 +17,35 @@ use crate::error::Result;
 // All disk formats need to read multi-byte integers from File handles.
 // Little-endian variants for VDI, VHDX, VMDK; big-endian for VHD, QCOW2.
 
+/// Read exactly `len` bytes into a fresh `Vec`, growing the buffer as bytes
+/// arrive rather than pre-allocating `len` up front.
+///
+/// Disk headers carry attacker-controlled length fields (backing-file name,
+/// parent-locator path, key/value sizes). A hostile image could set one to
+/// several GB and turn a plain `vec![0u8; len]; read_exact(..)` into a memory
+/// DoS. `take(len).read_to_end(..)` is bounded by the bytes actually present in
+/// the file, so a bogus length allocates only what the file can supply and then
+/// fails with `UnexpectedEof` — same error contract as `read_exact`.
+/// Upper bound on how many block-allocation-table entries to *pre-reserve*.
+///
+/// BAT entry counts come from untrusted headers. This caps only the up-front
+/// `with_capacity` hint; the read loop still grows the vector on demand, so a
+/// legitimately huge disk is unaffected while a bogus count can't force a giant
+/// allocation before a single entry is read.
+pub(crate) const MAX_BAT_PREALLOC: usize = 1 << 20; // 1,048,576 entries
+
+pub(crate) fn read_exact_alloc<R: Read>(r: &mut R, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let n = r.take(len).read_to_end(&mut buf)?;
+    if n as u64 != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short read: file ended before the declared length",
+        ));
+    }
+    Ok(buf)
+}
+
 pub(crate) fn read_u16_le_file(f: &mut File) -> std::io::Result<u16> {
     let mut buf = [0u8; 2];
     f.read_exact(&mut buf)?;
@@ -146,7 +175,7 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         "raw" | "img" | "dd" => DiskFormat::Raw,
         _ => {
             // Unrecognized extension — probe magic bytes
-            log::debug!("Unknown extension '{}', probing magic bytes", ext);
+            log::debug!("Unknown extension '{ext}', probing magic bytes");
             detect_format_by_magic(path).unwrap_or(DiskFormat::Raw)
         }
     };

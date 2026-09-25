@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{VmkatzError, Result};
 use super::{read_u32_le_file, read_u64_le_file};
+use crate::error::{Result, VmkatzError};
 
 /// VHDX file identifier signature: "vhdxfile" (8 bytes at offset 0).
 const VHDX_FILE_SIGNATURE: u64 = 0x656C_6966_7864_6876; // "vhdxfile" LE
@@ -61,7 +61,7 @@ pub struct VhdxDisk {
     chunk_ratio: u64,
     bat: Vec<u64>,
     cursor: u64,
-    parent: Option<Box<VhdxDisk>>,
+    parent: Option<Box<Self>>,
 }
 
 fn read_guid(f: &mut File) -> std::io::Result<[u8; 16]> {
@@ -77,7 +77,6 @@ fn guid_is_zero(guid: &[u8; 16]) -> bool {
 
 /// Parsed VHDX header (the valid one with highest sequence number).
 struct VhdxHeader {
-    #[allow(dead_code)]
     sequence_number: u64,
     log_guid: [u8; 16],
 }
@@ -87,7 +86,7 @@ struct VhdxRegions {
     bat_offset: u64,
     bat_length: u32,
     metadata_offset: u64,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "longueur de la région métadonnées, non exploitée")]
     metadata_length: u32,
 }
 
@@ -147,8 +146,7 @@ fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
     let sig = read_u32_le_file(file)?;
     if sig != VHDX_REGION_SIGNATURE {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Invalid region table signature at 0x{:x}: 0x{:08x}",
-            offset, sig
+            "Invalid region table signature at 0x{offset:x}: 0x{sig:08x}"
         )));
     }
     let _checksum = read_u32_le_file(file)?;
@@ -157,8 +155,7 @@ fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
 
     if entry_count > 2047 {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Region table entry count too large: {}",
-            entry_count
+            "Region table entry count too large: {entry_count}"
         )));
     }
 
@@ -202,8 +199,7 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
     let sig = read_u64_le_file(file)?;
     if sig != VHDX_METADATA_SIGNATURE {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Invalid metadata signature: 0x{:016x}",
-            sig
+            "Invalid metadata signature: 0x{sig:016x}"
         )));
     }
     // Skip reserved (2B) + entry_count (2B) + reserved (20B) = 24B
@@ -218,8 +214,7 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
 
     if entry_count > 2047 {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Metadata entry count too large: {}",
-            entry_count
+            "Metadata entry count too large: {entry_count}"
         )));
     }
 
@@ -240,7 +235,7 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
     let mut has_parent = false;
 
     for (guid, item_offset, item_length) in &entries {
-        let abs_offset = metadata_offset + *item_offset as u64;
+        let abs_offset = metadata_offset + u64::from(*item_offset);
 
         if *guid == META_FILE_PARAMETERS && *item_length >= 8 {
             file.seek(SeekFrom::Start(abs_offset))?;
@@ -275,6 +270,14 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
 
 /// Parse parent locator from metadata to find the parent VHDX path.
 fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<String>> {
+    // Key-value entries: 12 bytes each (key_offset: u32, value_offset: u32, key_length: u16, value_length: u16)
+    struct KvEntry {
+        key_offset: u32,
+        value_offset: u32,
+        key_length: u16,
+        value_length: u16,
+    }
+
     // Re-read metadata entries to find parent locator
     file.seek(SeekFrom::Start(metadata_offset + 8))?; // skip signature
     let mut hdr_rest = [0u8; 2];
@@ -305,7 +308,7 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
         return Ok(None);
     }
 
-    let abs_offset = metadata_offset + parent_offset as u64;
+    let abs_offset = metadata_offset + u64::from(parent_offset);
     file.seek(SeekFrom::Start(abs_offset))?;
 
     // Parent locator header: LocatorType (16B) + Reserved (2B) + KeyValueCount (2B)
@@ -314,14 +317,6 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
     file.read_exact(&mut tmp2)?; // reserved
     file.read_exact(&mut tmp2)?;
     let kv_count = u16::from_le_bytes(tmp2);
-
-    // Key-value entries: 12 bytes each (key_offset: u32, value_offset: u32, key_length: u16, value_length: u16)
-    struct KvEntry {
-        key_offset: u32,
-        value_offset: u32,
-        key_length: u16,
-        value_length: u16,
-    }
 
     let mut kv_entries = Vec::new();
     for _ in 0..kv_count {
@@ -346,17 +341,15 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
 
     for kv in &kv_entries {
         // Read key (UTF-16LE)
-        let key_abs = abs_offset + kv.key_offset as u64;
+        let key_abs = abs_offset + u64::from(kv.key_offset);
         file.seek(SeekFrom::Start(key_abs))?;
-        let mut key_buf = vec![0u8; kv.key_length as usize];
-        file.read_exact(&mut key_buf)?;
+        let key_buf = super::read_exact_alloc(file, u64::from(kv.key_length))?;
         let key = utf16le_to_string(&key_buf);
 
         // Read value (UTF-16LE)
-        let val_abs = abs_offset + kv.value_offset as u64;
+        let val_abs = abs_offset + u64::from(kv.value_offset);
         file.seek(SeekFrom::Start(val_abs))?;
-        let mut val_buf = vec![0u8; kv.value_length as usize];
-        file.read_exact(&mut val_buf)?;
+        let val_buf = super::read_exact_alloc(file, u64::from(kv.value_length))?;
         let value = utf16le_to_string(&val_buf);
 
         match key.as_str() {
@@ -389,7 +382,7 @@ fn resolve_parent_path(child_path: &Path, parent_ref: &str) -> PathBuf {
         // On Linux: strip drive letter (e.g., "C:/foo" → "/foo") and try relative
         if normalized.len() > 2 && normalized.as_bytes()[1] == b':' {
             let stripped = &normalized[2..];
-            let child_dir = child_path.parent().unwrap_or(Path::new("."));
+            let child_dir = child_path.parent().unwrap_or_else(|| Path::new("."));
             let relative = child_dir.join(Path::new(stripped).file_name().unwrap_or_default());
             if relative.exists() {
                 return relative;
@@ -397,7 +390,7 @@ fn resolve_parent_path(child_path: &Path, parent_ref: &str) -> PathBuf {
         }
         parent_path.to_path_buf()
     } else {
-        let child_dir = child_path.parent().unwrap_or(Path::new("."));
+        let child_dir = child_path.parent().unwrap_or_else(|| Path::new("."));
         child_dir.join(parent_path)
     }
 }
@@ -413,7 +406,9 @@ impl VhdxDisk {
         // 2. Parse headers (pick valid one with highest sequence number)
         let header = parse_headers(&mut file)?;
         if !guid_is_zero(&header.log_guid) {
-            log::warn!("VHDX has non-empty log GUID — log replay not implemented, data may be inconsistent");
+            log::warn!(
+                "VHDX has non-empty log GUID — log replay not implemented, data may be inconsistent"
+            );
         }
 
         // 3. Parse region table (try at 0x30000, fallback to 0x40000)
@@ -432,12 +427,14 @@ impl VhdxDisk {
         );
 
         // 5. Compute BAT layout
-        let block_size = metadata.block_size as u64;
-        let logical_sector_size = metadata.logical_sector_size as u64;
+        let block_size = u64::from(metadata.block_size);
+        let logical_sector_size = u64::from(metadata.logical_sector_size);
         if block_size == 0 || logical_sector_size == 0 {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid VHDX metadata: block_size={}, logical_sector_size={}", block_size, logical_sector_size),
+                format!(
+                    "Invalid VHDX metadata: block_size={block_size}, logical_sector_size={logical_sector_size}"
+                ),
             )));
         }
         // chunk_ratio = (2^23 * logical_sector_size) / block_size
@@ -446,8 +443,7 @@ impl VhdxDisk {
         let chunk_ratio = (8_388_608 * logical_sector_size) / block_size;
         if chunk_ratio == 0 {
             return Err(VmkatzError::DiskFormatError(format!(
-                "Invalid VHDX chunk_ratio=0 (block_size={}, logical_sector_size={})",
-                block_size, logical_sector_size
+                "Invalid VHDX chunk_ratio=0 (block_size={block_size}, logical_sector_size={logical_sector_size})"
             )));
         }
         let data_blocks_count = metadata.virtual_disk_size.div_ceil(block_size);
@@ -463,12 +459,13 @@ impl VhdxDisk {
         };
 
         // Clamp to what's actually in the region
-        let max_entries_in_region = regions.bat_length as u64 / 8;
+        let max_entries_in_region = u64::from(regions.bat_length) / 8;
         let bat_entries_to_read = total_bat_entries.min(max_entries_in_region);
 
         // 6. Read BAT
         file.seek(SeekFrom::Start(regions.bat_offset))?;
-        let mut bat = Vec::with_capacity(bat_entries_to_read as usize);
+        let mut bat =
+            Vec::with_capacity((bat_entries_to_read as usize).min(super::MAX_BAT_PREALLOC));
         for _ in 0..bat_entries_to_read {
             bat.push(read_u64_le_file(&mut file)?);
         }
@@ -485,11 +482,11 @@ impl VhdxDisk {
             match parse_parent_locator(&mut file, regions.metadata_offset) {
                 Ok(Some(parent_ref)) => {
                     let parent_path = resolve_parent_path(path, &parent_ref);
-                    log::info!("VHDX: differencing disk, parent: {:?}", parent_path);
+                    log::info!("VHDX: differencing disk, parent: {}", parent_path.display());
                     if parent_path.exists() {
-                        Some(Box::new(VhdxDisk::open(&parent_path)?))
+                        Some(Box::new(Self::open(&parent_path)?))
                     } else {
-                        log::warn!("VHDX parent not found: {:?}", parent_path);
+                        log::warn!("VHDX parent not found: {}", parent_path.display());
                         None
                     }
                 }
@@ -498,7 +495,7 @@ impl VhdxDisk {
                     None
                 }
                 Err(e) => {
-                    log::warn!("VHDX parent locator parse error: {}", e);
+                    log::warn!("VHDX parent locator parse error: {e}");
                     None
                 }
             }
@@ -506,7 +503,7 @@ impl VhdxDisk {
             None
         };
 
-        Ok(VhdxDisk {
+        Ok(Self {
             file,
             disk_size: metadata.virtual_disk_size,
             block_size: metadata.block_size,
@@ -549,7 +546,7 @@ impl VhdxDisk {
             PAYLOAD_BLOCK_NOT_PRESENT => {
                 // Dynamic: zeros. Differencing: parent.
                 if let Some(ref mut parent) = self.parent {
-                    let virtual_offset = block_index * self.block_size as u64 + offset_in_block;
+                    let virtual_offset = block_index * u64::from(self.block_size) + offset_in_block;
                     parent.seek(SeekFrom::Start(virtual_offset))?;
                     parent.read(buf)
                 } else {
@@ -593,7 +590,7 @@ impl VhdxDisk {
         if sb_state != 6 || sb_file_offset == 0 {
             // Sector bitmap not present — fall through to parent
             if let Some(ref mut parent) = self.parent {
-                let virtual_offset = block_index * self.block_size as u64 + offset_in_block;
+                let virtual_offset = block_index * u64::from(self.block_size) + offset_in_block;
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
@@ -602,8 +599,8 @@ impl VhdxDisk {
         }
 
         // Read sector-by-sector using the bitmap
-        let sector_size = self.logical_sector_size as u64;
-        let block_size = self.block_size as u64;
+        let sector_size = u64::from(self.logical_sector_size);
+        let block_size = u64::from(self.block_size);
         let mut filled = 0usize;
         let mut pos_in_block = offset_in_block;
 
@@ -656,7 +653,7 @@ impl Read for VhdxDisk {
             return Ok(0);
         }
 
-        let block_size = self.block_size as u64;
+        let block_size = u64::from(self.block_size);
         let mut total = 0;
         while total < to_read {
             let pos = self.cursor;
@@ -701,4 +698,3 @@ impl super::DiskImage for VhdxDisk {
         self.disk_size
     }
 }
-

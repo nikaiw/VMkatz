@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{VmkatzError, Result};
 use super::{read_u16_be_file, read_u32_be_file, read_u64_be_file};
+use crate::error::{Result, VmkatzError};
 
 /// VHD footer cookie: "conectix" (8 bytes).
 const VHD_COOKIE: [u8; 8] = *b"conectix";
@@ -33,14 +33,17 @@ pub struct VhdDisk {
     /// Sector bitmap size per block (rounded up to 512-byte sector boundary).
     bitmap_sectors: u32,
     cursor: u64,
-    parent: Option<Box<VhdDisk>>,
+    parent: Option<Box<Self>>,
 }
 
 struct VhdFooter {
     data_offset: u64,
     current_size: u64,
     disk_type: u32,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "GUID unique du disque, conservé pour documenter le format"
+    )]
     unique_id: [u8; 16],
 }
 
@@ -166,8 +169,7 @@ fn parse_dynamic_header(file: &mut File, data_offset: u64) -> Result<VhdDynamicH
 /// Read a parent locator path from the file.
 fn read_parent_path(file: &mut File, locator: &ParentLocator) -> std::io::Result<String> {
     file.seek(SeekFrom::Start(locator.platform_data_offset))?;
-    let mut data = vec![0u8; locator.platform_data_length as usize];
-    file.read_exact(&mut data)?;
+    let data = super::read_exact_alloc(file, u64::from(locator.platform_data_length))?;
 
     // Wi2k/Wi2r/W2ku/W2ru are UTF-16LE encoded
     let code = locator.platform_code;
@@ -200,7 +202,7 @@ fn resolve_parent_path(child_path: &Path, parent_ref: &str) -> PathBuf {
             return parent_path.to_path_buf();
         }
         // On Linux: try just the filename in the same directory
-        let child_dir = child_path.parent().unwrap_or(Path::new("."));
+        let child_dir = child_path.parent().unwrap_or_else(|| Path::new("."));
         if let Some(name) = parent_path.file_name() {
             let sibling = child_dir.join(name);
             if sibling.exists() {
@@ -209,7 +211,7 @@ fn resolve_parent_path(child_path: &Path, parent_ref: &str) -> PathBuf {
         }
         parent_path.to_path_buf()
     } else {
-        let child_dir = child_path.parent().unwrap_or(Path::new("."));
+        let child_dir = child_path.parent().unwrap_or_else(|| Path::new("."));
         child_dir.join(parent_path)
     }
 }
@@ -233,7 +235,7 @@ impl VhdDisk {
 
         if footer.disk_type == DISK_TYPE_FIXED {
             // Fixed disk: raw data at offset 0, footer at end
-            return Ok(VhdDisk {
+            return Ok(Self {
                 file,
                 disk_size: footer.current_size,
                 disk_type: DISK_TYPE_FIXED,
@@ -269,7 +271,9 @@ impl VhdDisk {
 
         // Read BAT (big-endian u32 entries)
         file.seek(SeekFrom::Start(dyn_header.table_offset))?;
-        let mut bat = Vec::with_capacity(dyn_header.max_table_entries as usize);
+        let mut bat = Vec::with_capacity(
+            (dyn_header.max_table_entries as usize).min(super::MAX_BAT_PREALLOC),
+        );
         for _ in 0..dyn_header.max_table_entries {
             bat.push(read_u32_be_file(&mut file)?);
         }
@@ -289,18 +293,17 @@ impl VhdDisk {
                             continue;
                         }
                         let parent_path = resolve_parent_path(path, &parent_ref);
-                        log::info!("VHD: differencing disk, parent: {:?}", parent_path);
+                        log::info!("VHD: differencing disk, parent: {}", parent_path.display());
                         if parent_path.exists() {
-                            match VhdDisk::open(&parent_path) {
+                            match Self::open(&parent_path) {
                                 Ok(p) => {
                                     found_parent = Some(Box::new(p));
                                     break;
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "VHD: failed to open parent {:?}: {}",
-                                        parent_path,
-                                        e
+                                        "VHD: failed to open parent {}: {e}",
+                                        parent_path.display()
                                     );
                                 }
                             }
@@ -316,7 +319,7 @@ impl VhdDisk {
             None
         };
 
-        Ok(VhdDisk {
+        Ok(Self {
             file,
             disk_size: footer.current_size,
             disk_type: footer.disk_type,
@@ -337,7 +340,8 @@ impl VhdDisk {
     ) -> std::io::Result<usize> {
         if self.disk_type == DISK_TYPE_FIXED {
             // Fixed disk: direct read
-            let file_offset = block_index as u64 * self.block_size as u64 + offset_in_block as u64;
+            let file_offset =
+                block_index as u64 * u64::from(self.block_size) + u64::from(offset_in_block);
             self.file.seek(SeekFrom::Start(file_offset))?;
             return self.file.read(buf);
         }
@@ -347,7 +351,7 @@ impl VhdDisk {
         if bat_entry == BAT_UNUSED {
             if let Some(ref mut parent) = self.parent {
                 let virtual_offset =
-                    block_index as u64 * self.block_size as u64 + offset_in_block as u64;
+                    block_index as u64 * u64::from(self.block_size) + u64::from(offset_in_block);
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
@@ -356,15 +360,15 @@ impl VhdDisk {
         }
 
         // Block starts at bat_entry * 512 (sector offset)
-        let block_start = bat_entry as u64 * 512;
-        let data_start = block_start + self.bitmap_sectors as u64 * 512;
+        let block_start = u64::from(bat_entry) * 512;
+        let data_start = block_start + u64::from(self.bitmap_sectors) * 512;
 
         if self.disk_type == DISK_TYPE_DIFFERENCING {
             // Check sector bitmap for differencing disks
             self.read_diff_block(block_index, offset_in_block, block_start, data_start, buf)
         } else {
             // Dynamic disk: read directly from data area
-            let read_offset = data_start + offset_in_block as u64;
+            let read_offset = data_start + u64::from(offset_in_block);
             self.file.seek(SeekFrom::Start(read_offset))?;
             self.file.read(buf)
         }
@@ -382,14 +386,14 @@ impl VhdDisk {
         let mut filled = 0usize;
         let mut pos = offset_in_block;
 
-        while filled < buf.len() && (pos as u64) < self.block_size as u64 {
+        while filled < buf.len() && u64::from(pos) < u64::from(self.block_size) {
             let sector_in_block = pos / 512;
             let bitmap_byte_idx = sector_in_block / 8;
             let bitmap_bit = 7 - (sector_in_block % 8); // MSB first
 
             // Read bitmap byte
             self.file
-                .seek(SeekFrom::Start(block_start + bitmap_byte_idx as u64))?;
+                .seek(SeekFrom::Start(block_start + u64::from(bitmap_byte_idx)))?;
             let mut bm = [0u8; 1];
             self.file.read_exact(&mut bm)?;
 
@@ -399,11 +403,12 @@ impl VhdDisk {
             let chunk = avail.min(buf.len() - filled);
 
             if in_child {
-                let read_off = data_start + pos as u64;
+                let read_off = data_start + u64::from(pos);
                 self.file.seek(SeekFrom::Start(read_off))?;
                 self.file.read_exact(&mut buf[filled..filled + chunk])?;
             } else if let Some(ref mut parent) = self.parent {
-                let virtual_offset = block_index as u64 * self.block_size as u64 + pos as u64;
+                let virtual_offset =
+                    block_index as u64 * u64::from(self.block_size) + u64::from(pos);
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 parent.read_exact(&mut buf[filled..filled + chunk])?;
             } else {
@@ -438,13 +443,13 @@ impl Read for VhdDisk {
             return Ok(n);
         }
 
-        let block_size = self.block_size as u64;
+        let block_size = u64::from(self.block_size);
         let mut total = 0;
         while total < to_read {
             let pos = self.cursor;
             let block_index = (pos / block_size) as usize;
             let offset_in_block = (pos % block_size) as u32;
-            let avail_in_block = (block_size - offset_in_block as u64) as usize;
+            let avail_in_block = (block_size - u64::from(offset_in_block)) as usize;
             let chunk = (to_read - total).min(avail_in_block);
 
             let n =
@@ -483,4 +488,3 @@ impl super::DiskImage for VhdDisk {
         self.disk_size
     }
 }
-

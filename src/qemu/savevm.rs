@@ -14,8 +14,7 @@
 use std::fs;
 use std::path::Path;
 
-
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
 
 const PAGE_SIZE: usize = 4096;
@@ -54,9 +53,12 @@ struct MappedPage {
 
 /// A RAM block described in the MEM_SIZE header.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct RamBlock {
     name: String,
+    #[expect(
+        dead_code,
+        reason = "taille du bloc RAM, non exploitée (indexation par nom)"
+    )]
     size: u64,
 }
 
@@ -84,7 +86,8 @@ impl QemuSavevmLayer {
         // would be too slow (millions of small reads). Require mmap.
         if mmap.is_pread() {
             return Err(io_err(
-                "QEMU savevm requires mmap support (file I/O fallback too slow for stream parsing)".to_string()
+                "QEMU savevm requires mmap support (file I/O fallback too slow for stream parsing)"
+                    .to_string(),
             ));
         }
         let data = mmap.as_bytes();
@@ -97,11 +100,15 @@ impl QemuSavevmLayer {
         let version = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         if version < 3 {
             return Err(io_err(format!(
-                "Unsupported QEMU savevm version {} (expected >= 3)", version
+                "Unsupported QEMU savevm version {version} (expected >= 3)"
             )));
         }
 
-        log::info!("QEMU savevm: version {}, file size {} MB", version, mmap.len() / (1024 * 1024));
+        log::info!(
+            "QEMU savevm: version {}, file size {} MB",
+            version,
+            mmap.len() / (1024 * 1024)
+        );
 
         // Parse the stream to find RAM section and build page index
         let (pages, phys_end) = Self::parse_ram_stream(data)?;
@@ -113,7 +120,11 @@ impl QemuSavevmLayer {
             phys_end
         );
 
-        Ok(Self { mmap, pages, phys_end })
+        Ok(Self {
+            mmap,
+            pages,
+            phys_end,
+        })
     }
 
     /// Parse the entire savevm stream and extract RAM page locations.
@@ -134,12 +145,16 @@ impl QemuSavevmLayer {
 
             match section_type {
                 QEMU_VM_CONFIGURATION => {
-                    if offset + 4 > len { break; }
+                    if offset + 4 > len {
+                        break;
+                    }
                     let clen = read_be_u32(data, offset) as usize;
                     offset += 4 + clen;
                 }
                 QEMU_VM_SECTION_START | QEMU_VM_SECTION_FULL => {
-                    if offset + 4 > len { break; }
+                    if offset + 4 > len {
+                        break;
+                    }
                     let sid = read_be_u32(data, offset);
                     offset += 4;
                     let (name, new_off) = read_string(data, offset)?;
@@ -149,13 +164,24 @@ impl QemuSavevmLayer {
                     if name == "ram" {
                         ram_section_id = Some(sid);
                         // Parse MEM_SIZE + block list + EOS
-                        offset = Self::parse_ram_setup(data, offset, &mut ram_blocks, &mut block_gpa_bases, &mut phys_end, &mut below_4g)?;
+                        offset = Self::parse_ram_setup(
+                            data,
+                            offset,
+                            &mut ram_blocks,
+                            &mut block_gpa_bases,
+                            &mut phys_end,
+                            &mut below_4g,
+                        )?;
                     } else {
                         // Non-RAM device (dirty-bitmap, cpu, etc.) — skip by scanning
                         // forward for the next outer section marker we can recognize.
-                        log::debug!("QEMU savevm: skipping non-RAM device '{}' at 0x{:x}", name, offset);
-                        if let Some(next) = Self::scan_for_next_section(data, offset, ram_section_id) {
-                            log::debug!("QEMU savevm: found next RAM section at 0x{:x}", next);
+                        log::debug!(
+                            "QEMU savevm: skipping non-RAM device '{name}' at 0x{offset:x}"
+                        );
+                        if let Some(next) =
+                            Self::scan_for_next_section(data, offset, ram_section_id)
+                        {
+                            log::debug!("QEMU savevm: found next RAM section at 0x{next:x}");
                             offset = next;
                         } else {
                             break;
@@ -163,26 +189,36 @@ impl QemuSavevmLayer {
                     }
                 }
                 QEMU_VM_SECTION_PART => {
-                    if offset + 4 > len { break; }
+                    if offset + 4 > len {
+                        break;
+                    }
                     let sid = read_be_u32(data, offset);
                     offset += 4;
 
                     if ram_section_id == Some(sid) {
-                        offset = Self::parse_ram_pages(data, offset, &ram_blocks, &mut pages, &mut current_block_idx, below_4g)?;
+                        offset = Self::parse_ram_pages(
+                            data,
+                            offset,
+                            &ram_blocks,
+                            &mut pages,
+                            &mut current_block_idx,
+                            below_4g,
+                        )?;
                     } else {
                         // Non-RAM section part — scan forward for next recognizable marker
-                        log::debug!("QEMU savevm: skipping non-RAM SECTION_PART id={} at 0x{:x}", sid, offset);
-                        if let Some(next) = Self::scan_for_next_section(data, offset, ram_section_id) {
+                        log::debug!(
+                            "QEMU savevm: skipping non-RAM SECTION_PART id={sid} at 0x{offset:x}"
+                        );
+                        if let Some(next) =
+                            Self::scan_for_next_section(data, offset, ram_section_id)
+                        {
                             offset = next;
                         } else {
                             break;
                         }
                     }
                 }
-                QEMU_VM_SECTION_FOOTER => {
-                    offset += 4; // section_id
-                }
-                QEMU_VM_SECTION_END => {
+                QEMU_VM_SECTION_FOOTER | QEMU_VM_SECTION_END => {
                     offset += 4; // section_id
                 }
                 QEMU_VM_EOF => {
@@ -190,7 +226,11 @@ impl QemuSavevmLayer {
                 }
                 _ => {
                     // Unknown section type — try scanning forward for next RAM section
-                    log::debug!("QEMU savevm: unknown section type 0x{:02x} at 0x{:x}, scanning", section_type, offset - 1);
+                    log::debug!(
+                        "QEMU savevm: unknown section type 0x{:02x} at 0x{:x}, scanning",
+                        section_type,
+                        offset - 1
+                    );
                     if let Some(next) = Self::scan_for_next_section(data, offset, ram_section_id) {
                         offset = next;
                         continue;
@@ -201,7 +241,9 @@ impl QemuSavevmLayer {
         }
 
         if pages.is_empty() {
-            return Err(io_err("No RAM pages found in QEMU savevm stream".to_string()));
+            return Err(io_err(
+                "No RAM pages found in QEMU savevm stream".to_string(),
+            ));
         }
 
         // Deduplicate: later entries (from dirty page iterations) overwrite earlier ones.
@@ -240,7 +282,7 @@ impl QemuSavevmLayer {
 
         if flags & RAM_SAVE_FLAG_MEM_SIZE == 0 {
             return Err(io_err(format!(
-                "Expected RAM_SAVE_FLAG_MEM_SIZE, got flags 0x{:x}", flags
+                "Expected RAM_SAVE_FLAG_MEM_SIZE, got flags 0x{flags:x}"
             )));
         }
 
@@ -253,7 +295,9 @@ impl QemuSavevmLayer {
         while remaining > 0 && offset < len.saturating_sub(9) {
             let (name, new_off) = read_string(data, offset)?;
             offset = new_off;
-            if offset + 8 > len { break; }
+            if offset + 8 > len {
+                break;
+            }
             let block_size = read_be_u64(data, offset);
             offset += 8;
 
@@ -284,7 +328,10 @@ impl QemuSavevmLayer {
                 };
             }
             gpa_base += block_size;
-            ram_blocks.push(RamBlock { name, size: block_size });
+            ram_blocks.push(RamBlock {
+                name,
+                size: block_size,
+            });
             remaining = remaining.saturating_sub(block_size);
         }
 
@@ -322,7 +369,9 @@ impl QemuSavevmLayer {
 
             // Read block identifier if not CONTINUE
             if flags & RAM_SAVE_FLAG_CONTINUE == 0 {
-                if offset >= len { break; }
+                if offset >= len {
+                    break;
+                }
                 let (block_name, new_off) = read_string(data, offset)?;
                 offset = new_off;
                 // Find block index
@@ -334,7 +383,9 @@ impl QemuSavevmLayer {
             // Only store pages from pc.ram (block index 0) — that's the guest physical RAM.
             // Other blocks (vga.vram, ROM, flash) are device memory, not relevant for forensics.
             let is_main_ram = *current_block_idx == 0
-                || ram_blocks.get(*current_block_idx).is_some_and(|b| b.name == "pc.ram");
+                || ram_blocks
+                    .get(*current_block_idx)
+                    .is_some_and(|b| b.name == "pc.ram");
 
             // For pc.ram, addr is the offset within the RAM block.
             // QEMU maps pc.ram into two GPA regions separated by an MMIO gap:
@@ -362,8 +413,10 @@ impl QemuSavevmLayer {
                 offset += PAGE_SIZE;
             } else if flags & RAM_SAVE_FLAG_ZERO != 0 {
                 // Zero page: single fill byte follows (always 0x00 in practice)
-                if offset >= len { break; }
-                let _fill = data[offset];
+                if offset >= len {
+                    break;
+                }
+                // data[offset]: octet de remplissage (toujours 0x00, ignoré)
                 offset += 1;
                 // Don't store zero pages — read_phys returns zeros for unmapped GPAs
             } else if flags & RAM_SAVE_FLAG_COMPRESS_PAGE != 0 {
@@ -383,7 +436,11 @@ impl QemuSavevmLayer {
     /// Scan forward in the data stream for the next SECTION_PART with the RAM
     /// section ID, or another recognizable outer section marker. This skips past
     /// non-RAM device state sections whose internal format is opaque.
-    fn scan_for_next_section(data: &[u8], start: usize, ram_section_id: Option<u32>) -> Option<usize> {
+    fn scan_for_next_section(
+        data: &[u8],
+        start: usize,
+        ram_section_id: Option<u32>,
+    ) -> Option<usize> {
         let ram_sid = ram_section_id?;
         // Build the 5-byte pattern: SECTION_PART(0x02) + section_id(BE u32)
         let pattern = [
@@ -399,9 +456,14 @@ impl QemuSavevmLayer {
                 // Verify: the 8 bytes after the header should look like valid RAM flags
                 let val = u64::from_be_bytes(data[i + 5..i + 13].try_into().ok()?);
                 let flags = val & RAM_FLAG_MASK;
-                let has_page_or_zero = flags & (RAM_SAVE_FLAG_PAGE | RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_EOS) != 0;
+                let has_page_or_zero =
+                    flags & (RAM_SAVE_FLAG_PAGE | RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_EOS) != 0;
                 if has_page_or_zero {
-                    log::debug!("QEMU savevm: found RAM SECTION_PART at 0x{:x} (skipped {} bytes)", i, i - start);
+                    log::debug!(
+                        "QEMU savevm: found RAM SECTION_PART at 0x{:x} (skipped {} bytes)",
+                        i,
+                        i - start
+                    );
                     return Some(i);
                 }
             }
@@ -444,9 +506,9 @@ impl PhysicalMemory for QemuSavevmLayer {
             let to_copy = std::cmp::min(remaining_in_page, len - pos);
 
             if let Some(page) = self.find_page(cur_gpa) {
-                let file_off = page.file_offset as usize + offset_in_page;
-                let end = file_off + to_copy;
-                if end <= self.mmap.len() {
+                let file_off = page.file_offset + offset_in_page as u64;
+                let end = file_off + to_copy as u64;
+                if end <= self.mmap.len() as u64 {
                     let _ = self.mmap.read_at(file_off, &mut buf[pos..pos + to_copy]);
                 }
             }
@@ -467,9 +529,13 @@ impl PhysicalMemory for QemuSavevmLayer {
 /// Uses a simple read instead of mmap to work on block devices (LVM volumes).
 pub fn is_qemu_savevm(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = fs::File::open(path) else { return false };
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
     let mut magic = [0u8; 4];
-    if f.read_exact(&mut magic).is_err() { return false; }
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
     u32::from_be_bytes(magic) == QEVM_MAGIC
 }
 
@@ -483,15 +549,13 @@ fn io_err(msg: String) -> VmkatzError {
 fn read_be_u32(data: &[u8], offset: usize) -> u32 {
     data.get(offset..offset + 4)
         .and_then(|s| s.try_into().ok())
-        .map(u32::from_be_bytes)
-        .unwrap_or(0)
+        .map_or(0, u32::from_be_bytes)
 }
 
 fn read_be_u64(data: &[u8], offset: usize) -> u64 {
     data.get(offset..offset + 8)
         .and_then(|s| s.try_into().ok())
-        .map(u64::from_be_bytes)
-        .unwrap_or(0)
+        .map_or(0, u64::from_be_bytes)
 }
 
 /// Read a length-prefixed string (u8 len + bytes).

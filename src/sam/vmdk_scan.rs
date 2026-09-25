@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 
-use crate::error::Result;
-use super::{bootkey, hive};
 use super::disk_fallbacks::{CLUSTER_SIZE, MAX_HIVE_SIZE, MIN_SYSTEM_HIVE_SIZE};
+use super::{bootkey, hive};
+use crate::error::Result;
 
 /// Scan all physically allocated VMDK grains for registry hive signatures.
 ///
@@ -22,7 +23,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
     // Phase 1: Collect candidates from grain data
     let mut regf_candidates: Vec<(u64, u64)> = Vec::new(); // (virtual_offset, bins_size)
     let mut hbin_root_candidates: Vec<(u64, String)> = Vec::new(); // (virtual_offset, name)
-                                                                   // ALL hbin blocks: (virtual_offset, offset_in_hive, block_size)
+    // ALL hbin blocks: (virtual_offset, offset_in_hive, block_size)
     let mut all_hbin_blocks: Vec<(u64, u32, u32)> = Vec::new();
 
     vmdk.scan_all_grains(|virtual_byte, grain_data| {
@@ -34,10 +35,9 @@ pub(super) fn scan_vmdk_grains_for_hives(
 
             // Check for "regf" signature
             if pos + 0x2C <= grain_data.len() && chunk[0..4] == *b"regf" {
-                let bins_size = chunk.get(0x28..0x2C)
+                let bins_size = u64::from(chunk.get(0x28..0x2C)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map(u32::from_le_bytes)
-                    .unwrap_or(0) as u64;
+                    .map_or(0, u32::from_le_bytes));
                 if bins_size > 0 && bins_size <= MAX_HIVE_SIZE {
                     regf_candidates.push((virtual_byte + pos as u64, bins_size));
                 }
@@ -47,14 +47,12 @@ pub(super) fn scan_vmdk_grains_for_hives(
             if pos + 0x20 <= grain_data.len() && chunk[0..4] == *b"hbin" {
                 let hbin_hive_off = chunk.get(4..8)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map(u32::from_le_bytes)
-                    .unwrap_or(u32::MAX);
+                    .map_or(u32::MAX, u32::from_le_bytes);
                 let hbin_size = chunk.get(8..12)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map(u32::from_le_bytes)
-                    .unwrap_or(0);
+                    .map_or(0, u32::from_le_bytes);
                 if (0x1000..=0x100000).contains(&hbin_size)
-                    && (hbin_hive_off as u64) < MAX_HIVE_SIZE
+                    && u64::from(hbin_hive_off) < MAX_HIVE_SIZE
                     && hbin_hive_off % 0x1000 == 0
                 {
                     all_hbin_blocks.push((virtual_byte + pos as u64, hbin_hive_off, hbin_size));
@@ -67,8 +65,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
                         {
                             let name_len = chunk.get(cell_off + 0x4C..cell_off + 0x4E)
                                 .and_then(|s| <[u8; 2]>::try_from(s).ok())
-                                .map(u16::from_le_bytes)
-                                .unwrap_or(0) as usize;
+                                .map_or(0, u16::from_le_bytes) as usize;
                             if name_len > 0 && cell_off + 0x50 + name_len <= chunk.len() {
                                 let name = String::from_utf8_lossy(
                                     &chunk[cell_off + 0x50..cell_off + 0x50 + name_len],
@@ -76,10 +73,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
                                 .to_uppercase();
                                 if matches!(name.as_str(), "SAM" | "SYSTEM" | "SECURITY") {
                                     log::info!(
-                                        "Grain scan: found {} hbin(0) at virt 0x{:x}+0x{:x}",
-                                        name,
-                                        virtual_byte,
-                                        pos,
+                                        "Grain scan: found {name} hbin(0) at virt 0x{virtual_byte:x}+0x{pos:x}",
                                     );
                                     hbin_root_candidates.push((virtual_byte + pos as u64, name));
                                 }
@@ -118,9 +112,8 @@ pub(super) fn scan_vmdk_grains_for_hives(
         if vmdk.read_exact(&mut data).is_err() {
             continue;
         }
-        let h = match hive::Hive::new(&data) {
-            Ok(h) => h,
-            Err(_) => continue,
+        let Ok(h) = hive::Hive::new(&data) else {
+            continue;
         };
         let name = match h.root_key() {
             Ok(r) => r.name().to_uppercase(),
@@ -134,12 +127,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
             "SECURITY" if security_data.is_none() => &mut security_data,
             _ => continue,
         };
-        log::info!(
-            "Grain scan: read {} hive at virt 0x{:x} ({} bytes)",
-            name,
-            virt_off,
-            total_size
-        );
+        log::info!("Grain scan: read {name} hive at virt 0x{virt_off:x} ({total_size} bytes)");
         *target = Some(data);
 
         if sam_data.is_some() && system_data.is_some() {
@@ -181,14 +169,14 @@ pub(super) fn scan_vmdk_grains_for_hives(
             if &hbin_buf[0..4] != b"hbin" {
                 break;
             }
-            let hbin_hive_off = hbin_buf.get(4..8)
+            let hbin_hive_off = hbin_buf
+                .get(4..8)
                 .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                .map(u32::from_le_bytes)
-                .unwrap_or(u32::MAX) as usize;
-            let block_size = hbin_buf.get(8..12)
+                .map_or(u32::MAX, u32::from_le_bytes) as usize;
+            let block_size = hbin_buf
+                .get(8..12)
                 .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                .map(u32::from_le_bytes)
-                .unwrap_or(0) as usize;
+                .map_or(0, u32::from_le_bytes) as usize;
             if !(0x1000..=0x100000).contains(&block_size) {
                 break;
             }
@@ -270,22 +258,19 @@ pub(super) fn scan_vmdk_grains_for_hives(
                 _ => continue,
             };
 
-            let bins_size = match regf_info.get(name.as_str()) {
-                Some(&(_, bs)) => bs as u32,
-                None => {
-                    // No matching regf header. Use conservative default size.
-                    // Greedy assembly will fill gaps with zeros.
-                    let default = match name.as_str() {
-                        "SYSTEM" => 0x800000u32, // 8MB
-                        _ => 0x10000u32,         // 64KB for SAM/SECURITY
-                    };
-                    log::info!(
-                        "Fragmented {}: no matching regf header, using default bins_size=0x{:x}",
-                        name,
-                        default,
-                    );
-                    default
-                }
+            let bins_size = if let Some(&(_, bs)) = regf_info.get(name.as_str()) {
+                bs as u32
+            } else {
+                // No matching regf header. Use conservative default size.
+                // Greedy assembly will fill gaps with zeros.
+                let default = match name.as_str() {
+                    "SYSTEM" => 0x800000u32, // 8MB
+                    _ => 0x10000u32,         // 64KB for SAM/SECURITY
+                };
+                log::info!(
+                    "Fragmented {name}: no matching regf header, using default bins_size=0x{default:x}",
+                );
+                default
             };
 
             // Read the root hbin block
@@ -357,12 +342,13 @@ pub(super) fn scan_vmdk_grains_for_hives(
             detail.push_str(" SYSTEM not found");
         }
         if !regf_candidates.is_empty() || !hbin_root_candidates.is_empty() {
-            detail.push_str(&format!(
+            let _ = write!(
+                detail,
                 " ({} regf, {} hbin roots, {} total hbins scanned)",
                 regf_candidates.len(),
                 hbin_root_candidates.len(),
                 all_hbin_blocks.len(),
-            ));
+            );
         }
         Err(crate::error::VmkatzError::DecryptionError(detail))
     }
@@ -471,10 +457,7 @@ fn assemble_fragmented_hive(
     if vmdk.seek(SeekFrom::Start(root_virt)).is_err() {
         return None;
     }
-    let mut root_data = vec![0u8; root_block_size as usize];
-    if vmdk.read_exact(&mut root_data).is_err() {
-        return None;
-    }
+    let root_data = crate::disk::read_exact_alloc(vmdk, u64::from(root_block_size)).ok()?;
     if &root_data[0..4] != b"hbin" {
         return None;
     }
@@ -484,14 +467,11 @@ fn assemble_fragmented_hive(
     let max_backtrack_size = 256 * 1024u32; // 256KB
     if bins_size <= max_backtrack_size {
         if let Some(result) =
-            assemble_with_backtracking(vmdk, hbin_by_offset, name, bins_size, root_data.clone())
+            assemble_with_backtracking(vmdk, hbin_by_offset, name, bins_size, &root_data)
         {
             return Some(result);
         }
-        log::info!(
-            "Fragmented {}: backtracking failed, trying greedy fallback",
-            name
-        );
+        log::info!("Fragmented {name}: backtracking failed, trying greedy fallback");
     }
     assemble_greedy(vmdk, hbin_by_offset, name, bins_size, root_data)
 }
@@ -507,7 +487,7 @@ fn assemble_with_backtracking(
     hbin_by_offset: &HashMap<u32, Vec<(u64, u32)>>,
     name: &str,
     bins_size: u32,
-    root_data: Vec<u8>,
+    root_data: &[u8],
 ) -> Option<Vec<u8>> {
     let root_virt = {
         // Find root block virtual address from the hbin_by_offset map
@@ -542,18 +522,14 @@ fn assemble_with_backtracking(
 
     'outer: loop {
         if validations > max_validations {
-            log::info!(
-                "Fragmented {}: exceeded {} validations, giving up",
-                name,
-                max_validations
-            );
+            log::info!("Fragmented {name}: exceeded {max_validations} validations, giving up");
             break;
         }
 
         if current_offset >= bins_size {
             // Full chain — assemble and validate
             validations += 1;
-            let assembled = assemble_from_choices(&root_data, &choices);
+            let assembled = assemble_from_choices(root_data, &choices);
             if validate_hive_content(name, &assembled) {
                 log::info!(
                     "Fragmented {}: assembled {} bytes from {} blocks ({} validations)",
@@ -580,11 +556,7 @@ fn assemble_with_backtracking(
             Some(v) if !v.is_empty() => v,
             _ => {
                 if !do_backtrack(vmdk, &mut choices, &mut current_offset, &sorted_by_offset) {
-                    log::info!(
-                        "Fragmented {}: no candidates at offset 0x{:x}",
-                        name,
-                        current_offset
-                    );
+                    log::info!("Fragmented {name}: no candidates at offset 0x{current_offset:x}");
                     break;
                 }
                 continue;
@@ -616,11 +588,7 @@ fn assemble_with_backtracking(
         return Some(data);
     }
 
-    log::info!(
-        "Fragmented {}: search exhausted ({} validations)",
-        name,
-        validations
-    );
+    log::info!("Fragmented {name}: search exhausted ({validations} validations)");
     None
 }
 
@@ -634,17 +602,14 @@ fn read_hbin_at(
     if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
         return None;
     }
-    let mut block = vec![0u8; blk_size as usize];
-    if vmdk.read_exact(&mut block).is_err() {
-        return None;
-    }
+    let block = crate::disk::read_exact_alloc(vmdk, u64::from(blk_size)).ok()?;
     if block.len() < 12 || &block[0..4] != b"hbin" {
         return None;
     }
-    let actual_off = block.get(4..8)
+    let actual_off = block
+        .get(4..8)
         .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(u32::MAX);
+        .map_or(u32::MAX, u32::from_le_bytes);
     if actual_off != expected_offset {
         return None;
     }
@@ -708,15 +673,14 @@ fn assemble_greedy(
                 if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
                     continue;
                 }
-                let mut block = vec![0u8; blk_size as usize];
-                if vmdk.read_exact(&mut block).is_err() {
+                let Ok(block) = crate::disk::read_exact_alloc(vmdk, u64::from(blk_size)) else {
                     continue;
-                }
+                };
                 if block.len() >= 12 && &block[0..4] == b"hbin" {
-                    let actual_off = block.get(4..8)
+                    let actual_off = block
+                        .get(4..8)
                         .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                        .map(u32::from_le_bytes)
-                        .unwrap_or(u32::MAX);
+                        .map_or(u32::MAX, u32::from_le_bytes);
                     if actual_off == next_offset {
                         assembled.extend_from_slice(&block);
                         next_offset += blk_size;
@@ -747,12 +711,8 @@ fn assemble_greedy(
         blocks_missing
     );
 
-    if blocks_missing as u64 * 0x1000 > bins_size as u64 / 2 {
-        log::debug!(
-            "Fragmented {}: too many missing blocks ({}), rejecting",
-            name,
-            blocks_missing
-        );
+    if u64::from(blocks_missing) * 0x1000 > u64::from(bins_size) / 2 {
+        log::debug!("Fragmented {name}: too many missing blocks ({blocks_missing}), rejecting");
         return None;
     }
 
@@ -773,14 +733,10 @@ fn build_temp_hive(hbin_data: &[u8]) -> Vec<u8> {
 /// Strict validation: root key name matches AND expected subkey exists.
 fn validate_hive_content(name: &str, hbin_data: &[u8]) -> bool {
     let hive_data = build_temp_hive(hbin_data);
-    let h = match hive::Hive::new(&hive_data) {
-        Ok(h) => h,
-        Err(_) => return false,
+    let Ok(h) = hive::Hive::new(&hive_data) else {
+        return false;
     };
-    let root = match h.root_key() {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+    let Ok(root) = h.root_key() else { return false };
     let rname = root.name().to_uppercase();
     if rname != name.to_uppercase() {
         return false;
@@ -803,14 +759,10 @@ fn validate_hive_content(name: &str, hbin_data: &[u8]) -> bool {
 /// subkeys exist only in volatile storage or in the base disk).
 fn validate_hive_structure(name: &str, hbin_data: &[u8]) -> bool {
     let hive_data = build_temp_hive(hbin_data);
-    let h = match hive::Hive::new(&hive_data) {
-        Ok(h) => h,
-        Err(_) => return false,
+    let Ok(h) = hive::Hive::new(&hive_data) else {
+        return false;
     };
-    let root = match h.root_key() {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+    let Ok(root) = h.root_key() else { return false };
     root.name().to_uppercase() == name.to_uppercase()
 }
 
@@ -883,14 +835,10 @@ fn build_hive_from_hbins(
     }
 
     // Validate: try strict first (expected subkeys), fall back to structural (root name only)
-    let h = match hive::Hive::new(&hive_data) {
-        Ok(h) => h,
-        Err(_) => return None,
+    let Ok(h) = hive::Hive::new(&hive_data) else {
+        return None;
     };
-    let root = match h.root_key() {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
+    let Ok(root) = h.root_key() else { return None };
     let rname = root.name().to_uppercase();
     if rname != name.to_uppercase() {
         return None;
@@ -907,8 +855,7 @@ fn build_hive_from_hbins(
     };
     if !strict {
         log::debug!(
-            "build_hive_from_hbins: {} root key found but expected subkeys missing (delta disk?)",
-            name,
+            "build_hive_from_hbins: {name} root key found but expected subkeys missing (delta disk?)",
         );
     }
     // Accept if root name matches — the extraction pipeline will report
