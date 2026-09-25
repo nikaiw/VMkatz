@@ -32,7 +32,7 @@ impl<R: Read + Seek> BitLockerReader<R> {
     ///
     /// `partition_offset` is the byte offset of the encrypted partition on disk.
     /// `xts_key` is the full AES-XTS key (key1 || key2): 32 bytes for XTS-128, 64 for XTS-256.
-    pub fn new(inner: R, partition_offset: u64, xts_key: Vec<u8>) -> Self {
+    pub const fn new(inner: R, partition_offset: u64, xts_key: Vec<u8>) -> Self {
         Self {
             inner,
             partition_offset,
@@ -49,7 +49,11 @@ impl<R: Read + Seek> BitLockerReader<R> {
         let mut sector = [0u8; SECTOR_SIZE as usize];
 
         // Read encrypted sector 0
-        if self.inner.seek(SeekFrom::Start(self.partition_offset)).is_err() {
+        if self
+            .inner
+            .seek(SeekFrom::Start(self.partition_offset))
+            .is_err()
+        {
             return false;
         }
         if self.inner.read_exact(&mut sector).is_err() {
@@ -82,9 +86,7 @@ impl<R: Read + Seek> Read for BitLockerReader<R> {
             // Read the full encrypted sector from the underlying reader
             let disk_offset = self.partition_offset + sector_number * SECTOR_SIZE;
             self.inner.seek(SeekFrom::Start(disk_offset)).map_err(|e| {
-                io::Error::other(
-                    format!("BitLocker seek to sector {}: {}", sector_number, e),
-                )
+                io::Error::other(format!("BitLocker seek to sector {sector_number}: {e}"))
             })?;
 
             let mut sector_buf = [0u8; SECTOR_SIZE as usize];
@@ -103,9 +105,7 @@ impl<R: Read + Seek> Read for BitLockerReader<R> {
             // Decrypt the sector
             aes_xts::aes_xts_decrypt_sector(&self.xts_key, &mut sector_buf, sector_number)
                 .map_err(|e| {
-                    io::Error::other(
-                        format!("BitLocker XTS decrypt sector {}: {}", sector_number, e),
-                    )
+                    io::Error::other(format!("BitLocker XTS decrypt sector {sector_number}: {e}"))
                 })?;
 
             // Copy the relevant portion to the output buffer
@@ -128,16 +128,12 @@ impl<R: Read + Seek> Seek for BitLockerReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_position = match pos {
             SeekFrom::Start(offset) => offset,
-            SeekFrom::Current(delta) => {
-                if delta >= 0 {
-                    self.position.checked_add(delta as u64)
-                } else {
-                    self.position.checked_sub((-delta) as u64)
-                }
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "Seek position overflow")
-                })?
+            SeekFrom::Current(delta) => if delta >= 0 {
+                self.position.checked_add(delta as u64)
+            } else {
+                self.position.checked_sub((-delta) as u64)
             }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Seek position overflow"))?,
             SeekFrom::End(_) => {
                 // We don't know the partition size easily, so pass through to inner.
                 // This is rarely used by NTFS parsers (they use SeekFrom::Start).
@@ -168,8 +164,8 @@ impl<R: Read + Seek> Seek for BitLockerReader<R> {
 /// Returns `None` for unsupported encryption methods (Diffuser/CBC).
 pub fn build_xts_key(key: &crate::lsass::bitlocker::BitLockerKey) -> Option<Vec<u8>> {
     let expected_full_len = match key.method {
-        0x8004 => 32, // AES-128-XTS: 2 x 16 bytes
-        0x8005 => 64, // AES-256-XTS: 2 x 32 bytes
+        0x8004 => 32,     // AES-128-XTS: 2 x 16 bytes
+        0x8005 => 64,     // AES-256-XTS: 2 x 32 bytes
         _ => return None, // CBC/Diffuser modes not yet supported
     };
 
@@ -205,9 +201,9 @@ mod tests {
 
     /// Create a fake "encrypted" volume by XTS-encrypting known plaintext.
     fn make_encrypted_ntfs_volume(key: &[u8], partition_offset: u64) -> Vec<u8> {
+        use aes::Aes128;
         use aes::cipher::generic_array::GenericArray;
         use aes::cipher::{BlockEncrypt, KeyInit};
-        use aes::Aes128;
 
         // Create a 2-sector volume with NTFS signature
         let mut plaintext = vec![0u8; 1024];
@@ -289,9 +285,9 @@ mod tests {
 
     #[test]
     fn test_bitlocker_reader_read_and_seek() {
+        use aes::Aes128;
         use aes::cipher::generic_array::GenericArray;
         use aes::cipher::{BlockEncrypt, KeyInit};
-        use aes::Aes128;
 
         let key = [0x42u8; 32];
         let partition_offset = 512u64; // Small offset for simplicity

@@ -139,6 +139,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Enforce release channel (stable only from main)
+        run: |
+          TAG="${{ github.ref_name }}"
+          case "$TAG" in
+            *-beta*|*-alpha*|*-rc*)
+              echo "Prerelease tag $TAG — allowed from any branch (e.g. dev)."
+              exit 0
+              ;;
+          esac
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
+            echo "Stable tag $TAG is on main — OK."
+          else
+            echo "::error::Stable tag $TAG is not on main. Cut stable releases from main; tag dev builds as -beta/-rc."
+            exit 1
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:

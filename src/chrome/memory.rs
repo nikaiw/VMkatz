@@ -64,7 +64,7 @@ fn memory_profile(pid: u32, image: &str) -> BrowserProfile {
         browser: browser_from_image(image),
         user: String::new(),
         profile_name: String::new(),
-        path: format!("memory:pid={}", pid),
+        path: format!("memory:pid={pid}"),
     }
 }
 
@@ -76,9 +76,8 @@ pub fn extract_from_memory<S: ProcessSource>(source: &mut S) -> Result<ChromeFin
     for p in procs {
         match p.role {
             ChromeRole::Browser => {
-                let mem = match source.read_process_heap(p.pid) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(mem) = source.read_process_heap(p.pid) else {
+                    continue;
                 };
                 let profile = memory_profile(p.pid, &p.image);
                 for t in scan_heap_for_passwords(&mem) {
@@ -87,14 +86,16 @@ pub fn extract_from_memory<S: ProcessSource>(source: &mut S) -> Result<ChromeFin
                         url: t.url,
                         username: t.username,
                         password: t.password,
-                        source: ChromeSource::Memory { pid: p.pid, process: p.image.clone() },
+                        source: ChromeSource::Memory {
+                            pid: p.pid,
+                            process: p.image.clone(),
+                        },
                     });
                 }
             }
             ChromeRole::Network => {
-                let mem = match source.read_process_heap(p.pid) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(mem) = source.read_process_heap(p.pid) else {
+                    continue;
                 };
                 let profile = memory_profile(p.pid, &p.image);
                 for c in scan_heap_for_cookies(&mem) {
@@ -107,7 +108,10 @@ pub fn extract_from_memory<S: ProcessSource>(source: &mut S) -> Result<ChromeFin
                         expires: None,
                         http_only: false,
                         secure: false,
-                        source: ChromeSource::Memory { pid: p.pid, process: p.image.clone() },
+                        source: ChromeSource::Memory {
+                            pid: p.pid,
+                            process: p.image.clone(),
+                        },
                     });
                 }
             }
@@ -123,20 +127,28 @@ mod tests {
 
     #[test]
     fn classify_browser_no_type() {
-        assert_eq!(classify_cmdline("\"chrome.exe\" --foo"), ChromeRole::Browser);
+        assert_eq!(
+            classify_cmdline("\"chrome.exe\" --foo"),
+            ChromeRole::Browser
+        );
     }
 
     #[test]
     fn classify_network() {
         assert_eq!(
-            classify_cmdline("chrome.exe --type=utility --utility-sub-type=network.mojom.NetworkService --xx"),
+            classify_cmdline(
+                "chrome.exe --type=utility --utility-sub-type=network.mojom.NetworkService --xx"
+            ),
             ChromeRole::Network
         );
     }
 
     #[test]
     fn classify_renderer() {
-        assert_eq!(classify_cmdline("chrome.exe --type=renderer"), ChromeRole::Other);
+        assert_eq!(
+            classify_cmdline("chrome.exe --type=renderer"),
+            ChromeRole::Other
+        );
     }
 
     #[test]

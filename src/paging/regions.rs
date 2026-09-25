@@ -7,10 +7,12 @@
 
 use crate::error::Result;
 use crate::memory::PhysicalMemory;
-use crate::paging::entry::{PageTableEntry, PAGE_OFFSET_1GB, PAGE_OFFSET_2MB, PAGE_PHYS_MASK};
+use crate::paging::entry::{PAGE_OFFSET_1GB, PAGE_OFFSET_2MB, PAGE_PHYS_MASK, PageTableEntry};
 
 /// Filter applied to each page-table entry before emitting its page into a
-/// region. The default is "any mapped (or transition) user page"; the
+/// region.
+///
+/// The default is "any mapped (or transition) user page"; the
 /// chrome `CookieMonster` locator restricts to writable heap pages, which
 /// correspond closely to VirtualQueryEx's `MEM_COMMIT + PAGE_READWRITE +
 /// MEM_PRIVATE` filter even though the page table can't see allocation
@@ -26,13 +28,13 @@ pub enum RegionFilter {
 }
 
 impl RegionFilter {
-    fn accepts_leaf(self, pte: &PageTableEntry) -> bool {
+    const fn accepts_leaf(self, pte: PageTableEntry) -> bool {
         if !pte.is_present() && !pte.is_transition() {
             return false;
         }
         match self {
-            RegionFilter::AnyMapped => true,
-            RegionFilter::WritableUser => {
+            Self::AnyMapped => true,
+            Self::WritableUser => {
                 let raw = pte.raw();
                 // Bit 1 = R/W, bit 2 = U/S. Transition PTEs may not carry
                 // these flags meaningfully; keep them if marked transition.
@@ -55,28 +57,29 @@ pub struct MappedRegion {
 }
 
 impl MappedRegion {
-    pub fn end(&self) -> u64 {
+    pub const fn end(&self) -> u64 {
         self.start + self.len
     }
 }
 
 /// Walk the process's page tables and enumerate every present 4 KiB page in
-/// the canonical low half (userland, PML4 indices 0..256). Adjacent 4 KiB
+/// the canonical low half (userland, PML4 indices 0..256).
+///
+/// Adjacent 4 KiB
 /// pages are coalesced into a single [`MappedRegion`]. Large (2 MiB) and
 /// huge (1 GiB) pages contribute a single region each.
 ///
 /// Pages flagged "transition" (Windows-specific: still resident but marked
 /// not-present) are included; pages flagged pagefile/prototype are skipped
 /// since their backing isn't resolvable from page-table flags alone here.
-pub fn enumerate_user_regions<P: PhysicalMemory>(
-    phys: &P,
-    dtb: u64,
-) -> Result<Vec<MappedRegion>> {
+pub fn enumerate_user_regions<P: PhysicalMemory>(phys: &P, dtb: u64) -> Result<Vec<MappedRegion>> {
     enumerate_user_regions_filtered(phys, dtb, RegionFilter::AnyMapped)
 }
 
 /// Same as [`enumerate_user_regions`] but applies `filter` per page-table
-/// leaf. The chrome `CookieMonster` locator uses
+/// leaf.
+///
+/// The chrome `CookieMonster` locator uses
 /// [`RegionFilter::WritableUser`] to focus on heap pages and skip
 /// read-only code/rodata, which cuts the false-positive surface by ~95%.
 pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
@@ -112,9 +115,8 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
         if total_bytes >= MAX_TOTAL_BYTES {
             break;
         }
-        let pml4e_raw = match phys.read_phys_u64(pml4_base + pml4_idx * 8) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(pml4e_raw) = phys.read_phys_u64(pml4_base + pml4_idx * 8) else {
+            continue;
         };
         let pml4e = PageTableEntry(pml4e_raw);
         if !pml4e.is_present() {
@@ -127,9 +129,8 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
             if total_bytes >= MAX_TOTAL_BYTES {
                 break;
             }
-            let pdpte_raw = match phys.read_phys_u64(pdpt_base + pdpt_idx * 8) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Ok(pdpte_raw) = phys.read_phys_u64(pdpt_base + pdpt_idx * 8) else {
+                continue;
             };
             let pdpte = PageTableEntry(pdpte_raw);
             if !pdpte.is_present() {
@@ -139,7 +140,7 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
 
             // 1 GiB huge page → emit the whole gig.
             if pdpte.is_large_page() {
-                if filter.accepts_leaf(&pdpte) {
+                if filter.accepts_leaf(pdpte) {
                     emit(pdpt_va, PAGE_OFFSET_1GB + 1, &mut regions, &mut total_bytes);
                 }
                 continue;
@@ -150,9 +151,8 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
                 if total_bytes >= MAX_TOTAL_BYTES {
                     break;
                 }
-                let pde_raw = match phys.read_phys_u64(pd_base + pd_idx * 8) {
-                    Ok(v) => v,
-                    Err(_) => continue,
+                let Ok(pde_raw) = phys.read_phys_u64(pd_base + pd_idx * 8) else {
+                    continue;
                 };
                 let pde = PageTableEntry(pde_raw);
                 if !pde.is_present() {
@@ -162,7 +162,7 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
 
                 // 2 MiB large page → emit the whole 2 MiB.
                 if pde.is_large_page() {
-                    if filter.accepts_leaf(&pde) {
+                    if filter.accepts_leaf(pde) {
                         emit(pd_va, PAGE_OFFSET_2MB + 1, &mut regions, &mut total_bytes);
                     }
                     continue;
@@ -173,12 +173,11 @@ pub fn enumerate_user_regions_filtered<P: PhysicalMemory>(
                     if total_bytes >= MAX_TOTAL_BYTES {
                         break;
                     }
-                    let pte_raw = match phys.read_phys_u64(pt_base + pt_idx * 8) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Ok(pte_raw) = phys.read_phys_u64(pt_base + pt_idx * 8) else {
+                        continue;
                     };
                     let pte = PageTableEntry(pte_raw);
-                    if !filter.accepts_leaf(&pte) {
+                    if !filter.accepts_leaf(pte) {
                         continue;
                     }
                     let page_va = pd_va | (pt_idx << 12);

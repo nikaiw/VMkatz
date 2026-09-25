@@ -17,12 +17,12 @@ pub enum Browser {
 impl fmt::Display for Browser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Browser::Chrome => "Chrome",
-            Browser::Edge => "Edge",
-            Browser::Brave => "Brave",
-            Browser::Opera => "Opera",
-            Browser::Vivaldi => "Vivaldi",
-            Browser::Firefox => "Firefox",
+            Self::Chrome => "Chrome",
+            Self::Edge => "Edge",
+            Self::Brave => "Brave",
+            Self::Opera => "Opera",
+            Self::Vivaldi => "Vivaldi",
+            Self::Firefox => "Firefox",
         };
         f.write_str(s)
     }
@@ -96,7 +96,7 @@ pub struct ChromeFindings {
 }
 
 impl ChromeFindings {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.passwords.is_empty() && self.cookies.is_empty() && self.autofill.is_empty()
     }
 }

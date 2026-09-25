@@ -1224,7 +1224,7 @@ impl Vmfs6Volume {
             "Directory: {} alloc_map_blocks, {} DIRENT blocks found: {:?}",
             alloc_map_blocks.len(),
             dirent_blocks.len(),
-            &dirent_blocks
+            dirent_blocks
         );
 
         // Parse DIRENT blocks

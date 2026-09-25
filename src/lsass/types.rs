@@ -16,23 +16,23 @@ pub enum Arch {
 
 impl Arch {
     /// Pointer size in bytes.
-    pub fn ptr_size(self) -> u64 {
+    pub const fn ptr_size(self) -> u64 {
         match self {
-            Arch::X64 => 8,
-            Arch::X86 => 4,
+            Self::X64 => 8,
+            Self::X86 => 4,
         }
     }
 
     /// UNICODE_STRING struct size in bytes.
-    pub fn ustr_size(self) -> u64 {
+    pub const fn ustr_size(self) -> u64 {
         match self {
-            Arch::X64 => 16,
-            Arch::X86 => 8,
+            Self::X64 => 16,
+            Self::X86 => 8,
         }
     }
 
     /// LIST_ENTRY struct size (2 pointers).
-    pub fn list_entry_size(self) -> u64 {
+    pub const fn list_entry_size(self) -> u64 {
         self.ptr_size() * 2
     }
 }
@@ -41,7 +41,7 @@ impl Arch {
 pub fn read_ptr(vmem: &dyn VirtualMemory, addr: u64, arch: Arch) -> Result<u64> {
     match arch {
         Arch::X64 => Ok(vmem.read_virt_u64(addr)?),
-        Arch::X86 => Ok(vmem.read_virt_u32(addr)? as u64),
+        Arch::X86 => Ok(u64::from(vmem.read_virt_u32(addr)?)),
     }
 }
 
@@ -54,7 +54,7 @@ pub fn read_ustring(vmem: &dyn VirtualMemory, addr: u64, arch: Arch) -> Result<S
 }
 
 /// Validate a user-mode pointer for the given architecture.
-pub fn is_valid_user_ptr(ptr: u64, arch: Arch) -> bool {
+pub const fn is_valid_user_ptr(ptr: u64, arch: Arch) -> bool {
     match arch {
         Arch::X64 => ptr > 0x10000 && (ptr >> 48) == 0,
         Arch::X86 => ptr > 0x10000 && ptr < 0x8000_0000,
@@ -76,7 +76,7 @@ pub(super) fn format_sid_from_bytes(header: &[u8], sub_data: &[u8]) -> String {
     let authority = u64::from_be_bytes([
         0, 0, header[2], header[3], header[4], header[5], header[6], header[7],
     ]);
-    let mut s = format!("S-{}-{}", revision, authority);
+    let mut s = format!("S-{revision}-{authority}");
     for i in 0..sub_count {
         let sub = u32::from_le_bytes([
             sub_data[i * 4],
@@ -84,7 +84,7 @@ pub(super) fn format_sid_from_bytes(header: &[u8], sub_data: &[u8]) -> String {
             sub_data[i * 4 + 2],
             sub_data[i * 4 + 3],
         ]);
-        write!(s, "-{}", sub).ok();
+        write!(s, "-{sub}").ok();
     }
     s
 }
@@ -148,7 +148,7 @@ pub fn filetime_to_string(ft: u64) -> String {
 }
 
 /// Human-readable Windows logon type.
-pub fn logon_type_name(lt: u32) -> &'static str {
+pub const fn logon_type_name(lt: u32) -> &'static str {
     match lt {
         0 => "UndefinedLogonType",
         2 => "Interactive",
@@ -217,7 +217,7 @@ pub struct KerberosKey {
 
 impl KerberosKey {
     /// Human-readable encryption type name.
-    pub fn etype_name(&self) -> &'static str {
+    pub const fn etype_name(&self) -> &'static str {
         // Negative etypes are stored as u32, so -128 = 0xFFFFFF80, etc.
         match self.etype {
             1 => "DES_CBC_CRC",
@@ -226,9 +226,9 @@ impl KerberosKey {
             18 => "AES256_HMAC",
             23 => "RC4_HMAC",
             24 => "RC4_HMAC_EXP",
-            0xFFFF_FF7B => "RC4_HMAC_OLD", // -133
+            0xFFFF_FF7B => "RC4_HMAC_OLD",     // -133
             0xFFFF_FF80 => "RC4_HMAC_OLD_EXP", // -128
-            0xFFFF_FF79 => "DES_PLAIN", // -135
+            0xFFFF_FF79 => "DES_PLAIN",        // -135
             _ => "Unknown",
         }
     }
@@ -344,7 +344,7 @@ pub const LUID_IUSR: u64 = 0x3e3;
 /// Read a pointer-sized value from a byte buffer (no virtual memory needed).
 pub(super) fn read_ptr_from_buf(data: &[u8], off: usize, arch: Arch) -> u64 {
     match arch {
-        Arch::X86 => read_u32_le(data, off).unwrap_or(0) as u64,
+        Arch::X86 => u64::from(read_u32_le(data, off).unwrap_or(0)),
         Arch::X64 => read_u64_le(data, off).unwrap_or(0),
     }
 }
@@ -393,9 +393,9 @@ pub(super) fn read_data_section(
     dll_name: &str,
 ) -> Result<(u64, Vec<u8>)> {
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::VmkatzError::PatternNotFound(format!(".data section in {}", dll_name))
+        crate::error::VmkatzError::PatternNotFound(format!(".data section in {dll_name}"))
     })?;
-    let data_base = dll_base + data_sec.virtual_address as u64;
+    let data_base = dll_base + u64::from(data_sec.virtual_address);
     let data_size = std::cmp::min(data_sec.virtual_size as usize, max_size);
     let data = vmem.read_virt_bytes(data_base, data_size)?;
     Ok((data_base, data))
@@ -451,9 +451,9 @@ pub(super) fn scan_data_for_list_head(
         }
     }
 
-    Err(crate::error::VmkatzError::PatternNotFound(
-        format!("{} in {} .data section", error_label, dll_name),
-    ))
+    Err(crate::error::VmkatzError::PatternNotFound(format!(
+        "{error_label} in {dll_name} .data section"
+    )))
 }
 
 /// Fill username/domain for well-known Windows logon session LUIDs.
@@ -484,8 +484,8 @@ pub fn fill_wellknown_luid(cred: &mut Credential) {
 }
 
 impl Credential {
-    pub fn new_empty(luid: u64, username: String, domain: String) -> Self {
-        Credential {
+    pub const fn new_empty(luid: u64, username: String, domain: String) -> Self {
+        Self {
             luid,
             username,
             domain,
@@ -513,10 +513,9 @@ impl Credential {
                 .wdigest
                 .as_ref()
                 .is_some_and(|w| !w.password.is_empty())
-            || self
-                .kerberos
-                .as_ref()
-                .is_some_and(|k| !k.password.is_empty() || !k.keys.is_empty() || !k.tickets.is_empty())
+            || self.kerberos.as_ref().is_some_and(|k| {
+                !k.password.is_empty() || !k.keys.is_empty() || !k.tickets.is_empty()
+            })
             || self.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
             || !self.dpapi.is_empty()
             || !self.credman.is_empty()
@@ -591,12 +590,7 @@ impl std::fmt::Display for Credential {
                 }
             }
             for (key_bytes, etype_name) in &seen_keys {
-                writeln!(
-                    f,
-                    "    {:11}: {}",
-                    etype_name,
-                    hex::encode(key_bytes)
-                )?;
+                writeln!(f, "    {:11}: {}", etype_name, hex::encode(key_bytes))?;
             }
             for ticket in &krb.tickets {
                 writeln!(
@@ -726,7 +720,10 @@ mod tests {
         sub.extend_from_slice(&100u32.to_le_bytes());
         sub.extend_from_slice(&200u32.to_le_bytes());
         sub.extend_from_slice(&1001u32.to_le_bytes());
-        assert_eq!(format_sid_from_bytes(&header, &sub), "S-1-5-21-100-200-1001");
+        assert_eq!(
+            format_sid_from_bytes(&header, &sub),
+            "S-1-5-21-100-200-1001"
+        );
 
         // Invalid: too short
         assert_eq!(format_sid_from_bytes(&[1, 1, 0], &[0; 4]), "");
@@ -742,17 +739,26 @@ mod tests {
 
     #[test]
     fn test_fill_wellknown_luid() {
-        let mut cred = Credential { luid: 0x3e7, ..Default::default() };
+        let mut cred = Credential {
+            luid: 0x3e7,
+            ..Default::default()
+        };
         fill_wellknown_luid(&mut cred);
         assert_eq!(cred.username, "SYSTEM");
         assert_eq!(cred.domain, "NT AUTHORITY");
 
-        let mut cred2 = Credential { luid: 0x3e4, ..Default::default() };
+        let mut cred2 = Credential {
+            luid: 0x3e4,
+            ..Default::default()
+        };
         fill_wellknown_luid(&mut cred2);
         assert_eq!(cred2.username, "NETWORK SERVICE");
 
         // Non-wellknown LUID: username stays empty
-        let mut cred3 = Credential { luid: 0x12345, ..Default::default() };
+        let mut cred3 = Credential {
+            luid: 0x12345,
+            ..Default::default()
+        };
         fill_wellknown_luid(&mut cred3);
         assert!(cred3.username.is_empty());
     }

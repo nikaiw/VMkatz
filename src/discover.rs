@@ -40,7 +40,11 @@ pub fn discover_vm_files(dir: &Path) -> Result<VmDiscovery> {
                 }
             }
             Err(e) => {
-                log::debug!("Cannot read directory {}: {} (permission denied or I/O error)", scan_dir.display(), e);
+                log::debug!(
+                    "Cannot read directory {}: {} (permission denied or I/O error)",
+                    scan_dir.display(),
+                    e
+                );
             }
         }
     }
@@ -196,9 +200,12 @@ fn discover_vmdk(dir: &Path, all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
         // No descriptor found — collect orphan extent files (-sNNN.vmdk)
         // and pass the lowest-numbered one. VmdkDisk::open_from_directory
         // will discover all siblings from the same directory.
-        let mut extents: Vec<PathBuf> = all_files.iter()
+        let mut extents: Vec<PathBuf> = all_files
+            .iter()
             .filter(|f| {
-                f.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("vmdk"))
+                f.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("vmdk"))
                     && f.parent() == Some(dir)
                     && is_extent_filename(f.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
             })
@@ -220,7 +227,10 @@ fn discover_vdi(all_files: &[PathBuf], scan_dirs: &[PathBuf], out: &mut Vec<Path
         let mut found = false;
         for file in all_files {
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext.eq_ignore_ascii_case("vdi") && file.parent() == Some(snap_dir.as_path()) && file_size(file).unwrap_or(0) > 0 {
+            if ext.eq_ignore_ascii_case("vdi")
+                && file.parent() == Some(snap_dir.as_path())
+                && file_size(file).unwrap_or(0) > 0
+            {
                 out.push(file.clone());
                 found = true;
             }
@@ -313,8 +323,7 @@ fn is_text_descriptor(path: &Path) -> bool {
 /// VM file extensions that indicate a directory contains VM files.
 const VM_EXTENSIONS: &[&str] = &[
     // Memory snapshots
-    "vmsn", "vmss", "vmem", "sav", "elf", "bin", "raw",
-    // Disk images
+    "vmsn", "vmss", "vmem", "sav", "elf", "bin", "raw", // Disk images
     "vmdk", "vdi", "qcow2", "qcow", "vhdx", "vhd",
     // VM configuration (proves this is a VM directory)
     "vmx", "vbox",

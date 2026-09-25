@@ -1,4 +1,4 @@
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::VirtualMemory;
 
 // lsasrv.dll IV / key patterns for Windows 10 x64
@@ -44,21 +44,37 @@ pub static LSASRV_KEY_PATTERNS: &[&[u8]] = &[
 /// After match, two LEA [rip+disp32] instructions resolve the list base and bucket count.
 pub static MSV_LOGON_SESSION_PATTERNS: &[&[u8]] = &[
     // Win10 1607+: xor edi,edi; mov [r15],edi; mov r14,rbx; test r8d,r8d; je short
-    &[0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74,
+    ],
     // Win10 1903+: xor edi,edi; mov [r15],edi; mov r14,rbx; test r9d,r9d; je short
-    &[0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74],
+    &[
+        0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74,
+    ],
     // Win10 2004+: xor edi,edi; mov [r15],esi; mov r14,rbx; test r8d,r8d; je short
-    &[0x33, 0xFF, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xFF, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74,
+    ],
     // Win10 19041+/Win11: ...test r9d,r9d; je near (0F 84 = JE rel32)
-    &[0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x0F, 0x84],
+    &[
+        0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x0F, 0x84,
+    ],
     // Win10 19045/Win11 22H2: ...mov [r15],esi; test r9d,r9d; je short
-    &[0x33, 0xFF, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74],
+    &[
+        0x33, 0xFF, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74,
+    ],
     // Win7 SP1: xor esi,esi; mov [r15],ebp; mov r14,rbx; test eax,eax; je short
-    &[0x33, 0xF6, 0x45, 0x89, 0x2F, 0x4C, 0x8B, 0xF3, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xF6, 0x45, 0x89, 0x2F, 0x4C, 0x8B, 0xF3, 0x85, 0xC0, 0x74,
+    ],
     // Win8: xor esi,esi; mov [r15],esi; mov r14,rbx; test r8d,r8d; je short
-    &[0x33, 0xF6, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xF6, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74,
+    ],
     // Win8.1: xor esi,esi; mov [r15],esi; mov r14,rbx; test r9d,r9d; je short
-    &[0x33, 0xF6, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74],
+    &[
+        0x33, 0xF6, 0x45, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC9, 0x74,
+    ],
     // Win11 24H2+: mov [r12],r14d; mov edi,ebx; test r8d,r8d; jcc near
     &[0x45, 0x89, 0x34, 0x24, 0x8B, 0xFB, 0x45, 0x85, 0xC0, 0x0F],
     // Shorter fallback: xor edi,edi; mov [r15],edi; mov r14,rbx
@@ -123,9 +139,13 @@ pub static SSP_CREDENTIAL_PATTERNS: &[&[u8]] = &[
 /// Same instruction pattern family as MSV LogonSessionList (hash table init).
 pub static LIVESSP_LOGON_SESSION_PATTERNS: &[&[u8]] = &[
     // xor esi,esi; mov [r15],ebp; mov r14,rbx; test eax,eax; je short
-    &[0x33, 0xF6, 0x45, 0x89, 0x2F, 0x4C, 0x8B, 0xF3, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xF6, 0x45, 0x89, 0x2F, 0x4C, 0x8B, 0xF3, 0x85, 0xC0, 0x74,
+    ],
     // xor edi,edi; mov [r15],esi; mov r14,rbx; test r8d,r8d; je short
-    &[0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74],
+    &[
+        0x33, 0xFF, 0x41, 0x89, 0x37, 0x4C, 0x8B, 0xF3, 0x45, 0x85, 0xC0, 0x74,
+    ],
 ];
 
 /// Pattern to find cloudap cache in cloudap.dll.
@@ -167,11 +187,7 @@ pub fn find_pattern(
         if let Some(offset) = find_bytes(&data, pattern) {
             let addr = base + offset as u64;
             log::info!(
-                "Found pattern '{}' (variant {}) at 0x{:x} (base+0x{:x})",
-                name,
-                pat_idx,
-                addr,
-                offset
+                "Found pattern '{name}' (variant {pat_idx}) at 0x{addr:x} (base+0x{offset:x})"
             );
             return Ok((addr, pat_idx));
         }
@@ -198,14 +214,9 @@ pub fn resolve_rip_relative(
 ) -> Result<u64> {
     let disp_addr = (code_addr as i64 + disp_offset) as u64;
     let displacement = vmem.read_virt_u32(disp_addr)? as i32;
-    let target = (disp_addr as i64 + 4 + displacement as i64) as u64;
+    let target = (disp_addr as i64 + 4 + i64::from(displacement)) as u64;
     log::debug!(
-        "RIP-relative: code=0x{:x} disp_offset={} disp_addr=0x{:x} disp={} target=0x{:x}",
-        code_addr,
-        disp_offset,
-        disp_addr,
-        displacement,
-        target
+        "RIP-relative: code=0x{code_addr:x} disp_offset={disp_offset} disp_addr=0x{disp_addr:x} disp={displacement} target=0x{target:x}"
     );
     Ok(target)
 }
@@ -232,10 +243,10 @@ pub fn find_list_via_lea(vmem: &dyn VirtualMemory, pattern_addr: u64, label: &st
         }
     }
 
-    Err(VmkatzError::PatternNotFound(format!("LEA for {}", label)))
+    Err(VmkatzError::PatternNotFound(format!("LEA for {label}")))
 }
 
-pub fn is_heap_ptr(addr: u64) -> bool {
+pub const fn is_heap_ptr(addr: u64) -> bool {
     addr > 0x10000 && (addr >> 48) == 0
 }
 
@@ -252,7 +263,10 @@ pub static LSASRV_KEY_PATTERNS_X86: &[&[u8]] = &[
 
 /// Patterns to find LogonSessionList in msv1_0.dll on Win10 x86.
 /// Currently unused: MSV x86 uses .data fallback scanning instead of .text patterns.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "signatures x86 conservées, réservées à un futur chemin lsass 32 bits"
+)]
 pub static MSV_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
     // Win10 x86: XOR EAX,EAX; MOV [ESI],EAX; MOV [ESI+4],EAX (most common, 11/12 builds)
     &[0x33, 0xC0, 0x89, 0x06, 0x89, 0x46, 0x04],
@@ -308,10 +322,8 @@ pub static TSPKG_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
 ];
 
 /// Patterns to find SspCredentialList in msv1_0.dll on Win10 x86.
-pub static SSP_CREDENTIAL_PATTERNS_X86: &[&[u8]] = &[
-    &[0x83, 0xEC, 0x10, 0x68],
-    &[0x83, 0xEC, 0x0C, 0x68],
-];
+pub static SSP_CREDENTIAL_PATTERNS_X86: &[&[u8]] =
+    &[&[0x83, 0xEC, 0x10, 0x68], &[0x83, 0xEC, 0x0C, 0x68]];
 
 /// Patterns to find g_MasterKeyCacheList in lsasrv.dll on Win10 x86 (DPAPI).
 pub static DPAPI_MASTER_KEY_PATTERNS_X86: &[&[u8]] = &[
@@ -325,7 +337,7 @@ pub static DPAPI_MASTER_KEY_PATTERNS_X86: &[&[u8]] = &[
 /// Matches: PUSH imm32 (0x68), MOV EAX,[abs32] (0xA1), MOV [abs32],EAX (0xA3),
 /// LEA/MOV reg,[abs32] (0x8D/0x8B with ModRM mod=00, rm=101).
 #[inline]
-fn is_x86_abs_address_insn(data: &[u8], i: usize) -> bool {
+const fn is_x86_abs_address_insn(data: &[u8], i: usize) -> bool {
     match data[i] {
         0x68 | 0xA1 | 0xA3 => true,
         0x8D | 0x8B => i + 1 < data.len() && (data[i + 1] & 0xC7) == 0x05,
@@ -355,9 +367,8 @@ pub fn find_list_via_abs(
                 let modrm = data[i + 1];
                 (modrm & 0xC7) == 0x05
             }
-            0x68 => true, // PUSH imm32
-            0xA1 => true, // MOV EAX,[abs32]
-            0xA3 => true, // MOV [abs32],EAX
+            // PUSH imm32, MOV EAX,[abs32], MOV [abs32],EAX
+            0x68 | 0xA1 | 0xA3 => true,
             _ => false,
         };
 
@@ -374,7 +385,12 @@ pub fn find_list_via_abs(
             continue;
         }
 
-        let target = u32::from_le_bytes([data[abs_off], data[abs_off + 1], data[abs_off + 2], data[abs_off + 3]]) as u64;
+        let target = u64::from(u32::from_le_bytes([
+            data[abs_off],
+            data[abs_off + 1],
+            data[abs_off + 2],
+            data[abs_off + 3],
+        ]));
 
         // Must point into .data section
         if target < data_base || target >= data_end {
@@ -383,9 +399,14 @@ pub fn find_list_via_abs(
 
         // Validate as LIST_ENTRY: flink should be valid or self-referencing
         if let Ok(flink) = vmem.read_virt_u32(target) {
-            let flink = flink as u64;
+            let flink = u64::from(flink);
             if flink == target || (flink > 0x10000 && flink < 0x8000_0000) {
-                log::info!("Found x86 {} via abs at 0x{:x} → 0x{:x}", label, search_start + i as u64, target);
+                log::info!(
+                    "Found x86 {} via abs at 0x{:x} → 0x{:x}",
+                    label,
+                    search_start + i as u64,
+                    target
+                );
                 return Ok(target);
             }
         }
@@ -398,20 +419,38 @@ pub fn find_list_via_abs(
         if !is_x86_abs_address_insn(&data2, i) {
             continue;
         }
-        let abs_off = if data2[i] == 0x68 || data2[i] == 0xA1 || data2[i] == 0xA3 { i + 1 } else { i + 2 };
-        if abs_off + 4 > data2.len() { continue; }
-        let target = u32::from_le_bytes([data2[abs_off], data2[abs_off+1], data2[abs_off+2], data2[abs_off+3]]) as u64;
-        if target < data_base || target >= data_end || target < dll_base { continue; }
+        let abs_off = if data2[i] == 0x68 || data2[i] == 0xA1 || data2[i] == 0xA3 {
+            i + 1
+        } else {
+            i + 2
+        };
+        if abs_off + 4 > data2.len() {
+            continue;
+        }
+        let target = u64::from(u32::from_le_bytes([
+            data2[abs_off],
+            data2[abs_off + 1],
+            data2[abs_off + 2],
+            data2[abs_off + 3],
+        ]));
+        if target < data_base || target >= data_end || target < dll_base {
+            continue;
+        }
         if let Ok(flink) = vmem.read_virt_u32(target) {
-            let flink = flink as u64;
+            let flink = u64::from(flink);
             if flink == target || (flink > 0x10000 && flink < 0x8000_0000) {
-                log::info!("Found x86 {} via wider abs scan at 0x{:x} → 0x{:x}", label, search_start2 + i as u64, target);
+                log::info!(
+                    "Found x86 {} via wider abs scan at 0x{:x} → 0x{:x}",
+                    label,
+                    search_start2 + i as u64,
+                    target
+                );
                 return Ok(target);
             }
         }
     }
 
-    Err(VmkatzError::PatternNotFound(format!("abs for {}", label)))
+    Err(VmkatzError::PatternNotFound(format!("abs for {label}")))
 }
 
 // -- Pre-Vista (WinXP / Win2003) patterns --
@@ -451,10 +490,9 @@ pub fn resolve_absolute_address(
     disp_offset: i64,
 ) -> Result<u64> {
     let addr = (code_addr as i64 + disp_offset) as u64;
-    let abs_addr = vmem.read_virt_u32(addr)? as u64;
+    let abs_addr = u64::from(vmem.read_virt_u32(addr)?);
     log::debug!(
-        "Absolute address: code=0x{:x} offset={} read_addr=0x{:x} target=0x{:x}",
-        code_addr, disp_offset, addr, abs_addr
+        "Absolute address: code=0x{code_addr:x} offset={disp_offset} read_addr=0x{addr:x} target=0x{abs_addr:x}"
     );
     Ok(abs_addr)
 }

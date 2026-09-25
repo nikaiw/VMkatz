@@ -28,26 +28,29 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let mut part_reader = vmkatz::sam::PartitionReader::new(&mut disk, part_offset);
-        let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(ntfs) = ntfs::Ntfs::new(&mut part_reader) else {
+            continue;
         };
         let root = ntfs.root_directory(&mut part_reader)?;
         if cmd == "get" {
-            let (parent, name) = match path.rsplit_once('\\') {
-                Some((p, n)) => (p, n),
-                None => {
-                    eprintln!("get: path needs a parent dir");
-                    continue;
-                }
+            let Some((parent, name)) = path.rsplit_once('\\') else {
+                eprintln!("get: path needs a parent dir");
+                continue;
             };
-            let parent_dir = match vmkatz::sam::navigate_to_dir(&ntfs, &root, &mut part_reader, parent) {
-                Ok(d) => d,
-                Err(e) => { eprintln!("navigate {} fail at part 0x{:x}: {}", parent, part_offset, e); continue; }
-            };
+            let parent_dir =
+                match vmkatz::sam::navigate_to_dir(&ntfs, &root, &mut part_reader, parent) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("navigate {parent} fail at part 0x{part_offset:x}: {e}");
+                        continue;
+                    }
+                };
             let file = match vmkatz::sam::find_entry(&ntfs, &parent_dir, &mut part_reader, name) {
                 Ok(f) => f,
-                Err(e) => { eprintln!("find {} fail: {}", name, e); continue; }
+                Err(e) => {
+                    eprintln!("find {name} fail: {e}");
+                    continue;
+                }
             };
             let data = vmkatz::sam::read_file_data(&file, &mut part_reader)?;
             let out = &args[4];
@@ -57,7 +60,10 @@ fn main() -> anyhow::Result<()> {
         }
         let dir = match vmkatz::sam::navigate_to_dir(&ntfs, &root, &mut part_reader, path) {
             Ok(d) => d,
-            Err(e) => { eprintln!("navigate fail at part 0x{:x}: {}", part_offset, e); continue; }
+            Err(e) => {
+                eprintln!("navigate fail at part 0x{part_offset:x}: {e}");
+                continue;
+            }
         };
         if cmd == "ls" {
             let entries = vmkatz::sam::list_directory(&ntfs, &dir, &mut part_reader)?;

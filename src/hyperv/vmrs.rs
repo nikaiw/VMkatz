@@ -23,36 +23,44 @@ const HEADER_SIZE: usize = 46;
 const BACKUP_HEADER_OFFSET: u64 = 4096;
 const RAM_BLOCK_SIZE: usize = 0x100000; // 1 MB
 
-/// Parsed HyperVStorage header (46 bytes).
+/// Parsed HyperVStorage header (46 bytes). `magic` and the CRC32 are validated
+/// at parse time via locals, so they are not stored here.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct HvsHeader {
-    magic: u32,
-    crc32: u32,
     sequence: u16,
     version: u32,
     data_alignment: u32,
     data_offset: u64,
     data_size: u64,
-    undo_size: u32,
 }
 
 /// ObjectTable entry (18 bytes on disk).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ObjectTableEntry {
     entry_type: u8,
+    #[expect(
+        dead_code,
+        reason = "CRC on-disk de l'entrée, non vérifié pour l'instant"
+    )]
     crc32: u32,
     file_offset: u64,
     size: u32,
+    #[expect(dead_code, reason = "flags on-disk de l'entrée, non exploités")]
     flags: u8,
 }
 
 /// GPA memory chunk describing a contiguous physical memory region.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct GpaMemoryChunk {
+    #[expect(
+        dead_code,
+        reason = "mapping GPA identité: réservé à un mapping fin ultérieur"
+    )]
     start_page_index: u64,
+    #[expect(
+        dead_code,
+        reason = "mapping GPA identité: réservé à un mapping fin ultérieur"
+    )]
     page_count: u64,
 }
 
@@ -103,7 +111,7 @@ impl VmrsLayer {
             header.data_size
         );
 
-        let mut layer = VmrsLayer {
+        let mut layer = Self {
             inner: RefCell::new(VmrsInner {
                 file,
                 block_cache: HashMap::new(),
@@ -121,7 +129,7 @@ impl VmrsLayer {
         layer.parse_data_region()?;
 
         // Determine RAM layout
-        layer.build_memory_layout()?;
+        layer.build_memory_layout();
 
         log::info!(
             "VMRS: {} RAM blocks, {} memory chunks, {:.0} MB physical",
@@ -170,7 +178,7 @@ impl VmrsLayer {
         if magic != VMRS_MAGIC {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bad VMRS magic: {:#x} (expected {:#x})", magic, VMRS_MAGIC),
+                format!("Bad VMRS magic: {magic:#x} (expected {VMRS_MAGIC:#x})"),
             )));
         }
 
@@ -184,8 +192,7 @@ impl VmrsLayer {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "VMRS header CRC mismatch at offset {:#x}: stored={:#x} computed={:#x}",
-                    offset, stored_crc, computed_crc
+                    "VMRS header CRC mismatch at offset {offset:#x}: stored={stored_crc:#x} computed={computed_crc:#x}"
                 ),
             )));
         }
@@ -195,13 +202,12 @@ impl VmrsLayer {
         let data_alignment = u32::from_le_bytes(buf[22..26].try_into().unwrap());
         let data_offset = u64::from_le_bytes(buf[26..34].try_into().unwrap());
         let data_size = u64::from_le_bytes(buf[34..42].try_into().unwrap());
-        let undo_size = u32::from_le_bytes(buf[42..46].try_into().unwrap());
 
         // Validate alignment (0x1000 to 0x10000)
         if !(0x1000..=0x10000).contains(&data_alignment) {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bad data_alignment: {:#x}", data_alignment),
+                format!("Bad data_alignment: {data_alignment:#x}"),
             )));
         }
 
@@ -209,19 +215,16 @@ impl VmrsLayer {
         if version < 0x100 {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("VMRS version too low: {:#x}", version),
+                format!("VMRS version too low: {version:#x}"),
             )));
         }
 
         Ok(HvsHeader {
-            magic,
-            crc32: stored_crc,
             sequence,
             version,
             data_alignment,
             data_offset,
             data_size,
-            undo_size,
         })
     }
 
@@ -256,11 +259,11 @@ impl VmrsLayer {
         if entry_count > 100_000 {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("ObjectTable entry count too large: {}", entry_count),
+                format!("ObjectTable entry count too large: {entry_count}"),
             )));
         }
 
-        log::debug!("VMRS: ObjectTable at {:#x} with {} entries", offset, entry_count);
+        log::debug!("VMRS: ObjectTable at {offset:#x} with {entry_count} entries");
 
         // Read entries (18 bytes each)
         let entries_size = entry_count * 18;
@@ -283,7 +286,10 @@ impl VmrsLayer {
             }
         }
 
-        log::debug!("VMRS: {} non-empty object entries", self.object_entries.len());
+        log::debug!(
+            "VMRS: {} non-empty object entries",
+            self.object_entries.len()
+        );
         Ok(())
     }
 
@@ -347,7 +353,7 @@ impl VmrsLayer {
         let _kt_index = u16::from_le_bytes(data[2..4].try_into().unwrap());
 
         // Walk entries starting at offset 10
-        self.walk_key_entries(&data, 10, entry.file_offset, "")?;
+        self.walk_key_entries(&data, 10, entry.file_offset, "");
 
         Ok(())
     }
@@ -359,14 +365,14 @@ impl VmrsLayer {
         start: usize,
         base_file_offset: u64,
         parent_path: &str,
-    ) -> Result<()> {
+    ) {
         let total = data.len();
         let mut offset = start;
 
         while offset + 21 < total {
             // Entry header
             let entry_type = data[offset];
-            let _flags = data[offset + 1];
+            // data[offset + 1]: entry flags (non exploité)
             let entry_total_size =
                 u32::from_le_bytes(data[offset + 2..offset + 6].try_into().unwrap()) as usize;
 
@@ -402,7 +408,7 @@ impl VmrsLayer {
                 let full_path = if parent_path.is_empty() {
                     key_name.clone()
                 } else {
-                    format!("{}/{}", parent_path, key_name)
+                    format!("{parent_path}/{key_name}")
                 };
 
                 // Extract value info based on type
@@ -428,10 +434,7 @@ impl VmrsLayer {
                             if value_size > 0 {
                                 self.key_values.insert(
                                     full_path.clone(),
-                                    (
-                                        base_file_offset + value_data_offset as u64,
-                                        value_size,
-                                    ),
+                                    (base_file_offset + value_data_offset as u64, value_size),
                                 );
                             }
                         }
@@ -448,18 +451,15 @@ impl VmrsLayer {
 
                 // Check for child key table reference
                 // Bytes [6:8] = child count, [8:12] = child object table entry offset
-                let child_obj_ref = u32::from_le_bytes(
-                    data[offset + 8..offset + 12].try_into().unwrap(),
-                );
+                let child_obj_ref =
+                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
                 if child_obj_ref > 0 {
                     // Try to find and parse the child key table
                     if let Some(child_entry) = self.find_object_entry(child_obj_ref) {
-                        let child_data = self.read_file_bytes(
-                            child_entry.file_offset,
-                            child_entry.size as usize,
-                        );
+                        let child_data = self
+                            .read_file_bytes(child_entry.file_offset, child_entry.size as usize);
                         if let Ok(child_data) = child_data {
-                            let _ = self.walk_key_entries(
+                            self.walk_key_entries(
                                 &child_data,
                                 10,
                                 child_entry.file_offset,
@@ -469,13 +469,11 @@ impl VmrsLayer {
                     }
                 }
 
-                log::trace!("VMRS key: {} (type={}, size={})", full_path, entry_type, entry_total_size);
+                log::trace!("VMRS key: {full_path} (type={entry_type}, size={entry_total_size})");
             }
 
             offset += entry_total_size;
         }
-
-        Ok(())
     }
 
     /// Find an ObjectTableEntry by some reference (try as index, then as offset).
@@ -490,13 +488,13 @@ impl VmrsLayer {
         // Try to find by matching file offset
         self.object_entries
             .iter()
-            .find(|e| e.file_offset == reference as u64 && e.size > 0)
+            .find(|e| e.file_offset == u64::from(reference) && e.size > 0)
             .cloned()
     }
 
     /// Brute-force scan: search the data region for RAM block patterns.
     /// This is a fallback when KeyTable parsing doesn't find the keys.
-    fn scan_for_ram_blocks(&mut self) -> Result<()> {
+    fn scan_for_ram_blocks(&self) -> Result<()> {
         log::info!("VMRS: Scanning data region for RAM blocks...");
 
         // We need to scan the object table entries for large data blobs
@@ -545,7 +543,7 @@ impl VmrsLayer {
     }
 
     /// Build the memory layout from parsed keys.
-    fn build_memory_layout(&mut self) -> Result<()> {
+    fn build_memory_layout(&mut self) {
         // Determine the key path prefix based on version
         let prefix = if self.header.version > 0x500 {
             "/savedstate/"
@@ -555,7 +553,7 @@ impl VmrsLayer {
 
         // Count RAM blocks by probing keys
         let mut block_count = 0u64;
-        let format_modern = format!("{}RamBlock", prefix);
+        let format_modern = format!("{prefix}RamBlock");
         for key in self.key_values.keys() {
             if key.starts_with(&format_modern) || key.contains("RamBlock") {
                 block_count += 1;
@@ -587,8 +585,6 @@ impl VmrsLayer {
             });
             self.phys_size = block_count * RAM_BLOCK_SIZE as u64;
         }
-
-        Ok(())
     }
 
     /// Read bytes from the file at a given offset.
@@ -609,11 +605,11 @@ impl VmrsLayer {
 
         // Try both key formats
         let key_paths = [
-            format!("savedstate/RamBlock{}", block_index),
-            format!("/savedstate/RamBlock{}", block_index),
-            format!("RamBlock{}", block_index),
-            format!("savedstate/RamMemoryBlock{}", block_index),
-            format!("/savedstate/RamMemoryBlock{}", block_index),
+            format!("savedstate/RamBlock{block_index}"),
+            format!("/savedstate/RamBlock{block_index}"),
+            format!("RamBlock{block_index}"),
+            format!("savedstate/RamMemoryBlock{block_index}"),
+            format!("/savedstate/RamMemoryBlock{block_index}"),
         ];
 
         let mut value_info = None;
@@ -638,7 +634,7 @@ impl VmrsLayer {
                         && e.file_offset > 0
                         && e.entry_type != 0
                         && e.entry_type != 2  // not a key table
-                        && e.entry_type != 4  // not free
+                        && e.entry_type != 4 // not free
                 })
                 .collect();
 
@@ -651,7 +647,7 @@ impl VmrsLayer {
         let (file_offset, compressed_size) = value_info.ok_or_else(|| {
             VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("RAM block {} not found", block_index),
+                format!("RAM block {block_index} not found"),
             ))
         })?;
 
@@ -664,7 +660,7 @@ impl VmrsLayer {
             raw_data
         } else {
             // Compressed — use VmCompressUnpack
-            vm_compress_unpack(&raw_data)?
+            vm_compress_unpack(&raw_data)
         };
 
         // Cache the result
@@ -728,7 +724,7 @@ impl PhysicalMemory for VmrsLayer {
 fn hvs_crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
     for &byte in data {
-        crc ^= byte as u32;
+        crc ^= u32::from(byte);
         for _ in 0..8 {
             if crc & 1 != 0 {
                 crc = (crc >> 1) ^ 0xEDB88320;
@@ -748,7 +744,7 @@ fn hvs_crc32(data: &[u8]) -> u32 {
 /// - 0xFFFFFFFD: fill N pages with pattern (read count, then pattern)
 /// - 0xFFFFFFFC: variable page size
 /// - other: compressed_size — if 4096, raw copy; else LZNT1 decompress
-fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
+fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
     let mut output = vec![0u8; RAM_BLOCK_SIZE];
     let mut out_offset = 0usize;
     let mut in_offset = 0usize;
@@ -786,8 +782,7 @@ fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
                     break;
                 }
                 let count =
-                    u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap())
-                        as usize;
+                    u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap()) as usize;
                 in_offset += 4;
                 let pattern = &data[in_offset..in_offset + 8];
                 in_offset += 8;
@@ -811,15 +806,14 @@ fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
                 if in_offset + 4 > data.len() {
                     break;
                 }
-                let page_size = u32::from_le_bytes(
-                    data[in_offset..in_offset + 4].try_into().unwrap(),
-                ) as usize;
+                let page_size =
+                    u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap()) as usize;
                 in_offset += 4;
                 if page_size == 0 || in_offset + page_size > data.len() {
                     break;
                 }
                 // Decompress with LZNT1
-                let decompressed = lznt1_decompress(&data[in_offset..in_offset + page_size], 4096)?;
+                let decompressed = lznt1_decompress(&data[in_offset..in_offset + page_size], 4096);
                 let copy_len = decompressed.len().min(RAM_BLOCK_SIZE - out_offset);
                 output[out_offset..out_offset + copy_len]
                     .copy_from_slice(&decompressed[..copy_len]);
@@ -844,7 +838,7 @@ fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
                         break;
                     }
                     let decompressed =
-                        lznt1_decompress(&data[in_offset..in_offset + compressed_size], 4096)?;
+                        lznt1_decompress(&data[in_offset..in_offset + compressed_size], 4096);
                     let copy_len = decompressed.len().min(RAM_BLOCK_SIZE - out_offset);
                     output[out_offset..out_offset + copy_len]
                         .copy_from_slice(&decompressed[..copy_len]);
@@ -852,14 +846,18 @@ fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
                     in_offset += compressed_size;
                 } else {
                     // Invalid tag
-                    log::warn!("VMRS: Invalid compression tag {:#x} at offset {}", tag, in_offset - 4);
+                    log::warn!(
+                        "VMRS: Invalid compression tag {:#x} at offset {}",
+                        tag,
+                        in_offset - 4
+                    );
                     break;
                 }
             }
         }
     }
 
-    Ok(output)
+    output
 }
 
 /// LZNT1 decompression (Windows RtlDecompressBuffer algorithm 2/COMPRESSION_FORMAT_LZNT1).
@@ -869,7 +867,7 @@ fn vm_compress_unpack(data: &[u8]) -> Result<Vec<u8>> {
 /// - Chunk header: bit 15 = compressed flag, bits 0-11 = chunk data size - 1
 /// - Uncompressed chunk: raw bytes follow
 /// - Compressed chunk: mix of flag bytes and literal/backreference tokens
-fn lznt1_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
+fn lznt1_decompress(input: &[u8], max_output: usize) -> Vec<u8> {
     let mut output = Vec::with_capacity(max_output);
     let mut in_pos = 0;
 
@@ -888,12 +886,7 @@ fn lznt1_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
             break;
         }
 
-        if !is_compressed {
-            // Uncompressed chunk
-            let copy_len = chunk_size.min(max_output - output.len());
-            output.extend_from_slice(&input[in_pos..in_pos + copy_len]);
-            in_pos += chunk_size;
-        } else {
+        if is_compressed {
             // Compressed chunk
             let chunk_end = in_pos + chunk_size;
             let chunk_start_output = output.len();
@@ -949,16 +942,21 @@ fn lznt1_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
                     }
                 }
             }
+        } else {
+            // Uncompressed chunk
+            let copy_len = chunk_size.min(max_output - output.len());
+            output.extend_from_slice(&input[in_pos..in_pos + copy_len]);
+            in_pos += chunk_size;
         }
     }
 
-    Ok(output)
+    output
 }
 
 /// LZNT1 displacement bits for a given position in the uncompressed chunk.
 /// Per MS-XCA §2.4.1.1.1: 4 bits up to pos 15, then +1 bit each time pos
 /// reaches the next power of two (16, 32, 64, ...).
-fn lznt1_displacement_bits(pos_in_chunk: usize) -> u32 {
+const fn lznt1_displacement_bits(pos_in_chunk: usize) -> u32 {
     let mut bits = 4u32;
     let mut threshold = 16usize;
     while threshold <= pos_in_chunk && bits < 12 {

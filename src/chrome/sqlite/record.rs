@@ -21,7 +21,7 @@ pub fn read_varint(bytes: &[u8]) -> Result<(i64, usize)> {
             return Err(Error::Parse("varint truncated".into()));
         }
         let b = bytes[i];
-        acc = (acc << 7) | ((b & 0x7F) as u64);
+        acc = (acc << 7) | u64::from(b & 0x7F);
         if b & 0x80 == 0 {
             return Ok((acc as i64, i + 1));
         }
@@ -29,7 +29,7 @@ pub fn read_varint(bytes: &[u8]) -> Result<(i64, usize)> {
     if bytes.len() < 9 {
         return Err(Error::Parse("varint 9-byte truncated".into()));
     }
-    acc = (acc << 8) | (bytes[8] as u64);
+    acc = (acc << 8) | u64::from(bytes[8]);
     Ok((acc as i64, 9))
 }
 
@@ -72,21 +72,24 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         0 => (Value::Null, 0),
         1 => {
             need(b, 1)?;
-            (Value::Int(b[0] as i8 as i64), 1)
+            (Value::Int(i64::from(b[0] as i8)), 1)
         }
         2 => {
             need(b, 2)?;
-            (Value::Int(i16::from_be_bytes([b[0], b[1]]) as i64), 2)
+            (Value::Int(i64::from(i16::from_be_bytes([b[0], b[1]]))), 2)
         }
         3 => {
             need(b, 3)?;
             // 24-bit big-endian, sign-extended via arithmetic shift.
-            let v = ((b[0] as i64) << 56) >> 40 | ((b[1] as i64) << 8) | (b[2] as i64);
+            let v = (i64::from(b[0]) << 56) >> 40 | (i64::from(b[1]) << 8) | i64::from(b[2]);
             (Value::Int(v), 3)
         }
         4 => {
             need(b, 4)?;
-            (Value::Int(i32::from_be_bytes(b[..4].try_into().unwrap()) as i64), 4)
+            (
+                Value::Int(i64::from(i32::from_be_bytes(b[..4].try_into().unwrap()))),
+                4,
+            )
         }
         5 => {
             need(b, 6)?;
@@ -103,11 +106,17 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         }
         6 => {
             need(b, 8)?;
-            (Value::Int(i64::from_be_bytes(b[..8].try_into().unwrap())), 8)
+            (
+                Value::Int(i64::from_be_bytes(b[..8].try_into().unwrap())),
+                8,
+            )
         }
         7 => {
             need(b, 8)?;
-            (Value::Real(f64::from_be_bytes(b[..8].try_into().unwrap())), 8)
+            (
+                Value::Real(f64::from_be_bytes(b[..8].try_into().unwrap())),
+                8,
+            )
         }
         8 => (Value::Int(0), 0),
         9 => (Value::Int(1), 0),
@@ -122,7 +131,7 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
             need(b, n)?;
             (Value::Text(b[..n].to_vec()), n)
         }
-        _ => return Err(Error::Parse(format!("bad serial type {}", serial_type))),
+        _ => return Err(Error::Parse(format!("bad serial type {serial_type}"))),
     })
 }
 
@@ -130,21 +139,33 @@ impl Value {
     /// UTF-8 decode of a TEXT column. Returns None if bytes aren't valid UTF-8 (Chromium
     /// stores binary ciphertext in some TEXT columns — use `text_bytes`/`as_bytes` then).
     pub fn as_text(&self) -> Option<&str> {
-        if let Value::Text(b) = self { std::str::from_utf8(b).ok() } else { None }
+        if let Self::Text(b) = self {
+            std::str::from_utf8(b).ok()
+        } else {
+            None
+        }
     }
     pub fn as_blob(&self) -> Option<&[u8]> {
-        if let Value::Blob(b) = self { Some(b) } else { None }
+        if let Self::Blob(b) = self {
+            Some(b)
+        } else {
+            None
+        }
     }
     /// Raw bytes for either a TEXT or BLOB column. Useful when a TEXT column
     /// holds binary data (e.g. Chromium cookies).
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            Value::Text(b) | Value::Blob(b) => Some(b),
+            Self::Text(b) | Self::Blob(b) => Some(b),
             _ => None,
         }
     }
-    pub fn as_int(&self) -> Option<i64> {
-        if let Value::Int(i) = self { Some(*i) } else { None }
+    pub const fn as_int(&self) -> Option<i64> {
+        if let Self::Int(i) = self {
+            Some(*i)
+        } else {
+            None
+        }
     }
 }
 

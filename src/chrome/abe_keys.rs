@@ -53,7 +53,7 @@ impl BrowserKeyMap {
     }
 
     /// Returns true if no entries were found.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -75,11 +75,7 @@ impl BrowserKeyMap {
     /// Hardcoded Chrome 135.0.7049.115 keys.
     pub fn fallback() -> Self {
         Self {
-            entries: vec![
-                (1, CHROME_135_V1),
-                (2, CHROME_135_V2),
-                (3, CHROME_135_V3),
-            ],
+            entries: vec![(1, CHROME_135_V1), (2, CHROME_135_V2), (3, CHROME_135_V3)],
             fallback: true,
         }
     }
@@ -87,7 +83,7 @@ impl BrowserKeyMap {
     /// Merge another map's entries in. Existing `(version, key)` slots are kept;
     /// the merged map's entries with the same version are dropped (first wins).
     /// Returns `true` if at least one entry was added.
-    pub fn merge(&mut self, other: BrowserKeyMap) -> bool {
+    pub fn merge(&mut self, other: Self) -> bool {
         let mut added = false;
         for (v, k) in other.entries {
             if !self.entries.iter().any(|&(ev, _)| ev == v) {
@@ -219,14 +215,14 @@ mod tests {
     use super::*;
 
     /// Build a 56-byte entry with the given version, meta values, key, and trail.
-    fn make_entry(version: u8, m1: u32, m2: u32, key: &[u8; 32], trail: &[u8; 8]) -> Vec<u8> {
+    fn make_entry(version: u8, m1: u32, m2: u32, key: &[u8; 32], trail: [u8; 8]) -> Vec<u8> {
         let mut e = Vec::with_capacity(56);
         e.push(version);
         e.extend_from_slice(&[0u8; 7]);
         e.extend_from_slice(&m1.to_le_bytes());
         e.extend_from_slice(&m2.to_le_bytes());
         e.extend_from_slice(key);
-        e.extend_from_slice(trail);
+        e.extend_from_slice(&trail);
         e
     }
 
@@ -267,15 +263,15 @@ mod tests {
 
     fn chrome_135_table_bytes() -> Vec<u8> {
         let mut t = Vec::with_capacity(STRIDE * 3);
-        t.extend(make_entry(1, 1, 1, &CHROME_135_V1, &[0u8; 8]));
-        t.extend(make_entry(2, 1, 3, &CHROME_135_V2, &[0u8; 8]));
+        t.extend(make_entry(1, 1, 1, &CHROME_135_V1, [0u8; 8]));
+        t.extend(make_entry(2, 1, 3, &CHROME_135_V2, [0u8; 8]));
         // Real Chrome 135 has a pointer in the v=3 trail; emulate that.
         t.extend(make_entry(
             3,
             0,
             1,
             &CHROME_135_V3,
-            &[0x30, 0xc0, 0x1e, 0x40, 0x01, 0x00, 0x00, 0x00],
+            [0x30, 0xc0, 0x1e, 0x40, 0x01, 0x00, 0x00, 0x00],
         ));
         t
     }

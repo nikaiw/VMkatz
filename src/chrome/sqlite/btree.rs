@@ -1,5 +1,5 @@
 use super::page::Pager;
-use super::record::{decode_record, read_varint, Value};
+use super::record::{Value, decode_record, read_varint};
 use crate::error::{Result, VmkatzError as Error};
 
 const PAGE_INTERIOR_INDEX: u8 = 0x02;
@@ -47,9 +47,11 @@ fn walk_inner<F: FnMut(i64, Vec<Value>) -> Result<()>>(
                 .checked_add(8)
                 .ok_or_else(|| Error::Parse("cell ptr offset overflow".into()))?;
             let cell_ptr_end = cell_ptr_off
-                .checked_add(cell_count.checked_mul(2).ok_or_else(|| {
-                    Error::Parse("cell pointer array size overflow".into())
-                })?)
+                .checked_add(
+                    cell_count
+                        .checked_mul(2)
+                        .ok_or_else(|| Error::Parse("cell pointer array size overflow".into()))?,
+                )
                 .ok_or_else(|| Error::Parse("cell pointer array end overflow".into()))?;
             if cell_ptr_end > page.len() {
                 return Err(Error::Parse("cell pointer array beyond page".into()));
@@ -66,9 +68,11 @@ fn walk_inner<F: FnMut(i64, Vec<Value>) -> Result<()>>(
                 .checked_add(12)
                 .ok_or_else(|| Error::Parse("cell ptr offset overflow".into()))?;
             let cell_ptr_end = cell_ptr_off
-                .checked_add(cell_count.checked_mul(2).ok_or_else(|| {
-                    Error::Parse("cell pointer array size overflow".into())
-                })?)
+                .checked_add(
+                    cell_count
+                        .checked_mul(2)
+                        .ok_or_else(|| Error::Parse("cell pointer array size overflow".into()))?,
+                )
                 .ok_or_else(|| Error::Parse("cell pointer array end overflow".into()))?;
             if cell_ptr_end > page.len() {
                 return Err(Error::Parse("cell pointer array beyond page".into()));
@@ -76,15 +80,10 @@ fn walk_inner<F: FnMut(i64, Vec<Value>) -> Result<()>>(
             for i in 0..cell_count {
                 let p = cell_ptr_off + i * 2;
                 let cell_off = u16::from_be_bytes([page[p], page[p + 1]]) as usize;
-                if cell_off
-                    .checked_add(4)
-                    .map(|e| e > page.len())
-                    .unwrap_or(true)
-                {
+                if cell_off.checked_add(4).is_none_or(|e| e > page.len()) {
                     return Err(Error::Parse("interior cell out of range".into()));
                 }
-                let child =
-                    u32::from_be_bytes(page[cell_off..cell_off + 4].try_into().unwrap());
+                let child = u32::from_be_bytes(page[cell_off..cell_off + 4].try_into().unwrap());
                 // The varint rowid that follows is unused for table walks.
                 walk_inner(pager, child, cb, depth + 1)?;
             }
@@ -97,7 +96,7 @@ fn walk_inner<F: FnMut(i64, Vec<Value>) -> Result<()>>(
             // Index B-trees aren't needed for the chrome use case.
             return Err(Error::Parse("unexpected index page in table walk".into()));
         }
-        _ => return Err(Error::Parse(format!("unknown btree page kind {}", kind))),
+        _ => return Err(Error::Parse(format!("unknown btree page kind {kind}"))),
     }
     Ok(())
 }
@@ -176,8 +175,7 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
         let mut buf = Vec::with_capacity(payload_size_us);
         buf.extend_from_slice(&page[payload_off..local_end]);
 
-        let mut next =
-            u32::from_be_bytes(page[local_end..next_ptr_end].try_into().unwrap());
+        let mut next = u32::from_be_bytes(page[local_end..next_ptr_end].try_into().unwrap());
         let mut remaining = payload_size_us - local;
         // Cap the number of overflow hops to defend against cyclic chains.
         let max_hops = pager.header.page_count as usize + 1;

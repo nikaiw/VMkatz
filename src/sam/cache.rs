@@ -6,7 +6,7 @@
 
 use super::hashes::{aes128_cbc_decrypt, decode_utf16le};
 use super::hive::Hive;
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 /// A single domain cached credential entry.
 #[derive(Debug)]
@@ -54,12 +54,9 @@ pub fn extract_cached_credentials(
     let root = hive.root_key()?;
 
     // Navigate to Cache key
-    let cache_key = match root.subkey(&hive, "Cache") {
-        Ok(k) => k,
-        Err(_) => {
-            log::info!("SECURITY\\Cache key not found, no cached credentials");
-            return Ok(Vec::new());
-        }
+    let Ok(cache_key) = root.subkey(&hive, "Cache") else {
+        log::info!("SECURITY\\Cache key not found, no cached credentials");
+        return Ok(Vec::new());
     };
 
     // Read iteration count
@@ -93,7 +90,7 @@ pub fn extract_cached_credentials(
         }
     };
 
-    log::info!("DCC2 iteration count: {}", iteration_count);
+    log::info!("DCC2 iteration count: {iteration_count}");
 
     // AES key = first 16 bytes of the NL$KM secret.
     // Note: pypykatz/impacket use [16:32] on the RAW blob (including the 16-byte
@@ -104,11 +101,10 @@ pub fn extract_cached_credentials(
 
     // Try NL$1 through NL$50 (max configurable cache size)
     for i in 1..=50 {
-        let value_name = format!("NL${}", i);
+        let value_name = format!("NL${i}");
 
-        let data = match cache_key.value(&hive, &value_name) {
-            Ok(d) => d,
-            Err(_) => break, // No more entries
+        let Ok(data) = cache_key.value(&hive, &value_name) else {
+            break;
         };
 
         // NL_RECORD header is 0x60 (96) bytes minimum
@@ -150,13 +146,13 @@ pub fn extract_cached_credentials(
         let plaintext = match aes128_cbc_decrypt(aes_key, iv, encrypted) {
             Ok(pt) => pt,
             Err(e) => {
-                log::warn!("NL${}: decryption failed: {}", i, e);
+                log::warn!("NL${i}: decryption failed: {e}");
                 continue;
             }
         };
 
         if plaintext.len() < 0x48 + user_length {
-            log::warn!("NL${}: decrypted data too short", i);
+            log::warn!("NL${i}: decrypted data too short");
             continue;
         }
 
@@ -216,6 +212,6 @@ pub fn extract_cached_credentials(
 }
 
 /// Round up to DWORD alignment.
-fn pad4(len: usize) -> usize {
+const fn pad4(len: usize) -> usize {
     (len + 3) & !3
 }

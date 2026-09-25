@@ -17,7 +17,7 @@ pub enum Target {
 #[derive(Debug, Clone)]
 pub struct Signature {
     pub target: Target,
-    pub major_version: u32,  // 0 = generic / fallback
+    pub major_version: u32, // 0 = generic / fallback
     /// Byte pattern; `None` is a wildcard byte.
     pub pattern: &'static [Option<u8>],
     /// Offset from match start to the field of interest.
@@ -40,7 +40,9 @@ pub fn scan(haystack: &[u8], pattern: &[Option<u8>]) -> Vec<usize> {
     'outer: for i in 0..=haystack.len() - pattern.len() {
         for (j, p) in pattern.iter().enumerate() {
             if let Some(b) = p {
-                if haystack[i + j] != *b { continue 'outer; }
+                if haystack[i + j] != *b {
+                    continue 'outer;
+                }
             }
         }
         hits.push(i);

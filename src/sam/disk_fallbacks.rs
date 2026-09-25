@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::error::Result;
 use super::hive;
+use crate::error::Result;
 
 /// Read into `buf` with resilient I/O: on error, zero-fill the failing 4KB block
 /// and continue. This allows extraction from live/in-use block devices where
@@ -91,9 +91,13 @@ pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::Hi
                     }
                     // Stop once we have SAM + SYSTEM (SECURITY is optional)
                     if let (Some(_), Some(_)) = (&sam_data, &system_data) {
-                        log::info!("Found all required hives ({} total regf)", found_count);
+                        log::info!("Found all required hives ({found_count} total regf)");
                         // Move out of the Options -- both confirmed Some above
-                        return Ok((sam_data.take().unwrap_or_default(), system_data.take().unwrap_or_default(), security_data));
+                        return Ok((
+                            sam_data.take().unwrap_or_default(),
+                            system_data.take().unwrap_or_default(),
+                            security_data,
+                        ));
                     }
                 }
                 // Restore read position for continued scanning
@@ -110,7 +114,7 @@ pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::Hi
     if let (Some(sam), Some(system)) = (sam_data, system_data) {
         Ok((sam, system, security_data))
     } else {
-        let mut detail = format!("Raw scan found {} regf hive(s)", found_count);
+        let mut detail = format!("Raw scan found {found_count} regf hive(s)");
         if !has_sam {
             detail.push_str(", SAM hive not found");
         }
@@ -136,13 +140,14 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
     }
 
     // hive_bins_data_size at offset 0x28
-    let bins_size = u32::from_le_bytes(
-        header.get(0x28..0x2C)
+    let bins_size = u64::from(u32::from_le_bytes(
+        header
+            .get(0x28..0x2C)
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .unwrap_or([0; 4]),
-    ) as u64;
+    ));
     if bins_size == 0 || bins_size > MAX_HIVE_SIZE {
-        log::debug!("regf at 0x{:x}: bins_size={} (skipped)", offset, bins_size);
+        log::debug!("regf at 0x{offset:x}: bins_size={bins_size} (skipped)");
         return None;
     }
 
@@ -157,24 +162,19 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
     let hive = match hive::Hive::new(&data) {
         Ok(h) => h,
         Err(e) => {
-            log::debug!("regf at 0x{:x}: hive parse error: {}", offset, e);
+            log::debug!("regf at 0x{offset:x}: hive parse error: {e}");
             return None;
         }
     };
     let root = match hive.root_key() {
         Ok(r) => r,
         Err(e) => {
-            log::debug!("regf at 0x{:x}: root key error: {}", offset, e);
+            log::debug!("regf at 0x{offset:x}: root key error: {e}");
             return None;
         }
     };
     let name = root.name().to_uppercase();
-    log::debug!(
-        "regf at 0x{:x}: root='{}', size={}",
-        offset,
-        name,
-        total_size
-    );
+    log::debug!("regf at 0x{offset:x}: root='{name}', size={total_size}");
 
     // Accept known hive names with minimum size validation to reject
     // false matches (e.g. volatile "System" hive vs real config SYSTEM)
@@ -183,16 +183,11 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
         "SAM" if total_size >= MIN_SAM_HIVE_SIZE => Some((name, data)),
         "SECURITY" => Some((name, data)),
         "SYSTEM" | "SAM" => {
-            log::debug!(
-                "regf at 0x{:x}: '{}' too small ({}B), skipping",
-                offset,
-                name,
-                total_size
-            );
+            log::debug!("regf at 0x{offset:x}: '{name}' too small ({total_size}B), skipping");
             None
         }
         _ => {
-            log::debug!("regf at 0x{:x}: skipping hive '{}'", offset, name);
+            log::debug!("regf at 0x{offset:x}: skipping hive '{name}'");
             None
         }
     }
@@ -239,14 +234,14 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
         while pos + 0x60 <= n {
             if &chunk[pos..pos + 4] == b"hbin" {
                 // hbin header: "hbin"(4) + offset_in_hive(4) + size(4) + ...
-                let hbin_hive_off = chunk.get(pos + 4..pos + 8)
+                let hbin_hive_off = chunk
+                    .get(pos + 4..pos + 8)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map(u32::from_le_bytes)
-                    .unwrap_or(u32::MAX);
-                let hbin_size = chunk.get(pos + 8..pos + 12)
+                    .map_or(u32::MAX, u32::from_le_bytes);
+                let hbin_size = chunk
+                    .get(pos + 8..pos + 12)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map(u32::from_le_bytes)
-                    .unwrap_or(0);
+                    .map_or(0, u32::from_le_bytes);
 
                 // Only interested in first hbin of a hive (offset_in_hive == 0)
                 if hbin_hive_off == 0 && (0x1000..=0x100000).contains(&hbin_size) {
@@ -267,7 +262,11 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
                         }
                         if let (Some(_), Some(_)) = (&sam_data, &system_data) {
                             log::info!("Found all required hives via hbin scan");
-                            return Ok((sam_data.take().unwrap_or_default(), system_data.take().unwrap_or_default(), security_data));
+                            return Ok((
+                                sam_data.take().unwrap_or_default(),
+                                system_data.take().unwrap_or_default(),
+                                security_data,
+                            ));
                         }
                     }
                     let _ = reader.seek(SeekFrom::Start(offset + n as u64));
@@ -284,7 +283,7 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
     if let (Some(sam), Some(system)) = (sam_data, system_data) {
         Ok((sam, system, security_data))
     } else {
-        let mut detail = format!("hbin scan found {} candidate(s) but missing", found_count);
+        let mut detail = format!("hbin scan found {found_count} candidate(s) but missing");
         if !has_sam {
             detail.push_str(" SAM");
         }
@@ -331,17 +330,16 @@ fn try_read_hbin_hive<R: Read + Seek>(
     // Since we already filtered for hbin offset_in_hive==0, the NK cell at
     // offset 0x20 IS the root key by definition.
 
-    let name_len = first_block.get(cell_off + 0x4C..cell_off + 0x4E)
+    let name_len = first_block
+        .get(cell_off + 0x4C..cell_off + 0x4E)
         .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map(u16::from_le_bytes)
-        .unwrap_or(0) as usize;
+        .map_or(0, u16::from_le_bytes) as usize;
     if name_len == 0 || cell_off + 0x50 + name_len > first_block.len() {
         return None;
     }
 
-    let name =
-        String::from_utf8_lossy(&first_block[cell_off + 0x50..cell_off + 0x50 + name_len])
-            .to_uppercase();
+    let name = String::from_utf8_lossy(&first_block[cell_off + 0x50..cell_off + 0x50 + name_len])
+        .to_uppercase();
 
     // Only accept target hive names
     if !matches!(name.as_str(), "SAM" | "SYSTEM" | "SECURITY") {
@@ -382,14 +380,14 @@ fn try_read_hbin_hive<R: Read + Seek>(
             break;
         }
 
-        let hbin_hive_off = hbin_buf.get(4..8)
+        let hbin_hive_off = hbin_buf
+            .get(4..8)
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
-            .map(u32::from_le_bytes)
-            .unwrap_or(u32::MAX) as usize;
-        let block_size = hbin_buf.get(8..12)
+            .map_or(u32::MAX, u32::from_le_bytes) as usize;
+        let block_size = hbin_buf
+            .get(8..12)
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
-            .map(u32::from_le_bytes)
-            .unwrap_or(0) as usize;
+            .map_or(0, u32::from_le_bytes) as usize;
         if !(0x1000..=0x100000).contains(&block_size) {
             break;
         }
@@ -424,11 +422,11 @@ fn try_read_hbin_hive<R: Read + Seek>(
     // Apply same size validation
     match name.as_str() {
         "SYSTEM" if total_size < MIN_SYSTEM_HIVE_SIZE => {
-            log::debug!("hbin hive '{}' too small ({}B), skipping", name, total_size);
+            log::debug!("hbin hive '{name}' too small ({total_size}B), skipping");
             return None;
         }
         "SAM" if total_size < MIN_SAM_HIVE_SIZE => {
-            log::debug!("hbin hive '{}' too small ({}B), skipping", name, total_size);
+            log::debug!("hbin hive '{name}' too small ({total_size}B), skipping");
             return None;
         }
         _ => {}

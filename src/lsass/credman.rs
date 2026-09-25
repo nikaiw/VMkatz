@@ -1,6 +1,9 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
-use crate::lsass::types::{Arch, CredmanCredential, read_ptr, read_ustring, is_valid_user_ptr, read_data_section, read_ptr_from_buf};
+use crate::lsass::types::{
+    Arch, CredmanCredential, is_valid_user_ptr, read_data_section, read_ptr, read_ptr_from_buf,
+    read_ustring,
+};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -49,13 +52,33 @@ const CREDMAN_MSV_OFFSET_VARIANTS: &[CredmanMsvOffsets] = &[
 /// x86 MSV entry offsets for CredentialManager pointer.
 const CREDMAN_MSV_OFFSET_VARIANTS_X86: &[CredmanMsvOffsets] = &[
     // Win10 1607+ (LIST_63) x86
-    CredmanMsvOffsets { flink: 0x00, luid: 0x3C, username: 0x48, credman_ptr: 0xB0 },
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x48,
+        credman_ptr: 0xB0,
+    },
     // Win8/8.1 (LIST_62) x86
-    CredmanMsvOffsets { flink: 0x00, luid: 0x3C, username: 0x44, credman_ptr: 0xA4 },
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x44,
+        credman_ptr: 0xA4,
+    },
     // Win7 SP1 (LIST_61) x86
-    CredmanMsvOffsets { flink: 0x00, luid: 0x3C, username: 0x44, credman_ptr: 0x80 },
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x44,
+        credman_ptr: 0x80,
+    },
     // Vista (LIST_60) x86
-    CredmanMsvOffsets { flink: 0x00, luid: 0x3C, username: 0x44, credman_ptr: 0x84 },
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x44,
+        credman_ptr: 0x84,
+    },
 ];
 
 /// KIWI_CREDMAN_LIST_ENTRY per-arch offsets.
@@ -64,9 +87,9 @@ struct CredmanEntryOffsets {
     flink_offset: u64,
     cb_enc_password: u64,
     enc_password: u64,
-    user: u64,     // UNICODE_STRING (display username)
-    server1: u64,  // UNICODE_STRING (target)
-    server2: u64,  // UNICODE_STRING (domain)
+    user: u64,    // UNICODE_STRING (display username)
+    server1: u64, // UNICODE_STRING (target)
+    server2: u64, // UNICODE_STRING (domain)
 }
 
 const CREDMAN_ENTRY_VARIANTS: &[CredmanEntryOffsets] = &[
@@ -138,8 +161,12 @@ pub fn extract_credman_credentials_arch(
     let mut validated = false;
 
     // Strategy 1: Try hash table walk (LogonSessionListCount hash table, most common)
-    let tables = find_inline_hash_table(vmem, &pe, msv_base, arch)?;
-    log::debug!("Credman {:?}: found {} hash table candidates", arch, tables.len());
+    let tables = find_inline_hash_table(vmem, &pe, msv_base, arch);
+    log::debug!(
+        "Credman {:?}: found {} hash table candidates",
+        arch,
+        tables.len()
+    );
 
     'ht: for (table_addr, bucket_count) in &tables {
         for offsets in msv_variants {
@@ -163,7 +190,7 @@ pub fn extract_credman_credentials_arch(
 
     // Strategy 2: Fallback to single-list candidates (LogonSessionList)
     if !validated {
-        let list_candidates = find_msv_list_candidates(vmem, &pe, msv_base, arch)?;
+        let list_candidates = find_msv_list_candidates(vmem, &pe, msv_base, arch);
         log::debug!(
             "Credman {:?}: found {} single-list candidates",
             arch,
@@ -195,9 +222,8 @@ fn try_single_list_candidates(
 
     for list_addr in list_candidates {
         for offsets in msv_variants {
-            let head_flink = match read_ptr(vmem, *list_addr, arch) {
-                Ok(f) => f,
-                Err(_) => continue,
+            let Ok(head_flink) = read_ptr(vmem, *list_addr, arch) else {
+                continue;
             };
             if head_flink == 0 || head_flink == *list_addr {
                 continue;
@@ -215,8 +241,8 @@ fn try_single_list_candidates(
                     break;
                 }
                 test_visited.insert(test_current);
-                let test_username = read_ustring(vmem, test_current + offsets.username, arch)
-                    .unwrap_or_default();
+                let test_username =
+                    read_ustring(vmem, test_current + offsets.username, arch).unwrap_or_default();
                 let test_luid = vmem.read_virt_u64(test_current + offsets.luid).unwrap_or(0);
                 if !test_username.is_empty() && test_luid > 0 && test_luid < 0x100000 {
                     found_valid = true;
@@ -257,9 +283,8 @@ fn validate_hash_table_variant(
     let step = arch.list_entry_size() as usize;
     for bucket_idx in 0..bucket_count {
         let bucket_addr = table_addr + (bucket_idx * step) as u64;
-        let flink = match read_ptr(vmem, bucket_addr, arch) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok(flink) = read_ptr(vmem, bucket_addr, arch) else {
+            continue;
         };
         if flink == bucket_addr || flink == 0 || !is_valid_user_ptr(flink, arch) {
             continue;
@@ -281,9 +306,8 @@ fn walk_msv_for_credman(
     arch: Arch,
 ) -> Vec<(u64, CredmanCredential)> {
     let mut results = Vec::new();
-    let head_flink = match read_ptr(vmem, list_addr, arch) {
-        Ok(f) => f,
-        Err(_) => return results,
+    let Ok(head_flink) = read_ptr(vmem, list_addr, arch) else {
+        return results;
     };
 
     let mut current = head_flink;
@@ -300,12 +324,7 @@ fn walk_msv_for_credman(
 
         let username = read_ustring(vmem, current + offsets.username, arch).unwrap_or_default();
         log::debug!(
-            "Credman {:?}: MSV entry at 0x{:x} LUID=0x{:x} user='{}' CredmanPtr=0x{:x}",
-            arch,
-            current,
-            luid,
-            username,
-            credman_ptr
+            "Credman {arch:?}: MSV entry at 0x{current:x} LUID=0x{luid:x} user='{username}' CredmanPtr=0x{credman_ptr:x}"
         );
 
         if is_valid_user_ptr(credman_ptr, arch) {
@@ -336,9 +355,8 @@ fn walk_hash_table_for_credman(
 
     for bucket_idx in 0..bucket_count {
         let bucket_addr = table_addr + (bucket_idx as u64) * step;
-        let flink = match read_ptr(vmem, bucket_addr, arch) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok(flink) = read_ptr(vmem, bucket_addr, arch) else {
+            continue;
         };
 
         if flink == bucket_addr || flink == 0 || !is_valid_user_ptr(flink, arch) {
@@ -361,8 +379,7 @@ fn walk_hash_table_for_credman(
             if !username.is_empty() {
                 entries_found += 1;
                 log::debug!(
-                    "Credman {:?}: hash bucket {} entry at 0x{:x} LUID=0x{:x} user='{}' CredmanPtr=0x{:x}",
-                    arch, bucket_idx, current, luid, username, credman_ptr
+                    "Credman {arch:?}: hash bucket {bucket_idx} entry at 0x{current:x} LUID=0x{luid:x} user='{username}' CredmanPtr=0x{credman_ptr:x}"
                 );
 
                 if is_valid_user_ptr(credman_ptr, arch) {
@@ -401,22 +418,25 @@ fn extract_credman_from_ptr(
     results: &mut Vec<(u64, CredmanCredential)>,
     arch: Arch,
 ) {
-    let set_list_entry_list1 = match arch { Arch::X64 => 0x18u64, Arch::X86 => 0x0C };
-    let starter_start = match arch { Arch::X64 => 0x08u64, Arch::X86 => 0x04 };
+    let set_list_entry_list1 = match arch {
+        Arch::X64 => 0x18u64,
+        Arch::X86 => 0x0C,
+    };
+    let starter_start = match arch {
+        Arch::X64 => 0x08u64,
+        Arch::X86 => 0x04,
+    };
 
-    log::debug!(
-        "Credman {:?}: LUID=0x{:x} CredentialManager=0x{:x}",
-        arch,
-        luid,
-        credman_ptr
-    );
+    log::debug!("Credman {arch:?}: LUID=0x{luid:x} CredentialManager=0x{credman_ptr:x}");
 
     // credman_ptr -> KIWI_CREDMAN_SET_LIST_ENTRY
     // Read list1 pointer at SET_LIST_ENTRY + offset
     let list1_ptr = match read_ptr(vmem, credman_ptr + set_list_entry_list1, arch) {
         Ok(p) if is_valid_user_ptr(p, arch) => p,
         _ => {
-            log::debug!("Credman {:?}: list1 pointer at 0x{:x}+0x{:x} invalid", arch, credman_ptr, set_list_entry_list1);
+            log::debug!(
+                "Credman {arch:?}: list1 pointer at 0x{credman_ptr:x}+0x{set_list_entry_list1:x} invalid"
+            );
             return;
         }
     };
@@ -424,17 +444,13 @@ fn extract_credman_from_ptr(
     // list1_ptr -> KIWI_CREDMAN_LIST_STARTER
     // The sentinel reference for list termination is &start (list1_ptr + offset)
     let sentinel = list1_ptr + starter_start;
-    let first_flink = match read_ptr(vmem, sentinel, arch) {
-        Ok(f) => f,
-        Err(_) => return,
+    let Ok(first_flink) = read_ptr(vmem, sentinel, arch) else {
+        return;
     };
 
     if first_flink == 0 || first_flink == sentinel || !is_valid_user_ptr(first_flink, arch) {
         log::debug!(
-            "Credman {:?}: list at starter 0x{:x} is empty (flink=0x{:x})",
-            arch,
-            list1_ptr,
-            first_flink
+            "Credman {arch:?}: list at starter 0x{list1_ptr:x} is empty (flink=0x{first_flink:x})"
         );
         return;
     }
@@ -458,9 +474,8 @@ fn walk_credman_list(
     };
 
     let mut results = Vec::new();
-    let mut current_flink_addr = match read_ptr(vmem, sentinel, arch) {
-        Ok(f) => f,
-        Err(_) => return results,
+    let Ok(mut current_flink_addr) = read_ptr(vmem, sentinel, arch) else {
+        return results;
     };
     let mut visited = std::collections::HashSet::new();
 
@@ -477,7 +492,9 @@ fn walk_credman_list(
         for entry_offsets in entry_variants {
             // Subtract flink_offset to get struct base
             let struct_base = current_flink_addr - entry_offsets.flink_offset;
-            if let Some(cred) = try_extract_credman_entry(vmem, struct_base, entry_offsets, keys, arch) {
+            if let Some(cred) =
+                try_extract_credman_entry(vmem, struct_base, entry_offsets, keys, arch)
+            {
                 results.push(cred);
                 break;
             }
@@ -552,10 +569,9 @@ fn find_msv_list_candidates(
     pe: &PeHeaders,
     msv_base: u64,
     arch: Arch,
-) -> Result<Vec<u64>> {
-    let (data_base, data) = match read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") {
-        Ok(r) => r,
-        Err(_) => return Ok(Vec::new()),
+) -> Vec<u64> {
+    let Ok((data_base, data)) = read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") else {
+        return Vec::new();
     };
     let data_size = data.len();
 
@@ -576,17 +592,15 @@ fn find_msv_list_candidates(
         let list_addr = data_base + off as u64;
 
         // Verify: entry's blink points back to list_addr
-        let entry_blink = match read_ptr(vmem, flink + step as u64, arch) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Ok(entry_blink) = read_ptr(vmem, flink + step as u64, arch) else {
+            continue;
         };
         if entry_blink != list_addr {
             continue;
         }
 
-        let entry_flink = match read_ptr(vmem, flink, arch) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok(entry_flink) = read_ptr(vmem, flink, arch) else {
+            continue;
         };
         if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
             continue;
@@ -595,7 +609,7 @@ fn find_msv_list_candidates(
         candidates.push(list_addr);
     }
 
-    Ok(candidates)
+    candidates
 }
 
 /// Search the .data section for an inline LogonSessionList hash table.
@@ -604,11 +618,10 @@ fn find_inline_hash_table(
     pe: &PeHeaders,
     msv_base: u64,
     arch: Arch,
-) -> Result<Vec<(u64, usize)>> {
+) -> Vec<(u64, usize)> {
     let msv_end = msv_base + 0x100000;
-    let (data_base, data) = match read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") {
-        Ok(r) => r,
-        Err(_) => return Ok(Vec::new()),
+    let Ok((data_base, data)) = read_data_section(vmem, pe, msv_base, 0x10000, "msv1_0.dll") else {
+        return Vec::new();
     };
     let data_size = data.len();
 
@@ -652,5 +665,5 @@ fn find_inline_hash_table(
         tables.push((table_addr, run_count));
     }
 
-    Ok(tables)
+    tables
 }

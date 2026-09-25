@@ -1,10 +1,10 @@
 use std::cell::Cell;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::entry::{
-    PageTableEntry, LARGE_1GB_MASK, LARGE_2MB_MASK, PAGE_OFFSET_1GB, PAGE_OFFSET_2MB,
-    PAGE_PHYS_MASK,
+    LARGE_1GB_MASK, LARGE_2MB_MASK, PAGE_OFFSET_1GB, PAGE_OFFSET_2MB, PAGE_PHYS_MASK,
+    PageTableEntry,
 };
 
 /// TLB cache size: 256 entries, direct-mapped by VA page number.
@@ -34,7 +34,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
 
     /// Look up a VA page in the TLB. Returns Some(pa_page_base) on hit.
     #[inline]
-    fn tlb_lookup(&self, va_page: u64) -> Option<u64> {
+    const fn tlb_lookup(&self, va_page: u64) -> Option<u64> {
         let idx = (va_page as usize) % TLB_SIZE;
         let (cached_va, cached_pa) = self.tlb[idx].get();
         if cached_va == va_page && va_page != 0 {
@@ -190,7 +190,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                 let pt_page = pagefile
                     .resolve_pte(pde.raw())
                     .ok_or(VmkatzError::PageFault(vaddr, "PD-pagefile"))?;
-                return self.walk_from_pt(&pt_page, vaddr, Some(pagefile));
+                return Self::walk_from_pt(&pt_page, vaddr, Some(pagefile));
             }
             return Err(VmkatzError::PageFault(vaddr, "PD"));
         }
@@ -255,7 +255,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                     let pt_page = pf
                         .resolve_pte(pde.raw())
                         .ok_or(VmkatzError::PageFault(vaddr, "PD-pagefile"))?;
-                    return self.walk_from_pt(&pt_page, vaddr, pagefile);
+                    return Self::walk_from_pt(&pt_page, vaddr, pagefile);
                 }
             }
             return Err(VmkatzError::PageFault(vaddr, "PD"));
@@ -286,7 +286,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
                     let pt_page = pf
                         .resolve_pte(pde.raw())
                         .ok_or(VmkatzError::PageFault(vaddr, "PD-pagefile"))?;
-                    return self.walk_from_pt(&pt_page, vaddr, pagefile);
+                    return Self::walk_from_pt(&pt_page, vaddr, pagefile);
                 }
             }
             return Err(VmkatzError::PageFault(vaddr, "PD"));
@@ -302,7 +302,6 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     /// Continue page table walk from a resolved PT page (in-memory buffer).
     #[cfg(feature = "sam")]
     fn walk_from_pt(
-        &self,
         pt_page: &[u8; 4096],
         vaddr: u64,
         _pagefile: Option<&crate::paging::pagefile::PagefileReader>,
@@ -364,7 +363,7 @@ pub struct PageMapping {
     pub size: u64, // 4KB, 2MB, or 1GB
 }
 
-impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
+impl<P: PhysicalMemory> PageTableWalker<'_, P> {
     /// Enumerate all present user-mode pages for a given CR3.
     /// Calls the callback for each present page mapping.
     ///
@@ -487,7 +486,7 @@ impl<'a, P: PhysicalMemory> PaePageTableWalker<'a, P> {
     }
 
     #[inline]
-    fn tlb_lookup(&self, va_page: u32) -> Option<u64> {
+    const fn tlb_lookup(&self, va_page: u32) -> Option<u64> {
         let idx = (va_page as usize) % TLB_SIZE;
         let (cached_va, cached_pa) = self.tlb[idx].get();
         if cached_va == va_page && va_page != 0 {
@@ -510,7 +509,7 @@ impl<'a, P: PhysicalMemory> PaePageTableWalker<'a, P> {
     pub fn translate(&self, cr3: u64, vaddr: u64) -> Result<u64> {
         let vaddr32 = vaddr as u32;
         let va_page = vaddr32 >> 12;
-        let page_offset = (vaddr32 & 0xFFF) as u64;
+        let page_offset = u64::from(vaddr32 & 0xFFF);
 
         // TLB fast path
         if let Some(pa_base) = self.tlb_lookup(va_page) {
@@ -521,7 +520,7 @@ impl<'a, P: PhysicalMemory> PaePageTableWalker<'a, P> {
         let pdpt_base = cr3 & 0xFFFF_FFE0;
 
         // PDPT index: bits 31:30 (2 bits → 4 entries, each 8 bytes → 32 bytes total)
-        let pdpt_idx = ((vaddr32 >> 30) & 0x3) as u64;
+        let pdpt_idx = u64::from((vaddr32 >> 30) & 0x3);
         let pdpte = self.phys.read_phys_u64(pdpt_base + pdpt_idx * 8)?;
         if pdpte & 1 == 0 {
             return Err(VmkatzError::PageFault(vaddr, "PAE-PDPT"));
@@ -529,7 +528,7 @@ impl<'a, P: PhysicalMemory> PaePageTableWalker<'a, P> {
         let pd_base = pdpte & PAGE_PHYS_MASK;
 
         // PD index: bits 29:21 (9 bits → 512 entries)
-        let pd_idx = ((vaddr32 >> 21) & 0x1FF) as u64;
+        let pd_idx = u64::from((vaddr32 >> 21) & 0x1FF);
         let pde = self.phys.read_phys_u64(pd_base + pd_idx * 8)?;
         if pde & 1 == 0 {
             return Err(VmkatzError::PageFault(vaddr, "PAE-PD"));
@@ -537,14 +536,14 @@ impl<'a, P: PhysicalMemory> PaePageTableWalker<'a, P> {
         // 2MB large page (bit 7)
         if pde & (1 << 7) != 0 {
             let frame = pde & LARGE_2MB_MASK;
-            let pa = frame | ((vaddr32 as u64) & PAGE_OFFSET_2MB);
+            let pa = frame | (u64::from(vaddr32) & PAGE_OFFSET_2MB);
             self.tlb_insert(va_page, pa & !0xFFF);
             return Ok(pa);
         }
         let pt_base = pde & PAGE_PHYS_MASK;
 
         // PT index: bits 20:12 (9 bits → 512 entries)
-        let pt_idx = ((vaddr32 >> 12) & 0x1FF) as u64;
+        let pt_idx = u64::from((vaddr32 >> 12) & 0x1FF);
         let pte_val = self.phys.read_phys_u64(pt_base + pt_idx * 8)?;
         let pte = PageTableEntry(pte_val);
         if !pte.is_present() {
@@ -648,10 +647,9 @@ impl<'a, P: PhysicalMemory> PaeProcessMemory<'a, P> {
             dtb,
         }
     }
-
 }
 
-impl<'a, P: PhysicalMemory> VirtualMemory for PaeProcessMemory<'a, P> {
+impl<P: PhysicalMemory> VirtualMemory for PaeProcessMemory<'_, P> {
     fn read_virt(&self, vaddr: u64, buf: &mut [u8]) -> Result<()> {
         let mut offset = 0;
         while offset < buf.len() {
@@ -680,6 +678,7 @@ impl<'a, P: PhysicalMemory> VirtualMemory for PaeProcessMemory<'a, P> {
 }
 
 /// Process virtual memory: combines a DTB (CR3) with physical memory for address translation.
+///
 /// Optional pagefile reader resolves pages swapped to pagefile.sys on disk.
 /// Optional file-backed resolver serves demand-paged DLL sections from disk.
 pub struct ProcessMemory<'a, P: PhysicalMemory> {
@@ -720,10 +719,9 @@ impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
             filebacked,
         }
     }
-
 }
 
-impl<'a, P: PhysicalMemory> VirtualMemory for ProcessMemory<'a, P> {
+impl<P: PhysicalMemory> VirtualMemory for ProcessMemory<'_, P> {
     fn read_virt(&self, vaddr: u64, buf: &mut [u8]) -> Result<()> {
         // Handle page-crossing reads, zero-fill pages that fault (demand-paged/swapped).
         let mut offset = 0;
@@ -780,7 +778,7 @@ impl<'a, P: PhysicalMemory> VirtualMemory for ProcessMemory<'a, P> {
                             continue;
                         }
                     }
-                    log::trace!("Page fault: {} at VA 0x{:x}", e, current_vaddr);
+                    log::trace!("Page fault: {e} at VA 0x{current_vaddr:x}");
                     buf[offset..offset + chunk].fill(0);
                 }
             }

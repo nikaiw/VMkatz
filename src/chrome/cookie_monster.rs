@@ -34,7 +34,9 @@ use crate::memory::VirtualMemory;
 // ============================================================================
 
 /// 152-byte structural signature of a `net::CookieMonster` instance's
-/// first members. Wildcards: `0xAA`, `0xCC`. The `0xBB` bytes at the six
+/// first members.
+///
+/// Wildcards: `0xAA`, `0xCC`. The `0xBB` bytes at the six
 /// fixed offsets [`PATCH_OFFSETS`] get replaced via [`patch_module_high_half`]
 /// before each per-region scan — they represent the high 4 bytes of
 /// pointer fields that must point back into the same chrome.dll / heap
@@ -60,13 +62,17 @@ pub const COOKIE_MONSTER_SIG: [u8; 152] = [
 const PATCH_OFFSETS: [usize; 6] = [16, 24, 56, 64, 88, 152];
 
 /// Byte offset from a `CookieMonster` instance to the `std::map`
-/// `RbRoot` head. Fixed at 0x30 (`0x28` + `sizeof(uintptr_t)` per
+/// `RbRoot` head.
+///
+/// Fixed at 0x30 (`0x28` + `sizeof(uintptr_t)` per
 /// `Main.cpp`'s `CookieMapOffset` calculation) across observed Chrome
 /// / Edge versions.
 pub const COOKIE_MAP_OFFSET: u64 = 0x30;
 
 /// Replace the four bytes ending at each [`PATCH_OFFSETS`] position with
-/// the high half (bytes 4..8) of `region_base` in little-endian form. On
+/// the high half (bytes 4..8) of `region_base` in little-endian form.
+///
+/// On
 /// x64 Windows this turns the otherwise-wildcard pointer-high-half
 /// windows into a fixed match for "the high 4 bytes of any pointer that
 /// targets the same memory region we're scanning."
@@ -83,7 +89,9 @@ pub fn patch_module_high_half(sig: &mut [u8; 152], region_base: u64) {
 
 /// Scan `mem` (mapped at virtual address `base_va`) for every offset
 /// where the (already module-half-patched) [`COOKIE_MONSTER_SIG`]
-/// matches. Returns absolute virtual addresses by adding `base_va`.
+/// matches.
+///
+/// Returns absolute virtual addresses by adding `base_va`.
 /// Matches are 8-byte aligned (the candidate object always starts on a
 /// pointer-aligned boundary).
 pub fn scan_for_cookie_monster(mem: &[u8], base_va: u64, sig: &[u8; 152]) -> Vec<u64> {
@@ -108,7 +116,7 @@ pub fn scan_for_cookie_monster(mem: &[u8], base_va: u64, sig: &[u8; 152]) -> Vec
 fn matches_signature(sig: &[u8; 152], window: &[u8]) -> bool {
     for (s, w) in sig.iter().zip(window.iter()) {
         match *s {
-            0xAA | 0xCC => continue,
+            0xAA | 0xCC => {}
             other => {
                 if other != *w {
                     return false;
@@ -123,9 +131,10 @@ fn matches_signature(sig: &[u8; 152], window: &[u8]) -> bool {
 // In-process C++ struct layouts (MSVC x64)
 // ============================================================================
 
-
 /// `std::string` short-string-optimization layout (MSVC x64): a 23-byte
-/// inline buffer with the length stored in byte 23. When `len > 22`, byte
+/// inline buffer with the length stored in byte 23.
+///
+/// When `len > 22`, byte
 /// 23 holds 23 and the first 8 bytes of `buf` are reinterpreted as a
 /// pointer to a heap-allocated character buffer.
 #[repr(C)]
@@ -136,7 +145,9 @@ pub struct OptimizedString {
 }
 
 /// Cookie value variant introduced in Chrome 130 / Edge 130 for
-/// "ProcessBoundEncryption". Holds either plaintext bytes or
+/// "ProcessBoundEncryption".
+///
+/// Holds either plaintext bytes or
 /// `CryptProtectMemory`-encrypted bytes. We can't decrypt the latter
 /// offline — when `encrypted == 1` we report the value as `<encrypted>`
 /// rather than corrupt bytes.
@@ -147,9 +158,9 @@ pub struct ProcessBoundString {
     pub data_size: u64,
     pub data_capacity: u64,
     pub original_size: u64,
-    pub _unk: [u8; 8],
+    pub unk: [u8; 8],
     pub encrypted: u8,
-    pub _pad: [u8; 7],
+    pub pad: [u8; 7],
 }
 
 /// `_Tree_node` in MSVC's `std::map` red-black tree. The cookie-map nodes
@@ -162,7 +173,7 @@ pub struct RbNode {
     pub right: u64,
     pub parent: u64,
     pub is_black: u8,
-    pub _pad: [u8; 7],
+    pub pad: [u8; 7],
     pub key: OptimizedString,
     pub value_address: u64,
 }
@@ -231,32 +242,32 @@ pub enum CookieVariant {
 }
 
 impl CookieVariant {
-    fn name_offset(self) -> usize {
+    const fn name_offset(self) -> usize {
         match self {
-            CookieVariant::Legacy => 0,
+            Self::Legacy => 0,
             _ => 8, // skip vfptr
         }
     }
 
-    fn domain_offset(self) -> usize {
+    const fn domain_offset(self) -> usize {
         match self {
-            CookieVariant::Legacy => 24 * 2,
+            Self::Legacy => 24 * 2,
             _ => 8 + 24,
         }
     }
 
-    fn path_offset(self) -> usize {
+    const fn path_offset(self) -> usize {
         match self {
-            CookieVariant::Legacy => 24 * 3,
+            Self::Legacy => 24 * 3,
             _ => 8 + 24 * 2,
         }
     }
 
     /// `(secure_offset, http_only_offset)`. `None` for the legacy layout
     /// which stores neither in the same struct.
-    fn flags_offset(self) -> Option<(usize, usize)> {
+    const fn flags_offset(self) -> Option<(usize, usize)> {
         match self {
-            CookieVariant::Legacy => None,
+            Self::Legacy => None,
             _ => Some((8 + 24 * 3 + 8, 8 + 24 * 3 + 8 + 1)),
         }
     }
@@ -266,19 +277,19 @@ impl CookieVariant {
     ///   1 secure + 1 http_only + 4 same_site +
     ///   partition_key{120|128|136} + 4 source_scheme + 4 source_port
     /// then the value.
-    fn value_offset(self) -> usize {
+    const fn value_offset(self) -> usize {
         let header = 8 + 24 * 3 + 8 + 1 + 1 + 4;
         let pk = match self {
-            CookieVariant::Chrome124 => 120,
-            CookieVariant::Chrome130Pb | CookieVariant::Chrome130 => 128,
-            CookieVariant::Edge130Pb | CookieVariant::Edge130 => 136,
-            CookieVariant::Legacy => return 24, // second OptimizedString
+            Self::Chrome124 => 120,
+            Self::Chrome130Pb | Self::Chrome130 => 128,
+            Self::Edge130Pb | Self::Edge130 => 136,
+            Self::Legacy => return 24, // second OptimizedString
         };
         header + pk + 4 + 4
     }
 
-    fn is_process_bound(self) -> bool {
-        matches!(self, CookieVariant::Chrome130Pb | CookieVariant::Edge130Pb)
+    const fn is_process_bound(self) -> bool {
+        matches!(self, Self::Chrome130Pb | Self::Edge130Pb)
     }
 }
 
@@ -334,7 +345,9 @@ fn read_process_bound_value(vmem: &dyn VirtualMemory, pb_addr: u64) -> String {
 }
 
 /// Walk an MSVC `std::map`-style red-black tree rooted at `root_addr` (a
-/// pointer to an [`RbRoot`] struct). For each leaf node, call `visit` with
+/// pointer to an [`RbRoot`] struct).
+///
+/// For each leaf node, call `visit` with
 /// the `value_address` (which points at a `CanonicalCookie`). Returns the
 /// number of nodes for which `visit` returned `true`.
 pub fn walk_cookie_tree(
@@ -355,9 +368,8 @@ pub fn walk_cookie_tree(
         if node_addr == 0 || !visited.insert(node_addr) || visited.len() > cap {
             continue;
         }
-        let node_buf = match vmem.read_virt_bytes(node_addr, std::mem::size_of::<RbNode>()) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Ok(node_buf) = vmem.read_virt_bytes(node_addr, std::mem::size_of::<RbNode>()) else {
+            continue;
         };
         if node_buf.len() < std::mem::size_of::<RbNode>() {
             continue;

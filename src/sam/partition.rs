@@ -57,16 +57,11 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
             mbr[entry_offset + 11],
         ]);
 
-        log::debug!(
-            "MBR Partition {}: type=0x{:02x}, LBA_start={}",
-            i,
-            part_type,
-            lba_start
-        );
+        log::debug!("MBR Partition {i}: type=0x{part_type:02x}, LBA_start={lba_start}");
 
         // NTFS partition type is 0x07
         if part_type == 0x07 && lba_start > 0 {
-            partitions.push(lba_start as u64 * 512);
+            partitions.push(u64::from(lba_start) * 512);
         }
     }
 
@@ -81,6 +76,13 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
 
 /// Parse GPT partition table and find NTFS (Basic Data) partitions.
 fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
+    // "Microsoft Basic Data" GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+    // Mixed-endian byte representation
+    const BASIC_DATA_GUID: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
+    ];
+
     // GPT header at LBA 1 (offset 512)
     reader.seek(SeekFrom::Start(512))?;
     let mut hdr = [0u8; 92];
@@ -100,30 +102,17 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     // GPT spec: entry_size is typically 128 bytes; reject invalid values
     if !(128..=4096).contains(&entry_size) {
         return Err(crate::error::VmkatzError::DecryptionError(format!(
-            "Invalid GPT entry size: {} (expected 128-4096)",
-            entry_size,
+            "Invalid GPT entry size: {entry_size} (expected 128-4096)",
         )));
     }
 
-    log::debug!(
-        "GPT: entry_lba={}, num_entries={}, entry_size={}",
-        entry_lba,
-        num_entries,
-        entry_size
-    );
-
-    // "Microsoft Basic Data" GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
-    // Mixed-endian byte representation
-    const BASIC_DATA_GUID: [u8; 16] = [
-        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26,
-        0x99, 0xC7,
-    ];
+    log::debug!("GPT: entry_lba={entry_lba}, num_entries={num_entries}, entry_size={entry_size}");
 
     let mut partitions = Vec::new();
     let entries_offset = entry_lba * 512;
 
     for i in 0..num_entries {
-        let entry_offset = entries_offset + i as u64 * entry_size as u64;
+        let entry_offset = entries_offset + u64::from(i) * u64::from(entry_size);
         if reader.seek(SeekFrom::Start(entry_offset)).is_err() {
             continue; // Skip entries we can't seek to
         }
@@ -142,7 +131,7 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         let first_lba = crate::utils::read_u64_le(&entry, 0x20).unwrap_or(0);
 
         if type_guid == BASIC_DATA_GUID {
-            log::debug!("GPT partition {}: Basic Data at LBA {}", i, first_lba);
+            log::debug!("GPT partition {i}: Basic Data at LBA {first_lba}");
             partitions.push(first_lba * 512);
         }
     }

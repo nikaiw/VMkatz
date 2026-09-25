@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::lsass::finder::{DiskPathRef, PagefileRef};
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::entry::{PageTableEntry, PAGE_PHYS_MASK};
+use crate::paging::entry::{PAGE_PHYS_MASK, PageTableEntry};
 use crate::paging::translate::ProcessMemory;
 use crate::windows::offsets::X64_LDR;
 use crate::windows::peb::{self, LoadedModule};
@@ -59,7 +59,7 @@ pub fn dump_process<P: PhysicalMemory>(
                 m
             }
             Err(e) => {
-                log::warn!("Module enumeration failed: {}", e);
+                log::warn!("Module enumeration failed: {e}");
                 Vec::new()
             }
         }
@@ -81,7 +81,7 @@ pub fn dump_process<P: PhysicalMemory>(
             }
             Ok(_) => None,
             Err(e) => {
-                log::info!("Dump file-backed unavailable: {}", e);
+                log::info!("Dump file-backed unavailable: {e}");
                 None
             }
         }
@@ -100,7 +100,7 @@ pub fn dump_process<P: PhysicalMemory>(
 
     // Add module VA ranges for file-backed DLL page resolution
     for m in &modules {
-        let page_count = (m.size as u64).div_ceil(0x1000);
+        let page_count = u64::from(m.size).div_ceil(0x1000);
         for i in 0..page_count {
             page_vas.insert(m.base + i * 0x1000);
         }
@@ -124,7 +124,7 @@ pub fn dump_process<P: PhysicalMemory>(
     if let Some(pf) = pagefile {
         let resolved = pf.pages_resolved();
         if resolved > 0 {
-            log::info!("Dump: {} pagefile pages resolved", resolved);
+            log::info!("Dump: {resolved} pagefile pages resolved");
         }
     }
 
@@ -270,7 +270,7 @@ fn write_minidump(
     let mem64_header = 16u64; // NumberOfMemoryRanges(8) + BaseRva(8)
     let mem64_descs = regions.len() as u64 * 16;
     let mem64_list_size = mem64_header + mem64_descs;
-    let memory_data_rva = mem64_rva as u64 + mem64_list_size;
+    let memory_data_rva = u64::from(mem64_rva) + mem64_list_size;
 
     // === MINIDUMP_HEADER (32 bytes) ===
     w.write_all(&MINIDUMP_SIGNATURE.to_le_bytes())?;

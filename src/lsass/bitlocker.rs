@@ -52,13 +52,13 @@ impl BitLockerKey {
     }
 
     /// Key size in bits (128 or 256).
-    pub fn key_bits(&self) -> usize {
+    pub const fn key_bits(&self) -> usize {
         self.fvek.len() * 8
     }
 }
 
 /// Mode byte to (dislocker_method, cipher_name, fvek_len, has_tweak) mapping.
-fn decode_fvec_mode(mode: u8) -> Option<(u16, &'static str, usize, bool)> {
+const fn decode_fvec_mode(mode: u8) -> Option<(u16, &'static str, usize, bool)> {
     match mode {
         0x00 => Some((0x8000, "AES-128-CBC + Elephant Diffuser", 16, true)),
         0x01 => Some((0x8001, "AES-256-CBC + Elephant Diffuser", 32, true)),
@@ -69,7 +69,7 @@ fn decode_fvec_mode(mode: u8) -> Option<(u16, &'static str, usize, bool)> {
 }
 
 /// Mode byte to (dislocker_method, cipher_name, fvek_len) mapping for Cngb.
-fn decode_cngb_mode(mode: u8) -> Option<(u16, &'static str, usize)> {
+const fn decode_cngb_mode(mode: u8) -> Option<(u16, &'static str, usize)> {
     match mode {
         0x10 => Some((0x8004, "AES-128-XTS", 16)),
         0x20 => Some((0x8005, "AES-256-XTS", 32)),
@@ -121,7 +121,10 @@ pub fn extract_bitlocker_keys<M: PhysicalMemory>(mem: &M) -> Vec<BitLockerKey> {
 
     while chunk_addr < phys_size {
         let read_len = SCAN_CHUNK_SIZE.min((phys_size - chunk_addr) as usize);
-        if mem.read_phys(chunk_addr, &mut chunk_buf[..read_len]).is_err() {
+        if mem
+            .read_phys(chunk_addr, &mut chunk_buf[..read_len])
+            .is_err()
+        {
             chunk_addr += read_len as u64;
             continue;
         }
@@ -142,17 +145,17 @@ pub fn extract_bitlocker_keys<M: PhysicalMemory>(mem: &M) -> Vec<BitLockerKey> {
                         "BitLocker: FVEc hit at 0x{:x} — {} ({})",
                         abs_addr,
                         key.cipher,
-                        if key.tweak.is_empty() { "no tweak" } else { "with tweak" }
+                        if key.tweak.is_empty() {
+                            "no tweak"
+                        } else {
+                            "with tweak"
+                        }
                     );
                     candidates.push(key);
                 }
             } else if tag == CNGB_TAG {
                 for key in try_extract_cngb(mem, abs_addr) {
-                    log::info!(
-                        "BitLocker: Cngb hit at 0x{:x} — {}",
-                        abs_addr,
-                        key.cipher
-                    );
+                    log::info!("BitLocker: Cngb hit at 0x{:x} — {}", abs_addr, key.cipher);
                     candidates.push(key);
                 }
             }
@@ -186,9 +189,8 @@ fn try_extract_fvec<M: PhysicalMemory>(mem: &M, tag_addr: u64) -> Vec<BitLockerK
     // We read from tag_addr - 32 to capture any pool header, plus enough
     // forward data for both offset variants.
     let base = tag_addr.saturating_sub(32);
-    let buf = match mem.read_phys_bytes(base, EXTRACT_BUF_SIZE) {
-        Ok(b) => b,
-        Err(_) => return results,
+    let Ok(buf) = mem.read_phys_bytes(base, EXTRACT_BUF_SIZE) else {
+        return results;
     };
 
     // Offset of the tag within our buffer
@@ -271,9 +273,8 @@ fn try_extract_cngb<M: PhysicalMemory>(mem: &M, tag_addr: u64) -> Vec<BitLockerK
     let mut results = Vec::new();
 
     let base = tag_addr.saturating_sub(32);
-    let buf = match mem.read_phys_bytes(base, EXTRACT_BUF_SIZE) {
-        Ok(b) => b,
-        Err(_) => return results,
+    let Ok(buf) = mem.read_phys_bytes(base, EXTRACT_BUF_SIZE) else {
+        return results;
     };
 
     let tag_off = (tag_addr - base) as usize;
@@ -367,8 +368,10 @@ mod tests {
         let key = BitLockerKey {
             method: 0x8004,
             cipher: "AES-128-XTS",
-            fvek: vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                       0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10],
+            fvek: vec![
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10,
+            ],
             tweak: Vec::new(),
             phys_addr: 0x1000,
             pool_tag: "Cngb",

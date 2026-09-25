@@ -51,7 +51,7 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
             pos += 4;
         }
 
-        let inline_len = (flags & 0x3F) as u64;
+        let inline_len = u64::from(flags & 0x3F);
         let data_size = if inline_len >= 62 {
             if pos + 8 > data.len() {
                 break;

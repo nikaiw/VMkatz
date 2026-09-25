@@ -116,8 +116,7 @@ fn parse_dynamic_header(file: &mut File, data_offset: u64) -> Result<VhdDynamicH
     file.read_exact(&mut cookie)?;
     if cookie != CXSPARSE_COOKIE {
         return Err(VmkatzError::DiskFormatError(format!(
-            "Invalid dynamic header cookie: {:?}",
-            &cookie
+            "Invalid dynamic header cookie: {cookie:?}"
         )));
     }
 

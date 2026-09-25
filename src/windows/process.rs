@@ -355,18 +355,10 @@ pub fn enumerate_processes(
     visited.insert(system.eprocess_phys + offsets.active_process_links);
 
     // Create appropriate page table walker based on bitness
-    let x64_walker;
-    let pae_walker;
-    match offsets.bitness {
-        WindowsBitness::X64 => {
-            x64_walker = Some(PageTableWalker::new(phys));
-            pae_walker = None;
-        }
-        WindowsBitness::X86Pae => {
-            x64_walker = None;
-            pae_walker = Some(PaePageTableWalker::new(phys));
-        }
-    }
+    let (x64_walker, pae_walker) = match offsets.bitness {
+        WindowsBitness::X64 => (Some(PageTableWalker::new(phys)), None),
+        WindowsBitness::X86Pae => (None, Some(PaePageTableWalker::new(phys))),
+    };
 
     loop {
         if visited.contains(&current_flink) {

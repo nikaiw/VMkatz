@@ -4,7 +4,7 @@
 //! (JD, Skew1, GBG, Data), concatenated and permuted.
 
 use super::hive::Hive;
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 /// Permutation table applied to the raw 16-byte key.
 const PBOX: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
@@ -17,18 +17,17 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
     // Determine ControlSet numbers to try.
     // Prefer Select\Current (canonical), fall back to trying 001/002/003 directly
     // when Select is missing (e.g., incomplete hives from fragmented disks).
-    let cs_numbers = match root.subkey(&hive, "Select") {
-        Ok(select) => match select.value_dword(&hive, "Current") {
+    let cs_numbers = if let Ok(select) = root.subkey(&hive, "Select") {
+        match select.value_dword(&hive, "Current") {
             Ok(current) => {
-                log::info!("Current ControlSet: {}", current);
+                log::info!("Current ControlSet: {current}");
                 vec![current, 1, 2, 3]
             }
             Err(_) => vec![1, 2, 3],
-        },
-        Err(_) => {
-            log::info!("Select key not found, trying ControlSet001/002/003 directly");
-            vec![1, 2, 3]
         }
+    } else {
+        log::info!("Select key not found, trying ControlSet001/002/003 directly");
+        vec![1, 2, 3]
     };
 
     // Try each ControlSet until bootkey extraction succeeds
@@ -43,7 +42,7 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
         }
         seen[cs_num as usize] = true;
 
-        let cs_name = format!("ControlSet{:03}", cs_num);
+        let cs_name = format!("ControlSet{cs_num:03}");
         let lsa = match root
             .subkey(&hive, &cs_name)
             .and_then(|cs| cs.subkey(&hive, "Control"))
@@ -51,7 +50,7 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
         {
             Ok(lsa) => lsa,
             Err(e) => {
-                log::debug!("ControlSet{:03}: LSA path not found: {}", cs_num, e);
+                log::debug!("ControlSet{cs_num:03}: LSA path not found: {e}");
                 last_err = Some(e);
                 continue;
             }
@@ -60,12 +59,12 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
         match extract_bootkey_from_lsa(&hive, &lsa) {
             Ok(bootkey) => {
                 if cs_num != 1 || seen[1] {
-                    log::info!("Bootkey extracted from ControlSet{:03}", cs_num);
+                    log::info!("Bootkey extracted from ControlSet{cs_num:03}");
                 }
                 return Ok(bootkey);
             }
             Err(e) => {
-                log::debug!("ControlSet{:03}: bootkey extraction failed: {}", cs_num, e);
+                log::debug!("ControlSet{cs_num:03}: bootkey extraction failed: {e}");
                 last_err = Some(e);
             }
         }
@@ -86,17 +85,12 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
         .filter(|p| p.iter().all(|&b| b == 0))
         .count();
     let total_pages = hive_size / 0x1000;
-    let gap_pct = if total_pages > 0 {
-        zero_pages * 100 / total_pages
-    } else {
-        0
-    };
+    let gap_pct = (zero_pages * 100).checked_div(total_pages).unwrap_or(0);
 
     if gap_pct > 10 {
         Err(VmkatzError::DecryptionError(format!(
-            "Bootkey extraction failed: SYSTEM hive has {}% zero-filled pages ({}/{}) — \
+            "Bootkey extraction failed: SYSTEM hive has {gap_pct}% zero-filled pages ({zero_pages}/{total_pages}) — \
              bootkey registry cells (JD/Skew1/GBG/Data) are in missing disk extents",
-            gap_pct, zero_pages, total_pages,
         )))
     } else {
         Err(last_err.unwrap_or_else(|| {
@@ -114,7 +108,7 @@ fn extract_bootkey_from_lsa(hive: &Hive<'_>, lsa: &super::hive::Key<'_>) -> Resu
         let sub = lsa.subkey(hive, kn)?;
         let class = sub.class_name(hive)?;
         let bytes = hex::decode(&class).map_err(|e| {
-            VmkatzError::DecryptionError(format!("Bad hex in {} class name '{}': {}", kn, class, e))
+            VmkatzError::DecryptionError(format!("Bad hex in {kn} class name '{class}': {e}"))
         })?;
         raw.extend_from_slice(&bytes);
     }
@@ -176,7 +170,8 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
             let sig = crate::utils::read_u16_le(hive_data, cell_data_off).unwrap_or(0);
             if sig == 0x6B6E {
                 // "nk"
-                let name_len = crate::utils::read_u16_le(hive_data, cell_data_off + 0x48).unwrap_or(0) as usize;
+                let name_len = crate::utils::read_u16_le(hive_data, cell_data_off + 0x48)
+                    .unwrap_or(0) as usize;
 
                 if name_len > 0 && cell_data_off + 0x4C + name_len <= hive_data.len() {
                     let name = std::str::from_utf8(
@@ -187,8 +182,12 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
                     for &(target, idx) in &targets {
                         if name.eq_ignore_ascii_case(target) && class_bytes[idx].is_none() {
                             // Read class name from this NK cell
-                            let class_offset = crate::utils::read_u32_le(hive_data, cell_data_off + 0x30).unwrap_or(0xFFFF_FFFF);
-                            let class_len = crate::utils::read_u16_le(hive_data, cell_data_off + 0x4A).unwrap_or(0) as usize;
+                            let class_offset =
+                                crate::utils::read_u32_le(hive_data, cell_data_off + 0x30)
+                                    .unwrap_or(0xFFFF_FFFF);
+                            let class_len =
+                                crate::utils::read_u16_le(hive_data, cell_data_off + 0x4A)
+                                    .unwrap_or(0) as usize;
 
                             if class_offset != 0xFFFF_FFFF && class_len > 0 {
                                 if let Some(bytes) =
@@ -225,12 +224,11 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
 
     let mut raw = Vec::with_capacity(16);
     for (i, name) in ["JD", "Skew1", "GBG", "Data"].iter().enumerate() {
-        match &class_bytes[i] {
-            Some(bytes) => raw.extend_from_slice(bytes),
-            None => {
-                log::debug!("Bootkey scan: {} not found", name);
-                return None;
-            }
+        if let Some(bytes) = &class_bytes[i] {
+            raw.extend_from_slice(bytes);
+        } else {
+            log::debug!("Bootkey scan: {name} not found");
+            return None;
         }
     }
 
@@ -279,8 +277,7 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
                 if sig == 0x6B6E {
                     // "nk"
                     let name_len =
-                        crate::utils::read_u16_le(block_data, cd + 0x48).unwrap_or(0)
-                            as usize;
+                        crate::utils::read_u16_le(block_data, cd + 0x48).unwrap_or(0) as usize;
 
                     if name_len > 0 && cd + 0x4C + name_len <= block_data.len() {
                         let name =
@@ -289,8 +286,11 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
                         for &(target, idx) in &targets {
                             if name.eq_ignore_ascii_case(target) && class_bytes[idx].is_none() {
-                                let class_offset = crate::utils::read_u32_le(block_data, cd + 0x30).unwrap_or(0xFFFF_FFFF);
-                                let class_len = crate::utils::read_u16_le(block_data, cd + 0x4A).unwrap_or(0) as usize;
+                                let class_offset = crate::utils::read_u32_le(block_data, cd + 0x30)
+                                    .unwrap_or(0xFFFF_FFFF);
+                                let class_len = crate::utils::read_u16_le(block_data, cd + 0x4A)
+                                    .unwrap_or(0)
+                                    as usize;
 
                                 if class_offset != 0xFFFF_FFFF && class_len > 0 {
                                     // Try to resolve class cell across all blocks
@@ -299,7 +299,9 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
                                     {
                                         log::info!(
                                             "Bootkey block scan: found {} class ({} bytes) in hbin at offset 0x{:x}",
-                                            target, bytes.len(), block_hive_off,
+                                            target,
+                                            bytes.len(),
+                                            block_hive_off,
                                         );
                                         class_bytes[idx] = Some(bytes);
                                     }
@@ -328,12 +330,11 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
     let mut raw = Vec::with_capacity(16);
     for (i, name) in ["JD", "Skew1", "GBG", "Data"].iter().enumerate() {
-        match &class_bytes[i] {
-            Some(bytes) => raw.extend_from_slice(bytes),
-            None => {
-                log::debug!("Bootkey block scan: {} not found", name);
-                return None;
-            }
+        if let Some(bytes) = &class_bytes[i] {
+            raw.extend_from_slice(bytes);
+        } else {
+            log::debug!("Bootkey block scan: {name} not found");
+            return None;
         }
     }
 
@@ -372,8 +373,7 @@ fn resolve_class_across_blocks(
                 continue;
             }
             // Read cell at this position
-            let size_raw =
-                crate::utils::read_i32_le(block_data, local_off).unwrap_or(0);
+            let size_raw = crate::utils::read_i32_le(block_data, local_off).unwrap_or(0);
             let abs_size = size_raw.unsigned_abs() as usize;
             if abs_size < 4 || local_off + abs_size > block_data.len() {
                 continue;

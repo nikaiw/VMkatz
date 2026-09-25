@@ -6,7 +6,7 @@ required-features = ["chrome"]
 [package]
 name = "vmkatz"
 version = "1.4.5-beta.1"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [features]
@@ -49,3 +49,36 @@ serde = { version = "1", features = ["derive"], optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+
+[lints.clippy]
+# pedantic + nursery at deny; lints that are just noise for a low-level
+# disk/memory forensic parser are allowed below (priority -1 lets these win).
+pedantic = { level = "deny", priority = -1 }
+nursery  = { level = "deny", priority = -1 }
+
+# Deliberate for binary parsing: offset/size casts, format acronyms, long fns.
+cast_possible_truncation = "allow"
+cast_possible_wrap       = "allow"
+cast_sign_loss           = "allow"
+cast_precision_loss      = "allow"
+doc_markdown             = "allow"
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+must_use_candidate       = "allow"
+too_many_lines           = "allow"
+similar_names            = "allow"
+unreadable_literal       = "allow"
+module_name_repetitions  = "allow"
+
+# Opinion: the "fixed" form reads worse here.
+option_if_let_else       = "allow"
+verbose_bit_mask         = "allow"
+collapsible_if           = "allow"  # 2024 let-chains vs our nested parse guards
+
+# Low-value style/naming.
+struct_field_names       = "allow"
+many_single_char_names   = "allow"
+too_many_arguments       = "allow"
+struct_excessive_bools   = "allow"
+naive_bytecount          = "allow"
+chunks_exact_to_as_chunks = "allow"  # as_chunks() is newer API churn; chunks_exact reads clearly here

@@ -290,24 +290,59 @@ fn lzf_decompress(data: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
                     "LZF back-reference before start",
                 ));
             }
-            let mut ref_pos = op - offset;
+            let ref_pos = op - offset;
             if op + length > expected_len {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "LZF output overrun",
                 ));
             }
-            // Copy byte-by-byte (overlapping allowed)
-            for _ in 0..length {
-                out[op] = out[ref_pos];
-                op += 1;
-                ref_pos += 1;
+            // Copy byte-by-byte (overlapping back-reference: reads may hit
+            // bytes written earlier in this same loop, so it stays sequential).
+            for i in 0..length {
+                out[op + i] = out[ref_pos + i];
             }
+            op += length;
         }
     }
 
     out.truncate(op);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lzf_decompress;
+
+    #[test]
+    fn lzf_literal_run() {
+        // ctrl=1 => 2 literal bytes "AB"
+        let out = lzf_decompress(&[0x01, b'A', b'B'], 2).unwrap();
+        assert_eq!(out, b"AB");
+    }
+
+    #[test]
+    fn lzf_rle_overlap_offset1() {
+        // "A" then back-ref offset=1 length=4 => replicate last byte (RLE).
+        // ctrl=0x40 (len (2>>0)+2=4), off byte 0x00 => offset=1.
+        let out = lzf_decompress(&[0x00, b'A', 0x40, 0x00], 5).unwrap();
+        assert_eq!(out, b"AAAAA");
+    }
+
+    #[test]
+    fn lzf_pattern_overlap_offset2() {
+        // "AB" then back-ref offset=2 length=4 => period-2 repeat "ABABAB".
+        // A naive slice copy would read stale bytes; sequential copy must not.
+        let out = lzf_decompress(&[0x01, b'A', b'B', 0x40, 0x01], 6).unwrap();
+        assert_eq!(out, b"ABABAB");
+    }
+
+    #[test]
+    fn lzf_nonoverlap_backref() {
+        // "ABCD" then back-ref offset=4 length=4 => copy first 4 bytes.
+        let out = lzf_decompress(&[0x03, b'A', b'B', b'C', b'D', 0x40, 0x03], 8).unwrap();
+        assert_eq!(out, b"ABCDABCD");
+    }
 }
 
 impl VBoxLayer {
