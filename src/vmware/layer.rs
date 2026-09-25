@@ -1,12 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
 use crate::vmware::header::{self, PAGE_SIZE};
 use crate::vmware::tags::{self, Tag};
-
 
 /// A memory region mapping guest physical pages to VMEM file offsets.
 #[derive(Debug, Clone, Copy)]
@@ -65,7 +63,10 @@ impl VmwareLayer {
                 (vmem_path, regions, tags)
             } else {
                 // Memory is embedded in the .vmsn/.vmss file itself
-                log::info!("No separate .vmem file, using embedded memory from {}", path.display());
+                log::info!(
+                    "No separate .vmem file, using embedded memory from {}",
+                    path.display()
+                );
                 (path.to_path_buf(), regions, tags)
             }
         };
@@ -88,14 +89,14 @@ impl VmwareLayer {
             if let Some(tag) = mem_tag {
                 let align_mask = tags::find_tag(&all_tags, "align_mask", &[0, 0])
                     .and_then(|t| {
-                        let off = t.data_offset as usize;
+                        let off = t.data_offset;
                         let mut buf = [0u8; 4];
                         data.read_at(off, &mut buf).ok()?;
-                        Some(u32::from_le_bytes(buf) as u64)
+                        Some(u64::from(u32::from_le_bytes(buf)))
                     })
                     .unwrap_or(0xFFF);
                 let offset = (tag.data_offset + align_mask) & !align_mask;
-                log::info!("Embedded memory base offset: 0x{:x}", offset);
+                log::info!("Embedded memory base offset: 0x{offset:x}");
                 offset
             } else {
                 0
@@ -111,7 +112,7 @@ impl VmwareLayer {
             } else {
                 data.len() as u64 / PAGE_SIZE as u64
             };
-            log::info!("No memory regions in VMSN, using identity mapping ({} pages)", page_count);
+            log::info!("No memory regions in VMSN, using identity mapping ({page_count} pages)");
             vec![MemoryRegion {
                 guest_page_num: 0,
                 vmem_page_num: 0,
@@ -182,7 +183,9 @@ impl VmwareLayer {
         let tag_start = memory_group.offset as usize;
         let tag_end = tag_start.saturating_add(memory_group.size as usize);
         if tag_start > vmsn_data.len() {
-            return Err(VmkatzError::GroupNotFound("memory group offset beyond file"));
+            return Err(VmkatzError::GroupNotFound(
+                "memory group offset beyond file",
+            ));
         }
         let tag_data = &vmsn_data[tag_start..tag_end.min(vmsn_data.len())];
         let all_tags = tags::parse_tags(tag_data, memory_group.offset)?;
@@ -198,38 +201,30 @@ impl VmwareLayer {
             );
         }
 
-        let regions_count = tags::find_tag(&all_tags, "regionsCount", &[])
-            .map(|t| {
-                let off = t.data_offset as usize;
-                crate::utils::read_u32_le(&vmsn_data, off).unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let regions_count = tags::find_tag(&all_tags, "regionsCount", &[]).map_or(0, |t| {
+            let off = t.data_offset;
+            crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0)
+        });
 
-        log::info!("Memory regions: {}", regions_count);
+        log::info!("Memory regions: {regions_count}");
 
         // Cap allocation: regions_count comes from tag data and could be forged
         let mut regions = Vec::with_capacity((regions_count as usize).min(4096));
         for i in 0..regions_count {
-            let vmem_page = tags::find_tag(&all_tags, "regionPageNum", &[i])
-                .map(|t| {
-                    let off = t.data_offset as usize;
-                    crate::utils::read_u32_le(&vmsn_data, off).unwrap_or(0) as u64
-                })
-                .unwrap_or(0);
+            let vmem_page = tags::find_tag(&all_tags, "regionPageNum", &[i]).map_or(0, |t| {
+                let off = t.data_offset;
+                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
+            });
 
-            let guest_page = tags::find_tag(&all_tags, "regionPPN", &[i])
-                .map(|t| {
-                    let off = t.data_offset as usize;
-                    crate::utils::read_u32_le(&vmsn_data, off).unwrap_or(0) as u64
-                })
-                .unwrap_or(0);
+            let guest_page = tags::find_tag(&all_tags, "regionPPN", &[i]).map_or(0, |t| {
+                let off = t.data_offset;
+                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
+            });
 
-            let page_count = tags::find_tag(&all_tags, "regionSize", &[i])
-                .map(|t| {
-                    let off = t.data_offset as usize;
-                    crate::utils::read_u32_le(&vmsn_data, off).unwrap_or(0) as u64
-                })
-                .unwrap_or(0);
+            let page_count = tags::find_tag(&all_tags, "regionSize", &[i]).map_or(0, |t| {
+                let off = t.data_offset;
+                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
+            });
 
             log::info!(
                 "  Region {}: guest_phys=0x{:x} vmem_file=0x{:x} pages=0x{:x} ({}MB)",
@@ -253,17 +248,21 @@ impl VmwareLayer {
     }
 
     /// Translate a guest physical address to a byte offset in the VMEM data.
-    fn guest_phys_to_vmem_offset(&self, phys_addr: u64) -> Result<usize> {
+    fn guest_phys_to_vmem_offset(&self, phys_addr: u64) -> Result<u64> {
         let page_num = phys_addr / PAGE_SIZE as u64;
         let page_offset = phys_addr % PAGE_SIZE as u64;
 
         // Regions are sorted by guest_page_num; use binary search.
-        let idx = self.regions.partition_point(|r| r.guest_page_num + r.page_count <= page_num);
+        let idx = self
+            .regions
+            .partition_point(|r| r.guest_page_num + r.page_count <= page_num);
         if let Some(region) = self.regions.get(idx) {
-            if page_num >= region.guest_page_num && page_num < region.guest_page_num + region.page_count {
+            if page_num >= region.guest_page_num
+                && page_num < region.guest_page_num + region.page_count
+            {
                 let vmem_page = page_num - region.guest_page_num + region.vmem_page_num;
                 let offset = vmem_page * PAGE_SIZE as u64 + page_offset + self.base_offset;
-                return Ok(offset as usize);
+                return Ok(offset);
             }
         }
 
@@ -285,7 +284,9 @@ impl VmwareLayer {
 impl PhysicalMemory for VmwareLayer {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<()> {
         let offset = self.guest_phys_to_vmem_offset(phys_addr)?;
-        self.data.read_at(offset, buf).map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))
+        self.data
+            .read_at(offset, buf)
+            .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))
     }
 
     fn phys_size(&self) -> u64 {

@@ -1,10 +1,10 @@
 use std::io::{Read, Seek};
 
-use ntfs::structured_values::NtfsFileNamespace;
 use ntfs::NtfsReadSeek;
+use ntfs::structured_values::NtfsFileNamespace;
 
-use crate::error::Result;
 use super::ntfs_fallback;
+use crate::error::Result;
 
 /// Wraps a Read+Seek with a partition offset.
 pub struct PartitionReader<'a, R: Read + Seek> {
@@ -13,12 +13,12 @@ pub struct PartitionReader<'a, R: Read + Seek> {
 }
 
 impl<'a, R: Read + Seek> PartitionReader<'a, R> {
-    pub fn new(inner: &'a mut R, offset: u64) -> Self {
+    pub const fn new(inner: &'a mut R, offset: u64) -> Self {
         Self { inner, offset }
     }
 
     /// Access the underlying reader (for fallback paths that manage offsets themselves).
-    fn inner_mut(&mut self) -> &mut R {
+    const fn inner_mut(&mut self) -> &mut R {
         self.inner
     }
 }
@@ -59,72 +59,73 @@ pub fn find_entry<'n, R: Read + Seek>(
 ) -> Result<ntfs::NtfsFile<'n>> {
     let index = dir.directory_index(reader).map_err(|e| {
         crate::error::VmkatzError::DecryptionError(format!(
-            "Directory index error for '{}': {}",
-            name, e
+            "Directory index error for '{name}': {e}"
         ))
     })?;
     let mut iter = index.entries();
     while let Some(entry) = iter.next(reader) {
         let entry = entry.map_err(|e| {
-            crate::error::VmkatzError::DecryptionError(format!("Dir entry error: {}", e))
+            crate::error::VmkatzError::DecryptionError(format!("Dir entry error: {e}"))
         })?;
         // key() returns Option<Result<NtfsFileName>>
         let key = match entry.key() {
             Some(Ok(k)) => k,
             Some(Err(e)) => {
-                log::warn!("Index key error: {}", e);
+                log::warn!("Index key error: {e}");
                 continue;
             }
             None => continue, // Last entry sentinel, no key
         };
         if key.name().to_string_lossy().eq_ignore_ascii_case(name) {
             let file = entry.to_file(ntfs, reader).map_err(|e| {
-                crate::error::VmkatzError::DecryptionError(format!(
-                    "Failed to open '{}': {}",
-                    name, e
-                ))
+                crate::error::VmkatzError::DecryptionError(format!("Failed to open '{name}': {e}"))
             })?;
             return Ok(file);
         }
     }
     Err(crate::error::VmkatzError::DiskFormatError(format!(
-        "NTFS entry '{}' not found",
-        name
+        "NTFS entry '{name}' not found"
     )))
 }
 
 /// Read file data ($DATA attribute) into a Vec<u8>.
 /// Uses resilient reads — on I/O errors, zero-fills the failing chunk and continues.
 /// This allows extraction from live/in-use block devices.
-pub fn read_file_data<R: Read + Seek>(
-    file: &ntfs::NtfsFile,
-    reader: &mut R,
-) -> Result<Vec<u8>> {
+pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> Result<Vec<u8>> {
+    // Attribute length comes from untrusted NTFS metadata; cap it so a bogus
+    // size cannot drive a multi-GB allocation (real hives are well under this).
+    const MAX_ATTR_LEN: u64 = 2 << 30; // 2 GiB
+    const CHUNK: usize = 4096;
+
     let data_item = file
         .data(reader, "")
         .ok_or_else(|| {
             crate::error::VmkatzError::DecryptionError("No $DATA attribute".to_string())
         })?
-        .map_err(|e| crate::error::VmkatzError::DecryptionError(format!("$DATA error: {}", e)))?;
+        .map_err(|e| crate::error::VmkatzError::DecryptionError(format!("$DATA error: {e}")))?;
     let data_attr = data_item.to_attribute().map_err(|e| {
-        crate::error::VmkatzError::DecryptionError(format!("to_attribute error: {}", e))
+        crate::error::VmkatzError::DecryptionError(format!("to_attribute error: {e}"))
     })?;
     let mut data_value = data_attr.value(reader).map_err(|e| {
-        crate::error::VmkatzError::DecryptionError(format!("Attribute value error: {}", e))
+        crate::error::VmkatzError::DecryptionError(format!("Attribute value error: {e}"))
     })?;
     let len = data_value.len();
+    if len > MAX_ATTR_LEN {
+        return Err(crate::error::VmkatzError::DecryptionError(format!(
+            "NTFS attribute too large: {len} bytes"
+        )));
+    }
     let mut buf = vec![0u8; len as usize];
     // Try exact read first; on error, use chunked resilient read
     match data_value.read_exact(reader, &mut buf) {
         Ok(()) => Ok(buf),
         Err(e) => {
-            log::warn!("Exact read failed ({}), retrying with resilient I/O", e);
+            log::warn!("Exact read failed ({e}), retrying with resilient I/O");
             // Reset and try chunked reads with zero-fill on errors
             let mut data_value = data_attr.value(reader).map_err(|e2| {
-                crate::error::VmkatzError::DecryptionError(format!("Attribute value error: {}", e2))
+                crate::error::VmkatzError::DecryptionError(format!("Attribute value error: {e2}"))
             })?;
             let mut offset = 0usize;
-            const CHUNK: usize = 4096;
             while offset < buf.len() {
                 let end = (offset + CHUNK).min(buf.len());
                 // Seek to the correct position before each chunk to avoid cursor desync
@@ -151,25 +152,19 @@ pub fn list_directory<'n, R: Read + Seek>(
     reader: &mut R,
 ) -> Result<Vec<(String, bool)>> {
     let index = dir.directory_index(reader).map_err(|e| {
-        crate::error::VmkatzError::DecryptionError(format!("Directory index error: {}", e))
+        crate::error::VmkatzError::DecryptionError(format!("Directory index error: {e}"))
     })?;
     let mut entries = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut iter = index.entries();
     while let Some(entry) = iter.next(reader) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let key = match entry.key() {
-            Some(Ok(k)) => k,
-            _ => continue,
-        };
+        let Ok(entry) = entry else { continue };
+        let Some(Ok(key)) = entry.key() else { continue };
         // Skip DOS 8.3 short names — always prefer the Win32 long name
         if key.namespace() == NtfsFileNamespace::Dos {
             continue;
         }
-        let name = key.name().to_string_lossy().to_string();
+        let name = key.name().to_string_lossy().clone();
         // Skip NTFS special entries and dedup
         if name == "." || name == ".." || name.starts_with('$') {
             continue;
@@ -189,10 +184,7 @@ pub fn navigate_to_dir<'n, R: Read + Seek>(
     reader: &mut R,
     path: &str,
 ) -> Result<ntfs::NtfsFile<'n>> {
-    let components: Vec<&str> = path
-        .split(['\\', '/'])
-        .filter(|s| !s.is_empty())
-        .collect();
+    let components: Vec<&str> = path.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
     let mut current = root.clone();
     for &component in &components {
         current = find_entry(ntfs, &current, reader, component)?;
@@ -212,7 +204,7 @@ pub(super) fn read_hive_files<R: Read + Seek>(
     let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
         Ok(n) => n,
         Err(e) => {
-            log::info!("NTFS parse error: {}, trying MFTMirr fallback", e);
+            log::info!("NTFS parse error: {e}, trying MFTMirr fallback");
             return ntfs_fallback::try_mftmirr_fallback(part_reader.inner_mut(), partition_offset);
         }
     };
@@ -243,14 +235,14 @@ pub(super) fn read_hive_files<R: Read + Seek>(
             match result {
                 Ok(hives) => Ok(hives),
                 Err(e) => {
-                    log::info!("NTFS traversal error: {}, trying MFTMirr fallback", e);
+                    log::info!("NTFS traversal error: {e}, trying MFTMirr fallback");
                     drop(ntfs);
                     ntfs_fallback::try_mftmirr_fallback(part_reader.inner_mut(), partition_offset)
                 }
             }
         }
         Err(e) => {
-            log::info!("NTFS root dir error: {}, trying MFTMirr fallback", e,);
+            log::info!("NTFS root dir error: {e}, trying MFTMirr fallback");
             drop(ntfs);
             ntfs_fallback::try_mftmirr_fallback(part_reader.inner_mut(), partition_offset)
         }
@@ -266,11 +258,11 @@ pub(super) fn read_ntds_artifacts<R: Read + Seek>(
     let mut part_reader = PartitionReader::new(reader, partition_offset);
 
     let ntfs = ntfs::Ntfs::new(&mut part_reader).map_err(|e| {
-        crate::error::VmkatzError::DecryptionError(format!("NTFS parse error: {}", e))
+        crate::error::VmkatzError::DecryptionError(format!("NTFS parse error: {e}"))
     })?;
 
     let root = ntfs.root_directory(&mut part_reader).map_err(|e| {
-        crate::error::VmkatzError::DecryptionError(format!("NTFS root dir error: {}", e))
+        crate::error::VmkatzError::DecryptionError(format!("NTFS root dir error: {e}"))
     })?;
 
     let windows = find_entry(&ntfs, &root, &mut part_reader, "Windows")?;

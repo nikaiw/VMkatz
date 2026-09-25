@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{VmkatzError, Result};
 use super::{read_u16_le_file, read_u32_le_file, read_u64_le_file};
+use crate::error::{Result, VmkatzError};
 
 const VDI_MAGIC: u32 = 0xBEDA_107F;
 const BAT_UNALLOCATED: u32 = 0xFFFF_FFFF;
@@ -17,7 +17,7 @@ pub struct VdiDisk {
     bat: Vec<u32>,
     offset_data: u64,
     cursor: u64,
-    parent: Option<Box<VdiDisk>>,
+    parent: Option<Box<Self>>,
 }
 
 /// Raw VDI UUID stored as 16 bytes (Microsoft LE format).
@@ -37,8 +37,22 @@ impl std::fmt::Display for VdiUuid {
         write!(
             f,
             "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
-            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+            b[3],
+            b[2],
+            b[1],
+            b[0],
+            b[5],
+            b[4],
+            b[7],
+            b[6],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15]
         )
     }
 }
@@ -74,8 +88,8 @@ fn parse_header(file: &mut File) -> Result<VdiHeader> {
 
     // BAT offset at 0x154, data offset at 0x158
     file.seek(SeekFrom::Start(0x154))?;
-    let offset_blocks = read_u32_le_file(file)? as u64;
-    let offset_data = read_u32_le_file(file)? as u64;
+    let offset_blocks = u64::from(read_u32_le_file(file)?);
+    let offset_data = u64::from(read_u32_le_file(file)?);
 
     // Disk size (u64) at 0x170
     file.seek(SeekFrom::Start(0x170))?;
@@ -123,8 +137,7 @@ fn find_parent_vdi(child_path: &Path, parent_uuid: &VdiUuid) -> Result<PathBuf> 
     }
 
     Err(VmkatzError::DiskFormatError(format!(
-        "Parent VDI with UUID {} not found",
-        parent_uuid
+        "Parent VDI with UUID {parent_uuid} not found"
     )))
 }
 
@@ -158,7 +171,7 @@ fn parse_vbox_for_disk(
     let content = std::fs::read_to_string(vbox_path).ok()?;
     // Look for HardDisk entries with matching UUID
     // Format: <HardDisk uuid="{UUID}" location="path" ...>
-    let needle = format!("uuid=\"{{{}}}", parent_uuid_str);
+    let needle = format!("uuid=\"{{{parent_uuid_str}}}");
     let idx = content.find(&needle)?;
     // Find location attribute AFTER the UUID match (not before, to avoid picking
     // a location from a different HardDisk entry earlier in the XML)
@@ -248,7 +261,8 @@ impl VdiDisk {
 
         // Read BAT
         file.seek(SeekFrom::Start(header.offset_blocks))?;
-        let mut bat = Vec::with_capacity(header.blocks_total as usize);
+        let mut bat =
+            Vec::with_capacity((header.blocks_total as usize).min(super::MAX_BAT_PREALLOC));
         for _ in 0..header.blocks_total {
             bat.push(read_u32_le_file(&mut file)?);
         }
@@ -257,13 +271,13 @@ impl VdiDisk {
         let parent = if header.image_type == VDI_IMAGE_DIFF && !header.parent_uuid.is_zero() {
             log::debug!("VDI: diff image, parent UUID = {}", header.parent_uuid);
             let parent_path = find_parent_vdi(path, &header.parent_uuid)?;
-            log::debug!("VDI: found parent at {:?}", parent_path);
-            Some(Box::new(VdiDisk::open(&parent_path)?))
+            log::debug!("VDI: found parent at {}", parent_path.display());
+            Some(Box::new(Self::open(&parent_path)?))
         } else {
             None
         };
 
-        Ok(VdiDisk {
+        Ok(Self {
             file,
             disk_size: header.disk_size,
             block_size: header.block_size,
@@ -287,18 +301,19 @@ impl VdiDisk {
             if let Some(ref mut parent) = self.parent {
                 // Delegate to parent for differencing images
                 let virtual_offset =
-                    block_idx as u64 * self.block_size as u64 + offset_in_block as u64;
+                    block_idx as u64 * u64::from(self.block_size) + u64::from(offset_in_block);
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
             // Dynamic image: unallocated = zeros
-            buf.iter_mut().for_each(|b| *b = 0);
+            buf.fill(0);
             return Ok(buf.len());
         }
 
         // data_offset = offset_data + bat_entry * block_size + offset_in_block
-        let data_offset =
-            self.offset_data + bat_entry as u64 * self.block_size as u64 + offset_in_block as u64;
+        let data_offset = self.offset_data
+            + u64::from(bat_entry) * u64::from(self.block_size)
+            + u64::from(offset_in_block);
         self.file.seek(SeekFrom::Start(data_offset))?;
         self.file.read(buf)
     }
@@ -319,8 +334,8 @@ impl Read for VdiDisk {
         let mut total = 0;
         while total < to_read {
             let pos = self.cursor;
-            let block_idx = (pos / self.block_size as u64) as usize;
-            let offset_in_block = (pos % self.block_size as u64) as u32;
+            let block_idx = (pos / u64::from(self.block_size)) as usize;
+            let offset_in_block = (pos % u64::from(self.block_size)) as u32;
             let avail_in_block = self.block_size - offset_in_block;
             let chunk = (to_read - total).min(avail_in_block as usize);
 

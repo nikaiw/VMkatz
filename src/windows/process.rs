@@ -1,10 +1,12 @@
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::entry::PAGE_PHYS_MASK;
 use crate::paging::ept::EptLayer;
-use crate::paging::translate::{PageTableWalker, PaePageTableWalker, PaeProcessMemory, ProcessMemory};
+use crate::paging::translate::{
+    PaePageTableWalker, PaeProcessMemory, PageTableWalker, ProcessMemory,
+};
 use crate::windows::eprocess::EprocessReader;
-use crate::windows::offsets::{EprocessOffsets, WindowsBitness, ALL_EPROCESS_OFFSETS};
+use crate::windows::offsets::{ALL_EPROCESS_OFFSETS, EprocessOffsets, WindowsBitness};
 
 /// Check if a Flink address is a valid kernel-mode linked list pointer.
 /// x64: canonical kernel address (top 16 bits = 0xFFFF).
@@ -30,8 +32,12 @@ fn validate_flink_translation(
     // non-zero process name and a valid kernel-mode Flink.
     let translate = |va: u64| -> std::result::Result<u64, ()> {
         match offsets.bitness {
-            WindowsBitness::X64 => PageTableWalker::new(phys).translate(dtb, va).map_err(|_| ()),
-            WindowsBitness::X86Pae => PaePageTableWalker::new(phys).translate(dtb, va).map_err(|_| ()),
+            WindowsBitness::X64 => PageTableWalker::new(phys)
+                .translate(dtb, va)
+                .map_err(|_| ()),
+            WindowsBitness::X86Pae => PaePageTableWalker::new(phys)
+                .translate(dtb, va)
+                .map_err(|_| ()),
         }
     };
 
@@ -47,22 +53,28 @@ fn validate_flink_translation(
 
     // The next EPROCESS must have a non-zero ImageFileName
     let mut name_buf = [0u8; 15];
-    if phys.read_phys(next_eprocess + offsets.image_file_name, &mut name_buf).is_err() {
+    if phys
+        .read_phys(next_eprocess + offsets.image_file_name, &mut name_buf)
+        .is_err()
+    {
         return false;
     }
     if name_buf.iter().all(|&b| b == 0) {
         return false;
     }
     // Process name must be printable ASCII
-    if !name_buf.iter().take_while(|&&b| b != 0).all(|&b| b.is_ascii_graphic() || b == b' ') {
+    if !name_buf
+        .iter()
+        .take_while(|&&b| b != 0)
+        .all(|&b| b.is_ascii_graphic() || b == b' ')
+    {
         return false;
     }
 
     // The next process's Flink must be a valid kernel VA
     let reader = EprocessReader::new(offsets);
-    let next_flink = match reader.read_flink(phys, next_eprocess) {
-        Ok(f) => f,
-        Err(_) => return false,
+    let Ok(next_flink) = reader.read_flink(phys, next_eprocess) else {
+        return false;
     };
     is_valid_kernel_flink(next_flink, offsets.bitness)
 }
@@ -137,9 +149,8 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
                     };
 
                     // Validate DTB
-                    let dtb = match reader.read_dtb(phys, eprocess_phys) {
-                        Ok(dtb) => dtb,
-                        Err(_) => continue,
+                    let Ok(dtb) = reader.read_dtb(phys, eprocess_phys) else {
+                        continue;
                     };
                     let dtb_base = dtb & PAGE_PHYS_MASK;
                     if dtb_base == 0 || dtb_base >= phys_size {
@@ -147,9 +158,8 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
                     }
 
                     // Validate Flink (bitness-aware)
-                    let flink = match reader.read_flink(phys, eprocess_phys) {
-                        Ok(f) => f,
-                        Err(_) => continue,
+                    let Ok(flink) = reader.read_flink(phys, eprocess_phys) else {
+                        continue;
                     };
                     if !is_valid_kernel_flink(flink, offsets.bitness) {
                         continue;
@@ -162,8 +172,7 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
                     let flink_valid = validate_flink_translation(phys, dtb, flink, offsets);
                     if !flink_valid {
                         log::debug!(
-                            "Rejecting System candidate at 0x{:x}: Flink 0x{:x} translation produced invalid EPROCESS (DTB=0x{:x})",
-                            eprocess_phys, flink, dtb
+                            "Rejecting System candidate at 0x{eprocess_phys:x}: Flink 0x{flink:x} translation produced invalid EPROCESS (DTB=0x{dtb:x})"
                         );
                         continue;
                     }
@@ -172,7 +181,11 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
 
                     log::info!(
                         "Found System process: eprocess_phys=0x{:x}, PID={}, DTB=0x{:x}, Flink=0x{:x}, bitness={:?}",
-                        eprocess_phys, pid, dtb, flink, offsets.bitness
+                        eprocess_phys,
+                        pid,
+                        dtb,
+                        flink,
+                        offsets.bitness
                     );
 
                     return Ok((
@@ -202,6 +215,7 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
 const MAX_EPT_SCAN_PAGES: usize = 4_000_000; // ~16 GB
 
 /// Fast System process scan for EPT layers (single-pass).
+///
 /// Iterates mapped regions in bulk (up to 1MB per read), trying all EPROCESS
 /// offset sets at each "System\0" match. Reads L1 data directly for the bulk
 /// scan, uses EPT translation only for validation.
@@ -214,9 +228,7 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
 
     if mapped > MAX_EPT_SCAN_PAGES {
         log::info!(
-            "EPT fast scan: skipping — {} mapped pages exceeds {} page scan limit",
-            mapped,
-            MAX_EPT_SCAN_PAGES,
+            "EPT fast scan: skipping — {mapped} mapped pages exceeds {MAX_EPT_SCAN_PAGES} page scan limit",
         );
         return Err(VmkatzError::SystemProcessNotFound);
     }
@@ -278,9 +290,8 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
                         };
 
                         // Validate DTB
-                        let dtb = match reader.read_dtb(ept, eprocess_l2) {
-                            Ok(dtb) => dtb,
-                            Err(_) => continue,
+                        let Ok(dtb) = reader.read_dtb(ept, eprocess_l2) else {
+                            continue;
                         };
                         let dtb_base = dtb & PAGE_PHYS_MASK;
                         if dtb_base == 0 || dtb_base >= ept.phys_size() {
@@ -288,9 +299,8 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
                         }
 
                         // Validate Flink (bitness-aware)
-                        let flink = match reader.read_flink(ept, eprocess_l2) {
-                            Ok(f) => f,
-                            Err(_) => continue,
+                        let Ok(flink) = reader.read_flink(ept, eprocess_l2) else {
+                            continue;
                         };
                         if !is_valid_kernel_flink(flink, offsets.bitness) {
                             continue;
@@ -300,7 +310,12 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
 
                         log::info!(
                             "EPT: Found System at L2=0x{:x} (L1=0x{:x}+0x{:x}), PID={}, DTB=0x{:x}, Flink=0x{:x}",
-                            eprocess_l2, l1_addr, page_off + off, pid, dtb, flink
+                            eprocess_l2,
+                            l1_addr,
+                            page_off + off,
+                            pid,
+                            dtb,
+                            flink
                         );
 
                         return Ok((
@@ -327,6 +342,7 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
 }
 
 /// Walk the EPROCESS linked list starting from the System process.
+///
 /// Uses the kernel DTB for virtual-to-physical translation of ActiveProcessLinks pointers.
 /// Dispatches to x64 or PAE page table walker based on EPROCESS bitness.
 pub fn enumerate_processes(
@@ -372,13 +388,16 @@ pub fn enumerate_processes(
         } else if let Some(ref walker) = pae_walker {
             walker.translate(kernel_dtb, current_flink)
         } else {
-            unreachable!()
+            // Unreachable today (bitness is X64 or X86Pae, each sets a walker),
+            // but the if/else isn't exhaustiveness-checked — degrade safely
+            // instead of panicking if a future bitness leaves both unset.
+            break;
         };
 
         let flink_phys = match flink_phys {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("Failed to translate Flink 0x{:x}: {}", current_flink, e);
+                log::warn!("Failed to translate Flink 0x{current_flink:x}: {e}");
                 break;
             }
         };
@@ -393,7 +412,7 @@ pub fn enumerate_processes(
         let pid = match reader.read_pid(phys, eprocess_phys) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("Failed to read PID at 0x{:x}: {}", eprocess_phys, e);
+                log::warn!("Failed to read PID at 0x{eprocess_phys:x}: {e}");
                 break;
             }
         };
@@ -402,7 +421,7 @@ pub fn enumerate_processes(
         let next_flink = match reader.read_flink(phys, eprocess_phys) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("Failed to read Flink at 0x{:x}: {}", eprocess_phys, e);
+                log::warn!("Failed to read Flink at 0x{eprocess_phys:x}: {e}");
                 break;
             }
         };
@@ -419,8 +438,12 @@ pub fn enumerate_processes(
             // Try full name from PEB if available (fixes 15-char truncation)
             let name = if peb != 0 && dtb != 0 {
                 match offsets.bitness {
-                    WindowsBitness::X64 => read_full_image_name(phys, dtb, peb).unwrap_or(short_name),
-                    WindowsBitness::X86Pae => read_full_image_name_32(phys, dtb, peb).unwrap_or(short_name),
+                    WindowsBitness::X64 => {
+                        read_full_image_name(phys, dtb, peb).unwrap_or(short_name)
+                    }
+                    WindowsBitness::X86Pae => {
+                        read_full_image_name_32(phys, dtb, peb).unwrap_or(short_name)
+                    }
                 }
             } else {
                 short_name
@@ -480,7 +503,7 @@ fn read_full_image_name_32(phys: &impl PhysicalMemory, dtb: u64, peb: u64) -> Op
     let vmem = PaeProcessMemory::new(phys, dtb);
 
     // 32-bit PEB + 0x10 → ProcessParameters pointer (u32)
-    let params_ptr = vmem.read_virt_u32(peb + PEB32_PROCESS_PARAMETERS).ok()? as u64;
+    let params_ptr = u64::from(vmem.read_virt_u32(peb + PEB32_PROCESS_PARAMETERS).ok()?);
     if params_ptr == 0 || params_ptr < 0x10000 {
         return None;
     }

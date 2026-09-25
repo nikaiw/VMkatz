@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 const VMDK_MAGIC: u32 = 0x564D444B; // "KDMV" LE
 const SECTOR_SIZE: u64 = 512;
@@ -12,7 +12,7 @@ pub struct VmdkDisk {
     extents: Vec<VmdkExtent>,
     disk_size: u64,
     cursor: u64,
-    parent: Option<Box<VmdkDisk>>,
+    parent: Option<Box<Self>>,
 }
 
 struct VmdkExtent {
@@ -48,7 +48,7 @@ impl VmdkDisk {
             return Self::open_from_directory(path);
         }
 
-        let base_dir = path.parent().unwrap_or(Path::new("."));
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let desc_text = std::fs::read_to_string(path).map_err(VmkatzError::Io)?;
         let desc = parse_descriptor(&desc_text)?;
 
@@ -71,12 +71,12 @@ impl VmdkDisk {
         // Recursively open parent if snapshot
         let parent = if let Some(ref hint) = desc.parent_hint {
             let parent_path = resolve_parent_path(base_dir, hint);
-            Some(Box::new(VmdkDisk::open(&parent_path)?))
+            Some(Box::new(Self::open(&parent_path)?))
         } else {
             None
         };
 
-        Ok(VmdkDisk {
+        Ok(Self {
             extents,
             disk_size,
             cursor: 0,
@@ -92,7 +92,7 @@ impl VmdkDisk {
     /// covers sectors `(N-1)*capacity` through `N*capacity-1`. Missing extents
     /// (gaps in numbering) return zeros for their sector range.
     fn open_from_directory(extent_path: &Path) -> Result<Self> {
-        let dir = extent_path.parent().unwrap_or(Path::new("."));
+        let dir = extent_path.parent().unwrap_or_else(|| Path::new("."));
         let numbered_extents = collect_extent_files(dir)?;
 
         if numbered_extents.is_empty() {
@@ -117,7 +117,7 @@ impl VmdkDisk {
             // Each extent's start_sector = (num - 1) * capacity
             let mut ext = open_extent(path, 0, 0)?;
             capacity_per_extent = ext.capacity;
-            ext.start_sector = (*num as u64 - 1) * ext.capacity;
+            ext.start_sector = (u64::from(*num) - 1) * ext.capacity;
             log::info!(
                 "  Extent s{:03}: {} (start_sector={}, capacity={}MB)",
                 num,
@@ -128,16 +128,16 @@ impl VmdkDisk {
             extents.push(ext);
         }
 
-        let disk_size = max_num as u64 * capacity_per_extent * SECTOR_SIZE;
+        let disk_size = u64::from(max_num) * capacity_per_extent * SECTOR_SIZE;
         log::info!(
             "Total virtual disk: {}MB ({} of {} extents present, {:.0}% coverage)",
             disk_size / (1024 * 1024),
             numbered_extents.len(),
             max_num,
-            numbered_extents.len() as f64 / max_num as f64 * 100.0
+            numbered_extents.len() as f64 / f64::from(max_num) * 100.0
         );
 
-        Ok(VmdkDisk {
+        Ok(Self {
             extents,
             disk_size,
             cursor: 0,
@@ -225,8 +225,8 @@ impl VmdkDisk {
             }
 
             let grain_index = local_sector / ext.grain_size;
-            let gt_index = (grain_index / ext.num_gtes_per_gt as u64) as usize;
-            let gte_index = (grain_index % ext.num_gtes_per_gt as u64) as usize;
+            let gt_index = (grain_index / u64::from(ext.num_gtes_per_gt)) as usize;
+            let gte_index = (grain_index % u64::from(ext.num_gtes_per_gt)) as usize;
 
             // How many bytes remain in this grain from current offset
             let grain_offset = (local_sector % ext.grain_size) * SECTOR_SIZE + sector_off;
@@ -240,7 +240,7 @@ impl VmdkDisk {
                     0u32
                 } else {
                     // Read GTE from grain table
-                    let gt_byte_off = gt_sector as u64 * SECTOR_SIZE + gte_index as u64 * 4;
+                    let gt_byte_off = u64::from(gt_sector) * SECTOR_SIZE + gte_index as u64 * 4;
                     let mut gte_buf = [0u8; 4];
                     let ok = ext.file.seek(SeekFrom::Start(gt_byte_off)).is_ok()
                         && ext.file.read_exact(&mut gte_buf).is_ok();
@@ -256,7 +256,7 @@ impl VmdkDisk {
 
             if grain_sector != 0 {
                 // Grain is allocated in this layer
-                let data_off = grain_sector as u64 * SECTOR_SIZE + grain_offset;
+                let data_off = u64::from(grain_sector) * SECTOR_SIZE + grain_offset;
                 // Handle truncated extent files: if data is beyond file, treat as zeros
                 let read_ok = ext.file.seek(SeekFrom::Start(data_off)).is_ok()
                     && ext
@@ -348,7 +348,7 @@ impl VmdkDisk {
                 }
 
                 // Read the grain table
-                let gt_offset = gt_sector as u64 * SECTOR_SIZE;
+                let gt_offset = u64::from(gt_sector) * SECTOR_SIZE;
                 let gt_size = num_gtes as usize * 4;
                 let mut gt_buf = vec![0u8; gt_size];
                 let ok = self.extents[ext_idx]
@@ -368,7 +368,7 @@ impl VmdkDisk {
                         continue;
                     }
 
-                    let data_offset = grain_sector as u64 * SECTOR_SIZE;
+                    let data_offset = u64::from(grain_sector) * SECTOR_SIZE;
                     let mut grain_data = vec![0u8; grain_bytes as usize];
                     let read_ok = self.extents[ext_idx]
                         .file
@@ -384,7 +384,7 @@ impl VmdkDisk {
                     }
 
                     // Virtual byte offset = (start_sector + local_grain_index * grain_size) * SECTOR_SIZE
-                    let local_grain = gd_idx as u64 * num_gtes as u64 + gte_idx as u64;
+                    let local_grain = gd_idx as u64 * u64::from(num_gtes) + gte_idx as u64;
                     let virtual_byte = (start_sector
                         + local_grain * self.extents[ext_idx].grain_size)
                         * SECTOR_SIZE;
@@ -512,6 +512,10 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
 }
 
 fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Result<VmdkExtent> {
+    // grain_size is attacker-controlled and drives per-grain buffer sizes
+    // (grain_size * 512 bytes), so bound it: 65536 sectors = a 32 MiB grain.
+    const MAX_GRAIN_SECTORS: u64 = 1 << 16;
+
     let mut file = File::open(path).map_err(VmkatzError::Io)?;
 
     let mut hdr = [0u8; 0x48];
@@ -523,26 +527,26 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
     }
 
     // SparseExtentHeader fields (VMDK format spec):
-    let capacity = u64::from_le_bytes(hdr[0x0C..0x14].try_into().unwrap());        // capacity (sectors)
-    let grain_size = u64::from_le_bytes(hdr[0x14..0x1C].try_into().unwrap());      // grainSize (sectors)
+    let capacity = u64::from_le_bytes(hdr[0x0C..0x14].try_into().unwrap()); // capacity (sectors)
+    let grain_size = u64::from_le_bytes(hdr[0x14..0x1C].try_into().unwrap()); // grainSize (sectors)
     let num_gtes_per_gt = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap()); // numGTEsPerGT
     let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap()); // gdOffset (sectors)
 
     // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt)
-    if grain_size == 0 || num_gtes_per_gt == 0 {
+    if grain_size == 0 || grain_size > MAX_GRAIN_SECTORS || num_gtes_per_gt == 0 {
         return Err(VmkatzError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Invalid VMDK header: grain_size={}, numGTEsPerGT={}", grain_size, num_gtes_per_gt),
+            format!("Invalid VMDK header: grain_size={grain_size}, numGTEsPerGT={num_gtes_per_gt}"),
         )));
     }
     let total_grains = capacity.div_ceil(grain_size);
-    let gd_entries = total_grains.div_ceil(num_gtes_per_gt as u64) as usize;
+    let gd_entries = total_grains.div_ceil(u64::from(num_gtes_per_gt)) as usize;
 
-    // Read the entire grain directory
+    // Read the entire grain directory. gd_entries derives from the untrusted
+    // capacity, so size the read against the file rather than pre-allocating.
     let gd_byte_off = gd_offset_sectors * SECTOR_SIZE;
     file.seek(SeekFrom::Start(gd_byte_off))?;
-    let mut gd_raw = vec![0u8; gd_entries * 4];
-    file.read_exact(&mut gd_raw)?;
+    let gd_raw = super::read_exact_alloc(&mut file, (gd_entries as u64).saturating_mul(4))?;
 
     let gd: Vec<u32> = gd_raw
         .chunks_exact(4)
@@ -633,7 +637,9 @@ fn parse_extent_number(stem: &str) -> Option<u32> {
     if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
         let num: u32 = suffix.parse().ok()?;
         // Extent numbers are 1-based (s001, s002, ...); reject 0 to prevent underflow
-        if num == 0 { return None; }
+        if num == 0 {
+            return None;
+        }
         Some(num)
     } else {
         None

@@ -114,8 +114,8 @@ pub enum MappedFile {
 impl MappedFile {
     pub fn len(&self) -> usize {
         match self {
-            MappedFile::Mmap(m) => m.len(),
-            MappedFile::Pread { size, .. } => *size as usize,
+            Self::Mmap(m) => m.len(),
+            Self::Pread { size, .. } => *size as usize,
         }
     }
 
@@ -125,48 +125,50 @@ impl MappedFile {
 
     /// Read bytes at an offset into the provided buffer.
     /// Works for both mmap (memcpy) and pread (syscall) variants.
-    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> std::io::Result<()> {
+    ///
+    /// `offset` is a `u64` so callers never have to truncate a guest-physical or
+    /// file offset to `usize` — which would silently corrupt reads above 4 GiB on
+    /// 32-bit targets (armv7/arm builds) parsing large memory snapshots.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let eof = || {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "read_at: offset=0x{offset:x} len={} exceeds file size {}",
+                    buf.len(),
+                    self.len()
+                ),
+            )
+        };
         match self {
-            MappedFile::Mmap(m) => {
-                let end = offset + buf.len();
-                if end > m.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "mmap read_at: offset=0x{:x} len={} exceeds file size {}",
-                            offset,
-                            buf.len(),
-                            m.len()
-                        ),
-                    ));
-                }
-                buf.copy_from_slice(&m[offset..end]);
+            Self::Mmap(m) => {
+                // On 32-bit, an offset past usize is necessarily past the mmap.
+                let start = usize::try_from(offset).map_err(|_| eof())?;
+                let end = start
+                    .checked_add(buf.len())
+                    .filter(|&e| e <= m.len())
+                    .ok_or_else(eof)?;
+                buf.copy_from_slice(&m[start..end]);
                 Ok(())
             }
-            MappedFile::Pread { file, size } => {
-                let end = offset as u64 + buf.len() as u64;
-                if end > *size {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "pread read_at: offset=0x{:x} len={} exceeds file size {}",
-                            offset,
-                            buf.len(),
-                            size
-                        ),
-                    ));
+            Self::Pread { file, size } => {
+                if offset
+                    .checked_add(buf.len() as u64)
+                    .is_none_or(|end| end > *size)
+                {
+                    return Err(eof());
                 }
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
                     let f = file.lock().unwrap();
-                    f.read_exact_at(buf, offset as u64)?;
+                    f.read_exact_at(buf, offset)?;
                 }
                 #[cfg(not(unix))]
                 {
                     use std::io::{Read, Seek, SeekFrom};
                     let mut f = file.lock().unwrap();
-                    f.seek(SeekFrom::Start(offset as u64))?;
+                    f.seek(SeekFrom::Start(offset))?;
                     f.read_exact(buf)?;
                 }
                 Ok(())
@@ -178,16 +180,16 @@ impl MappedFile {
     /// Panics on Pread variant — callers that need slicing must use read_at instead.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            MappedFile::Mmap(m) => m,
-            MappedFile::Pread { .. } => {
+            Self::Mmap(m) => m,
+            Self::Pread { .. } => {
                 panic!("as_bytes() not supported on pread fallback — use read_at()")
             }
         }
     }
 
     /// Whether this is using the pread fallback (for logging).
-    pub fn is_pread(&self) -> bool {
-        matches!(self, MappedFile::Pread { .. })
+    pub const fn is_pread(&self) -> bool {
+        matches!(self, Self::Pread { .. })
     }
 }
 

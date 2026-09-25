@@ -10,8 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
 
 const PAGE_SIZE: u64 = 4096;
@@ -77,9 +76,9 @@ impl QemuElfLayer {
 
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type != ET_CORE {
-            return Err(VmkatzError::ElfError(
-                format!("ELF type {} is not ET_CORE (expected {})", e_type, ET_CORE),
-            ));
+            return Err(VmkatzError::ElfError(format!(
+                "ELF type {e_type} is not ET_CORE (expected {ET_CORE})"
+            )));
         }
 
         let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap());
@@ -87,12 +86,9 @@ impl QemuElfLayer {
         let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
 
         if e_phentsize < ELF64_PHDR_SIZE {
-            return Err(VmkatzError::ElfError(
-                format!(
-                    "ELF phdr size {} < expected {}",
-                    e_phentsize, ELF64_PHDR_SIZE
-                ),
-            ));
+            return Err(VmkatzError::ElfError(format!(
+                "ELF phdr size {e_phentsize} < expected {ELF64_PHDR_SIZE}"
+            )));
         }
 
         // Parse program headers, collect PT_LOAD segments
@@ -160,7 +156,7 @@ impl QemuElfLayer {
     }
 
     /// Number of PT_LOAD segments.
-    pub fn segment_count(&self) -> usize {
+    pub const fn segment_count(&self) -> usize {
         self.segments.len()
     }
 
@@ -191,10 +187,11 @@ impl PhysicalMemory for QemuElfLayer {
             let offset_in_seg = phys_addr - seg.gpa_start;
             let avail = seg.file_size - offset_in_seg;
             if avail >= len {
-                let file_off = (seg.file_offset + offset_in_seg) as usize;
-                let end = file_off + buf.len();
-                if end <= self.mmap.len() {
-                    self.mmap.read_at(file_off, buf)
+                let file_off = seg.file_offset + offset_in_seg;
+                let end = file_off + buf.len() as u64;
+                if end <= self.mmap.len() as u64 {
+                    self.mmap
+                        .read_at(file_off, buf)
                         .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))?;
                     return Ok(());
                 }
@@ -211,11 +208,13 @@ impl PhysicalMemory for QemuElfLayer {
                 let offset_in_seg = cur_gpa - seg.gpa_start;
                 let avail = seg.file_size - offset_in_seg;
                 let to_copy = std::cmp::min(avail, len - pos) as usize;
-                let file_off = (seg.file_offset + offset_in_seg) as usize;
-                let end = file_off + to_copy;
-                if end <= self.mmap.len() {
+                let file_off = seg.file_offset + offset_in_seg;
+                let end = file_off + to_copy as u64;
+                if end <= self.mmap.len() as u64 {
                     let dst_start = pos as usize;
-                    let _ = self.mmap.read_at(file_off, &mut buf[dst_start..dst_start + to_copy]);
+                    let _ = self
+                        .mmap
+                        .read_at(file_off, &mut buf[dst_start..dst_start + to_copy]);
                 }
                 pos += to_copy as u64;
             } else {

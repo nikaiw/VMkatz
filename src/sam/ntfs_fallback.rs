@@ -9,7 +9,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 /// Read into `buf` in block-sized chunks. On I/O error, zero-fill the failing
 /// block and continue. `block_size` is the logical record size (e.g., MFT record size).
@@ -31,24 +31,21 @@ fn resilient_read_blocks<R: Read>(reader: &mut R, buf: &mut [u8], block_size: us
 fn read_u32(data: &[u8], off: usize) -> u32 {
     data.get(off..off + 4)
         .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u32::from_le_bytes)
 }
 
 /// Read a u64 from a byte slice at the given offset, returning 0 on out-of-bounds.
 fn read_u64(data: &[u8], off: usize) -> u64 {
     data.get(off..off + 8)
         .and_then(|s| s.try_into().ok())
-        .map(u64::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u64::from_le_bytes)
 }
 
 /// Read a u16 from a byte slice at the given offset, returning 0 on out-of-bounds.
 fn read_u16(data: &[u8], off: usize) -> u16 {
     data.get(off..off + 2)
         .and_then(|s| s.try_into().ok())
-        .map(u16::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u16::from_le_bytes)
 }
 
 /// NTFS boot sector parameters.
@@ -77,8 +74,8 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
         ));
     }
 
-    let bytes_per_sector = u16::from_le_bytes([data[0x0B], data[0x0C]]) as u64;
-    let sectors_per_cluster = data[0x0D] as u64;
+    let bytes_per_sector = u64::from(u16::from_le_bytes([data[0x0B], data[0x0C]]));
+    let sectors_per_cluster = u64::from(data[0x0D]);
     let cluster_size = bytes_per_sector * sectors_per_cluster;
     if cluster_size == 0 {
         return Err(VmkatzError::DecryptionError(
@@ -90,17 +87,23 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     let mftmirr_cluster = read_u64(data, 0x38);
 
     // Record size: signed byte at 0x40. Positive → clusters, negative → 2^|value|.
+    // Guard both arithmetic paths: a hostile boot sector could overflow the
+    // shift (>= 64 panics) or the multiply, or declare an absurd size that would
+    // drive multi-GB record allocations downstream.
     let raw = data[0x40] as i8;
-    let record_size = if raw > 0 {
-        raw as u64 * cluster_size
+    let record_size_u64: u64 = if raw > 0 {
+        (raw as u64).saturating_mul(cluster_size)
     } else {
-        1u64 << (-raw as u32)
-    } as u32;
-    if record_size == 0 {
-        return Err(VmkatzError::DecryptionError(
-            "Invalid NTFS boot sector: record_size is 0".into(),
-        ));
+        let shift = i32::from(raw).unsigned_abs();
+        if shift < 64 { 1u64 << shift } else { 0 }
+    };
+    // MFT records are 1024 bytes in practice; bound to a sane range.
+    if record_size_u64 == 0 || record_size_u64 > (1 << 20) {
+        return Err(VmkatzError::DecryptionError(format!(
+            "Invalid NTFS boot sector: record_size={record_size_u64}"
+        )));
     }
+    let record_size = record_size_u64 as u32;
 
     Ok(NtfsParams {
         cluster_size,
@@ -133,7 +136,7 @@ fn parse_data_runs(data: &[u8]) -> Vec<DataRun> {
         // Read run length (unsigned)
         let mut length = 0u64;
         for i in 0..length_size {
-            length |= (data[pos + i] as u64) << (i * 8);
+            length |= u64::from(data[pos + i]) << (i * 8);
         }
         pos += length_size;
 
@@ -141,7 +144,7 @@ fn parse_data_runs(data: &[u8]) -> Vec<DataRun> {
         if offset_size > 0 {
             let mut offset = 0i64;
             for i in 0..offset_size {
-                offset |= (data[pos + i] as i64) << (i * 8);
+                offset |= i64::from(data[pos + i]) << (i * 8);
             }
             // Sign-extend
             if offset_size < 8 && (data[pos + offset_size - 1] & 0x80) != 0 {
@@ -280,7 +283,10 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     if 0x42 + name_len * 2 > fname.len() {
         return None;
     }
-    Some((crate::utils::utf16le_decode(&fname[0x42..0x42 + name_len * 2]), parent_ref))
+    Some((
+        crate::utils::utf16le_decode(&fname[0x42..0x42 + name_len * 2]),
+        parent_ref,
+    ))
 }
 
 /// Extract best filename and parent ref from a FILE record (prefers Win32 over DOS).
@@ -305,7 +311,7 @@ fn extract_data_attribute(record: &[u8]) -> Option<(Vec<DataRun>, u64)> {
 
     if non_resident == 0 {
         // Resident
-        let value_length = read_u32(record, pos + 0x10) as u64;
+        let value_length = u64::from(read_u32(record, pos + 0x10));
         return Some((Vec::new(), value_length));
     }
 
@@ -348,9 +354,9 @@ fn read_from_data_runs<R: Read + Seek>(
     file_size: u64,
     cluster_size: u64,
     partition_offset: u64,
-) -> Result<Vec<u8>> {
-    let mut data = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
+) -> Vec<u8> {
     const BLOCK: u64 = 4096;
+    let mut data = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
     let mut io_errors = 0u32;
 
     for run in runs {
@@ -366,13 +372,15 @@ fn read_from_data_runs<R: Read + Seek>(
             let ok = reader.seek(SeekFrom::Start(disk_pos)).is_ok() && {
                 let start = data.len();
                 data.resize(start + block_size, 0);
-                match reader.read_exact(&mut data[start..start + block_size]) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        // Zero-fill on error
-                        data[start..start + block_size].fill(0);
-                        false
-                    }
+                if matches!(
+                    reader.read_exact(&mut data[start..start + block_size]),
+                    Ok(())
+                ) {
+                    true
+                } else {
+                    // Zero-fill on error
+                    data[start..start + block_size].fill(0);
+                    false
                 }
             };
 
@@ -397,7 +405,7 @@ fn read_from_data_runs<R: Read + Seek>(
     }
 
     data.truncate(file_size as usize);
-    Ok(data)
+    data
 }
 
 /// Read a single MFT record by record number, using the MFT data runs map.
@@ -408,7 +416,7 @@ fn read_mft_record<R: Read + Seek>(
     params: &NtfsParams,
     partition_offset: u64,
 ) -> Option<Vec<u8>> {
-    let byte_offset = record_number * params.record_size as u64;
+    let byte_offset = record_number * u64::from(params.record_size);
     let cluster_offset = byte_offset / params.cluster_size;
     let offset_in_cluster = byte_offset % params.cluster_size;
 
@@ -445,15 +453,13 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
     params: &NtfsParams,
     partition_offset: u64,
 ) -> Vec<u64> {
-    let (pos, _len) = match find_attribute(record, 0x20) {
-        Some(v) => v,
-        None => return Vec::new(),
+    let Some((pos, len)) = find_attribute(record, 0x20) else {
+        return Vec::new();
     };
 
     let non_resident = record[pos + 8];
-    let attr_list_data;
 
-    if non_resident == 0 {
+    let attr_list_data = if non_resident == 0 {
         // Resident $ATTRIBUTE_LIST
         let value_length = read_u32(record, pos + 0x10) as usize;
         let value_offset = read_u16(record, pos + 0x14) as usize;
@@ -461,7 +467,7 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
         if start + value_length > record.len() {
             return Vec::new();
         }
-        attr_list_data = record[start..start + value_length].to_vec();
+        record[start..start + value_length].to_vec()
     } else {
         // Non-resident $ATTRIBUTE_LIST — read from data runs
         if pos + 0x38 > record.len() {
@@ -469,18 +475,21 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
         }
         let real_size = read_u64(record, pos + 0x30);
         let runs_offset = read_u16(record, pos + 0x20) as usize;
-        if pos + runs_offset >= pos + _len || real_size > 256 * 1024 {
+        if pos + runs_offset >= pos + len || real_size > 256 * 1024 {
             return Vec::new();
         }
-        let runs = parse_data_runs(&record[pos + runs_offset..pos + _len]);
+        let runs = parse_data_runs(&record[pos + runs_offset..pos + len]);
         if runs.is_empty() {
             return Vec::new();
         }
-        match read_from_data_runs(reader, &runs, real_size, params.cluster_size, partition_offset) {
-            Ok(data) => attr_list_data = data,
-            Err(_) => return Vec::new(),
-        }
-    }
+        read_from_data_runs(
+            reader,
+            &runs,
+            real_size,
+            params.cluster_size,
+            partition_offset,
+        )
+    };
 
     let mut extension_records = Vec::new();
     let mut off = 0;
@@ -520,25 +529,44 @@ fn read_hive_from_record<R: Read + Seek>(
     // Try $DATA in base record
     if let Some((runs, file_size)) = extract_data_attribute(record) {
         if !runs.is_empty() {
-            log::info!("{}: {} data runs, {} bytes (base record)", name, runs.len(), file_size);
-            return read_from_data_runs(reader, &runs, file_size, params.cluster_size, partition_offset);
+            log::info!(
+                "{}: {} data runs, {} bytes (base record)",
+                name,
+                runs.len(),
+                file_size
+            );
+            return Ok(read_from_data_runs(
+                reader,
+                &runs,
+                file_size,
+                params.cluster_size,
+                partition_offset,
+            ));
         }
     }
 
     // $DATA not in base record — check $ATTRIBUTE_LIST for extension records
     let ext_records = parse_attribute_list_from_record(reader, record, params, partition_offset);
     if ext_records.is_empty() {
-        return Err(VmkatzError::DecryptionError(format!("{}: no $DATA attribute", name)));
+        return Err(VmkatzError::DecryptionError(format!(
+            "{name}: no $DATA attribute"
+        )));
     }
 
-    log::info!("{}: $DATA in {} extension record(s), reading via $ATTRIBUTE_LIST", name, ext_records.len());
+    log::info!(
+        "{}: $DATA in {} extension record(s), reading via $ATTRIBUTE_LIST",
+        name,
+        ext_records.len()
+    );
 
     // Collect data runs from all extension records
     let mut all_runs = Vec::new();
     let mut file_size = 0u64;
 
     for &ext_ref in &ext_records {
-        if let Some(ext_record) = read_mft_record(reader, ext_ref, mft_runs, params, partition_offset) {
+        if let Some(ext_record) =
+            read_mft_record(reader, ext_ref, mft_runs, params, partition_offset)
+        {
             if let Some((runs, size)) = extract_data_attribute(&ext_record) {
                 all_runs.extend(runs);
                 if size > file_size {
@@ -546,16 +574,29 @@ fn read_hive_from_record<R: Read + Seek>(
                 }
             }
         } else {
-            log::debug!("{}: extension record #{} inaccessible", name, ext_ref);
+            log::debug!("{name}: extension record #{ext_ref} inaccessible");
         }
     }
 
     if all_runs.is_empty() {
-        return Err(VmkatzError::DecryptionError(format!("{}: no data runs from extension records", name)));
+        return Err(VmkatzError::DecryptionError(format!(
+            "{name}: no data runs from extension records"
+        )));
     }
 
-    log::info!("{}: {} total data runs, {} bytes", name, all_runs.len(), file_size);
-    read_from_data_runs(reader, &all_runs, file_size, params.cluster_size, partition_offset)
+    log::info!(
+        "{}: {} total data runs, {} bytes",
+        name,
+        all_runs.len(),
+        file_size
+    );
+    Ok(read_from_data_runs(
+        reader,
+        &all_runs,
+        file_size,
+        params.cluster_size,
+        partition_offset,
+    ))
 }
 
 /// Verify that a parent record chain leads to \Windows\System32\config.
@@ -568,27 +609,25 @@ fn verify_config_parent<R: Read + Seek>(
     partition_offset: u64,
 ) -> bool {
     // Read parent record (should be "config")
-    let parent = match read_mft_record(reader, parent_ref, mft_runs, params, partition_offset) {
-        Some(r) => r,
-        None => return false,
+    let Some(parent) = read_mft_record(reader, parent_ref, mft_runs, params, partition_offset)
+    else {
+        return false;
     };
-    let (parent_name, grandparent_ref) = match extract_filename(&parent) {
-        Some(n) => n,
-        None => return false,
+    let Some((parent_name, grandparent_ref)) = extract_filename(&parent) else {
+        return false;
     };
     if !parent_name.eq_ignore_ascii_case("config") {
         return false;
     }
 
     // Read grandparent (should be "System32")
-    let grandparent =
-        match read_mft_record(reader, grandparent_ref, mft_runs, params, partition_offset) {
-            Some(r) => r,
-            None => return false,
-        };
-    let (gp_name, _) = match extract_filename(&grandparent) {
-        Some(n) => n,
-        None => return false,
+    let Some(grandparent) =
+        read_mft_record(reader, grandparent_ref, mft_runs, params, partition_offset)
+    else {
+        return false;
+    };
+    let Some((gp_name, _)) = extract_filename(&grandparent) else {
+        return false;
     };
     gp_name.eq_ignore_ascii_case("System32")
 }
@@ -618,15 +657,12 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     // Read $MFTMirr (contains copies of MFT records 0-3)
     let mftmirr_abs = partition_offset + params.mftmirr_position;
     reader.seek(SeekFrom::Start(mftmirr_abs)).map_err(|e| {
-        VmkatzError::DecryptionError(format!(
-            "Cannot seek to MFTMirr at 0x{:x}: {}",
-            mftmirr_abs, e
-        ))
+        VmkatzError::DecryptionError(format!("Cannot seek to MFTMirr at 0x{mftmirr_abs:x}: {e}"))
     })?;
     let mut mftmirr_data = vec![0u8; params.record_size as usize * 4];
     reader
         .read_exact(&mut mftmirr_data)
-        .map_err(|e| VmkatzError::DecryptionError(format!("Cannot read MFTMirr: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("Cannot read MFTMirr: {e}")))?;
 
     // Parse record 0 ($MFT) from MFTMirr
     let mut mft_record = mftmirr_data[..params.record_size as usize].to_vec();
@@ -640,7 +676,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     let (mft_runs, mft_size) = extract_data_attribute(&mft_record)
         .ok_or_else(|| VmkatzError::DecryptionError("MFTMirr: no $DATA in $MFT record".into()))?;
 
-    let total_records = mft_size / params.record_size as u64;
+    let total_records = mft_size / u64::from(params.record_size);
     log::info!(
         "MFT: {} data runs, {} bytes ({} records)",
         mft_runs.len(),
@@ -653,8 +689,8 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     for run in &mft_runs {
         let abs_offset = partition_offset + run.lcn_start * params.cluster_size;
         let run_bytes = run.vcn_length * params.cluster_size;
-        let first_record = run.vcn_start * params.cluster_size / params.record_size as u64;
-        let num_records = run_bytes / params.record_size as u64;
+        let first_record = run.vcn_start * params.cluster_size / u64::from(params.record_size);
+        let num_records = run_bytes / u64::from(params.record_size);
 
         // Test accessibility by trying to seek to the segment
         // (don't require FILE signature — live VMs may have transient I/O on first record)
@@ -736,9 +772,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
                     ) {
                         let rec_num = first_rec + rec_idx + i as u64;
                         log::info!(
-                            "MFTMirr scan: found {} at MFT record #{} (parent verified)",
-                            name_upper,
-                            rec_num,
+                            "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (parent verified)",
                         );
                         *target = Some(record);
                     } else {
@@ -807,17 +841,13 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
                         match hive_check {
                             Some(true) => {
                                 log::info!(
-                                    "MFTMirr scan: found {} at MFT record #{} (regf-validated)",
-                                    name_upper,
-                                    rec_num,
+                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (regf-validated)",
                                 );
                                 *target = Some(record);
                             }
                             Some(false) => {
                                 log::info!(
-                                    "MFTMirr scan: found {} at MFT record #{} (not a regf hive, skipping)",
-                                    name_upper,
-                                    rec_num,
+                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (not a regf hive, skipping)",
                                 );
                             }
                             None => {
@@ -826,9 +856,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
                                 // zero-fill only the specific 4KB blocks that fail.
                                 // For live VMs, most blocks are readable.
                                 log::info!(
-                                    "MFTMirr scan: found {} at MFT record #{} (first extent check failed, accepting for resilient read)",
-                                    name_upper,
-                                    rec_num,
+                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (first extent check failed, accepting for resilient read)",
                                 );
                                 *target = Some(record);
                             }
@@ -850,23 +878,35 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
 
     // Read file data from found records
     let sam_data = match sam_record {
-        Some(ref rec) => read_hive_from_record(reader, rec, "SAM", &mft_runs, &params, partition_offset)?,
+        Some(ref rec) => {
+            read_hive_from_record(reader, rec, "SAM", &mft_runs, &params, partition_offset)?
+        }
         None => {
             return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SAM hive not found in accessible MFT segments".into(),
-            ))
+            ));
         }
     };
     let system_data = match system_record {
-        Some(ref rec) => read_hive_from_record(reader, rec, "SYSTEM", &mft_runs, &params, partition_offset)?,
+        Some(ref rec) => {
+            read_hive_from_record(reader, rec, "SYSTEM", &mft_runs, &params, partition_offset)?
+        }
         None => {
             return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SYSTEM hive not found in accessible MFT segments".into(),
-            ))
+            ));
         }
     };
     let security_data = security_record.as_ref().and_then(|rec| {
-        read_hive_from_record(reader, rec, "SECURITY", &mft_runs, &params, partition_offset).ok()
+        read_hive_from_record(
+            reader,
+            rec,
+            "SECURITY",
+            &mft_runs,
+            &params,
+            partition_offset,
+        )
+        .ok()
     });
 
     // Validate hive data — accept "regf" header or "hbin" blocks (regf may be zero-filled

