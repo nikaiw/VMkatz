@@ -57,8 +57,7 @@ fn read_len(bytes: &[u8], cur: &mut usize, cap: usize, label: &'static str) -> R
     let v = read_u32(bytes, cur)? as usize;
     if v > cap {
         return Err(Error::Parse(format!(
-            "dpapi blob {} length {} exceeds cap {}",
-            label, v, cap
+            "dpapi blob {label} length {v} exceeds cap {cap}"
         )));
     }
     Ok(v)
@@ -92,7 +91,7 @@ pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
     let _provider = take(bytes, &mut cur, 16)?;
     let _mk_version = read_u32(bytes, &mut cur)?;
     let mk_guid: [u8; 16] = take(bytes, &mut cur, 16)?.try_into().unwrap();
-    let mk_guid_str = format_guid(&mk_guid);
+    let mk_guid_str = crate::utils::format_guid(&mk_guid);
     let flags = read_u32(bytes, &mut cur)?;
     let desc_len = read_len(bytes, &mut cur, MAX_DESC, "description")?;
     let description = utf16le(take(bytes, &mut cur, desc_len)?);
@@ -135,26 +134,9 @@ fn utf16le(b: &[u8]) -> String {
         .to_string()
 }
 
-fn format_guid(g: &[u8; 16]) -> String {
-    // Mixed-endian: first 3 fields are little-endian, last 2 are big-endian.
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        u32::from_le_bytes(g[0..4].try_into().unwrap()),
-        u16::from_le_bytes(g[4..6].try_into().unwrap()),
-        u16::from_le_bytes(g[6..8].try_into().unwrap()),
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
-}
-
 /// Decrypt a DPAPI blob using a cleartext masterkey (typically 64 bytes).
 pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
+    type HmacSha512 = Hmac<Sha512>;
     // Modern combo: crypt_alg = CALG_AES_256 (0x6610), hmac_alg = CALG_SHA512 (0x800E).
     if blob.crypt_alg != 0x6610 || blob.hmac_alg != 0x800E {
         return Err(Error::Parse(format!(
@@ -169,7 +151,6 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
     //   AES-256-CBC decrypt with key=derivedKey[:32] and IV = ALL ZEROS
     // The IV is NOT derived from sessionKey bytes — that's the masterkey-FILE
     // convention, which uses a different (PBKDF2) derivation entirely.
-    type HmacSha512 = Hmac<Sha512>;
     let mk_sha1 = Sha1::digest(masterkey);
     let mut h =
         HmacSha512::new_from_slice(&mk_sha1).map_err(|_| Error::Parse("hmac key".into()))?;
@@ -178,7 +159,7 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
 
     let key = &session[..32];
     let iv = [0u8; 16];
-    if blob.cipher_text.len() % 16 != 0 {
+    if !blob.cipher_text.len().is_multiple_of(16) {
         return Err(Error::Parse("dpapi ciphertext not block-aligned".into()));
     }
     let mut buf = blob.cipher_text.to_vec();
@@ -191,14 +172,15 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn guid_format() {
         let g = [
             0x78, 0x56, 0x34, 0x12, 0x34, 0x12, 0x78, 0x56, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
             0x00, 0x11,
         ];
-        assert_eq!(format_guid(&g), "12345678-1234-5678-aabb-ccddeeff0011");
+        assert_eq!(
+            crate::utils::format_guid(&g),
+            "12345678-1234-5678-aabb-ccddeeff0011"
+        );
     }
 }

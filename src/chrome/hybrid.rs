@@ -20,14 +20,20 @@ pub struct HybridKeyring {
 }
 
 impl HybridKeyring {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn insert(&mut self, mk_guid: impl Into<String>, masterkey: Vec<u8>) {
         self.from_memory.insert(mk_guid.into(), masterkey);
     }
 
-    pub fn len(&self) -> usize { self.from_memory.len() }
-    pub fn is_empty(&self) -> bool { self.from_memory.is_empty() }
+    pub fn len(&self) -> usize {
+        self.from_memory.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.from_memory.is_empty()
+    }
 }
 
 impl MasterkeyResolver for HybridKeyring {
@@ -36,7 +42,9 @@ impl MasterkeyResolver for HybridKeyring {
     }
 }
 
-/// Compose two resolvers: try `primary` first, fall back to `fallback`. Returns the
+/// Compose two resolvers: try `primary` first, fall back to `fallback`.
+///
+/// Returns the
 /// matched bytes regardless of which resolver supplied them. Source-tagging is the
 /// orchestrator's responsibility (currently always `DiskDpapi` from disk.rs — Task 18
 /// can refine this).
@@ -45,9 +53,11 @@ pub struct ComposedResolver<'a, A: MasterkeyResolver, B: MasterkeyResolver> {
     pub fallback: &'a B,
 }
 
-impl<'a, A: MasterkeyResolver, B: MasterkeyResolver> MasterkeyResolver for ComposedResolver<'a, A, B> {
+impl<A: MasterkeyResolver, B: MasterkeyResolver> MasterkeyResolver for ComposedResolver<'_, A, B> {
     fn resolve(&self, mk_guid: &str) -> Option<Vec<u8>> {
-        self.primary.resolve(mk_guid).or_else(|| self.fallback.resolve(mk_guid))
+        self.primary
+            .resolve(mk_guid)
+            .or_else(|| self.fallback.resolve(mk_guid))
     }
 }
 
@@ -74,7 +84,10 @@ mod tests {
         a.insert("a", vec![10]);
         let mut b = HybridKeyring::new();
         b.insert("b", vec![20]);
-        let c = ComposedResolver { primary: &a, fallback: &b };
+        let c = ComposedResolver {
+            primary: &a,
+            fallback: &b,
+        };
         assert_eq!(c.resolve("a"), Some(vec![10]));
         assert_eq!(c.resolve("b"), Some(vec![20]));
         assert_eq!(c.resolve("c"), None);
@@ -86,7 +99,10 @@ mod tests {
         a.insert("k", vec![1]);
         let mut b = HybridKeyring::new();
         b.insert("k", vec![2]);
-        let c = ComposedResolver { primary: &a, fallback: &b };
+        let c = ComposedResolver {
+            primary: &a,
+            fallback: &b,
+        };
         assert_eq!(c.resolve("k"), Some(vec![1]));
     }
 }

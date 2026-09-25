@@ -49,44 +49,44 @@ pub fn aes_xts_decrypt_sector(key: &[u8], sector: &mut [u8], sector_number: u64)
     }
 
     match key.len() {
-        32 => xts_decrypt_128(key, sector, sector_number),
-        64 => xts_decrypt_256(key, sector, sector_number),
+        32 => {
+            xts_decrypt_128(key, sector, sector_number);
+            Ok(())
+        }
+        64 => {
+            xts_decrypt_256(key, sector, sector_number);
+            Ok(())
+        }
         n => Err(VmkatzError::DecryptionError(format!(
-            "AES-XTS: key must be 32 or 64 bytes, got {}",
-            n
+            "AES-XTS: key must be 32 or 64 bytes, got {n}"
         ))),
     }
 }
 
 /// AES-128-XTS decryption: key1 and key2 are each 16 bytes.
-fn xts_decrypt_128(key: &[u8], sector: &mut [u8], sector_number: u64) -> Result<()> {
+fn xts_decrypt_128(key: &[u8], sector: &mut [u8], sector_number: u64) {
     let key1 = &key[..16];
     let key2 = &key[16..32];
 
     let cipher1 = Aes128::new(GenericArray::from_slice(key1));
     let cipher2 = Aes128::new(GenericArray::from_slice(key2));
 
-    xts_decrypt_inner(&cipher1, &cipher2, sector, sector_number)
+    xts_decrypt_inner(&cipher1, &cipher2, sector, sector_number);
 }
 
 /// AES-256-XTS decryption: key1 and key2 are each 32 bytes.
-fn xts_decrypt_256(key: &[u8], sector: &mut [u8], sector_number: u64) -> Result<()> {
+fn xts_decrypt_256(key: &[u8], sector: &mut [u8], sector_number: u64) {
     let key1 = &key[..32];
     let key2 = &key[32..64];
 
     let cipher1 = Aes256::new(GenericArray::from_slice(key1));
     let cipher2 = Aes256::new(GenericArray::from_slice(key2));
 
-    xts_decrypt_inner(&cipher1, &cipher2, sector, sector_number)
+    xts_decrypt_inner(&cipher1, &cipher2, sector, sector_number);
 }
 
 /// Generic XTS decryption core that works with any AES key size.
-fn xts_decrypt_inner<C1, C2>(
-    cipher1: &C1,
-    cipher2: &C2,
-    sector: &mut [u8],
-    sector_number: u64,
-) -> Result<()>
+fn xts_decrypt_inner<C1, C2>(cipher1: &C1, cipher2: &C2, sector: &mut [u8], sector_number: u64)
 where
     C1: BlockDecrypt,
     C2: BlockEncrypt,
@@ -123,8 +123,6 @@ where
         // Advance tweak for next block
         gf128_mul_x(&mut tweak);
     }
-
-    Ok(())
 }
 
 /// Decrypt a buffer of contiguous sectors using AES-XTS.

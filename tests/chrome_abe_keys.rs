@@ -4,9 +4,7 @@
 //! The test is skipped (passes with a printed note) when the sample file is
 //! absent so CI stays green.
 
-use vmkatz::chrome::abe_keys::{
-    BrowserKeyMap, CHROME_135_V1, CHROME_135_V2, CHROME_135_V3,
-};
+use vmkatz::chrome::abe_keys::{BrowserKeyMap, CHROME_135_V1, CHROME_135_V2, CHROME_135_V3};
 
 #[test]
 fn parse_local_chrome135_elevation_service() {
@@ -14,7 +12,7 @@ fn parse_local_chrome135_elevation_service() {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skipping: cannot read {} ({})", path, e);
+            eprintln!("skipping: cannot read {path} ({e})");
             return;
         }
     };

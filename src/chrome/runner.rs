@@ -9,12 +9,13 @@
 //! `ProcessSource` is non-trivial and not in this task.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::chrome::abe_keys::BrowserKeyMap;
 use crate::chrome::hybrid::HybridKeyring;
-use crate::chrome::output::{render, Format};
-use crate::chrome::profile::{discover_chromium, DiscoveredProfile};
+use crate::chrome::output::{Format, render};
+use crate::chrome::profile::{DiscoveredProfile, discover_chromium};
 use crate::chrome::types::ChromeFindings;
 use crate::error::Result;
 
@@ -48,7 +49,9 @@ pub fn run_reader<R: std::io::Read + std::io::Seek>(
         user_kr.len(),
         system_kr.len()
     );
-    let mut tree = ArtifactsTree { profiles: &profiles };
+    let mut tree = ArtifactsTree {
+        profiles: &profiles,
+    };
     let findings =
         crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr), &key_map)
             .unwrap_or_default();
@@ -66,25 +69,25 @@ pub fn run_disk_with_passwords(
     extra_passwords: &[String],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles(disk_path)?;
-    let (user_kr, system_kr) = match build_keyrings_from_disk_with_passwords(
-        disk_path,
-        extra_passwords,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            log::info!("[chrome] disk-only keyrings unavailable: {}", e);
-            return Ok(DiscoverySummary {
-                profiles,
-                findings: ChromeFindings::default(),
-            });
-        }
-    };
+    let (user_kr, system_kr) =
+        match build_keyrings_from_disk_with_passwords(disk_path, extra_passwords) {
+            Ok(p) => p,
+            Err(e) => {
+                log::info!("[chrome] disk-only keyrings unavailable: {e}");
+                return Ok(DiscoverySummary {
+                    profiles,
+                    findings: ChromeFindings::default(),
+                });
+            }
+        };
     log::info!(
         "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
         user_kr.len(),
         system_kr.len()
     );
-    let mut tree = ArtifactsTree { profiles: &profiles };
+    let mut tree = ArtifactsTree {
+        profiles: &profiles,
+    };
     let findings =
         crate::chrome::disk::extract_from_disk(&mut tree, &user_kr, Some(&system_kr), &key_map)
             .unwrap_or_default();
@@ -103,18 +106,18 @@ where
     S: crate::chrome::disk::MasterkeyResolver,
 {
     let (profiles, key_map) = discover_profiles(disk_path)?;
-    let mut tree = ArtifactsTree { profiles: &profiles };
-    let findings = crate::chrome::disk::extract_from_disk(
-        &mut tree,
-        user_resolver,
-        system_resolver,
-        &key_map,
-    )
-    .unwrap_or_default();
+    let mut tree = ArtifactsTree {
+        profiles: &profiles,
+    };
+    let findings =
+        crate::chrome::disk::extract_from_disk(&mut tree, user_resolver, system_resolver, &key_map)
+            .unwrap_or_default();
     Ok(DiscoverySummary { profiles, findings })
 }
 
-/// Reader-based variant: caller owns the disk handle, we only borrow it. Used
+/// Reader-based variant: caller owns the disk handle, we only borrow it.
+///
+/// Used
 /// by the hybrid path (lsass mem + disk) so the same File handle services both
 /// keyring building and chrome discovery, avoiding a second `open()` that can
 /// race against external filesystem locks (e.g. ESXi system datastores).
@@ -129,19 +132,19 @@ where
     S: crate::chrome::disk::MasterkeyResolver,
 {
     let (profiles, key_map) = discover_profiles_in_reader(reader)?;
-    let mut tree = ArtifactsTree { profiles: &profiles };
-    let findings = crate::chrome::disk::extract_from_disk(
-        &mut tree,
-        user_resolver,
-        system_resolver,
-        &key_map,
-    )
-    .unwrap_or_default();
+    let mut tree = ArtifactsTree {
+        profiles: &profiles,
+    };
+    let findings =
+        crate::chrome::disk::extract_from_disk(&mut tree, user_resolver, system_resolver, &key_map)
+            .unwrap_or_default();
     Ok(DiscoverySummary { profiles, findings })
 }
 
 /// Reader-based variant of `build_keyrings_from_disk_with_passwords` — the
-/// caller already has a disk reader and pre-extracted secrets. Used by the
+/// caller already has a disk reader and pre-extracted secrets.
+///
+/// Used by the
 /// hybrid path so we open the disk once and share the handle.
 pub fn build_keyrings_from_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
@@ -171,16 +174,24 @@ struct ArtifactsTree<'a> {
     profiles: &'a [DiscoveredProfile],
 }
 
-impl<'a> crate::chrome::profile::FileTree for ArtifactsTree<'a> {
+impl crate::chrome::profile::FileTree for ArtifactsTree<'_> {
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {
         if p == "Users" {
-            let mut users: Vec<String> = self.profiles.iter().map(|d| d.profile.user.clone()).collect();
+            let mut users: Vec<String> = self
+                .profiles
+                .iter()
+                .map(|d| d.profile.user.clone())
+                .collect();
             users.sort();
             users.dedup();
             return Ok(users);
         }
         for d in self.profiles {
-            let browser_root = d.profile.path.rsplit_once('\\').map(|(parent, _)| parent).unwrap_or("");
+            let browser_root = d
+                .profile
+                .path
+                .rsplit_once('\\')
+                .map_or("", |(parent, _)| parent);
             if p == browser_root {
                 return Ok(vec![d.profile.profile_name.clone()]);
             }
@@ -191,18 +202,34 @@ impl<'a> crate::chrome::profile::FileTree for ArtifactsTree<'a> {
     fn read_file(&mut self, p: &str) -> Result<Option<Vec<u8>>> {
         for d in self.profiles {
             let prof_path = &d.profile.path;
-            let browser_root = prof_path.rsplit_once('\\').map(|(parent, _)| parent).unwrap_or("");
-            if p == format!("{}\\Local State", browser_root) {
+            let browser_root = prof_path.rsplit_once('\\').map_or("", |(parent, _)| parent);
+            if p == format!("{browser_root}\\Local State") {
                 return Ok(d.artifacts.local_state.clone());
             }
-            if p == format!("{}\\Login Data", prof_path) { return Ok(d.artifacts.login_data.clone()); }
-            if p == format!("{}\\Login Data-wal", prof_path) { return Ok(d.artifacts.login_data_wal.clone()); }
-            if p == format!("{}\\Network\\Cookies", prof_path) { return Ok(d.artifacts.cookies.clone()); }
-            if p == format!("{}\\Network\\Cookies-wal", prof_path) { return Ok(d.artifacts.cookies_wal.clone()); }
-            if p == format!("{}\\Cookies", prof_path) { return Ok(d.artifacts.cookies.clone()); }
-            if p == format!("{}\\Cookies-wal", prof_path) { return Ok(d.artifacts.cookies_wal.clone()); }
-            if p == format!("{}\\Web Data", prof_path) { return Ok(d.artifacts.web_data.clone()); }
-            if p == format!("{}\\Web Data-wal", prof_path) { return Ok(d.artifacts.web_data_wal.clone()); }
+            if p == format!("{prof_path}\\Login Data") {
+                return Ok(d.artifacts.login_data.clone());
+            }
+            if p == format!("{prof_path}\\Login Data-wal") {
+                return Ok(d.artifacts.login_data_wal.clone());
+            }
+            if p == format!("{prof_path}\\Network\\Cookies") {
+                return Ok(d.artifacts.cookies.clone());
+            }
+            if p == format!("{prof_path}\\Network\\Cookies-wal") {
+                return Ok(d.artifacts.cookies_wal.clone());
+            }
+            if p == format!("{prof_path}\\Cookies") {
+                return Ok(d.artifacts.cookies.clone());
+            }
+            if p == format!("{prof_path}\\Cookies-wal") {
+                return Ok(d.artifacts.cookies_wal.clone());
+            }
+            if p == format!("{prof_path}\\Web Data") {
+                return Ok(d.artifacts.web_data.clone());
+            }
+            if p == format!("{prof_path}\\Web Data-wal") {
+                return Ok(d.artifacts.web_data_wal.clone());
+            }
         }
         Ok(None)
     }
@@ -226,17 +253,14 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
     let mut last_err: Option<String> = None;
     for &part_offset in &partitions {
         if crate::sam::is_bitlocker_partition(disk, part_offset) {
-            log::info!(
-                "[chrome] partition at 0x{:x} is BitLocker, skipping",
-                part_offset
-            );
+            log::info!("[chrome] partition at 0x{part_offset:x} is BitLocker, skipping");
             continue;
         }
         let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
         let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
             Ok(n) => n,
             Err(e) => {
-                last_err = Some(format!("ntfs parse at 0x{:x}: {}", part_offset, e));
+                last_err = Some(format!("ntfs parse at 0x{part_offset:x}: {e}"));
                 continue;
             }
         };
@@ -248,16 +272,13 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
             match discover_chromium(&mut tree) {
                 Ok(p) => p,
                 Err(e) => {
-                    last_err = Some(format!("discover at 0x{:x}: {}", part_offset, e));
+                    last_err = Some(format!("discover at 0x{part_offset:x}: {e}"));
                     continue;
                 }
             }
         };
         if profiles.is_empty() {
-            log::info!(
-                "[chrome] no profiles on NTFS partition at 0x{:x}",
-                part_offset
-            );
+            log::info!("[chrome] no profiles on NTFS partition at 0x{part_offset:x}");
             continue;
         }
         let key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
@@ -265,7 +286,7 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
     }
 
     if let Some(msg) = last_err {
-        log::info!("[chrome] discovery: {}", msg);
+        log::info!("[chrome] discovery: {msg}");
     }
     Ok((Vec::new(), BrowserKeyMap::fallback()))
 }
@@ -305,11 +326,7 @@ const ELEVATION_PATHS: &[(&str, &str, &str)] = &[
         r"Program Files (x86)\Vivaldi\Application",
         "elevation_service.exe",
     ),
-    (
-        "opera",
-        r"Program Files\Opera",
-        "elevation_service.exe",
-    ),
+    ("opera", r"Program Files\Opera", "elevation_service.exe"),
     (
         "opera",
         r"Program Files (x86)\Opera",
@@ -324,46 +341,37 @@ fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
     ntfs: &ntfs::Ntfs,
     reader: &mut R,
 ) -> BrowserKeyMap {
-    let root = match ntfs.root_directory(reader) {
-        Ok(r) => r,
-        Err(_) => return BrowserKeyMap::fallback(),
+    let Ok(root) = ntfs.root_directory(reader) else {
+        return BrowserKeyMap::fallback();
     };
     let mut merged = BrowserKeyMap {
         entries: Vec::new(),
         fallback: false,
     };
     for (browser, parent_dir, exe_name) in ELEVATION_PATHS {
-        let app_dir = match crate::sam::navigate_to_dir(ntfs, &root, reader, parent_dir) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(app_dir) = crate::sam::navigate_to_dir(ntfs, &root, reader, parent_dir) else {
+            continue;
         };
-        let version_entries = match crate::sam::list_directory(ntfs, &app_dir, reader) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(version_entries) = crate::sam::list_directory(ntfs, &app_dir, reader) else {
+            continue;
         };
         for (ver_name, is_dir) in version_entries {
             if !is_dir || !is_version_dir(&ver_name) {
                 continue;
             }
-            let ver_dir = match crate::sam::find_entry(ntfs, &app_dir, reader, &ver_name) {
-                Ok(d) => d,
-                Err(_) => continue,
+            let Ok(ver_dir) = crate::sam::find_entry(ntfs, &app_dir, reader, &ver_name) else {
+                continue;
             };
-            let exe_file = match crate::sam::find_entry(ntfs, &ver_dir, reader, exe_name) {
-                Ok(f) => f,
-                Err(_) => continue,
+            let Ok(exe_file) = crate::sam::find_entry(ntfs, &ver_dir, reader, exe_name) else {
+                continue;
             };
-            let exe_bytes = match crate::sam::read_file_data(&exe_file, reader) {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Ok(exe_bytes) = crate::sam::read_file_data(&exe_file, reader) else {
+                continue;
             };
             let parsed = BrowserKeyMap::from_pe_or_fallback(&exe_bytes);
             if parsed.fallback {
                 log::info!(
-                    "[chrome] {} {}\\{} parse miss (using fallback)",
-                    browser,
-                    parent_dir,
-                    ver_name
+                    "[chrome] {browser} {parent_dir}\\{ver_name} parse miss (using fallback)"
                 );
                 continue;
             }
@@ -378,10 +386,7 @@ fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
             let pre = merged.entries.len();
             let added = merged.merge(parsed);
             if !added && pre > 0 {
-                log::info!(
-                    "[chrome] {} keys overlap existing slots, keeping first match",
-                    browser
-                );
+                log::info!("[chrome] {browser} keys overlap existing slots, keeping first match");
             }
         }
     }
@@ -394,15 +399,13 @@ fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
 
 /// Is `name` a dotted-decimal version directory like `135.0.7049.115`?
 fn is_version_dir(name: &str) -> bool {
-    !name.is_empty()
-        && name.contains('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.')
+    !name.is_empty() && name.contains('.') && name.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Walk the disk, decrypt every accessible DPAPI masterkey file using SAM- and
-/// LSA-derived pre-keys, and return `(user_keyring, system_keyring)`. Logs the
+/// LSA-derived pre-keys, and return `(user_keyring, system_keyring)`.
+///
+/// Logs the
 /// count of master keys decrypted from each context.
 ///
 /// This is the "no memory snapshot" path: we extract SAM hashes + LSA secrets
@@ -410,9 +413,7 @@ fn is_version_dir(name: &str) -> bool {
 /// `S-1-5-18` Protect directory, decrypting each MK file with the matching
 /// pre-key. Failed MKs are skipped with an info log so a single bad file
 /// doesn't abort the whole walk.
-pub fn build_keyrings_from_disk(
-    disk_path: &Path,
-) -> Result<(HybridKeyring, HybridKeyring)> {
+pub fn build_keyrings_from_disk(disk_path: &Path) -> Result<(HybridKeyring, HybridKeyring)> {
     build_keyrings_from_disk_with_passwords(disk_path, &[])
 }
 
@@ -422,7 +423,11 @@ pub fn build_keyrings_from_disk_with_passwords(
 ) -> Result<(HybridKeyring, HybridKeyring)> {
     let secrets = crate::sam::extract_disk_secrets(disk_path)?;
     let mut disk = crate::disk::open_disk(disk_path)?;
-    Ok(build_keyrings_with_secrets(&mut disk, &secrets, extra_passwords))
+    Ok(build_keyrings_with_secrets(
+        &mut disk,
+        &secrets,
+        extra_passwords,
+    ))
 }
 
 /// Reader-based + already-extracted-secrets variant of `build_keyrings_from_disk`.
@@ -443,9 +448,10 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     //  - `Protect\S-1-5-18\<GUID>` (machine-context)  → user_key
     //  - `Protect\S-1-5-18\User\<GUID>` (user-context) → machine_key
     let dpapi_system = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
-        crate::sam::lsa::LsaSecretType::DpapiSystem { user_key, machine_key } => {
-            Some((*user_key, *machine_key))
-        }
+        crate::sam::lsa::LsaSecretType::DpapiSystem {
+            user_key,
+            machine_key,
+        } => Some((*user_key, *machine_key)),
         _ => None,
     });
 
@@ -455,10 +461,8 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     let mut password_candidates: Vec<String> = extra_passwords.to_vec();
     for s in &secrets.lsa_secrets {
         match &s.parsed {
-            crate::sam::lsa::LsaSecretType::DefaultPassword { password } => {
-                password_candidates.push(password.clone());
-            }
-            crate::sam::lsa::LsaSecretType::ServicePassword { password, .. } => {
+            crate::sam::lsa::LsaSecretType::DefaultPassword { password }
+            | crate::sam::lsa::LsaSecretType::ServicePassword { password, .. } => {
                 password_candidates.push(password.clone());
             }
             _ => {}
@@ -484,13 +488,11 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
             continue;
         }
         let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
-        let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(ntfs) = ntfs::Ntfs::new(&mut part_reader) else {
+            continue;
         };
-        let root = match ntfs.root_directory(&mut part_reader) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Ok(root) = ntfs.root_directory(&mut part_reader) else {
+            continue;
         };
 
         // System masterkeys live in Windows\System32\Microsoft\Protect\S-1-5-18\
@@ -507,7 +509,11 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                     if sid != "S-1-5-18" {
                         return None;
                     }
-                    let pre_key = if sub.is_empty() { user_key } else { machine_key };
+                    let pre_key = if sub.is_empty() {
+                        user_key
+                    } else {
+                        machine_key
+                    };
                     crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
                 },
                 &mut system_kr,
@@ -516,16 +522,13 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
         }
 
         // User masterkeys: Users\<user>\AppData\Roaming\Microsoft\Protect\<SID>\<guid>
-        let users_dir =
-            match crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Users") {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-        let user_entries =
-            match crate::sam::list_directory(&ntfs, &users_dir, &mut part_reader) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        let Ok(users_dir) = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Users") else {
+            continue;
+        };
+        let Ok(user_entries) = crate::sam::list_directory(&ntfs, &users_dir, &mut part_reader)
+        else {
+            continue;
+        };
 
         for (user_name, is_dir) in user_entries {
             if !is_dir {
@@ -538,8 +541,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
             ) {
                 continue;
             }
-            let protect_path =
-                format!("{}\\AppData\\Roaming\\Microsoft\\Protect", user_name);
+            let protect_path = format!("{user_name}\\AppData\\Roaming\\Microsoft\\Protect");
 
             decrypt_mks_in_protect(
                 &ntfs,
@@ -592,25 +594,21 @@ fn decrypt_mks_in_protect<'n, R, F>(
     R: std::io::Read + std::io::Seek,
     F: FnMut(&str, &str, &[u8]) -> Option<Vec<u8>>,
 {
-    let protect_dir = match crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(protect_dir) = crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) else {
+        return;
     };
-    let sids = match crate::sam::list_directory(ntfs, &protect_dir, reader) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(sids) = crate::sam::list_directory(ntfs, &protect_dir, reader) else {
+        return;
     };
     for (sid, is_sid_dir) in sids {
         if !is_sid_dir || !sid.starts_with("S-1-5-") {
             continue;
         }
-        let sid_dir = match crate::sam::find_entry(ntfs, &protect_dir, reader, &sid) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(sid_dir) = crate::sam::find_entry(ntfs, &protect_dir, reader, &sid) else {
+            continue;
         };
-        let mk_entries = match crate::sam::list_directory(ntfs, &sid_dir, reader) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(mk_entries) = crate::sam::list_directory(ntfs, &sid_dir, reader) else {
+            continue;
         };
         // Collect MK files in this SID dir AND in its optional `User\` subdir.
         // The `User\` subdir under S-1-5-18 holds user-context MKs used by SYSTEM
@@ -637,18 +635,16 @@ fn decrypt_mks_in_protect<'n, R, F>(
                     Err(_) => continue,
                 }
             } else {
-                let user_sub = match crate::sam::find_entry(ntfs, &sid_dir, reader, &sub) {
-                    Ok(d) => d,
-                    Err(_) => continue,
+                let Ok(user_sub) = crate::sam::find_entry(ntfs, &sid_dir, reader, &sub) else {
+                    continue;
                 };
                 match crate::sam::find_entry(ntfs, &user_sub, reader, &mk_name) {
                     Ok(f) => f,
                     Err(_) => continue,
                 }
             };
-            let mk_data = match crate::sam::read_file_data(&mk_file, reader) {
-                Ok(d) => d,
-                Err(_) => continue,
+            let Ok(mk_data) = crate::sam::read_file_data(&mk_file, reader) else {
+                continue;
             };
             match decrypt_fn(&sid, &sub, &mk_data) {
                 Some(clear) => {
@@ -656,7 +652,11 @@ fn decrypt_mks_in_protect<'n, R, F>(
                         "[chrome] decrypted {} MK: SID={}{} GUID={}",
                         label,
                         sid,
-                        if sub.is_empty() { "".into() } else { format!("/{}", sub) },
+                        if sub.is_empty() {
+                            String::new()
+                        } else {
+                            format!("/{sub}")
+                        },
                         mk_name
                     );
                     out.insert(mk_name.to_lowercase(), clear);
@@ -666,7 +666,11 @@ fn decrypt_mks_in_protect<'n, R, F>(
                         "[chrome] MK decrypt failed: ctx={} SID={}{} GUID={}",
                         label,
                         sid,
-                        if sub.is_empty() { "".into() } else { format!("/{}", sub) },
+                        if sub.is_empty() {
+                            String::new()
+                        } else {
+                            format!("/{sub}")
+                        },
                         mk_name
                     );
                 }
@@ -726,17 +730,24 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
             s.push_str("[Chrome] no profiles found\n");
         } else {
             for p in &summary.profiles {
-                s.push_str(&format!(
+                let _ = write!(
+                    s,
                     "[Chrome] {}/{} ({})\n  artifacts: local_state={} login_data={} cookies={} web_data={}\n  path: {}\n",
                     p.profile.user,
                     p.profile.profile_name,
                     p.profile.browser,
-                    p.artifacts.local_state.as_ref().map(|v| v.len()).unwrap_or(0),
-                    p.artifacts.login_data.as_ref().map(|v| v.len()).unwrap_or(0),
-                    p.artifacts.cookies.as_ref().map(|v| v.len()).unwrap_or(0),
-                    p.artifacts.web_data.as_ref().map(|v| v.len()).unwrap_or(0),
+                    p.artifacts
+                        .local_state
+                        .as_ref()
+                        .map_or(0, std::vec::Vec::len),
+                    p.artifacts
+                        .login_data
+                        .as_ref()
+                        .map_or(0, std::vec::Vec::len),
+                    p.artifacts.cookies.as_ref().map_or(0, std::vec::Vec::len),
+                    p.artifacts.web_data.as_ref().map_or(0, std::vec::Vec::len),
                     p.profile.path,
-                ));
+                );
             }
         }
         // Append any decrypted findings via the standard formatter (empty until
@@ -761,7 +772,7 @@ mod tests {
                 browser,
                 user: user.into(),
                 profile_name: "Default".into(),
-                path: format!(r"Users\{}\AppData\Local\...\Default", user),
+                path: format!(r"Users\{user}\AppData\Local\...\Default"),
             },
             artifacts: ProfileArtifacts {
                 local_state: Some(b"{}".to_vec()),

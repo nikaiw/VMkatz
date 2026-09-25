@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::lsass::types::Arch;
 use crate::memory::VirtualMemory;
 use crate::windows::peb::LoadedModule;
@@ -61,17 +61,14 @@ impl Minidump {
     }
 
     /// Number of memory regions in the dump.
-    pub fn region_count(&self) -> usize {
+    pub const fn region_count(&self) -> usize {
         self.regions.len()
     }
 
     /// Return all memory region VA ranges as (start_va, size) pairs.
     /// Used for fallback credential scanning over all dump regions.
     pub fn region_ranges(&self) -> Vec<(u64, u64)> {
-        self.regions
-            .iter()
-            .map(|r| (r.start_va, r.size))
-            .collect()
+        self.regions.iter().map(|r| (r.start_va, r.size)).collect()
     }
 
     /// Parse minidump from raw bytes.
@@ -107,11 +104,7 @@ impl Minidump {
             let stream_rva = read_u32(&data, entry_off + 8) as usize;
 
             if stream_rva + stream_size > data.len() {
-                log::warn!(
-                    "Minidump stream {} (type {}) extends past EOF, skipping",
-                    i,
-                    stream_type
-                );
+                log::warn!("Minidump stream {i} (type {stream_type}) extends past EOF, skipping");
                 continue;
             }
 
@@ -143,7 +136,11 @@ impl Minidump {
             region_index.insert(r.start_va, i);
         }
 
-        let arch = if processor_arch == 0 { Arch::X86 } else { Arch::X64 };
+        let arch = if processor_arch == 0 {
+            Arch::X86
+        } else {
+            Arch::X64
+        };
 
         log::info!(
             "Minidump: {} memory regions, {} modules, build {}, arch={:?}",
@@ -205,9 +202,8 @@ impl VirtualMemory for Minidump {
                 .find_region(current_va)
                 .ok_or(VmkatzError::PageFault(current_va, "minidump"))?;
 
-            let file_off = match region.file_offset.checked_add(offset) {
-                Some(v) => v,
-                None => return Err(VmkatzError::PageFault(current_va, "minidump-overflow")),
+            let Some(file_off) = region.file_offset.checked_add(offset) else {
+                return Err(VmkatzError::PageFault(current_va, "minidump-overflow"));
             };
             let available = (region.size - offset) as usize;
             let to_copy = (len - bytes_read).min(available);
@@ -238,15 +234,14 @@ fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
     let count = read_u32(data, rva) as usize;
     // Cap module count to prevent excessive iteration on malformed dumps
     if count > 4096 {
-        log::warn!("Module count {} too large, capping at 4096", count);
+        log::warn!("Module count {count} too large, capping at 4096");
         return modules;
     }
     let entries_start = rva + 4;
 
     for i in 0..count {
-        let off = match entries_start.checked_add(i.saturating_mul(108)) {
-            Some(o) => o,
-            None => break,
+        let Some(off) = entries_start.checked_add(i.saturating_mul(108)) else {
+            break;
         };
         if off + 108 > data.len() {
             break;
@@ -291,7 +286,7 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
     let count = read_u64(data, rva) as usize;
     // Cap region count to prevent excessive iteration on malformed dumps
     if count > 1_000_000 {
-        log::warn!("Memory64 region count {} too large, capping", count);
+        log::warn!("Memory64 region count {count} too large, capping");
         return regions;
     }
     let base_rva = read_u64(data, rva + 8);
@@ -300,9 +295,8 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
     let mut current_file_offset = base_rva;
 
     for i in 0..count {
-        let desc_off = match descs_start.checked_add(i.saturating_mul(16)) {
-            Some(o) => o,
-            None => break,
+        let Some(desc_off) = descs_start.checked_add(i.saturating_mul(16)) else {
+            break;
         };
         if desc_off + 16 > data.len() {
             break;

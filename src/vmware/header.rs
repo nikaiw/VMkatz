@@ -1,4 +1,4 @@
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 const HEADER_SIZE: usize = 12;
 const GROUP_SIZE: usize = 80;
@@ -33,10 +33,7 @@ impl VmsnHeader {
         }
         let _reserved = crate::utils::read_u32_le(data, 4).unwrap_or(0);
         let group_count = crate::utils::read_u32_le(data, 8).unwrap_or(0);
-        Ok(Self {
-            magic,
-            group_count,
-        })
+        Ok(Self { magic, group_count })
     }
 }
 

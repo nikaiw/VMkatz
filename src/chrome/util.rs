@@ -3,11 +3,20 @@ pub fn b64_decode(input: &str) -> Option<Vec<u8>> {
     const TBL: [i8; 256] = {
         let mut t = [-1i8; 256];
         let mut i = 0u8;
-        while i < 26 { t[(b'A' + i) as usize] = i as i8; i += 1; }
+        while i < 26 {
+            t[(b'A' + i) as usize] = i as i8;
+            i += 1;
+        }
         let mut i = 0u8;
-        while i < 26 { t[(b'a' + i) as usize] = (26 + i) as i8; i += 1; }
+        while i < 26 {
+            t[(b'a' + i) as usize] = (26 + i) as i8;
+            i += 1;
+        }
         let mut i = 0u8;
-        while i < 10 { t[(b'0' + i) as usize] = (52 + i) as i8; i += 1; }
+        while i < 10 {
+            t[(b'0' + i) as usize] = (52 + i) as i8;
+            i += 1;
+        }
         t[b'+' as usize] = 62;
         t[b'/' as usize] = 63;
         t
@@ -18,11 +27,15 @@ pub fn b64_decode(input: &str) -> Option<Vec<u8>> {
     let mut bits = 0u32;
     for &b in bytes {
         if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' {
-            if b == b'=' { break; }
+            if b == b'=' {
+                break;
+            }
             continue;
         }
         let v = TBL[b as usize];
-        if v < 0 { return None; }
+        if v < 0 {
+            return None;
+        }
         buf = (buf << 6) | (v as u32);
         bits += 6;
         if bits >= 8 {
@@ -36,10 +49,12 @@ pub fn b64_decode(input: &str) -> Option<Vec<u8>> {
 
 /// Chrome time epoch (1601-01-01) to Unix epoch (1970-01-01), in seconds.
 /// Returns None for the sentinel value 0 (no expiry).
-pub fn chrome_time_to_unix(chrome_us: i64) -> Option<i64> {
-    if chrome_us == 0 { return None; }
+pub const fn chrome_time_to_unix(chrome_us: i64) -> Option<i64> {
     // Chrome stores microseconds since 1601-01-01 UTC.
     const EPOCH_DELTA_SECS: i64 = 11_644_473_600;
+    if chrome_us == 0 {
+        return None;
+    }
     Some(chrome_us / 1_000_000 - EPOCH_DELTA_SECS)
 }
 

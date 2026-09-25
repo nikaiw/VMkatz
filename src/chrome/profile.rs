@@ -37,7 +37,10 @@ const CHROMIUM_PATHS: &[(Browser, &str)] = &[
         r"AppData\Local\BraveSoftware\Brave-Browser\User Data",
     ),
     (Browser::Vivaldi, r"AppData\Local\Vivaldi\User Data"),
-    (Browser::Opera, r"AppData\Roaming\Opera Software\Opera Stable"),
+    (
+        Browser::Opera,
+        r"AppData\Roaming\Opera Software\Opera Stable",
+    ),
 ];
 
 /// Trait abstracting the NTFS reader so we can unit-test with an in-memory fake.
@@ -62,48 +65,43 @@ pub fn discover_chromium<T: FileTree>(tree: &mut T) -> Result<Vec<DiscoveredProf
             continue;
         }
         for (browser, sub) in CHROMIUM_PATHS {
-            let root = format!(r"Users\{}\{}", user, sub);
-            let profiles = match tree.list_dir(&root) {
-                Ok(p) => p,
-                Err(_) => continue,
+            let root = format!(r"Users\{user}\{sub}");
+            let Ok(profiles) = tree.list_dir(&root) else {
+                continue;
             };
             let local_state = tree
-                .read_file(&format!(r"{}\Local State", root))
+                .read_file(&format!(r"{root}\Local State"))
                 .unwrap_or(None);
             for prof in profiles {
                 if prof != "Default" && !prof.starts_with("Profile ") {
                     continue;
                 }
-                let pdir = format!(r"{}\{}", root, prof);
-                let mut art = ProfileArtifacts::default();
-                art.local_state = local_state.clone();
-                art.login_data = tree
-                    .read_file(&format!(r"{}\Login Data", pdir))
-                    .unwrap_or(None);
-                art.login_data_wal = tree
-                    .read_file(&format!(r"{}\Login Data-wal", pdir))
-                    .unwrap_or(None);
-                // Modern Chromium stores Cookies under <profile>\Network\
-                art.cookies = tree
-                    .read_file(&format!(r"{}\Network\Cookies", pdir))
-                    .unwrap_or(None)
-                    .or_else(|| {
-                        tree.read_file(&format!(r"{}\Cookies", pdir))
-                            .unwrap_or(None)
-                    });
-                art.cookies_wal = tree
-                    .read_file(&format!(r"{}\Network\Cookies-wal", pdir))
-                    .unwrap_or(None)
-                    .or_else(|| {
-                        tree.read_file(&format!(r"{}\Cookies-wal", pdir))
-                            .unwrap_or(None)
-                    });
-                art.web_data = tree
-                    .read_file(&format!(r"{}\Web Data", pdir))
-                    .unwrap_or(None);
-                art.web_data_wal = tree
-                    .read_file(&format!(r"{}\Web Data-wal", pdir))
-                    .unwrap_or(None);
+                let pdir = format!(r"{root}\{prof}");
+                let art = ProfileArtifacts {
+                    local_state: local_state.clone(),
+                    login_data: tree
+                        .read_file(&format!(r"{pdir}\Login Data"))
+                        .unwrap_or(None),
+                    login_data_wal: tree
+                        .read_file(&format!(r"{pdir}\Login Data-wal"))
+                        .unwrap_or(None),
+                    // Modern Chromium stores Cookies under <profile>\Network\
+                    cookies: tree
+                        .read_file(&format!(r"{pdir}\Network\Cookies"))
+                        .unwrap_or(None)
+                        .or_else(|| tree.read_file(&format!(r"{pdir}\Cookies")).unwrap_or(None)),
+                    cookies_wal: tree
+                        .read_file(&format!(r"{pdir}\Network\Cookies-wal"))
+                        .unwrap_or(None)
+                        .or_else(|| {
+                            tree.read_file(&format!(r"{pdir}\Cookies-wal"))
+                                .unwrap_or(None)
+                        }),
+                    web_data: tree.read_file(&format!(r"{pdir}\Web Data")).unwrap_or(None),
+                    web_data_wal: tree
+                        .read_file(&format!(r"{pdir}\Web Data-wal"))
+                        .unwrap_or(None),
+                };
                 if art.login_data.is_none() && art.cookies.is_none() && art.web_data.is_none() {
                     continue;
                 }
@@ -141,20 +139,18 @@ pub struct NtfsTree<'a, R: Read + Seek> {
 }
 
 impl<'a, R: Read + Seek> NtfsTree<'a, R> {
-    pub fn new(ntfs: &'a ntfs::Ntfs, reader: &'a mut R) -> Self {
+    pub const fn new(ntfs: &'a ntfs::Ntfs, reader: &'a mut R) -> Self {
         Self { ntfs, reader }
     }
 }
 
-impl<'a, R: Read + Seek> FileTree for NtfsTree<'a, R> {
+impl<R: Read + Seek> FileTree for NtfsTree<'_, R> {
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
-        let root = match self.ntfs.root_directory(self.reader) {
-            Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
+        let Ok(root) = self.ntfs.root_directory(self.reader) else {
+            return Ok(Vec::new());
         };
-        let dir = match navigate_to_dir(self.ntfs, &root, self.reader, path) {
-            Ok(d) => d,
-            Err(_) => return Ok(Vec::new()),
+        let Ok(dir) = navigate_to_dir(self.ntfs, &root, self.reader, path) else {
+            return Ok(Vec::new());
         };
         match list_directory(self.ntfs, &dir, self.reader) {
             Ok(entries) => Ok(entries.into_iter().map(|(name, _is_dir)| name).collect()),
@@ -163,21 +159,17 @@ impl<'a, R: Read + Seek> FileTree for NtfsTree<'a, R> {
     }
 
     fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
-        let (dir_part, file_part) = match path.rsplit_once(['\\', '/']) {
-            Some((d, f)) => (d, f),
-            None => return Ok(None),
+        let Some((dir_part, file_part)) = path.rsplit_once(['\\', '/']) else {
+            return Ok(None);
         };
-        let root = match self.ntfs.root_directory(self.reader) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
+        let Ok(root) = self.ntfs.root_directory(self.reader) else {
+            return Ok(None);
         };
-        let dir = match navigate_to_dir(self.ntfs, &root, self.reader, dir_part) {
-            Ok(d) => d,
-            Err(_) => return Ok(None),
+        let Ok(dir) = navigate_to_dir(self.ntfs, &root, self.reader, dir_part) else {
+            return Ok(None);
         };
-        let file = match find_entry(self.ntfs, &dir, self.reader, file_part) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
+        let Ok(file) = find_entry(self.ntfs, &dir, self.reader, file_part) else {
+            return Ok(None);
         };
         match read_file_data(&file, self.reader) {
             Ok(buf) => Ok(Some(buf)),

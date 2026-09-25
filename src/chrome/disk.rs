@@ -4,11 +4,11 @@
 //! using a caller-provided masterkey resolver, decrypts SQLite blobs.
 
 use crate::chrome::abe_keys::BrowserKeyMap;
-use crate::chrome::blob::{classify, BlobScheme};
+use crate::chrome::blob::{BlobScheme, classify};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::chrome::local_state;
-use crate::chrome::profile::{discover_chromium, DiscoveredProfile, FileTree};
-use crate::chrome::sqlite::{walk_table, Pager, Value};
+use crate::chrome::profile::{DiscoveredProfile, FileTree, discover_chromium};
+use crate::chrome::sqlite::{Pager, Value, walk_table};
 use crate::chrome::types::{
     AutofillEntry, AutofillKind, BrowserProfile, ChromeFindings, ChromeSource, Cookie,
     SavedPassword,
@@ -24,7 +24,9 @@ pub trait MasterkeyResolver {
 
 /// Convenience impl over an owned HashMap so tests and simple callers can just hand
 /// in a `HashMap<String, Vec<u8>>`.
-impl MasterkeyResolver for std::collections::HashMap<String, Vec<u8>> {
+impl<S: std::hash::BuildHasher> MasterkeyResolver
+    for std::collections::HashMap<String, Vec<u8>, S>
+{
     fn resolve(&self, mk_guid: &str) -> Option<Vec<u8>> {
         self.get(mk_guid).cloned()
     }
@@ -74,9 +76,8 @@ fn per_profile<R: MasterkeyResolver, S: MasterkeyResolver>(
     key_map: &BrowserKeyMap,
 ) -> Result<ChromeFindings> {
     let mut out = ChromeFindings::default();
-    let keys = match derive_keys(p, user_resolver, system_resolver, key_map) {
-        Some(k) => k,
-        None => return Ok(out),
+    let Some(keys) = derive_keys(p, user_resolver, system_resolver, key_map) else {
+        return Ok(out);
     };
 
     if let Some(db) = &p.artifacts.login_data {
@@ -103,7 +104,7 @@ fn per_profile<R: MasterkeyResolver, S: MasterkeyResolver>(
             p.artifacts.web_data_wal.as_deref(),
             &keys,
             &p.profile,
-            ChromeSource::DiskDpapi,
+            &ChromeSource::DiskDpapi,
             &mut out,
         )?;
     }
@@ -123,12 +124,8 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     let v20 = if let (Some(appb), Some(sys)) =
         (ls.app_bound_encrypted_key.as_deref(), system_resolver)
     {
-        match crate::chrome::abe::unwrap_app_bound_with_resolvers(
-            appb,
-            user_resolver,
-            sys,
-            key_map,
-        ) {
+        match crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys, key_map)
+        {
             Ok(k) => Some(k),
             Err(e) => {
                 log::info!("[chrome] {} v20 unwrap failed: {}", p.profile.path, e);
@@ -144,7 +141,10 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
 /// SQLite type affinity can land a v10/v11/v20 blob in a TEXT column. Treat both
 /// when scanning row columns for the encrypted value.
 fn is_chrome_blob(b: &[u8]) -> bool {
-    matches!(classify(b), BlobScheme::V10 | BlobScheme::V11 | BlobScheme::V20)
+    matches!(
+        classify(b),
+        BlobScheme::V10 | BlobScheme::V11 | BlobScheme::V20
+    )
 }
 
 /// Try v10/v11 then v20 against `blob`; return plaintext + which scheme produced it
@@ -154,11 +154,17 @@ fn decrypt_value(blob: &[u8], keys: &ProfileKeys) -> Option<(Vec<u8>, ChromeSour
 }
 
 /// Same as `decrypt_value` but allows binding to AAD (e.g. cookie host).
-fn decrypt_value_aad(blob: &[u8], keys: &ProfileKeys, aad: &[u8]) -> Option<(Vec<u8>, ChromeSource)> {
+fn decrypt_value_aad(
+    blob: &[u8],
+    keys: &ProfileKeys,
+    aad: &[u8],
+) -> Option<(Vec<u8>, ChromeSource)> {
     match classify(blob) {
-        BlobScheme::V10 | BlobScheme::V11 => crate::chrome::blob::decrypt_v10_aad(blob, &keys.v10, aad)
-            .ok()
-            .map(|pt| (pt, ChromeSource::DiskDpapi)),
+        BlobScheme::V10 | BlobScheme::V11 => {
+            crate::chrome::blob::decrypt_v10_aad(blob, &keys.v10, aad)
+                .ok()
+                .map(|pt| (pt, ChromeSource::DiskDpapi))
+        }
         BlobScheme::V20 => keys
             .v20
             .as_ref()
@@ -197,18 +203,26 @@ fn extract_logins(
         Some(w) => Pager::open_with_wal(db, w)?,
         None => Pager::open(db)?,
     };
-    let root = match pager.root_of("logins")? {
-        Some(r) => r,
-        None => return Ok(()),
+    let Some(root) = pager.root_of("logins")? else {
+        return Ok(());
     };
     walk_table(&pager, root, |_rid, cols| {
-        let url = cols.get(0).and_then(Value::as_text).unwrap_or("").to_string();
-        let username = cols.get(3).and_then(Value::as_text).unwrap_or("").to_string();
+        let url = cols
+            .first()
+            .and_then(Value::as_text)
+            .unwrap_or("")
+            .to_string();
+        let username = cols
+            .get(3)
+            .and_then(Value::as_text)
+            .unwrap_or("")
+            .to_string();
         // Chrome stores the encrypted password as BLOB in the schema, but SQLite type
         // affinity can land it as TEXT. Match by v10/v11/v20 prefix across both.
-        let blob: &[u8] = cols.iter().find_map(|c| {
-            c.as_bytes().filter(|b| is_chrome_blob(b))
-        }).unwrap_or(&[]);
+        let blob: &[u8] = cols
+            .iter()
+            .find_map(|c| c.as_bytes().filter(|b| is_chrome_blob(b)))
+            .unwrap_or(&[]);
         if let Some((pt, source)) = decrypt_value(blob, keys) {
             let password = String::from_utf8_lossy(&pt).into_owned();
             out.passwords.push(SavedPassword {
@@ -234,9 +248,8 @@ fn extract_cookies(
         Some(w) => Pager::open_with_wal(db, w)?,
         None => Pager::open(db)?,
     };
-    let root = match pager.root_of("cookies")? {
-        Some(r) => r,
-        None => return Ok(()),
+    let Some(root) = pager.root_of("cookies")? else {
+        return Ok(());
     };
     walk_table(&pager, root, |_rid, cols| {
         // Cookies schema varies by Chrome version; use heuristics:
@@ -264,17 +277,18 @@ fn extract_cookies(
             .find(|s| !s.is_empty() && !s.contains('.') && !s.starts_with('/'))
             .unwrap_or("")
             .to_string();
-        let blob: &[u8] = cols.iter().find_map(|c| {
-            c.as_bytes().filter(|b| is_chrome_blob(b))
-        }).unwrap_or(&[]);
+        let blob: &[u8] = cols
+            .iter()
+            .find_map(|c| c.as_bytes().filter(|b| is_chrome_blob(b)))
+            .unwrap_or(&[]);
         let exp_us = cols
             .iter()
             .filter_map(Value::as_int)
             .find(|n| *n > 10_000_000_000_000_000);
         // Modern Chrome cookies bind ciphertext to host via AES-GCM AAD. Try empty
         // AAD first (older versions), then host-as-AAD if that fails.
-        let decrypted = decrypt_value(blob, keys)
-            .or_else(|| decrypt_value_aad(blob, keys, host.as_bytes()));
+        let decrypted =
+            decrypt_value(blob, keys).or_else(|| decrypt_value_aad(blob, keys, host.as_bytes()));
         if let Some((pt, source)) = decrypted {
             let value = strip_cookie_prefix(&pt);
             out.cookies.push(Cookie {
@@ -298,7 +312,9 @@ fn extract_cookies(
 fn strip_cookie_prefix(pt: &[u8]) -> String {
     if pt.len() > 32 {
         let head_binary = pt[..32].iter().any(|&b| b == 0 || b > 127);
-        let tail_ascii = pt[32..].iter().all(|&b| b == 0 || (b >= 0x20 && b < 0x7F));
+        let tail_ascii = pt[32..]
+            .iter()
+            .all(|&b| b == 0 || (0x20..0x7F).contains(&b));
         if head_binary && tail_ascii {
             return String::from_utf8_lossy(&pt[32..]).into_owned();
         }
@@ -311,7 +327,7 @@ fn extract_autofill(
     wal: Option<&[u8]>,
     _keys: &ProfileKeys,
     profile: &BrowserProfile,
-    src: ChromeSource,
+    src: &ChromeSource,
     out: &mut ChromeFindings,
 ) -> Result<()> {
     let pager = match wal {
@@ -321,8 +337,16 @@ fn extract_autofill(
     // autofill table (form fields): name TEXT, value TEXT, value_lower TEXT, date_created INT, ...
     if let Some(root) = pager.root_of("autofill")? {
         walk_table(&pager, root, |_rid, cols| {
-            let name = cols.get(0).and_then(Value::as_text).unwrap_or("").to_string();
-            let value = cols.get(1).and_then(Value::as_text).unwrap_or("").to_string();
+            let name = cols
+                .first()
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
+            let value = cols
+                .get(1)
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
             if !name.is_empty() && !value.is_empty() {
                 out.autofill.push(AutofillEntry {
                     profile: profile.clone(),

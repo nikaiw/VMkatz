@@ -10,7 +10,7 @@
 //! - Tagged/fixed/variable column value extraction
 //! - Long value (separated record) resolution
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use std::collections::HashMap;
 
 /// ESE database backed by a byte slice.
@@ -26,7 +26,7 @@ pub struct EseDb<'a> {
 pub struct EseColumn {
     pub id: u32,
     pub name: String,
-    #[allow(dead_code)] // stored for debugging, not read at runtime
+    /// Column type from the catalog (kept for debugging).
     pub col_type: u32,
     pub offset: u16,
     pub size: u16,
@@ -45,7 +45,6 @@ struct EseTable {
     lv_pgno: u32,
     columns: Vec<EseColumn>,
 }
-
 
 // ESE page flags (from JET_bitXxx / esent.h)
 const PAGE_FLAG_ROOT: u32 = 0x01;
@@ -68,12 +67,14 @@ const JET_COLTYP_LONG_LONG: u32 = 15;
 const JET_COLTYP_UNSIGNED_SHORT: u32 = 17;
 
 /// Fixed-size for each column type (0 = variable length).
-fn fixed_size_for_type(col_type: u32) -> usize {
+const fn fixed_size_for_type(col_type: u32) -> usize {
     match col_type {
         JET_COLTYPBIT | JET_COLTYP_UNSIGNED_BYTE => 1,
         JET_COLTYP_SHORT | JET_COLTYP_UNSIGNED_SHORT => 2,
         JET_COLTYP_LONG | JET_COLTYP_UNSIGNED_LONG | JET_COLTYP_IEEE_SINGLE => 4,
-        JET_COLTYP_CURRENCY | JET_COLTYP_IEEE_DOUBLE | JET_COLTYP_DATE_TIME
+        JET_COLTYP_CURRENCY
+        | JET_COLTYP_IEEE_DOUBLE
+        | JET_COLTYP_DATE_TIME
         | JET_COLTYP_LONG_LONG => 8,
         _ => 0, // variable/tagged
     }
@@ -92,22 +93,17 @@ impl<'a> EseDb<'a> {
 
         // Page size: offset 0xEC in the header (u32)
         let page_size = u32_le(data, 0xEC) as usize;
-        if page_size == 0 || !page_size.is_power_of_two() || !(4096..=32768).contains(&page_size)
-        {
+        if page_size == 0 || !page_size.is_power_of_two() || !(4096..=32768).contains(&page_size) {
             // Fallback: try common page sizes
             let ps = if data.len() >= 2 * 8192 { 8192 } else { 4096 };
-            log::info!(
-                "ESE: page_size field = {}, using fallback {}",
-                page_size,
-                ps
-            );
-            return Self::init(data, ps);
+            log::info!("ESE: page_size field = {page_size}, using fallback {ps}");
+            return Ok(Self::init(data, ps));
         }
 
-        Self::init(data, page_size)
+        Ok(Self::init(data, page_size))
     }
 
-    fn init(data: &'a [u8], page_size: usize) -> Result<EseDb<'a>> {
+    fn init(data: &'a [u8], page_size: usize) -> Self {
         log::info!(
             "ESE: {} bytes, page_size={}, {} pages",
             data.len(),
@@ -122,9 +118,9 @@ impl<'a> EseDb<'a> {
         };
 
         // Parse catalog at page 4 (MSysObjects)
-        db.parse_catalog()?;
+        db.parse_catalog();
 
-        Ok(db)
+        db
     }
 
     /// Get page data by logical page number.
@@ -149,7 +145,7 @@ impl<'a> EseDb<'a> {
     ///   +0x10: pgnoPrev(4) +0x14: pgnoNext(4) +0x18: objidFDP(4)
     ///   +0x1C: cbFree(2)   +0x1E: cbUncommittedFree(2)
     ///   +0x20: ibMicFree(2) +0x22: itagMicFree(2) +0x24: fPageFlags(4)
-    fn page_header(&self, page: &[u8]) -> (u32, u32) {
+    fn page_header(page: &[u8]) -> (u32, u32) {
         let flags = u32_le(page, 0x24);
         let next = u32_le(page, 0x14);
         (flags, next)
@@ -179,8 +175,12 @@ impl<'a> EseDb<'a> {
     ///
     /// Returns (offset_in_data_area, size, flags).
     fn read_tag(&self, page: &[u8], tag_idx: usize, page_flags: u32) -> (usize, usize, u8) {
-        let Some(tag_bytes) = (tag_idx + 1).checked_mul(4) else { return (0, 0, 0) };
-        if tag_bytes > self.page_size { return (0, 0, 0); }
+        let Some(tag_bytes) = (tag_idx + 1).checked_mul(4) else {
+            return (0, 0, 0);
+        };
+        if tag_bytes > self.page_size {
+            return (0, 0, 0);
+        }
         let tag_pos = self.page_size - tag_bytes;
         if tag_pos + 4 > page.len() {
             return (0, 0, 0);
@@ -249,7 +249,7 @@ impl<'a> EseDb<'a> {
     /// Leaf tag format:
     ///   If TAG_FLAG.Compressed (0x04): prefix_size(u16 & 0x1FFF) + suffix_size(u16) + suffix + data
     ///   Otherwise: suffix_size(u16 & 0x1FFF) + suffix + data
-    fn strip_leaf_key<'b>(&self, tag_data: &'b [u8], tag_flags: u8) -> &'b [u8] {
+    fn strip_leaf_key(tag_data: &[u8], tag_flags: u8) -> &[u8] {
         let mut off = 0;
         let compressed = tag_flags & 0x04 != 0;
 
@@ -277,11 +277,7 @@ impl<'a> EseDb<'a> {
     /// Extract the key bytes from a leaf tag entry.
     ///
     /// Returns (prefix_size, key_suffix_bytes).
-    fn extract_leaf_key<'b>(
-        &self,
-        tag_data: &'b [u8],
-        tag_flags: u8,
-    ) -> (usize, &'b [u8]) {
+    fn extract_leaf_key(tag_data: &[u8], tag_flags: u8) -> (usize, &[u8]) {
         let mut off = 0;
         let compressed = tag_flags & 0x04 != 0;
 
@@ -305,7 +301,7 @@ impl<'a> EseDb<'a> {
 
     /// Traverse a B+ tree starting at the given root page, collecting all leaf records.
     /// Calls `callback` for each leaf record data (with key bytes stripped).
-    fn traverse_btree<F>(&self, root_pgno: u32, mut callback: F) -> Result<()>
+    fn traverse_btree<F>(&self, root_pgno: u32, mut callback: F)
     where
         F: FnMut(&'a [u8]),
     {
@@ -317,12 +313,11 @@ impl<'a> EseDb<'a> {
                 continue;
             }
 
-            let page = match self.page_data(pgno) {
-                Some(p) => p,
-                None => continue,
+            let Some(page) = self.page_data(pgno) else {
+                continue;
             };
 
-            let (flags, _next_page) = self.page_header(page);
+            let (flags, _next_page) = Self::page_header(page);
             let (_hdr_size, num_tags) = self.page_tags(page);
 
             // Skip empty or space tree pages
@@ -330,18 +325,13 @@ impl<'a> EseDb<'a> {
                 continue;
             }
 
-            log::debug!(
-                "ESE traverse: page {} flags=0x{:x} tags={}",
-                pgno, flags, num_tags
-            );
+            log::debug!("ESE traverse: page {pgno} flags=0x{flags:x} tags={num_tags}");
 
             if flags & PAGE_FLAG_LEAF != 0 {
                 // Leaf page: tag 0 is page key prefix (skip), tags 1+ are records
                 for i in 1..num_tags {
-                    if let Some((tag_data, tag_flags)) =
-                        self.tag_data_with_flags(page, i, flags)
-                    {
-                        let record = self.strip_leaf_key(tag_data, tag_flags);
+                    if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
+                        let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if !record.is_empty() {
                             callback(record);
                         }
@@ -352,10 +342,8 @@ impl<'a> EseDb<'a> {
                 // Tag 0 is page key prefix or root header (skip).
                 // Tags 1+ contain key + child_page_pointer.
                 for i in 1..num_tags {
-                    if let Some((tag_data, tag_flags)) =
-                        self.tag_data_with_flags(page, i, flags)
-                    {
-                        let record = self.strip_leaf_key(tag_data, tag_flags);
+                    if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
+                        let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
                             let child = u32_le(record, 0);
                             stack.push(child);
@@ -364,13 +352,11 @@ impl<'a> EseDb<'a> {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Traverse a B+ tree, calling `callback` with (key, record_data) for each leaf record.
     /// Used for long value resolution where the key is needed.
-    fn traverse_btree_kv<F>(&self, root_pgno: u32, mut callback: F) -> Result<()>
+    fn traverse_btree_kv<F>(&self, root_pgno: u32, mut callback: F)
     where
         F: FnMut(Vec<u8>, &'a [u8]),
     {
@@ -382,12 +368,11 @@ impl<'a> EseDb<'a> {
                 continue;
             }
 
-            let page = match self.page_data(pgno) {
-                Some(p) => p,
-                None => continue,
+            let Some(page) = self.page_data(pgno) else {
+                continue;
             };
 
-            let (flags, _) = self.page_header(page);
+            let (flags, _) = Self::page_header(page);
             let (_, num_tags) = self.page_tags(page);
 
             if flags & PAGE_FLAG_SPACE_TREE != 0 || flags & PAGE_FLAG_INDEX != 0 {
@@ -405,16 +390,12 @@ impl<'a> EseDb<'a> {
                 };
 
                 for i in 1..num_tags {
-                    if let Some((tag_data, tag_flags)) =
-                        self.tag_data_with_flags(page, i, flags)
-                    {
-                        let (prefix_size, key_suffix) =
-                            self.extract_leaf_key(tag_data, tag_flags);
-                        let record = self.strip_leaf_key(tag_data, tag_flags);
+                    if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
+                        let (prefix_size, key_suffix) = Self::extract_leaf_key(tag_data, tag_flags);
+                        let record = Self::strip_leaf_key(tag_data, tag_flags);
 
                         // Reconstruct full key
-                        let mut key =
-                            Vec::with_capacity(prefix_size + key_suffix.len());
+                        let mut key = Vec::with_capacity(prefix_size + key_suffix.len());
                         let prefix_end = prefix_size.min(page_key_prefix.len());
                         key.extend_from_slice(&page_key_prefix[..prefix_end]);
                         if prefix_end < prefix_size {
@@ -430,10 +411,8 @@ impl<'a> EseDb<'a> {
             } else {
                 // Branch/FDP: follow child pointers (skip tag 0)
                 for i in 1..num_tags {
-                    if let Some((tag_data, tag_flags)) =
-                        self.tag_data_with_flags(page, i, flags)
-                    {
-                        let record = self.strip_leaf_key(tag_data, tag_flags);
+                    if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
+                        let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
                             let child = u32_le(record, 0);
                             stack.push(child);
@@ -442,18 +421,16 @@ impl<'a> EseDb<'a> {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Parse the catalog (MSysObjects, page 4) to discover tables and columns.
-    fn parse_catalog(&mut self) -> Result<()> {
+    fn parse_catalog(&mut self) {
         // The catalog is a B+ tree rooted at page 4
         let mut records: Vec<Vec<u8>> = Vec::new();
 
         self.traverse_btree(4, |data| {
             records.push(data.to_vec());
-        })?;
+        });
 
         log::info!("ESE catalog: {} raw records", records.len());
 
@@ -487,17 +464,18 @@ impl<'a> EseDb<'a> {
             }
 
             // Preamble
-            let last_fixed_id = rec[0] as u16;
-            let last_var_id = rec[1] as u16;
+            let last_fixed_id = u16::from(rec[0]);
+            let last_var_id = u16::from(rec[1]);
             let var_data_off = u16_le(rec, 2) as usize;
 
             log::debug!(
-                "ESE catalog rec[{}]: last_fixed_id={} last_var_id={} var_data_off={}",
-                rec_idx, last_fixed_id, last_var_id, var_data_off
+                "ESE catalog rec[{rec_idx}]: last_fixed_id={last_fixed_id} last_var_id={last_var_id} var_data_off={var_data_off}"
             );
 
             if last_fixed_id < 7 || var_data_off < 4 {
-                log::debug!("ESE catalog rec[{}]: skipped (last_fixed_id < 7 or var_data_off < 4)", rec_idx);
+                log::debug!(
+                    "ESE catalog rec[{rec_idx}]: skipped (last_fixed_id < 7 or var_data_off < 4)"
+                );
                 continue;
             }
 
@@ -510,17 +488,14 @@ impl<'a> EseDb<'a> {
             let _pages_or_locale = u32_le(rec, 26);
 
             // Extract name from variable column 128 (first variable column)
-            let name = self.extract_catalog_name(rec, var_data_off, last_var_id);
+            let name = Self::extract_catalog_name(rec, var_data_off, last_var_id);
 
             match rec_type {
                 1 => {
                     // Table
                     table_map.insert(obj_id_table, (name.clone(), coltyp_or_pgno));
                     log::debug!(
-                        "ESE catalog: table '{}' obj_id={} pgno={}",
-                        name,
-                        obj_id_table,
-                        coltyp_or_pgno
+                        "ESE catalog: table '{name}' obj_id={obj_id_table} pgno={coltyp_or_pgno}"
                     );
                 }
                 2 => {
@@ -550,11 +525,7 @@ impl<'a> EseDb<'a> {
                 4 => {
                     // Long Value tree
                     lv_map.insert(obj_id_table, coltyp_or_pgno);
-                    log::debug!(
-                        "ESE catalog: LV for obj_id={} pgno={}",
-                        obj_id_table,
-                        coltyp_or_pgno
-                    );
+                    log::debug!("ESE catalog: LV for obj_id={obj_id_table} pgno={coltyp_or_pgno}");
                 }
                 _ => {} // Index (3) and others - skip
             }
@@ -586,11 +557,10 @@ impl<'a> EseDb<'a> {
         }
 
         log::info!("ESE: {} tables parsed", self.tables.len());
-        Ok(())
     }
 
     /// Extract name string from catalog record's variable columns.
-    fn extract_catalog_name(&self, rec: &[u8], var_data_off: usize, last_var_id: u16) -> String {
+    fn extract_catalog_name(rec: &[u8], var_data_off: usize, last_var_id: u16) -> String {
         // Variable columns start after fixed data at var_data_off
         // First: offset array (2 bytes per variable column present)
         // Variable column IDs start at 128
@@ -622,7 +592,7 @@ impl<'a> EseDb<'a> {
         // Column 129 data: [offset[0] .. offset[1]]
         // etc.
 
-        let end_off = (first_off & 0x7FFF) as usize;  // Bit 15 is "null" flag
+        let end_off = (first_off & 0x7FFF) as usize; // Bit 15 is "null" flag
         if first_off & 0x8000 != 0 {
             return String::new(); // Column is null
         }
@@ -643,7 +613,10 @@ impl<'a> EseDb<'a> {
 
     /// List available table names.
     pub fn table_names(&self) -> Vec<&str> {
-        self.tables.keys().map(|s| s.as_str()).collect()
+        self.tables
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Get columns for a table.
@@ -660,7 +633,7 @@ impl<'a> EseDb<'a> {
         let tbl = self
             .tables
             .get(table)
-            .ok_or_else(|| ese_err(&format!("Table '{}' not found", table)))?;
+            .ok_or_else(|| ese_err(&format!("Table '{table}' not found")))?;
 
         let columns = &tbl.columns;
         let lv_pgno = tbl.lv_pgno;
@@ -669,7 +642,7 @@ impl<'a> EseDb<'a> {
         let mut records: Vec<&'a [u8]> = Vec::new();
         self.traverse_btree(tbl.data_pgno, |data| {
             records.push(data);
-        })?;
+        });
 
         log::info!(
             "ESE table '{}': {} leaf records, {} columns",
@@ -710,14 +683,14 @@ impl<'a> EseDb<'a> {
             return None;
         }
 
-        let last_fixed_id = rec[0] as u32;
-        let last_var_id = rec[1] as u32;
+        let last_fixed_id = u32::from(rec[0]);
+        let last_var_id = u32::from(rec[1]);
         let var_data_off = u16_le(rec, 2) as usize;
 
         if col.is_fixed {
-            self.read_fixed_column(rec, col, last_fixed_id, var_data_off)
+            Self::read_fixed_column(rec, col, last_fixed_id, var_data_off)
         } else if col.is_variable {
-            self.read_variable_column(rec, col, last_var_id, var_data_off, lv_pgno)
+            Self::read_variable_column(rec, col, last_var_id, var_data_off, lv_pgno)
         } else if col.is_tagged {
             self.read_tagged_column(rec, col, var_data_off, last_var_id, lv_pgno)
         } else {
@@ -727,7 +700,6 @@ impl<'a> EseDb<'a> {
 
     /// Read a fixed column value.
     fn read_fixed_column(
-        &self,
         rec: &[u8],
         col: &EseColumn,
         last_fixed_id: u32,
@@ -756,7 +728,6 @@ impl<'a> EseDb<'a> {
 
     /// Read a variable column value.
     fn read_variable_column(
-        &self,
         rec: &[u8],
         col: &EseColumn,
         last_var_id: u32,
@@ -802,7 +773,7 @@ impl<'a> EseDb<'a> {
         }
 
         let data = &rec[abs_start..abs_end];
-        self.maybe_resolve_lv(data, lv_pgno)
+        Some(Self::maybe_resolve_lv(data, lv_pgno))
     }
 
     /// Read a tagged column value.
@@ -953,12 +924,12 @@ impl<'a> EseDb<'a> {
     }
 
     /// Check if data is a long value reference and resolve it.
-    fn maybe_resolve_lv(&self, data: &[u8], _lv_pgno: u32) -> Option<Vec<u8>> {
+    fn maybe_resolve_lv(data: &[u8], _lv_pgno: u32) -> Vec<u8> {
         // Long values in variable columns are indicated by the column type being
         // JET_coltypLongBinary or JET_coltypLongText, and the data being a key.
         // However, we can't easily tell from just the data - return as-is for now.
         // The tagged column handler does explicit LV resolution.
-        Some(data.to_vec())
+        data.to_vec()
     }
 
     /// Resolve a long value from the LV tree.
@@ -983,13 +954,11 @@ impl<'a> EseDb<'a> {
                     let seg_offset = key
                         .get(4..8)
                         .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                        .map(u32::from_be_bytes)
-                        .unwrap_or(0);
+                        .map_or(0, u32::from_be_bytes);
                     chunks.push((seg_offset, data.to_vec()));
                 }
             }
-        })
-        .ok()?;
+        });
 
         if chunks.is_empty() {
             return None;
@@ -1006,19 +975,17 @@ impl<'a> EseDb<'a> {
 }
 
 fn ese_err(msg: &str) -> VmkatzError {
-    VmkatzError::DecryptionError(format!("ESE: {}", msg))
+    VmkatzError::DecryptionError(format!("ESE: {msg}"))
 }
 
 fn u16_le(data: &[u8], off: usize) -> u16 {
     data.get(off..off + 2)
         .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map(u16::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u16::from_le_bytes)
 }
 
 fn u32_le(data: &[u8], off: usize) -> u32 {
     data.get(off..off + 4)
         .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u32::from_le_bytes)
 }

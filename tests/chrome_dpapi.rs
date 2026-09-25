@@ -6,9 +6,9 @@ use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
-use sha2::Sha512;
 use sha1::Digest as Sha1Digest;
 use sha1::Sha1;
+use sha2::Sha512;
 use vmkatz::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
@@ -22,7 +22,11 @@ fn build_blob(plaintext: &[u8], masterkey: &[u8], salt: &[u8]) -> Vec<u8> {
     let session = h.finalize().into_bytes();
     let key = &session[..32];
     let iv = [0u8; 16];
-    assert_eq!(plaintext.len() % 16, 0, "test plaintext must be block-aligned");
+    assert_eq!(
+        plaintext.len() % 16,
+        0,
+        "test plaintext must be block-aligned"
+    );
     let mut buf = vec![0u8; plaintext.len()];
     buf[..plaintext.len()].copy_from_slice(plaintext);
     let cipher = Aes256CbcEnc::new(key.into(), (&iv).into());

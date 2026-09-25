@@ -132,7 +132,12 @@ impl MappedFile {
                 if end > m.len() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        format!("mmap read_at: offset=0x{:x} len={} exceeds file size {}", offset, buf.len(), m.len()),
+                        format!(
+                            "mmap read_at: offset=0x{:x} len={} exceeds file size {}",
+                            offset,
+                            buf.len(),
+                            m.len()
+                        ),
                     ));
                 }
                 buf.copy_from_slice(&m[offset..end]);
@@ -143,7 +148,12 @@ impl MappedFile {
                 if end > *size {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        format!("pread read_at: offset=0x{:x} len={} exceeds file size {}", offset, buf.len(), size),
+                        format!(
+                            "pread read_at: offset=0x{:x} len={} exceeds file size {}",
+                            offset,
+                            buf.len(),
+                            size
+                        ),
                     ));
                 }
                 #[cfg(unix)]
@@ -169,7 +179,9 @@ impl MappedFile {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             MappedFile::Mmap(m) => m,
-            MappedFile::Pread { .. } => panic!("as_bytes() not supported on pread fallback — use read_at()"),
+            MappedFile::Pread { .. } => {
+                panic!("as_bytes() not supported on pread fallback — use read_at()")
+            }
         }
     }
 
@@ -217,11 +229,7 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
     }
 
     // Try mmap first
-    let mmap_result = unsafe {
-        memmap2::MmapOptions::new()
-            .len(size as usize)
-            .map(file)
-    };
+    let mmap_result = unsafe { memmap2::MmapOptions::new().len(size as usize).map(file) };
 
     match mmap_result {
         Ok(m) => Ok(MappedFile::Mmap(m)),
@@ -251,4 +259,21 @@ pub fn utf16le_decode(data: &[u8]) -> String {
     )
     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
     .collect()
+}
+
+/// Format a 16-byte little-endian GUID as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+///
+/// Mixed-endian per the GUID layout: Data1(4)/Data2(2)/Data3(2) little-endian,
+/// Data4(8) big-endian. Falls back to plain hex for inputs shorter than 16 bytes.
+pub fn format_guid(bytes: &[u8]) -> String {
+    if bytes.len() < 16 {
+        return hex::encode(bytes);
+    }
+    let d1 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let d2 = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let d3 = u16::from_le_bytes([bytes[6], bytes[7]]);
+    format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
 }

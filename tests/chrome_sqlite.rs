@@ -33,8 +33,8 @@ fn list_tables_finds_logins_and_cookies() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert!(tables.contains(&"logins".to_string()), "got {:?}", tables);
-    assert!(tables.contains(&"cookies".to_string()), "got {:?}", tables);
+    assert!(tables.contains(&"logins".to_string()), "got {tables:?}");
+    assert!(tables.contains(&"cookies".to_string()), "got {tables:?}");
 }
 
 #[test]
@@ -51,8 +51,8 @@ fn walk_logins_table_finds_alice_and_bob() {
         Ok(())
     })
     .unwrap();
-    assert!(users.contains(&"alice".to_string()), "got {:?}", users);
-    assert!(users.contains(&"bob".to_string()), "got {:?}", users);
+    assert!(users.contains(&"alice".to_string()), "got {users:?}");
+    assert!(users.contains(&"bob".to_string()), "got {users:?}");
 }
 
 #[test]
@@ -64,16 +64,15 @@ fn wal_replay_surfaces_uncheckpointed_rows() {
     let root = pager.root_of("logins").unwrap().unwrap();
     let mut urls = Vec::new();
     walk_table(&pager, root, |_, cols| {
-        if let Some(u) = cols.get(0).and_then(|c| c.as_text()) {
+        if let Some(u) = cols.first().and_then(|c| c.as_text()) {
             urls.push(u.to_string());
         }
         Ok(())
     })
     .unwrap();
-    assert!(urls.iter().any(|u| u.contains("baseline")), "got {:?}", urls);
+    assert!(urls.iter().any(|u| u.contains("baseline")), "got {urls:?}");
     assert!(
         urls.iter().any(|u| u.contains("wal_only")),
-        "WAL replay failed; got {:?}",
-        urls
+        "WAL replay failed; got {urls:?}"
     );
 }

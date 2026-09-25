@@ -119,7 +119,7 @@ pub trait VirtualMemory {
             return Ok(String::new());
         }
         // 32-bit UNICODE_STRING: Buffer pointer is at offset 4 (u32), not offset 8 (u64)
-        let buffer_ptr = self.read_virt_u32(addr + 4)? as u64;
+        let buffer_ptr = u64::from(self.read_virt_u32(addr + 4)?);
         if buffer_ptr == 0 || buffer_ptr < 0x10000 {
             return Ok(String::new());
         }
@@ -137,13 +137,7 @@ pub trait VirtualMemory {
     }
 }
 
-/// Decode UTF-16LE bytes to String without intermediate Vec<u16> allocation.
+/// Decode UTF-16LE bytes to String (shared impl in `crate::utils`).
 fn utf16le_to_string(data: &[u8]) -> String {
-    char::decode_utf16(
-        data.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&c| c != 0),
-    )
-    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-    .collect()
+    crate::utils::utf16le_decode(data)
 }

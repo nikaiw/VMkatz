@@ -3,26 +3,26 @@
 //! Parses regf hive files to navigate keys, read values, and extract
 //! class names needed for bootkey/SAM hash extraction.
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 const HBIN_BASE: usize = 0x1000;
 
 // NK cell field offsets (relative to cell data start, after "nk" signature).
 // See https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md
-const NK_OFF_SUBKEY_COUNT: usize = 0x14;   // Number of stable subkeys (u32)
-const NK_OFF_SUBKEYS_LIST: usize = 0x1C;   // Offset to stable subkeys list (u32)
-const NK_OFF_VALUE_COUNT: usize = 0x24;    // Number of values (u32)
-const NK_OFF_VALUES_LIST: usize = 0x28;    // Offset to values list (u32)
-const NK_OFF_CLASS_OFFSET: usize = 0x30;   // Offset to class name (u32)
-const NK_OFF_NAME_LEN: usize = 0x48;       // Name length (u16)
-const NK_OFF_CLASS_LEN: usize = 0x4A;      // Class name length (u16)
-const NK_OFF_NAME: usize = 0x4C;           // Name string (variable length)
+const NK_OFF_SUBKEY_COUNT: usize = 0x14; // Number of stable subkeys (u32)
+const NK_OFF_SUBKEYS_LIST: usize = 0x1C; // Offset to stable subkeys list (u32)
+const NK_OFF_VALUE_COUNT: usize = 0x24; // Number of values (u32)
+const NK_OFF_VALUES_LIST: usize = 0x28; // Offset to values list (u32)
+const NK_OFF_CLASS_OFFSET: usize = 0x30; // Offset to class name (u32)
+const NK_OFF_NAME_LEN: usize = 0x48; // Name length (u16)
+const NK_OFF_CLASS_LEN: usize = 0x4A; // Class name length (u16)
+const NK_OFF_NAME: usize = 0x4C; // Name string (variable length)
 
 // VK cell field offsets (relative to cell data start, after "vk" signature).
-const VK_OFF_NAME_LEN: usize = 0x02;      // Name length (u16)
-const VK_OFF_DATA_SIZE: usize = 0x04;     // Data size (u32, high bit = inline flag)
-const VK_OFF_DATA_OFFSET: usize = 0x08;   // Data offset or inline data (u32)
-const VK_OFF_NAME: usize = 0x14;          // Name string (variable length)
+const VK_OFF_NAME_LEN: usize = 0x02; // Name length (u16)
+const VK_OFF_DATA_SIZE: usize = 0x04; // Data size (u32, high bit = inline flag)
+const VK_OFF_DATA_OFFSET: usize = 0x08; // Data offset or inline data (u32)
+const VK_OFF_NAME: usize = 0x14; // Name string (variable length)
 
 /// A parsed registry hive backed by a byte slice.
 pub struct Hive<'a> {
@@ -70,8 +70,7 @@ impl<'a> Hive<'a> {
         if sig != 0x6B6E {
             // "nk" as u16 LE
             return Err(hive_err(&format!(
-                "Expected NK signature at 0x{:x}, got 0x{:04x}",
-                file_off, sig
+                "Expected NK signature at 0x{file_off:x}, got 0x{sig:04x}"
             )));
         }
         Ok(Key {
@@ -98,27 +97,23 @@ impl<'a> Hive<'a> {
 
 impl<'a> Key<'a> {
     /// Navigate to a subkey by name (case-insensitive ASCII).
-    pub fn subkey(&self, hive: &Hive<'a>, name: &str) -> Result<Key<'a>> {
+    pub fn subkey(&self, hive: &Hive<'a>, name: &str) -> Result<Self> {
         let subkey_count = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEY_COUNT);
         if subkey_count == 0 {
             return Err(hive_err(&format!(
-                "Key has no subkeys, looking for '{}'",
-                name
+                "Key has no subkeys, looking for '{name}'"
             )));
         }
         let subkeys_list_offset = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEYS_LIST);
         if subkeys_list_offset == 0xFFFF_FFFF {
-            return Err(hive_err(&format!(
-                "No subkeys list, looking for '{}'",
-                name
-            )));
+            return Err(hive_err(&format!("No subkeys list, looking for '{name}'")));
         }
 
-        self.find_in_subkey_list(hive, subkeys_list_offset, name)
+        Self::find_in_subkey_list(hive, subkeys_list_offset, name)
     }
 
     /// Enumerate all subkeys.
-    pub fn subkeys(&self, hive: &Hive<'a>) -> Result<Vec<Key<'a>>> {
+    pub fn subkeys(&self, hive: &Hive<'a>) -> Result<Vec<Self>> {
         let subkey_count = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEY_COUNT) as usize;
         if subkey_count == 0 {
             return Ok(Vec::new());
@@ -128,7 +123,7 @@ impl<'a> Key<'a> {
             return Ok(Vec::new());
         }
 
-        self.collect_subkeys(hive, subkeys_list_offset)
+        Self::collect_subkeys(hive, subkeys_list_offset)
     }
 
     /// Read a binary value by name.
@@ -136,7 +131,7 @@ impl<'a> Key<'a> {
         let value_count = u32_at(self.data, self.cell_offset + NK_OFF_VALUE_COUNT);
         let values_list_offset = u32_at(self.data, self.cell_offset + NK_OFF_VALUES_LIST);
         if value_count == 0 || values_list_offset == 0xFFFF_FFFF {
-            return Err(hive_err(&format!("No values, looking for '{}'", name)));
+            return Err(hive_err(&format!("No values, looking for '{name}'")));
         }
 
         let list_data = hive.cell_data(values_list_offset)?;
@@ -155,9 +150,12 @@ impl<'a> Key<'a> {
                 continue;
             }
             let name_len = u16_at(self.data, vk_file_off + VK_OFF_NAME_LEN) as usize;
-            let vk_name = if name_len > 0 && vk_file_off + VK_OFF_NAME + name_len <= self.data.len() {
-                std::str::from_utf8(&self.data[vk_file_off + VK_OFF_NAME..vk_file_off + VK_OFF_NAME + name_len])
-                    .unwrap_or("")
+            let vk_name = if name_len > 0 && vk_file_off + VK_OFF_NAME + name_len <= self.data.len()
+            {
+                std::str::from_utf8(
+                    &self.data[vk_file_off + VK_OFF_NAME..vk_file_off + VK_OFF_NAME + name_len],
+                )
+                .unwrap_or("")
             } else {
                 ""
             };
@@ -185,7 +183,7 @@ impl<'a> Key<'a> {
             return Ok(cell[..data_size].to_vec());
         }
 
-        Err(hive_err(&format!("Value '{}' not found", name)))
+        Err(hive_err(&format!("Value '{name}' not found")))
     }
 
     /// Read a DWORD value by name.
@@ -229,18 +227,15 @@ impl<'a> Key<'a> {
         if name_len == 0 || self.cell_offset + NK_OFF_NAME + name_len > self.data.len() {
             return "";
         }
-        std::str::from_utf8(&self.data[self.cell_offset + NK_OFF_NAME..self.cell_offset + NK_OFF_NAME + name_len])
-            .unwrap_or("")
+        std::str::from_utf8(
+            &self.data[self.cell_offset + NK_OFF_NAME..self.cell_offset + NK_OFF_NAME + name_len],
+        )
+        .unwrap_or("")
     }
 
     // --- Internal helpers ---
 
-    fn find_in_subkey_list(
-        &self,
-        hive: &Hive<'a>,
-        list_offset: u32,
-        name: &str,
-    ) -> Result<Key<'a>> {
+    fn find_in_subkey_list(hive: &Hive<'a>, list_offset: u32, name: &str) -> Result<Self> {
         let cell = hive.cell_data(list_offset)?;
         if cell.len() < 4 {
             return Err(hive_err("Subkey list cell too small"));
@@ -285,23 +280,22 @@ impl<'a> Key<'a> {
                         break;
                     }
                     let sub_offset = u32_at(cell, entry_off);
-                    if let Ok(key) = self.find_in_subkey_list(hive, sub_offset, name) {
+                    if let Ok(key) = Self::find_in_subkey_list(hive, sub_offset, name) {
                         return Ok(key);
                     }
                 }
             }
             _ => {
                 return Err(hive_err(&format!(
-                    "Unknown subkey list signature: 0x{:04x}",
-                    sig
+                    "Unknown subkey list signature: 0x{sig:04x}"
                 )));
             }
         }
 
-        Err(hive_err(&format!("Subkey '{}' not found", name)))
+        Err(hive_err(&format!("Subkey '{name}' not found")))
     }
 
-    fn collect_subkeys(&self, hive: &Hive<'a>, list_offset: u32) -> Result<Vec<Key<'a>>> {
+    fn collect_subkeys(hive: &Hive<'a>, list_offset: u32) -> Result<Vec<Self>> {
         let cell = hive.cell_data(list_offset)?;
         if cell.len() < 4 {
             return Err(hive_err("Subkey list cell too small"));
@@ -342,7 +336,7 @@ impl<'a> Key<'a> {
                         break;
                     }
                     let sub_offset = u32_at(cell, entry_off);
-                    if let Ok(mut sub_keys) = self.collect_subkeys(hive, sub_offset) {
+                    if let Ok(mut sub_keys) = Self::collect_subkeys(hive, sub_offset) {
                         keys.append(&mut sub_keys);
                     }
                 }
@@ -355,7 +349,7 @@ impl<'a> Key<'a> {
 }
 
 fn hive_err(msg: &str) -> VmkatzError {
-    VmkatzError::DecryptionError(format!("Hive: {}", msg))
+    VmkatzError::DecryptionError(format!("Hive: {msg}"))
 }
 
 fn u16_at(data: &[u8], off: usize) -> u16 {

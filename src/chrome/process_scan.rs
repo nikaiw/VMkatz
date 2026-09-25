@@ -45,16 +45,14 @@
 //! disk path produces.
 
 use crate::chrome::cookie_monster::{
-    patch_module_high_half, read_cookie, scan_for_cookie_monster, walk_cookie_tree,
-    CookieVariant, COOKIE_MAP_OFFSET, COOKIE_MONSTER_SIG,
+    COOKIE_MAP_OFFSET, COOKIE_MONSTER_SIG, CookieVariant, patch_module_high_half, read_cookie,
+    scan_for_cookie_monster, walk_cookie_tree,
 };
 use crate::chrome::memory::is_chromium_image;
-use crate::chrome::types::{
-    Browser, BrowserProfile, ChromeFindings, ChromeSource, Cookie,
-};
+use crate::chrome::types::{Browser, BrowserProfile, ChromeFindings, ChromeSource, Cookie};
 use crate::error::Result;
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::regions::{enumerate_user_regions_filtered, RegionFilter};
+use crate::paging::regions::{RegionFilter, enumerate_user_regions_filtered};
 use crate::paging::translate::ProcessMemory;
 use crate::windows::process::Process;
 
@@ -109,26 +107,34 @@ pub fn scan_chromium_processes<P: PhysicalMemory>(
                 if instances > 0 {
                     log::info!(
                         "[chrome-mem] PID {} {} — {} CookieMonster instance(s), {} cookies harvested so far",
-                        proc.pid, proc.name, instances, findings.cookies.len()
+                        proc.pid,
+                        proc.name,
+                        instances,
+                        findings.cookies.len()
                     );
                 } else {
                     log::info!(
                         "[chrome-mem] PID {} {} — no CookieMonster instances found",
-                        proc.pid, proc.name
+                        proc.pid,
+                        proc.name
                     );
                 }
                 total_instances += instances;
             }
             Err(e) => log::info!(
                 "[chrome-mem] PID {} {} harvest failed: {}",
-                proc.pid, proc.name, e
+                proc.pid,
+                proc.name,
+                e
             ),
         }
         total_processes += 1;
     }
     log::info!(
         "[chrome-mem] scanned {} chromium process(es), located {} CookieMonster instance(s), {} cookies total",
-        total_processes, total_instances, findings.cookies.len()
+        total_processes,
+        total_instances,
+        findings.cookies.len()
     );
     Ok(findings)
 }
@@ -160,9 +166,8 @@ fn harvest_process<P: PhysicalMemory>(
         if take < COOKIE_MONSTER_SIG.len() {
             continue;
         }
-        let buf = match vmem.read_virt_bytes(region.start, take) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Ok(buf) = vmem.read_virt_bytes(region.start, take) else {
+            continue;
         };
         total_read += buf.len();
 
@@ -199,32 +204,41 @@ fn harvest_process<P: PhysicalMemory>(
         let map_size = vmem.read_virt_u64(map_root + 16).unwrap_or(0);
         log::debug!(
             "[chrome-mem] PID {} instance=0x{:x} map_root=0x{:x} begin_node=0x{:x} size={}",
-            proc.pid, instance_addr, map_root, begin_node, map_size
+            proc.pid,
+            instance_addr,
+            map_root,
+            begin_node,
+            map_size
         );
         let v = match variant {
             Some(v) => v,
-            None => match detect_variant(&vmem, map_root) {
-                Some(v) => {
+            None => {
+                if let Some(v) = detect_variant(&vmem, map_root) {
                     log::info!(
                         "[chrome-mem] PID {} {} — using variant {:?}",
-                        proc.pid, proc.name, v
+                        proc.pid,
+                        proc.name,
+                        v
                     );
                     variant = Some(v);
                     v
-                }
-                None => {
+                } else {
                     log::debug!(
                         "[chrome-mem] PID {} instance=0x{:x} — no variant matched, skipping",
-                        proc.pid, instance_addr
+                        proc.pid,
+                        instance_addr
                     );
                     continue;
                 }
-            },
+            }
         };
         if let Err(e) = harvest_tree(&vmem, map_root, v, proc, out) {
             log::debug!(
                 "[chrome-mem] PID {} {} — instance 0x{:x} tree walk error: {}",
-                proc.pid, proc.name, instance_addr, e
+                proc.pid,
+                proc.name,
+                instance_addr,
+                e
             );
         }
     }
@@ -347,6 +361,6 @@ fn memory_profile(pid: u32, image: &str) -> BrowserProfile {
         browser: browser_from_image(image),
         user: String::new(),
         profile_name: String::new(),
-        path: format!("memory:pid={}", pid),
+        path: format!("memory:pid={pid}"),
     }
 }

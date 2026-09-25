@@ -23,6 +23,7 @@ pub fn classify(blob: &[u8]) -> BlobScheme {
 }
 
 /// Decrypt v10/v11 blob with a 32-byte AES-GCM key.
+///
 /// `aad` is the optional Additional Authenticated Data; Chrome cookies may bind to
 /// the host string starting at some versions, while passwords use empty AAD.
 pub fn decrypt_v10(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {

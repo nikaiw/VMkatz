@@ -10,7 +10,7 @@
 //! Optimization: EptLayer precomputes the full L2→L1 mapping on construction,
 //! so subsequent reads use O(log n) binary search instead of 4-level walk.
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
 use crate::paging::entry::{LARGE_1GB_MASK, LARGE_2MB_MASK, PAGE_PHYS_MASK};
 
@@ -190,10 +190,7 @@ impl<'a, P: PhysicalMemory> EptLayer<'a, P> {
 
         if aborted {
             log::info!(
-                "EPT at 0x{:x}: aborted after {} pages (exceeds {} page cap — hypervisor-level EPT)",
-                ept_pml4,
-                mapped_pages,
-                max_pages,
+                "EPT at 0x{ept_pml4:x}: aborted after {mapped_pages} pages (exceeds {max_pages} page cap — hypervisor-level EPT)",
             );
             // Return empty layer — caller should skip this candidate
             return Self {
@@ -222,12 +219,12 @@ impl<'a, P: PhysicalMemory> EptLayer<'a, P> {
     }
 
     /// Returns true if the EPT was aborted during construction (too many pages).
-    pub fn is_aborted(&self) -> bool {
+    pub const fn is_aborted(&self) -> bool {
         self.mapped_count > 0 && self.mappings.is_empty()
     }
 
     /// Number of mapped 4KB-equivalent pages.
-    pub fn mapped_page_count(&self) -> usize {
+    pub const fn mapped_page_count(&self) -> usize {
         self.mapped_count
     }
 
@@ -295,7 +292,7 @@ impl Iterator for MappedPageIter<'_> {
     }
 }
 
-impl<'a, P: PhysicalMemory> PhysicalMemory for EptLayer<'a, P> {
+impl<P: PhysicalMemory> PhysicalMemory for EptLayer<'_, P> {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<()> {
         // Handle reads that might cross page boundaries
         let mut offset = 0;
@@ -327,6 +324,14 @@ const MAX_EPT_CANDIDATES: usize = 15;
 const SCAN_CHUNK_SIZE: usize = 256 * 4096;
 
 pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate>> {
+    // Scan budget: if no candidates found after scanning a portion of L1, give up.
+    // EPT PML4 tables are placed by the hypervisor in the lower portion of L1 memory.
+    // For genuine VBS VMs, candidates appear within the first few GB.
+    // Cap at 4GB — scanning more is wasteful since EPTs live in low memory.
+    const MAX_SCAN_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+    // Give up if we've scanned 256K pages (1GB) without finding a candidate.
+    const PAGES_WITHOUT_CANDIDATE_LIMIT: u64 = 256_000;
+
     let l1_size = l1.phys_size();
 
     log::info!(
@@ -337,19 +342,12 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
     let mut chunk_buf = vec![0u8; SCAN_CHUNK_SIZE];
     let mut candidates: Vec<EptCandidate> = Vec::new();
 
-    // Scan budget: if no candidates found after scanning a portion of L1, give up.
-    // EPT PML4 tables are placed by the hypervisor in the lower portion of L1 memory.
-    // For genuine VBS VMs, candidates appear within the first few GB.
-    // Cap at 4GB — scanning more is wasteful since EPTs live in low memory.
-    const MAX_SCAN_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
     let scan_budget = if l1_size < 2 * 1024 * 1024 * 1024 {
         l1_size / 4
     } else {
         (l1_size / 4).min(MAX_SCAN_BUDGET)
     };
     let mut pages_since_last_candidate: u64 = 0;
-    // Give up if we've scanned 256K pages (1GB) without finding a candidate.
-    const PAGES_WITHOUT_CANDIDATE_LIMIT: u64 = 256_000;
 
     let mut addr: u64 = 0;
     while addr < l1_size {
@@ -404,7 +402,7 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
 
                 // Stop scanning after collecting enough candidates
                 if candidates.len() >= MAX_EPT_CANDIDATES {
-                    log::info!("EPT scan: reached {} candidates, stopping scan", MAX_EPT_CANDIDATES);
+                    log::info!("EPT scan: reached {MAX_EPT_CANDIDATES} candidates, stopping scan");
                     break;
                 }
             } else {
@@ -426,8 +424,7 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
             // Also give up if too many pages since last candidate (gap too wide)
             if pages_since_last_candidate > PAGES_WITHOUT_CANDIDATE_LIMIT {
                 log::info!(
-                    "EPT scan: {} pages since last candidate, stopping scan",
-                    pages_since_last_candidate,
+                    "EPT scan: {pages_since_last_candidate} pages since last candidate, stopping scan",
                 );
                 addr = l1_size;
                 break;
@@ -449,8 +446,8 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
     // then non-zero count as tiebreaker.
     candidates.sort_by(|a, b| {
         // First: any non-zero data beats none
-        let a_has = if a.nonzero_pages > 0 { 1u32 } else { 0 };
-        let b_has = if b.nonzero_pages > 0 { 1u32 } else { 0 };
+        let a_has = u32::from(a.nonzero_pages > 0);
+        let b_has = u32::from(b.nonzero_pages > 0);
         b_has
             .cmp(&a_has)
             // Fewer PML4E = more likely Windows kernel EPT
@@ -514,7 +511,8 @@ fn score_ept_page(page: &[u8], l1_size: u64) -> (u32, u32, u32, u64) {
 
         if rwx != 0 && phys < l1_size && phys != 0
             && reserved_high == 0  // EPT reserved bits 63:52 must be 0
-            && !is_large           // PML4E cannot be a large page
+            && !is_large
+        // PML4E cannot be a large page
         {
             valid += 1;
             max_idx = i;

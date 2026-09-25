@@ -45,13 +45,13 @@ impl<'a> Pager<'a> {
         let ps = self.header.page_size as usize;
         let off = (page_no as usize - 1) * ps;
         if off + ps > self.bytes.len() {
-            return Err(Error::Parse(format!("page {} out of range", page_no)));
+            return Err(Error::Parse(format!("page {page_no} out of range")));
         }
         Ok(&self.bytes[off..off + ps])
     }
 
     /// Offset within page 1 where the B-tree header starts (after the 100-byte file header).
-    pub fn page1_btree_offset(&self) -> usize {
+    pub const fn page1_btree_offset(&self) -> usize {
         100
     }
 }

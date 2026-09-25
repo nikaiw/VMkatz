@@ -33,8 +33,7 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
     // usize on 32-bit targets. 65536 is SQLite's documented maximum.
     if page_size > 65_536 {
         return Err(Error::Parse(format!(
-            "implausible page_size {} for WAL parse",
-            page_size
+            "implausible page_size {page_size} for WAL parse"
         )));
     }
 
@@ -53,7 +52,10 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
     let mut pending: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut latest: HashMap<u32, Vec<u8>> = HashMap::new();
 
-    while cursor.checked_add(frame_size).map(|e| e <= bytes.len()).unwrap_or(false) {
+    while cursor
+        .checked_add(frame_size)
+        .is_some_and(|e| e <= bytes.len())
+    {
         let h = &bytes[cursor..cursor + 24];
         let page_no = u32::from_be_bytes(h[..4].try_into().unwrap());
         let db_size = u32::from_be_bytes(h[4..8].try_into().unwrap());
@@ -65,7 +67,7 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
         }
         if db_size != 0 {
             // Commit point: flush pending writes into the latest-overlay map.
-            for (p, d) in pending.drain(..) {
+            for (p, d) in std::mem::take(&mut pending) {
                 latest.insert(p, d);
             }
         }

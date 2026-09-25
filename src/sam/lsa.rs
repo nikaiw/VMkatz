@@ -5,14 +5,14 @@
 //! Supports both modern (AES-256-ECB, revision >= 0x00010006) and legacy
 //! (RC4, older revisions) encryption schemes.
 
-use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes256;
+use aes::cipher::{BlockDecrypt, KeyInit};
 use des::cipher::generic_array::GenericArray;
 use sha2::Digest;
 
 use super::hashes::{decode_utf16le, md5_hash, rc4};
 use super::hive::Hive;
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 
 /// A single LSA secret with its name, raw data, and parsed interpretation.
 #[derive(Debug)]
@@ -67,7 +67,7 @@ impl std::fmt::Display for LsaSecret {
                 )
             }
             LsaSecretType::DpapiBackupPreferred { guid } => {
-                write!(f, "  BCKUPKEY_P (Preferred Backup Key)\n    GUID: {}", guid)
+                write!(f, "  BCKUPKEY_P (Preferred Backup Key)\n    GUID: {guid}")
             }
             LsaSecretType::DpapiBackupKey {
                 guid,
@@ -79,20 +79,24 @@ impl std::fmt::Display for LsaSecret {
                 write!(
                     f,
                     "  BCKUPKEY (Domain DPAPI Backup Key)\n    GUID    : {}\n    Version : {}\n    Key     : {} bytes\n    Cert    : {} bytes\n    PVK     : {} bytes",
-                    guid, version, key_data.len(), cert_data.len(), pvk.len()
+                    guid,
+                    version,
+                    key_data.len(),
+                    cert_data.len(),
+                    pvk.len()
                 )
             }
             LsaSecretType::MachineAccount { password_hex } => {
-                write!(f, "  $MACHINE.ACC\n    password: {}", password_hex)
+                write!(f, "  $MACHINE.ACC\n    password: {password_hex}")
             }
             LsaSecretType::DefaultPassword { password } => {
-                write!(f, "  DefaultPassword\n    password: {}", password)
+                write!(f, "  DefaultPassword\n    password: {password}")
             }
             LsaSecretType::CachedDomainKey { key } => {
                 write!(f, "  NL$KM\n    key: {}", hex::encode(key))
             }
             LsaSecretType::ServicePassword { service, password } => {
-                write!(f, "  _SC_{}\n    password: {}", service, password)
+                write!(f, "  _SC_{service}\n    password: {password}")
             }
             LsaSecretType::Raw => {
                 let hex_str = hex::encode(&self.raw_data);
@@ -116,25 +120,22 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
     let policy = root.subkey(&hive, "Policy")?;
 
     // Check revision to determine modern vs legacy path
-    let revision = match policy.subkey(&hive, "PolRevision") {
-        Ok(rev_key) => {
-            match rev_key.value(&hive, "") {
-                Ok(data) if data.len() >= 4 => {
-                    // Default (unnamed) value: first DWORD is minor, second is major
-                    let val = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
-                    log::debug!("SECURITY Policy revision: 0x{:08x}", val);
-                    val
-                }
-                _ => {
-                    log::debug!("PolRevision value missing or too short, assuming legacy");
-                    0
-                }
+    let revision = if let Ok(rev_key) = policy.subkey(&hive, "PolRevision") {
+        match rev_key.value(&hive, "") {
+            Ok(data) if data.len() >= 4 => {
+                // Default (unnamed) value: first DWORD is minor, second is major
+                let val = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
+                log::debug!("SECURITY Policy revision: 0x{val:08x}");
+                val
+            }
+            _ => {
+                log::debug!("PolRevision value missing or too short, assuming legacy");
+                0
             }
         }
-        Err(_) => {
-            log::debug!("PolRevision key not found, assuming legacy");
-            0
-        }
+    } else {
+        log::debug!("PolRevision key not found, assuming legacy");
+        0
     };
 
     // Determine if modern (Vista+) or legacy encryption
@@ -155,7 +156,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
         match extract_lsa_key_modern(&hive, &policy, bootkey) {
             Ok(key) => (key, true),
             Err(e) => {
-                log::debug!("Modern LSA key extraction failed ({}), trying legacy fallback", e);
+                log::debug!("Modern LSA key extraction failed ({e}), trying legacy fallback");
                 (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
             }
         }
@@ -165,12 +166,9 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
     log::debug!("LSA key: {}", hex::encode(lsa_key));
 
     // Enumerate secrets
-    let secrets_key = match policy.subkey(&hive, "Secrets") {
-        Ok(k) => k,
-        Err(_) => {
-            log::warn!("Policy\\Secrets key not found");
-            return Ok(Vec::new());
-        }
+    let Ok(secrets_key) = policy.subkey(&hive, "Secrets") else {
+        log::warn!("Policy\\Secrets key not found");
+        return Ok(Vec::new());
     };
 
     let secret_subkeys = secrets_key.subkeys(&hive)?;
@@ -180,24 +178,18 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
         let secret_name = secret_key.name().to_string();
 
         // Read CurrVal subkey's default value
-        let curr_val = match secret_key.subkey(&hive, "CurrVal") {
-            Ok(cv) => cv,
-            Err(_) => {
-                log::warn!("Secret '{}': no CurrVal subkey", secret_name);
-                continue;
-            }
+        let Ok(curr_val) = secret_key.subkey(&hive, "CurrVal") else {
+            log::warn!("Secret '{secret_name}': no CurrVal subkey");
+            continue;
         };
 
-        let encrypted = match curr_val.value(&hive, "") {
-            Ok(data) => data,
-            Err(_) => {
-                log::warn!("Secret '{}': no default value in CurrVal", secret_name);
-                continue;
-            }
+        let Ok(encrypted) = curr_val.value(&hive, "") else {
+            log::warn!("Secret '{secret_name}': no default value in CurrVal");
+            continue;
         };
 
         if encrypted.is_empty() {
-            log::warn!("Secret '{}': empty CurrVal", secret_name);
+            log::warn!("Secret '{secret_name}': empty CurrVal");
             continue;
         }
 
@@ -205,7 +197,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
             match decrypt_secret_modern(&encrypted, &lsa_key) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("Secret '{}': decryption failed: {}", secret_name, e);
+                    log::warn!("Secret '{secret_name}': decryption failed: {e}");
                     continue;
                 }
             }
@@ -213,14 +205,14 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
             match decrypt_secret_legacy(&encrypted, &lsa_key) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("Secret '{}': decryption failed: {}", secret_name, e);
+                    log::warn!("Secret '{secret_name}': decryption failed: {e}");
                     continue;
                 }
             }
         };
 
         if raw_data.is_empty() {
-            log::debug!("Secret '{}': decrypted to empty data", secret_name);
+            log::debug!("Secret '{secret_name}': decrypted to empty data");
             continue;
         }
 
@@ -263,7 +255,7 @@ fn extract_lsa_key_modern(
     let salt = &ek_data[28..60];
     let encrypted = &ek_data[60..];
 
-    let decrypted = decrypt_aes_sha256(bootkey, salt, encrypted)?;
+    let decrypted = decrypt_aes_sha256(bootkey, salt, encrypted);
 
     // LSA_SECRET_BLOB: Length(4) + Random(12) + Secret(Length)
     if decrypted.len() < 16 {
@@ -284,7 +276,8 @@ fn extract_lsa_key_modern(
     let keys_header = 16 + 28; // NT6_SYSTEM_KEYS header ends at 44
     let key_data_offset = keys_header + 16 + 4 + 4; // skip KeyId + KeyType + KeySize = 68
     if decrypted.len() >= key_data_offset + 32 {
-        let key_size = crate::utils::read_u32_le(&decrypted, keys_header + 20).unwrap_or(0) as usize;
+        let key_size =
+            crate::utils::read_u32_le(&decrypted, keys_header + 20).unwrap_or(0) as usize;
         if key_size == 32 && decrypted.len() >= key_data_offset + 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&decrypted[key_data_offset..key_data_offset + 32]);
@@ -357,7 +350,7 @@ fn decrypt_secret_modern(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
         return Ok(Vec::new());
     }
 
-    let decrypted = decrypt_aes_sha256(lsa_key, salt, cipher_data)?;
+    let decrypted = decrypt_aes_sha256(lsa_key, salt, cipher_data);
 
     // Parse LSA_SECRET_BLOB: Length(4) + random(12) + Secret(Length bytes)
     if decrypted.len() < 16 {
@@ -450,7 +443,7 @@ fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         let mut segment = [0u8; DES_KEY_SEGMENT];
         let take = std::cmp::min(DES_KEY_SEGMENT, key_cursor.len());
         segment[..take].copy_from_slice(&key_cursor[..take]);
-        let des_key = transform_des_key(&segment);
+        let des_key = crate::sam::hashes::expand_des_key(segment);
 
         let block = GenericArray::from_slice(chunk);
         let key_ga = GenericArray::from_slice(&des_key);
@@ -470,27 +463,11 @@ fn des_ecb_decrypt_rotating(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 
 /// Expand 7-byte input to 8-byte DES key by spreading bits ([MS-LSAD] Section 5.1.3).
 /// Each output byte uses 7 bits of key material + 1 parity bit (shifted left, masked 0xFE).
-fn transform_des_key(input: &[u8; 7]) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[0] = input[0] >> 1;
-    out[1] = ((input[0] & 0x01) << 6) | (input[1] >> 2);
-    out[2] = ((input[1] & 0x03) << 5) | (input[2] >> 3);
-    out[3] = ((input[2] & 0x07) << 4) | (input[3] >> 4);
-    out[4] = ((input[3] & 0x0F) << 3) | (input[4] >> 5);
-    out[5] = ((input[4] & 0x1F) << 2) | (input[5] >> 6);
-    out[6] = ((input[5] & 0x3F) << 1) | (input[6] >> 7);
-    out[7] = input[6] & 0x7F;
-    for b in &mut out {
-        *b = (*b << 1) & 0xFE;
-    }
-    out
-}
-
 /// SHA-256 + AES-256-ECB decryption (modern LSA scheme).
 /// Key derivation: SHA256(key_material + salt * 1000) → AES-256 key.
 /// Mode: ECB (per mimikatz CRYPT_MODE_ECB, impacket per-block CBC reinit, pypykatz ECB).
 /// The 32-byte "lazyiv" field is a KDF salt, NOT an AES IV.
-fn decrypt_aes_sha256(key_material: &[u8], salt: &[u8], encrypted: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_aes_sha256(key_material: &[u8], salt: &[u8], encrypted: &[u8]) -> Vec<u8> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(key_material);
     for _ in 0..1000 {
@@ -502,9 +479,9 @@ fn decrypt_aes_sha256(key_material: &[u8], salt: &[u8], encrypted: &[u8]) -> Res
 }
 
 /// AES-256-ECB decryption (no IV, each block decrypted independently).
-fn aes256_ecb_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+fn aes256_ecb_decrypt(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let cipher = Aes256::new(key.into());
@@ -519,7 +496,7 @@ fn aes256_ecb_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     }
 
     buf.truncate(data.len());
-    Ok(buf)
+    buf
 }
 
 /// Parse a decrypted secret by its name into a typed variant.
@@ -594,18 +571,14 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
 }
 
 /// Format a 16-byte GUID as a standard string representation.
+/// Braced GUID form (`{xxxxxxxx-...}`) used by LSA secret naming; shares the
+/// core formatting with `crate::utils::format_guid`.
 fn format_guid(data: &[u8]) -> String {
     if data.len() < 16 {
-        return hex::encode(data);
+        hex::encode(data)
+    } else {
+        format!("{{{}}}", crate::utils::format_guid(data))
     }
-    // GUID binary layout: Data1(4 LE) + Data2(2 LE) + Data3(2 LE) + Data4(8 BE)
-    let d1 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let d2 = u16::from_le_bytes([data[4], data[5]]);
-    let d3 = u16::from_le_bytes([data[6], data[7]]);
-    format!(
-        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
-        d1, d2, d3, data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]
-    )
 }
 
 /// Parse a BCKUPKEY_{GUID} backup key secret.
@@ -690,5 +663,5 @@ fn build_pvk(key_data: &[u8]) -> Vec<u8> {
 }
 
 fn lsa_err(msg: &str) -> VmkatzError {
-    VmkatzError::DecryptionError(format!("LSA: {}", msg))
+    VmkatzError::DecryptionError(format!("LSA: {msg}"))
 }

@@ -23,7 +23,7 @@ pub struct LocalState {
 
 pub fn parse(json: &str) -> Result<LocalState> {
     let raw: LocalStateRaw =
-        serde_json::from_str(json).map_err(|e| Error::Parse(format!("LocalState json: {}", e)))?;
+        serde_json::from_str(json).map_err(|e| Error::Parse(format!("LocalState json: {e}")))?;
     let mut out = LocalState::default();
     if let Some(oc) = raw.os_crypt {
         if let Some(s) = oc.encrypted_key {
@@ -44,7 +44,7 @@ mod tests {
     fn parse_v10_key() {
         let key_bytes: Vec<u8> = b"DPAPIabc".to_vec();
         let enc = simple_b64(&key_bytes);
-        let json = format!(r#"{{"os_crypt":{{"encrypted_key":"{}"}}}}"#, enc);
+        let json = format!(r#"{{"os_crypt":{{"encrypted_key":"{enc}"}}}}"#);
         let parsed = parse(&json).unwrap();
         assert_eq!(parsed.encrypted_key.as_deref(), Some(&key_bytes[..]));
     }
@@ -57,12 +57,13 @@ mod tests {
     }
 
     fn simple_b64(bytes: &[u8]) -> String {
-        const TBL: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         let mut i = 0;
         while i + 3 <= bytes.len() {
-            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+            let n = (u32::from(bytes[i]) << 16)
+                | (u32::from(bytes[i + 1]) << 8)
+                | u32::from(bytes[i + 2]);
             out.push(TBL[((n >> 18) & 0x3F) as usize] as char);
             out.push(TBL[((n >> 12) & 0x3F) as usize] as char);
             out.push(TBL[((n >> 6) & 0x3F) as usize] as char);
@@ -71,12 +72,12 @@ mod tests {
         }
         let rem = bytes.len() - i;
         if rem == 1 {
-            let n = (bytes[i] as u32) << 16;
+            let n = u32::from(bytes[i]) << 16;
             out.push(TBL[((n >> 18) & 0x3F) as usize] as char);
             out.push(TBL[((n >> 12) & 0x3F) as usize] as char);
             out.push_str("==");
         } else if rem == 2 {
-            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+            let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8);
             out.push(TBL[((n >> 18) & 0x3F) as usize] as char);
             out.push(TBL[((n >> 12) & 0x3F) as usize] as char);
             out.push(TBL[((n >> 6) & 0x3F) as usize] as char);

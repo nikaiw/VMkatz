@@ -43,21 +43,26 @@ const MIN_FILE_SIZE: usize = 128 + 32;
 
 /// Parsed DPAPI master key file header (128 bytes at offset 0).
 #[derive(Debug)]
-#[allow(dead_code)]
 struct MasterKeyFileHeader {
     version: u32,
     guid: String,
+    #[expect(dead_code, reason = "flags on-disk du header DPAPI, non exploités")]
     flags: u32,
     masterkey_len: u64,
+    #[expect(dead_code, reason = "longueur on-disk de la backup key, non exploitée")]
     backupkey_len: u64,
+    #[expect(dead_code, reason = "longueur on-disk du credhist, non exploitée")]
     credhist_len: u64,
     domainkey_len: u64,
 }
 
 /// Parsed master key section (salt, rounds, algorithms, ciphertext).
 #[derive(Debug)]
-#[allow(dead_code)]
 struct MasterKeySection {
+    #[expect(
+        dead_code,
+        reason = "version on-disk de la section master key, non exploitée"
+    )]
     version: u32,
     salt: [u8; 16],
     rounds: u32,
@@ -105,20 +110,20 @@ fn parse_header(data: &[u8]) -> Result<MasterKeyFileHeader> {
 
     let flags = u32::from_le_bytes([data[0x5C], data[0x5D], data[0x5E], data[0x5F]]);
     let masterkey_len = u64::from_le_bytes([
-        data[0x60], data[0x61], data[0x62], data[0x63],
-        data[0x64], data[0x65], data[0x66], data[0x67],
+        data[0x60], data[0x61], data[0x62], data[0x63], data[0x64], data[0x65], data[0x66],
+        data[0x67],
     ]);
     let backupkey_len = u64::from_le_bytes([
-        data[0x68], data[0x69], data[0x6A], data[0x6B],
-        data[0x6C], data[0x6D], data[0x6E], data[0x6F],
+        data[0x68], data[0x69], data[0x6A], data[0x6B], data[0x6C], data[0x6D], data[0x6E],
+        data[0x6F],
     ]);
     let credhist_len = u64::from_le_bytes([
-        data[0x70], data[0x71], data[0x72], data[0x73],
-        data[0x74], data[0x75], data[0x76], data[0x77],
+        data[0x70], data[0x71], data[0x72], data[0x73], data[0x74], data[0x75], data[0x76],
+        data[0x77],
     ]);
     let domainkey_len = u64::from_le_bytes([
-        data[0x78], data[0x79], data[0x7A], data[0x7B],
-        data[0x7C], data[0x7D], data[0x7E], data[0x7F],
+        data[0x78], data[0x79], data[0x7A], data[0x7B], data[0x7C], data[0x7D], data[0x7E],
+        data[0x7F],
     ]);
 
     Ok(MasterKeyFileHeader {
@@ -162,7 +167,7 @@ fn parse_masterkey_section(data: &[u8]) -> Result<MasterKeySection> {
 }
 
 /// Map CryptoAPI cipher ALG_ID to hashcat string.
-fn cipher_name(alg: u32) -> Option<&'static str> {
+const fn cipher_name(alg: u32) -> Option<&'static str> {
     match alg {
         CALG_3DES => Some("des3"),
         CALG_AES_256 => Some("aes256"),
@@ -171,7 +176,7 @@ fn cipher_name(alg: u32) -> Option<&'static str> {
 }
 
 /// Map CryptoAPI hash ALG_ID to hashcat string.
-fn hash_name(alg: u32) -> Option<&'static str> {
+const fn hash_name(alg: u32) -> Option<&'static str> {
     match alg {
         CALG_SHA1 => Some("sha1"),
         CALG_SHA_512 => Some("sha512"),
@@ -180,6 +185,7 @@ fn hash_name(alg: u32) -> Option<&'static str> {
 }
 
 /// Parsed MK section fields needed to actually decrypt the masterkey.
+///
 /// Public face of the private `MasterKeySection` so external callers can
 /// drive `decrypt_masterkey_with_prekey` without re-parsing the file.
 #[derive(Debug, Clone)]
@@ -191,9 +197,11 @@ pub struct MasterKeyDecryptInput {
     pub ciphertext: Vec<u8>,
 }
 
-/// Extract the MK section from a full masterkey file. Returns `None` if the
-/// file is malformed, the algorithms aren't supported, or required fields are
-/// missing. Validates the same invariants as `parse_masterkey_file`.
+/// Extract the MK section from a full masterkey file.
+///
+/// Returns `None` if the file is malformed, the algorithms aren't supported, or
+/// required fields are missing. Validates the same invariants as
+/// `parse_masterkey_file`.
 pub fn extract_mk_section(file_bytes: &[u8]) -> Option<MasterKeyDecryptInput> {
     if file_bytes.len() < MIN_FILE_SIZE {
         return None;
@@ -228,10 +236,7 @@ pub fn extract_mk_section(file_bytes: &[u8]) -> Option<MasterKeyDecryptInput> {
 /// Encode a SID into the UTF-16LE byte form DPAPI expects: each codepoint
 /// little-endian, followed by a trailing NUL widechar.
 fn sid_utf16le_with_nul(sid: &str) -> Vec<u8> {
-    let mut bytes: Vec<u8> = sid
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
+    let mut bytes: Vec<u8> = sid.encode_utf16().flat_map(u16::to_le_bytes).collect();
     bytes.extend_from_slice(&[0u8, 0u8]);
     bytes
 }
@@ -256,10 +261,7 @@ fn user_local_prekey(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
 ///   `HMAC-SHA1(key = SHA1(UTF-16LE password), msg = UTF-16LE(SID + "\0"))`.
 fn user_local_prekey_pw(password: &str, sid: &str) -> Result<[u8; 20]> {
     use sha1::{Digest, Sha1};
-    let pwd_utf16: Vec<u8> = password
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
+    let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let pwd_sha1 = Sha1::digest(&pwd_utf16);
     let msg = sid_utf16le_with_nul(sid);
     let mut mac = HmacSha1::new_from_slice(&pwd_sha1)
@@ -276,10 +278,7 @@ fn user_local_prekey_pw(password: &str, sid: &str) -> Result<[u8; 20]> {
 /// Dispatches between AES-256/SHA-512 (modern, hashcat mode 15900) and
 /// 3DES/SHA-1 (legacy, mode 15300) based on the file's `alg_crypt`/`alg_hash`.
 /// Returns the 64-byte cleartext masterkey.
-pub fn decrypt_masterkey_with_prekey(
-    file_bytes: &[u8],
-    pre_key: &[u8],
-) -> Result<Vec<u8>> {
+pub fn decrypt_masterkey_with_prekey(file_bytes: &[u8], pre_key: &[u8]) -> Result<Vec<u8>> {
     let mk = extract_mk_section(file_bytes).ok_or_else(|| {
         VmkatzError::DecryptionError("malformed or unsupported DPAPI MK file".into())
     })?;
@@ -325,9 +324,7 @@ pub fn decrypt_masterkey_with_prekey(
             let cipher = TdesCbcDec::new(des3_key.into(), iv.into());
             cipher
                 .decrypt_padded_mut::<NoPadding>(&mut buf)
-                .map_err(|_| {
-                    VmkatzError::DecryptionError("3DES-CBC MK decrypt failed".into())
-                })?;
+                .map_err(|_| VmkatzError::DecryptionError("3DES-CBC MK decrypt failed".into()))?;
             buf
         }
         _ => {
@@ -435,20 +432,28 @@ fn dpapi_derive_key_sha1(passphrase: &[u8], salt: &[u8], keylen: usize, count: u
 
 fn verify_mk_hmac_sha512(pre_key: &[u8], salt: &[u8], mk: &[u8], stored: &[u8]) -> bool {
     use hmac::Mac;
-    let mut h1 = match HmacSha512::new_from_slice(pre_key) { Ok(h) => h, Err(_) => return false };
+    let Ok(mut h1) = HmacSha512::new_from_slice(pre_key) else {
+        return false;
+    };
     h1.update(salt);
     let key2 = h1.finalize().into_bytes();
-    let mut h2 = match HmacSha512::new_from_slice(&key2) { Ok(h) => h, Err(_) => return false };
+    let Ok(mut h2) = HmacSha512::new_from_slice(&key2) else {
+        return false;
+    };
     h2.update(mk);
     h2.finalize().into_bytes().as_slice() == stored
 }
 
 fn verify_mk_hmac_sha1(pre_key: &[u8], salt: &[u8], mk: &[u8], stored: &[u8]) -> bool {
     use hmac::Mac;
-    let mut h1 = match HmacSha1::new_from_slice(pre_key) { Ok(h) => h, Err(_) => return false };
+    let Ok(mut h1) = HmacSha1::new_from_slice(pre_key) else {
+        return false;
+    };
     h1.update(salt);
     let key2 = h1.finalize().into_bytes();
-    let mut h2 = match HmacSha1::new_from_slice(&key2) { Ok(h) => h, Err(_) => return false };
+    let Ok(mut h2) = HmacSha1::new_from_slice(&key2) else {
+        return false;
+    };
     h2.update(mk);
     h2.finalize().into_bytes().as_slice() == stored
 }
@@ -587,7 +592,7 @@ pub fn extract_masterkey_hashes_from_partition<R: Read + Seek>(
     let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
         Ok(n) => n,
         Err(e) => {
-            log::info!("NTFS parse error for DPAPI scan: {}", e);
+            log::info!("NTFS parse error for DPAPI scan: {e}");
             return results;
         }
     };
@@ -595,7 +600,7 @@ pub fn extract_masterkey_hashes_from_partition<R: Read + Seek>(
     let root = match ntfs.root_directory(&mut part_reader) {
         Ok(r) => r,
         Err(e) => {
-            log::info!("NTFS root dir error for DPAPI scan: {}", e);
+            log::info!("NTFS root dir error for DPAPI scan: {e}");
             return results;
         }
     };
@@ -611,28 +616,31 @@ pub fn extract_masterkey_hashes_from_partition<R: Read + Seek>(
     );
 
     // Find Users directory
-    let users_dir = match super::ntfs_reader::find_entry(&ntfs, &root, &mut part_reader, "Users") {
-        Ok(d) => d,
-        Err(_) => return results,
+    let Ok(users_dir) = super::ntfs_reader::find_entry(&ntfs, &root, &mut part_reader, "Users")
+    else {
+        return results;
     };
 
     // Scan each user profile: Users\{user}\AppData\Roaming\Microsoft\Protect
-    let user_entries =
-        match super::ntfs_reader::list_directory(&ntfs, &users_dir, &mut part_reader) {
-            Ok(e) => e,
-            Err(_) => return results,
-        };
+    let Ok(user_entries) = super::ntfs_reader::list_directory(&ntfs, &users_dir, &mut part_reader)
+    else {
+        return results;
+    };
 
     for (username, is_dir) in &user_entries {
         if !is_dir {
             continue;
         }
         let lower = username.to_lowercase();
-        if lower == "public" || lower == "default" || lower == "default user" || lower == "all users" {
+        if lower == "public"
+            || lower == "default"
+            || lower == "default user"
+            || lower == "all users"
+        {
             continue;
         }
 
-        let protect_path = format!("{}\\AppData\\Roaming\\Microsoft\\Protect", username);
+        let protect_path = format!("{username}\\AppData\\Roaming\\Microsoft\\Protect");
         scan_protect_dir(
             &ntfs,
             &users_dir,
@@ -655,62 +663,56 @@ fn scan_protect_dir<'n, R: Read + Seek>(
     username: &str,
     results: &mut Vec<DpapiMasterKeyHash>,
 ) {
-    let protect_dir =
-        match super::ntfs_reader::navigate_to_dir(ntfs, base_dir, reader, protect_path) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+    let Ok(protect_dir) = super::ntfs_reader::navigate_to_dir(ntfs, base_dir, reader, protect_path)
+    else {
+        return;
+    };
 
-    let sid_entries =
-        match super::ntfs_reader::list_directory(ntfs, &protect_dir, reader) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+    let Ok(sid_entries) = super::ntfs_reader::list_directory(ntfs, &protect_dir, reader) else {
+        return;
+    };
 
     for (sid_name, is_sid_dir) in &sid_entries {
         if !is_sid_dir || !sid_name.starts_with("S-1-5-") {
             continue;
         }
 
-        let sid_dir =
-            match super::ntfs_reader::find_entry(ntfs, &protect_dir, reader, sid_name) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+        let Ok(sid_dir) = super::ntfs_reader::find_entry(ntfs, &protect_dir, reader, sid_name)
+        else {
+            continue;
+        };
 
-        let mk_entries =
-            match super::ntfs_reader::list_directory(ntfs, &sid_dir, reader) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        let Ok(mk_entries) = super::ntfs_reader::list_directory(ntfs, &sid_dir, reader) else {
+            continue;
+        };
 
         for (mk_name, is_mk_dir) in &mk_entries {
             if *is_mk_dir || !is_guid_filename(mk_name) {
                 continue;
             }
 
-            let mk_file =
-                match super::ntfs_reader::find_entry(ntfs, &sid_dir, reader, mk_name) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
+            let Ok(mk_file) = super::ntfs_reader::find_entry(ntfs, &sid_dir, reader, mk_name)
+            else {
+                continue;
+            };
 
-            let mk_data = match super::ntfs_reader::read_file_data(&mk_file, reader) {
-                Ok(d) => d,
-                Err(_) => continue,
+            let Ok(mk_data) = super::ntfs_reader::read_file_data(&mk_file, reader) else {
+                continue;
             };
 
             // Read NTFS modification time as a proxy for key creation date
             let modified = mk_file
                 .info()
                 .ok()
-                .map(|info| info.modification_time().nt_timestamp())
-                .unwrap_or(0);
+                .map_or(0, |info| info.modification_time().nt_timestamp());
 
             if let Some(hash) = parse_masterkey_file(&mk_data, username, sid_name, modified) {
                 log::info!(
                     "DPAPI masterkey: user={} SID={} GUID={} mode={}",
-                    username, sid_name, hash.guid, hash.mode
+                    username,
+                    sid_name,
+                    hash.guid,
+                    hash.mode
                 );
                 results.push(hash);
             }
@@ -724,7 +726,10 @@ fn is_guid_filename(name: &str) -> bool {
         return false;
     }
     let bytes = name.as_bytes();
-    bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-'
+    bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
         && bytes.iter().enumerate().all(|(i, &b)| {
             if i == 8 || i == 13 || i == 18 || i == 23 {
                 true
@@ -740,10 +745,7 @@ pub fn extract_from_disk<R: Read + Seek>(reader: &mut R) -> Vec<DpapiMasterKeyHa
     let mut results = Vec::new();
 
     for &offset in &partitions {
-        log::info!(
-            "Scanning NTFS partition at 0x{:x} for DPAPI master keys",
-            offset
-        );
+        log::info!("Scanning NTFS partition at 0x{offset:x} for DPAPI master keys");
         let mut hashes = extract_masterkey_hashes_from_partition(reader, offset);
         results.append(&mut hashes);
         if !results.is_empty() {
@@ -811,7 +813,10 @@ mod tests {
         assert_eq!(hash.mode, 15900);
         assert_eq!(hash.username, "TestUser");
         assert_eq!(hash.sid, "S-1-5-21-111-222-333-1001");
-        assert!(hash.hash.starts_with("$DPAPImk$2*1*S-1-5-21-111-222-333-1001*aes256*sha512*8000*"));
+        assert!(
+            hash.hash
+                .starts_with("$DPAPImk$2*1*S-1-5-21-111-222-333-1001*aes256*sha512*8000*")
+        );
         assert!(hash.hash.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); // salt hex (16 bytes = 32 hex chars)
     }
 
@@ -892,8 +897,8 @@ mod tests {
         let stored_hmac = k2.finalize().into_bytes();
         let mut cleartext = Vec::with_capacity(144);
         cleartext.extend_from_slice(&hmac_salt);
-        cleartext.extend_from_slice(&stored_hmac);  // 64 bytes
-        cleartext.extend_from_slice(&mk_bytes);     // 64 bytes
+        cleartext.extend_from_slice(&stored_hmac); // 64 bytes
+        cleartext.extend_from_slice(&mk_bytes); // 64 bytes
         assert_eq!(cleartext.len(), 144);
 
         let cipher = aes_cbc_encrypt(&aes_key, &iv, &cleartext);
@@ -992,6 +997,9 @@ mod tests {
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.mode, 15300);
-        assert!(hash.hash.starts_with("$DPAPImk$1*1*S-1-5-21-999-888-777-500*des3*sha1*4000*"));
+        assert!(
+            hash.hash
+                .starts_with("$DPAPImk$1*1*S-1-5-21-999-888-777-500*des3*sha1*4000*")
+        );
     }
 }

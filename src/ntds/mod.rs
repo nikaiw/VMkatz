@@ -7,9 +7,9 @@
 
 pub mod ese;
 
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
+use crate::sam::hashes::{aes128_cbc_decrypt, expand_des_key, md5_hash, rc4};
 use ese::EseDb;
-use crate::sam::hashes::{rc4, md5_hash, aes128_cbc_decrypt};
 
 /// High-level NTDS context extracted from disk artifacts.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ pub fn extract_ad_hashes(
 
     // Log available tables for debugging
     let tables = db.table_names();
-    log::info!("NTDS tables: {:?}", tables);
+    log::info!("NTDS tables: {tables:?}");
 
     // The main table is "datatable"
     let columns = db.columns("datatable").ok_or_else(|| {
@@ -103,10 +103,7 @@ pub fn extract_ad_hashes(
             None => return,
         };
 
-        let rid = match rid {
-            Some(r) => r,
-            None => return,
-        };
+        let Some(rid) = rid else { return };
 
         // Read userAccountControl to verify this is a user account
         let _uac = read_col("ATTj589832")
@@ -257,7 +254,7 @@ fn decrypt_pek(pek_blob: &[u8], boot_key: &[u8; 16]) -> Result<Vec<u8>> {
 
     // Version at offset 0 (first 4 bytes)
     let version = crate::utils::read_u32_le(pek_blob, 0).unwrap_or(0);
-    log::info!("PEK version: {}", version);
+    log::info!("PEK version: {version}");
 
     match version {
         0x01 => {
@@ -334,8 +331,7 @@ fn decrypt_pek(pek_blob: &[u8], boot_key: &[u8; 16]) -> Result<Vec<u8>> {
             Ok(decrypted[36..52].to_vec())
         }
         _ => Err(VmkatzError::DecryptionError(format!(
-            "Unknown PEK version: {}",
-            version
+            "Unknown PEK version: {version}"
         ))),
     }
 }
@@ -400,7 +396,11 @@ fn decrypt_ad_hash(hash_blob: &[u8], pek: &[u8], rid: u32) -> Result<[u8; 16]> {
             aes128_cbc_decrypt(pek, salt, encrypted)?
         }
         _ => {
-            log::debug!("Unknown hash version: 0x{:08x}, blob_len={}", version, hash_blob.len());
+            log::debug!(
+                "Unknown hash version: 0x{:08x}, blob_len={}",
+                version,
+                hash_blob.len()
+            );
             return Ok([0u8; 16]);
         }
     };
@@ -472,24 +472,34 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     let rid_bytes = rid.to_le_bytes();
 
     let key1_src = [
-        rid_bytes[0], rid_bytes[1], rid_bytes[2], rid_bytes[3],
-        rid_bytes[0], rid_bytes[1], rid_bytes[2],
+        rid_bytes[0],
+        rid_bytes[1],
+        rid_bytes[2],
+        rid_bytes[3],
+        rid_bytes[0],
+        rid_bytes[1],
+        rid_bytes[2],
     ];
     let key2_src = [
-        rid_bytes[3], rid_bytes[0], rid_bytes[1], rid_bytes[2],
-        rid_bytes[3], rid_bytes[0], rid_bytes[1],
+        rid_bytes[3],
+        rid_bytes[0],
+        rid_bytes[1],
+        rid_bytes[2],
+        rid_bytes[3],
+        rid_bytes[0],
+        rid_bytes[1],
     ];
 
-    let des_key1 = expand_des_key(&key1_src);
-    let des_key2 = expand_des_key(&key2_src);
+    let des_key1 = expand_des_key(key1_src);
+    let des_key2 = expand_des_key(key2_src);
 
     let mut block1 = GenericArray::clone_from_slice(&encrypted[0..8]);
     let mut block2 = GenericArray::clone_from_slice(&encrypted[8..16]);
 
     let cipher1 = des::Des::new_from_slice(&des_key1)
-        .map_err(|e| VmkatzError::DecryptionError(format!("DES key1: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("DES key1: {e}")))?;
     let cipher2 = des::Des::new_from_slice(&des_key2)
-        .map_err(|e| VmkatzError::DecryptionError(format!("DES key2: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("DES key2: {e}")))?;
 
     cipher1.decrypt_block(&mut block1);
     cipher2.decrypt_block(&mut block2);
@@ -505,29 +515,6 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
 /// DES uses 56-bit keys packed into 8 bytes (7 data bits + 1 parity bit each).
 /// This distributes the 56 source bits into 8 key bytes, shifting each byte so
 /// that bits 7..1 carry key material and bit 0 is set for odd parity.
-fn expand_des_key(src: &[u8; 7]) -> [u8; 8] {
-    // Spread 7 source bytes across 8 key bytes (7 data bits each)
-    let mut key = [0u8; 8];
-    key[0] = src[0] >> 1;
-    key[1] = ((src[0] & 0x01) << 6) | (src[1] >> 2);
-    key[2] = ((src[1] & 0x03) << 5) | (src[2] >> 3);
-    key[3] = ((src[2] & 0x07) << 4) | (src[3] >> 4);
-    key[4] = ((src[3] & 0x0F) << 3) | (src[4] >> 5);
-    key[5] = ((src[4] & 0x1F) << 2) | (src[5] >> 6);
-    key[6] = ((src[5] & 0x3F) << 1) | (src[6] >> 7);
-    key[7] = src[6] & 0x7F;
-
-    // Set odd parity on each byte (DES ignores bit 0, uses it for parity check)
-    for b in &mut key {
-        let mut val = *b << 1;
-        let parity = (val.count_ones() + 1) & 1;
-        val |= parity as u8;
-        *b = val;
-    }
-
-    key
-}
-
 /// Decode an AD string (UTF-16LE typically).
 fn decode_ad_string(data: &[u8]) -> String {
     if data.is_empty() {

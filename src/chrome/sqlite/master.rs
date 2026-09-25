@@ -4,14 +4,14 @@ use crate::error::Result;
 
 #[derive(Debug, Clone)]
 pub struct MasterEntry {
-    pub kind: String,      // "table" | "index" | ...
+    pub kind: String, // "table" | "index" | ...
     pub name: String,
     pub tbl_name: String,
     pub rootpage: i64,
     pub sql: String,
 }
 
-impl<'a> Pager<'a> {
+impl Pager<'_> {
     /// Walk sqlite_master (root page 1) and return every `table` entry.
     pub fn list_tables(&self) -> Result<Vec<MasterEntry>> {
         let mut out = Vec::new();

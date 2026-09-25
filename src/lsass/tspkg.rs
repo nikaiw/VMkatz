@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{Arch, TspkgCredential, read_ptr, is_valid_user_ptr};
+use crate::lsass::types::{Arch, TspkgCredential, is_valid_user_ptr, read_ptr};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -35,11 +35,10 @@ pub fn extract_tspkg_credentials_arch(
     let pe = PeHeaders::parse_from_memory(vmem, tspkg_base)?;
     let mut results = Vec::new();
 
-    let text = match pe.find_section(".text") {
-        Some(s) => s,
-        None => return Ok(results),
+    let Some(text) = pe.find_section(".text") else {
+        return Ok(results);
     };
-    let text_base = tspkg_base + text.virtual_address as u64;
+    let text_base = tspkg_base + u64::from(text.virtual_address);
 
     // Select patterns based on architecture
     let pattern_set = match arch {
@@ -51,20 +50,18 @@ pub fn extract_tspkg_credentials_arch(
         Arch::X86 => "TSGlobalCredTable_x86",
     };
 
-    let (pattern_addr, _) = match patterns::find_pattern(
-        vmem, text_base, text.virtual_size,
-        pattern_set, label,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            log::info!("Could not find TsPkg pattern: {}", e);
-            return Ok(results);
-        }
-    };
+    let (pattern_addr, _) =
+        match patterns::find_pattern(vmem, text_base, text.virtual_size, pattern_set, label) {
+            Ok(r) => r,
+            Err(e) => {
+                log::info!("Could not find TsPkg pattern: {e}");
+                return Ok(results);
+            }
+        };
 
     // Find TSGlobalCredTable address using arch-appropriate method
     let table_addr = find_table_from_leas(vmem, &pe, tspkg_base, pattern_addr, arch)?;
-    log::info!("TsPkg TSGlobalCredTable at 0x{:x}", table_addr);
+    log::info!("TsPkg TSGlobalCredTable at 0x{table_addr:x}");
 
     // TSGlobalCredTable is a PVOID - dereference to get the first list entry.
     let list_head = read_ptr(vmem, table_addr, arch).unwrap_or(0);
@@ -73,14 +70,11 @@ pub fn extract_tspkg_credentials_arch(
         return Ok(results);
     }
     if !is_valid_user_ptr(list_head, arch) {
-        log::info!(
-            "TsPkg: TSGlobalCredTable has invalid pointer: 0x{:x}",
-            list_head
-        );
+        log::info!("TsPkg: TSGlobalCredTable has invalid pointer: 0x{list_head:x}");
         return Ok(results);
     }
 
-    log::info!("TsPkg: walking credential list from 0x{:x}", list_head);
+    log::info!("TsPkg: walking credential list from 0x{list_head:x}");
 
     // Walk the linked list. Each entry has Flink/Blink at +0x00.
     // The list terminates when Flink points back to the first entry.
@@ -122,9 +116,8 @@ fn detect_tspkg_primary_ptr(vmem: &dyn VirtualMemory, entry: u64, arch: Arch) ->
     };
 
     for &offset in offsets {
-        let ptr = match read_ptr(vmem, entry + offset, arch) {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(ptr) = read_ptr(vmem, entry + offset, arch) else {
+            continue;
         };
         if !is_valid_user_ptr(ptr, arch) {
             continue;
@@ -155,19 +148,21 @@ fn find_table_from_leas(
     match arch {
         Arch::X64 => find_table_from_leas_x64(vmem, pattern_addr),
         Arch::X86 => {
-            let ds = match pe.find_section(".data") {
-                Some(s) => s,
-                None => {
-                    return Err(crate::error::VmkatzError::PatternNotFound(
-                        "TsPkg x86: no .data section".to_string(),
-                    ))
-                }
+            let Some(ds) = pe.find_section(".data") else {
+                return Err(crate::error::VmkatzError::PatternNotFound(
+                    "TsPkg x86: no .data section".to_string(),
+                ));
             };
-            let data_base = dll_base + ds.virtual_address as u64;
-            let data_end = data_base + ds.virtual_size as u64;
+            let data_base = dll_base + u64::from(ds.virtual_address);
+            let data_end = data_base + u64::from(ds.virtual_size);
             // Try absolute address references first, fall back to .data scan
             match patterns::find_list_via_abs(
-                vmem, pattern_addr, dll_base, data_base, data_end, "tspkg_x86",
+                vmem,
+                pattern_addr,
+                dll_base,
+                data_base,
+                data_end,
+                "tspkg_x86",
             ) {
                 Ok(addr) => Ok(addr),
                 Err(_) => find_tspkg_table_in_data(vmem, data_base, ds.virtual_size as usize, arch)
@@ -196,7 +191,7 @@ fn find_table_from_leas_x64(vmem: &dyn VirtualMemory, pattern_addr: u64) -> Resu
 
         let disp = i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
         let rip_after = pattern_addr + i as u64 + 7;
-        let target = (rip_after as i64 + disp as i64) as u64;
+        let target = (rip_after as i64 + i64::from(disp)) as u64;
 
         if first_target.is_none() {
             first_target = Some(target);
@@ -209,8 +204,7 @@ fn find_table_from_leas_x64(vmem: &dyn VirtualMemory, pattern_addr: u64) -> Resu
                 if let Ok(flink) = vmem.read_virt_u64(val) {
                     if is_valid_user_ptr(flink, Arch::X64) {
                         log::debug!(
-                            "TsPkg: found table via LEA at pattern+0x{:02x} -> 0x{:x} (deref=0x{:x})",
-                            i, target, val
+                            "TsPkg: found table via LEA at pattern+0x{i:02x} -> 0x{target:x} (deref=0x{val:x})"
                         );
                         return Ok(target);
                     }
@@ -312,20 +306,16 @@ fn read_blob_ustring(blob: &[u8], offset: usize, arch: Arch) -> String {
     }
 
     let buf_off = match arch {
-        Arch::X64 => {
-            u64::from_le_bytes(
-                blob[offset + buf_field_offset..offset + buf_field_offset + 8]
-                    .try_into()
-                    .unwrap_or([0; 8]),
-            ) as usize
-        }
-        Arch::X86 => {
-            u32::from_le_bytes(
-                blob[offset + buf_field_offset..offset + buf_field_offset + 4]
-                    .try_into()
-                    .unwrap_or([0; 4]),
-            ) as usize
-        }
+        Arch::X64 => u64::from_le_bytes(
+            blob[offset + buf_field_offset..offset + buf_field_offset + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        ) as usize,
+        Arch::X86 => u32::from_le_bytes(
+            blob[offset + buf_field_offset..offset + buf_field_offset + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ) as usize,
     };
 
     if buf_off + len > blob.len() {
@@ -348,7 +338,7 @@ fn find_tspkg_table_in_data(
 
     for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
         let val = if arch == Arch::X86 {
-            u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as u64
+            u64::from(u32::from_le_bytes(data[off..off + 4].try_into().ok()?))
         } else {
             u64::from_le_bytes(data[off..off + 8].try_into().ok()?)
         };

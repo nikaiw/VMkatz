@@ -75,7 +75,7 @@ pub fn decrypt_aes_encrypted_key(
         let version = cipher[0];
         let key = key_map
             .resolve(version)
-            .ok_or_else(|| Error::Parse(format!("Chrome ABE version {} unknown", version)))?;
+            .ok_or_else(|| Error::Parse(format!("Chrome ABE version {version} unknown")))?;
         let nonce = &cipher[1..13];
         let ct = &cipher[13..];
         let gcm = Aes256Gcm::new((&key).into());
@@ -83,7 +83,10 @@ pub fn decrypt_aes_encrypted_key(
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|_| Error::Parse("Chrome ABE inner GCM auth fail".into()))?;
         if pt.len() != 32 {
-            return Err(Error::Parse(format!("Chrome ABE pt_len={} (want 32)", pt.len())));
+            return Err(Error::Parse(format!(
+                "Chrome ABE pt_len={} (want 32)",
+                pt.len()
+            )));
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(&pt);
@@ -104,7 +107,8 @@ fn parse_aes_encrypted_key_struct(blob: &[u8]) -> Result<(&[u8], &[u8], u8)> {
     }
     // Strip PKCS#7 padding if present.
     let pad = *blob.last().unwrap() as usize;
-    let unpadded_len = if pad >= 1 && pad <= 16 && blob.len() >= pad
+    let unpadded_len = if (1..=16).contains(&pad)
+        && blob.len() >= pad
         && blob[blob.len() - pad..].iter().all(|&b| b as usize == pad)
     {
         blob.len() - pad
@@ -118,21 +122,18 @@ fn parse_aes_encrypted_key_struct(blob: &[u8]) -> Result<(&[u8], &[u8], u8)> {
     let header_len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
     if header_len < 1 || 4 + header_len + 4 > buf.len() {
         return Err(Error::Parse(format!(
-            "ABE header_len {} out of range",
-            header_len
+            "ABE header_len {header_len} out of range"
         )));
     }
     let flag = buf[4];
     let header = &buf[..4 + header_len];
     let cipher_len_off = 4 + header_len;
-    let cipher_len = u32::from_le_bytes(
-        buf[cipher_len_off..cipher_len_off + 4].try_into().unwrap(),
-    ) as usize;
+    let cipher_len =
+        u32::from_le_bytes(buf[cipher_len_off..cipher_len_off + 4].try_into().unwrap()) as usize;
     let cipher_off = cipher_len_off + 4;
     if cipher_off + cipher_len > buf.len() {
         return Err(Error::Parse(format!(
-            "ABE cipher_len {} runs past buffer",
-            cipher_len
+            "ABE cipher_len {cipher_len} runs past buffer"
         )));
     }
     let cipher = &buf[cipher_off..cipher_off + cipher_len];
@@ -179,7 +180,9 @@ pub fn decrypt_v20(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
         .map_err(|_| Error::Parse("v20 GCM auth fail".into()))
 }
 
-/// Helper to chain APPB unwrap using `MasterkeyResolver`s. Both DPAPI layers
+/// Helper to chain APPB unwrap using `MasterkeyResolver`s.
+///
+/// Both DPAPI layers
 /// can reference MKs from either keyring — Chrome's elevation_service writes
 /// the v20 wrap entirely under SYSTEM-context user MKs (`S-1-5-18\User\`),
 /// not the desktop user's Protect dir. So both resolvers are consulted for
@@ -232,10 +235,10 @@ enum AbeLayer {
 }
 
 impl AbeLayer {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            AbeLayer::User => "layer1",
-            AbeLayer::System => "layer2",
+            Self::User => "layer1",
+            Self::System => "layer2",
         }
     }
 
@@ -244,8 +247,8 @@ impl AbeLayer {
     /// `decrypt_blob`) but produced garbage bytes.
     fn validates(self, out: &[u8]) -> bool {
         match self {
-            AbeLayer::User => parse_blob(strip_pkcs7(out)).is_ok(),
-            AbeLayer::System => {
+            Self::User => parse_blob(strip_pkcs7(out)).is_ok(),
+            Self::System => {
                 if out.len() < 4 {
                     return false;
                 }
@@ -308,7 +311,9 @@ where
 fn strip_pkcs7(pt: &[u8]) -> &[u8] {
     if let Some(&pad) = pt.last() {
         let pad = pad as usize;
-        if pad > 0 && pad <= 16 && pt.len() >= pad
+        if pad > 0
+            && pad <= 16
+            && pt.len() >= pad
             && pt[pt.len() - pad..].iter().all(|&b| b as usize == pad)
         {
             return &pt[..pt.len() - pad];
@@ -320,8 +325,6 @@ fn strip_pkcs7(pt: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Nonce};
 
     #[test]
     fn rejects_non_appb() {
@@ -345,7 +348,7 @@ mod tests {
         buf.extend_from_slice(v20_key);
         // PKCS#7 pad to a multiple of 16.
         let pad = 16 - (buf.len() % 16);
-        buf.extend(std::iter::repeat(pad as u8).take(pad));
+        buf.extend(std::iter::repeat_n(pad as u8, pad));
         buf
     }
 
@@ -366,7 +369,7 @@ mod tests {
 
         let mut appb = b"APPB".to_vec();
         appb.extend_from_slice(b"opaque_user_dpapi_blob");
-        let aes_key_clone = aes_encrypted_key.clone();
+        let aes_key_clone = aes_encrypted_key;
         let key = unwrap_app_bound_key(
             &appb,
             |_| Ok(b"opaque_system_dpapi_blob".to_vec()),

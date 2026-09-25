@@ -5,7 +5,7 @@ use std::path::Path;
 use ntfs::attribute_value::NtfsAttributeValue;
 
 use crate::disk::{self, DiskImage};
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::paging::entry::PageTableEntry;
 
 /// Maximum number of pagefiles Windows supports (0-15).
@@ -33,7 +33,7 @@ struct SinglePagefile {
 /// is immutable but disk seeks need &mut.
 pub struct PagefileReader {
     disk: RefCell<Box<dyn DiskImage>>,
-    pagefiles: Vec<Option<SinglePagefile>>,  // indexed by pagefile number (0-15)
+    pagefiles: Vec<Option<SinglePagefile>>, // indexed by pagefile number (0-15)
     pages_resolved: std::cell::Cell<u64>,
 }
 
@@ -72,7 +72,7 @@ impl PagefileReader {
                     pagefiles.push(Some(pf));
                 }
                 Err(e) => {
-                    log::debug!("No {}: {}", filename, e);
+                    log::debug!("No {filename}: {e}");
                     pagefiles.push(None);
                 }
             }
@@ -94,7 +94,7 @@ impl PagefileReader {
             .sum()
     }
 
-    pub fn pages_resolved(&self) -> u64 {
+    pub const fn pages_resolved(&self) -> u64 {
         self.pages_resolved.get()
     }
 
@@ -108,7 +108,7 @@ impl PagefileReader {
         }
 
         // Binary search for the data run containing this offset
-        let idx = match pf.data_runs.binary_search_by(|run| {
+        let Ok(idx) = pf.data_runs.binary_search_by(|run| {
             if byte_offset < run.file_offset {
                 std::cmp::Ordering::Greater
             } else if byte_offset >= run.file_offset + run.length {
@@ -116,12 +116,9 @@ impl PagefileReader {
             } else {
                 std::cmp::Ordering::Equal
             }
-        }) {
-            Ok(i) => i,
-            Err(_) => {
-                // Sparse region: return zeros
-                return Ok([0u8; 4096]);
-            }
+        }) else {
+            // Sparse region: return zeros
+            return Ok([0u8; 4096]);
         };
 
         let run = &pf.data_runs[idx];
@@ -163,14 +160,14 @@ fn extract_named_pagefile_data_runs(
         match try_extract_from_partition(disk, partition_offset, filename) {
             Ok(result) => return Ok(result),
             Err(e) => {
-                log::debug!("No {} at partition 0x{:x}: {}", filename, partition_offset, e);
+                log::debug!("No {filename} at partition 0x{partition_offset:x}: {e}");
             }
         }
     }
 
-    Err(VmkatzError::DecryptionError(
-        format!("{} not found on any NTFS partition", filename),
-    ))
+    Err(VmkatzError::DecryptionError(format!(
+        "{filename} not found on any NTFS partition"
+    )))
 }
 
 /// Try to extract pagefile data runs from a specific NTFS partition.
@@ -182,28 +179,26 @@ fn try_extract_from_partition(
     let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
 
     let ntfs = ntfs::Ntfs::new(&mut part_reader)
-        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS parse error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS parse error: {e}")))?;
 
     let root = ntfs
         .root_directory(&mut part_reader)
-        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root dir error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root dir error: {e}")))?;
 
     let pagefile_entry = crate::sam::find_entry(&ntfs, &root, &mut part_reader, filename)?;
 
     let data_item = pagefile_entry
         .data(&mut part_reader, "")
-        .ok_or_else(|| {
-            VmkatzError::DecryptionError(format!("{}: no $DATA attribute", filename))
-        })?
-        .map_err(|e| VmkatzError::DecryptionError(format!("{} $DATA error: {}", filename, e)))?;
+        .ok_or_else(|| VmkatzError::DecryptionError(format!("{filename}: no $DATA attribute")))?
+        .map_err(|e| VmkatzError::DecryptionError(format!("{filename} $DATA error: {e}")))?;
 
-    let data_attr = data_item.to_attribute().map_err(|e| {
-        VmkatzError::DecryptionError(format!("{} to_attribute error: {}", filename, e))
-    })?;
+    let data_attr = data_item
+        .to_attribute()
+        .map_err(|e| VmkatzError::DecryptionError(format!("{filename} to_attribute error: {e}")))?;
 
     let data_value = data_attr
         .value(&mut part_reader)
-        .map_err(|e| VmkatzError::DecryptionError(format!("{} value error: {}", filename, e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("{filename} value error: {e}")))?;
 
     let pagefile_size = data_value.len();
 
@@ -215,7 +210,7 @@ fn try_extract_from_partition(
 
             for run_result in nr.data_runs() {
                 let run = run_result.map_err(|e| {
-                    VmkatzError::DecryptionError(format!("{} data run error: {}", filename, e))
+                    VmkatzError::DecryptionError(format!("{filename} data run error: {e}"))
                 })?;
 
                 let allocated = run.allocated_size();
@@ -231,10 +226,13 @@ fn try_extract_from_partition(
                 cumulative_offset += allocated;
             }
 
-            Ok(SinglePagefile { data_runs: runs, pagefile_size })
+            Ok(SinglePagefile {
+                data_runs: runs,
+                pagefile_size,
+            })
         }
-        _ => Err(VmkatzError::DecryptionError(
-            format!("{}: $DATA is not non-resident (unexpected for a pagefile)", filename),
-        )),
+        _ => Err(VmkatzError::DecryptionError(format!(
+            "{filename}: $DATA is not non-resident (unexpected for a pagefile)"
+        ))),
     }
 }

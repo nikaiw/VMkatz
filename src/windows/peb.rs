@@ -6,12 +6,12 @@ use crate::windows::offsets::LdrOffsets;
 /// PEB.Ldr is at 0x0C (not 0x18 as in x64).
 pub const X86_LDR: LdrOffsets = LdrOffsets {
     peb_ldr: 0x0C,
-    ldr_in_load_order: 0x0C,        // InLoadOrderModuleList at PEB_LDR_DATA+0x0C
+    ldr_in_load_order: 0x0C, // InLoadOrderModuleList at PEB_LDR_DATA+0x0C
     ldr_in_memory_order: 0x14,
-    ldr_entry_dll_base: 0x18,       // DllBase in LDR_DATA_TABLE_ENTRY
-    ldr_entry_size_of_image: 0x20,  // SizeOfImage
-    ldr_entry_full_dll_name: 0x24,  // FullDllName (UNICODE_STRING32)
-    ldr_entry_base_dll_name: 0x2C,  // BaseDllName (UNICODE_STRING32)
+    ldr_entry_dll_base: 0x18,      // DllBase in LDR_DATA_TABLE_ENTRY
+    ldr_entry_size_of_image: 0x20, // SizeOfImage
+    ldr_entry_full_dll_name: 0x24, // FullDllName (UNICODE_STRING32)
+    ldr_entry_base_dll_name: 0x2C, // BaseDllName (UNICODE_STRING32)
 };
 
 /// A loaded DLL in a process's address space.
@@ -56,9 +56,8 @@ pub fn enumerate_modules(
         // LDR_DATA_TABLE_ENTRY starts at the LIST_ENTRY (InLoadOrderLinks is at offset 0)
         let entry_base = current;
 
-        let dll_base = match vmem.read_virt_u64(entry_base + ldr_offsets.ldr_entry_dll_base) {
-            Ok(b) => b,
-            Err(_) => break,
+        let Ok(dll_base) = vmem.read_virt_u64(entry_base + ldr_offsets.ldr_entry_dll_base) else {
+            break;
         };
 
         if dll_base == 0 {
@@ -88,9 +87,8 @@ pub fn enumerate_modules(
         });
 
         // Follow Flink to next entry
-        let next = match vmem.read_virt_u64(current) {
-            Ok(n) => n,
-            Err(_) => break,
+        let Ok(next) = vmem.read_virt_u64(current) else {
+            break;
         };
         current = next;
     }
@@ -108,14 +106,14 @@ pub fn enumerate_modules_32(
     let mut modules = Vec::new();
 
     // PEB.Ldr (32-bit pointer)
-    let ldr = vmem.read_virt_u32(peb_addr + ldr_offsets.peb_ldr)? as u64;
+    let ldr = u64::from(vmem.read_virt_u32(peb_addr + ldr_offsets.peb_ldr)?);
     if ldr == 0 {
         return Ok(modules);
     }
 
     // PEB_LDR_DATA.InLoadOrderModuleList (LIST_ENTRY32: Flink u32, Blink u32)
     let list_head = ldr + ldr_offsets.ldr_in_load_order;
-    let first_flink = vmem.read_virt_u32(list_head)? as u64;
+    let first_flink = u64::from(vmem.read_virt_u32(list_head)?);
     if first_flink == 0 || first_flink == list_head {
         return Ok(modules);
     }
@@ -133,12 +131,12 @@ pub fn enumerate_modules_32(
 
         // DllBase (32-bit pointer)
         let dll_base = match vmem.read_virt_u32(entry_base + ldr_offsets.ldr_entry_dll_base) {
-            Ok(b) => b as u64,
+            Ok(b) => u64::from(b),
             Err(_) => break,
         };
 
         if dll_base == 0 {
-            let next = vmem.read_virt_u32(current).unwrap_or(0) as u64;
+            let next = u64::from(vmem.read_virt_u32(current).unwrap_or(0));
             current = next;
             continue;
         }
@@ -165,7 +163,7 @@ pub fn enumerate_modules_32(
 
         // Follow Flink (32-bit)
         let next = match vmem.read_virt_u32(current) {
-            Ok(n) => n as u64,
+            Ok(n) => u64::from(n),
             Err(_) => break,
         };
         current = next;

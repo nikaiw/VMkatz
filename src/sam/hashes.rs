@@ -8,9 +8,9 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use des::cipher::generic_array::GenericArray;
 use des::cipher::{BlockDecrypt, KeyInit};
 
-use super::hive::Hive;
 use super::SamEntry;
-use crate::error::{VmkatzError, Result};
+use super::hive::Hive;
+use crate::error::{Result, VmkatzError};
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
@@ -43,27 +43,27 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
         }
 
         // Parse RID from hex key name (e.g., "000001F4" = 500)
-        let rid = match u32::from_str_radix(key_name, 16) {
-            Ok(r) => r,
-            Err(_) => {
-                log::warn!("Skipping non-hex user key: {}", key_name);
-                continue;
-            }
+        let Ok(rid) = u32::from_str_radix(key_name, 16) else {
+            log::warn!("Skipping non-hex user key: {key_name}");
+            continue;
         };
 
         let v_data = match user_key.value(&hive, "V") {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("RID {}: no V value: {}", rid, e);
+                log::warn!("RID {rid}: no V value: {e}");
                 continue;
             }
         };
 
         // Read per-user F value for Account Control Bits (ACB flags at offset 0x38)
-        let acb_flags = user_key.value(&hive, "F").ok()
+        let acb_flags = user_key
+            .value(&hive, "F")
+            .ok()
             .filter(|f| f.len() >= 0x3C)
-            .map(|f| u32::from_le_bytes([f[0x38], f[0x39], f[0x3A], f[0x3B]]))
-            .unwrap_or(0);
+            .map_or(0, |f| {
+                u32::from_le_bytes([f[0x38], f[0x39], f[0x3A], f[0x3B]])
+            });
 
         match extract_user_hashes(&v_data, &hashed_bootkey, rid, acb_flags) {
             Ok(entry) => {
@@ -73,12 +73,16 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
                     entry.username,
                     hex::encode(entry.nt_hash),
                     entry.acb_flags,
-                    if entry.is_disabled() { " [DISABLED]" } else { "" },
+                    if entry.is_disabled() {
+                        " [DISABLED]"
+                    } else {
+                        ""
+                    },
                 );
                 entries.push(entry);
             }
             Err(e) => {
-                log::warn!("RID {}: hash extraction failed: {}", rid, e);
+                log::warn!("RID {rid}: hash extraction failed: {e}");
             }
         }
     }
@@ -95,7 +99,7 @@ fn decrypt_hashed_bootkey(f: &[u8], bootkey: &[u8; 16]) -> Result<[u8; 16]> {
     }
 
     let revision = f[0x00];
-    log::info!("SAM F revision: 0x{:02x}", revision);
+    log::info!("SAM F revision: 0x{revision:02x}");
 
     match revision {
         0x03 => {
@@ -124,12 +128,17 @@ fn decrypt_hashed_bootkey(f: &[u8], bootkey: &[u8; 16]) -> Result<[u8; 16]> {
             hbk.copy_from_slice(&decrypted[..16]);
             Ok(hbk)
         }
-        _ => Err(sam_err(&format!("Unknown F revision: 0x{:02x}", revision))),
+        _ => Err(sam_err(&format!("Unknown F revision: 0x{revision:02x}"))),
     }
 }
 
 /// Extract username and hashes from a user's V value.
-fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32, acb_flags: u32) -> Result<SamEntry> {
+fn extract_user_hashes(
+    v: &[u8],
+    hashed_bootkey: &[u8; 16],
+    rid: u32,
+    acb_flags: u32,
+) -> Result<SamEntry> {
     if v.len() < 0xCC {
         return Err(sam_err("V value too short"));
     }
@@ -137,16 +146,24 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32, acb_flags:
     // Parse username from descriptor 1 (V+0x0C)
     let name_offset = (u32_le(v, 0x0C) as usize).saturating_add(0xCC);
     let name_length = u32_le(v, 0x10) as usize;
-    let username = if name_offset.checked_add(name_length).is_some_and(|end| end <= v.len()) && name_length > 0 {
+    let username = if name_offset
+        .checked_add(name_length)
+        .is_some_and(|end| end <= v.len())
+        && name_length > 0
+    {
         decode_utf16le(&v[name_offset..name_offset + name_length])
     } else {
-        format!("RID-{}", rid)
+        format!("RID-{rid}")
     };
 
     // Parse LM hash (desc[13] at V+0x9C)
     let lm_offset = (u32_le(v, 0x9C) as usize).saturating_add(0xCC);
     let lm_length = u32_le(v, 0xA0) as usize;
-    let lm_hash = if lm_length >= 4 && lm_offset.checked_add(lm_length).is_some_and(|end| end <= v.len()) {
+    let lm_hash = if lm_length >= 4
+        && lm_offset
+            .checked_add(lm_length)
+            .is_some_and(|end| end <= v.len())
+    {
         decrypt_sam_hash(
             &v[lm_offset..lm_offset + lm_length],
             hashed_bootkey,
@@ -160,7 +177,11 @@ fn extract_user_hashes(v: &[u8], hashed_bootkey: &[u8; 16], rid: u32, acb_flags:
     // Parse NT hash (desc[14] at V+0xA8)
     let nt_offset = (u32_le(v, 0xA8) as usize).saturating_add(0xCC);
     let nt_length = u32_le(v, 0xAC) as usize;
-    let nt_hash = if nt_length >= 4 && nt_offset.checked_add(nt_length).is_some_and(|end| end <= v.len()) {
+    let nt_hash = if nt_length >= 4
+        && nt_offset
+            .checked_add(nt_length)
+            .is_some_and(|end| end <= v.len())
+    {
         decrypt_sam_hash(
             &v[nt_offset..nt_offset + nt_length],
             hashed_bootkey,
@@ -193,7 +214,8 @@ fn decrypt_sam_hash(
 
     // SAM_HASH header: +0x00 u16 PekID, +0x02 u16 Revision
     let revision = u16::from_le_bytes(
-        hash_data.get(2..4)
+        hash_data
+            .get(2..4)
             .ok_or_else(|| sam_err("SAM_HASH header too short"))?
             .try_into()
             .map_err(|_| sam_err("SAM_HASH revision slice"))?,
@@ -234,7 +256,7 @@ fn decrypt_sam_hash(
             rc4(&rc4_key, encrypted)
         }
         _ => {
-            log::warn!("Unknown SAM_HASH revision: 0x{:04x}", revision);
+            log::warn!("Unknown SAM_HASH revision: 0x{revision:04x}");
             return Ok([0u8; 16]);
         }
     };
@@ -270,16 +292,16 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
         rid_bytes[1],
     ];
 
-    let des_key1 = expand_des_key(&key1_src);
-    let des_key2 = expand_des_key(&key2_src);
+    let des_key1 = expand_des_key(key1_src);
+    let des_key2 = expand_des_key(key2_src);
 
     let mut block1 = GenericArray::clone_from_slice(&encrypted[0..8]);
     let mut block2 = GenericArray::clone_from_slice(&encrypted[8..16]);
 
     let cipher1 =
-        des::Des::new_from_slice(&des_key1).map_err(|e| sam_err(&format!("DES key1: {}", e)))?;
+        des::Des::new_from_slice(&des_key1).map_err(|e| sam_err(&format!("DES key1: {e}")))?;
     let cipher2 =
-        des::Des::new_from_slice(&des_key2).map_err(|e| sam_err(&format!("DES key2: {}", e)))?;
+        des::Des::new_from_slice(&des_key2).map_err(|e| sam_err(&format!("DES key2: {e}")))?;
 
     cipher1.decrypt_block(&mut block1);
     cipher2.decrypt_block(&mut block2);
@@ -291,7 +313,7 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
 }
 
 /// Expand 7-byte key source to 8-byte DES key with odd parity.
-fn expand_des_key(src: &[u8; 7]) -> [u8; 8] {
+pub(crate) fn expand_des_key(src: [u8; 7]) -> [u8; 8] {
     let mut key = [0u8; 8];
     key[0] = src[0] >> 1;
     key[1] = ((src[0] & 0x01) << 6) | (src[1] >> 2);
@@ -321,10 +343,10 @@ pub(crate) fn aes128_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<V
     buf.extend(std::iter::repeat_n(0u8, pad_len));
 
     let decryptor =
-        Aes128CbcDec::new_from_slices(key, iv).map_err(|e| sam_err(&format!("AES init: {}", e)))?;
+        Aes128CbcDec::new_from_slices(key, iv).map_err(|e| sam_err(&format!("AES init: {e}")))?;
     decryptor
         .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
-        .map_err(|e| sam_err(&format!("AES decrypt: {}", e)))?;
+        .map_err(|e| sam_err(&format!("AES decrypt: {e}")))?;
 
     // Trim back to original size
     buf.truncate(data.len());
@@ -369,10 +391,9 @@ pub(crate) fn decode_utf16le(data: &[u8]) -> String {
 fn u32_le(data: &[u8], offset: usize) -> u32 {
     data.get(offset..offset + 4)
         .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(0)
+        .map_or(0, u32::from_le_bytes)
 }
 
 fn sam_err(msg: &str) -> VmkatzError {
-    VmkatzError::DecryptionError(format!("SAM: {}", msg))
+    VmkatzError::DecryptionError(format!("SAM: {msg}"))
 }

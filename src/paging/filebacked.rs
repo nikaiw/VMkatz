@@ -9,7 +9,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::disk;
-use crate::error::{VmkatzError, Result};
+use crate::error::{Result, VmkatzError};
 use crate::windows::peb::LoadedModule;
 
 /// IMAGE_SCN_MEM_WRITE — skip writable sections (in-memory content differs from disk).
@@ -41,7 +41,7 @@ impl FileBackedResolver {
             {
                 Ok(()) => break,
                 Err(e) => {
-                    log::debug!("File-backed: partition 0x{:x}: {}", partition_offset, e);
+                    log::debug!("File-backed: partition 0x{partition_offset:x}: {e}");
                 }
             }
         }
@@ -65,10 +65,10 @@ impl FileBackedResolver {
         let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
 
         let ntfs = ntfs::Ntfs::new(&mut part_reader)
-            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS: {}", e)))?;
+            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS: {e}")))?;
         let root = ntfs
             .root_directory(&mut part_reader)
-            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root: {}", e)))?;
+            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root: {e}")))?;
 
         // Navigate to Windows\System32
         let windows = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
@@ -96,11 +96,11 @@ impl FileBackedResolver {
                         sections.extend(secs);
                     }
                     Err(e) => {
-                        log::debug!("File-backed: {} PE parse: {}", dll_name, e);
+                        log::debug!("File-backed: {dll_name} PE parse: {e}");
                     }
                 },
                 Err(_) => {
-                    log::debug!("File-backed: {} not in System32", dll_name);
+                    log::debug!("File-backed: {dll_name} not in System32");
                 }
             }
         }
@@ -163,8 +163,9 @@ impl FileBackedResolver {
 
             let virt_size =
                 u32::from_le_bytes(pe_data[off + 8..off + 12].try_into().unwrap()) as usize;
-            let virt_addr =
-                u32::from_le_bytes(pe_data[off + 12..off + 16].try_into().unwrap()) as u64;
+            let virt_addr = u64::from(u32::from_le_bytes(
+                pe_data[off + 12..off + 16].try_into().unwrap(),
+            ));
             let raw_size =
                 u32::from_le_bytes(pe_data[off + 16..off + 20].try_into().unwrap()) as usize;
             let raw_offset =
@@ -203,7 +204,7 @@ impl FileBackedResolver {
     pub fn resolve_page(&self, vaddr: u64) -> Option<[u8; 4096]> {
         let page_base = vaddr & !0xFFF;
 
-        let idx = match self.sections.binary_search_by(|s| {
+        let Ok(idx) = self.sections.binary_search_by(|s| {
             let s_end = s.va_start + s.data.len() as u64;
             if page_base < s.va_start {
                 std::cmp::Ordering::Greater
@@ -212,9 +213,8 @@ impl FileBackedResolver {
             } else {
                 std::cmp::Ordering::Equal
             }
-        }) {
-            Ok(i) => i,
-            Err(_) => return None,
+        }) else {
+            return None;
         };
 
         let section = &self.sections[idx];
@@ -229,15 +229,15 @@ impl FileBackedResolver {
         Some(page)
     }
 
-    pub fn pages_resolved(&self) -> u64 {
+    pub const fn pages_resolved(&self) -> u64 {
         self.pages_resolved.get()
     }
 
-    pub fn total_bytes(&self) -> usize {
+    pub const fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
-    pub fn section_count(&self) -> usize {
+    pub const fn section_count(&self) -> usize {
         self.sections.len()
     }
 }

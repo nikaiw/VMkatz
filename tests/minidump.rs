@@ -1,8 +1,8 @@
 use std::path::Path;
-use vmkatz::minidump::Minidump;
 use vmkatz::memory::VirtualMemory;
+use vmkatz::minidump::Minidump;
 
-/// Synthetic minidump: header + 1 SystemInfoStream + 1 Memory64ListStream with 1 region.
+/// Synthetic minidump: header + 1 `SystemInfoStream` + 1 `Memory64ListStream` with 1 region.
 fn make_test_minidump() -> Vec<u8> {
     let mut data = Vec::new();
 
@@ -100,8 +100,14 @@ fn parse_real_minidump() {
     let has_lsasrv = mdmp.modules.iter().any(|m| m.base_name == "lsasrv.dll");
     assert!(has_lsasrv, "lsasrv.dll should be in module list");
 
-    let lsasrv = mdmp.modules.iter().find(|m| m.base_name == "lsasrv.dll").unwrap();
-    let mz = mdmp.read_virt_u16(lsasrv.base).expect("should read MZ header");
+    let lsasrv = mdmp
+        .modules
+        .iter()
+        .find(|m| m.base_name == "lsasrv.dll")
+        .unwrap();
+    let mz = mdmp
+        .read_virt_u16(lsasrv.base)
+        .expect("should read MZ header");
     assert_eq!(mz, 0x5A4D, "lsasrv.dll should start with MZ");
 }
 
@@ -143,11 +149,7 @@ fn extract_credentials_from_real_minidump() {
             false
         }
     });
-    assert!(
-        found_nt,
-        "should find NT hash {} (user@SECLAB)",
-        expected_nt
-    );
+    assert!(found_nt, "should find NT hash {expected_nt} (user@SECLAB)");
 
     let found_sha1 = msv_creds.iter().any(|c| {
         if let Some(msv) = &c.msv {
@@ -158,13 +160,15 @@ fn extract_credentials_from_real_minidump() {
     });
     assert!(
         found_sha1,
-        "should find SHA1 hash {} (matches pypykatz)",
-        expected_sha1
+        "should find SHA1 hash {expected_sha1} (matches pypykatz)"
     );
 
     // Verify the user's session metadata
     let user_cred = credentials
         .iter()
         .find(|c| c.username == "user" && c.domain == "SECLAB" && c.msv.is_some());
-    assert!(user_cred.is_some(), "should find user@SECLAB session with MSV data");
+    assert!(
+        user_cred.is_some(),
+        "should find user@SECLAB session with MSV data"
+    );
 }

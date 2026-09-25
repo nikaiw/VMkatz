@@ -5,7 +5,7 @@
 //! the scaffold here lands the data structures and the SQLite/JSON parsing so the
 //! crypto can land independently.
 
-use crate::chrome::sqlite::{walk_table, Pager, Value};
+use crate::chrome::sqlite::{Pager, Value, walk_table};
 use crate::chrome::types::{Browser, BrowserProfile, ChromeSource, SavedPassword};
 use crate::chrome::util::b64_decode;
 use crate::error::{Result, VmkatzError as Error};
@@ -29,10 +29,11 @@ pub(crate) struct LoginEntry {
 }
 
 /// Top-level: parse logins.json, derive NSS master key, decrypt each login.
+///
 /// Currently the decrypt step errors with a clear "not yet implemented" — callers
 /// should treat this as "Firefox extraction is partial in this build".
 pub fn extract_profile(p: &FirefoxProfile) -> Result<Vec<SavedPassword>> {
-    let _master = derive_master_key(&p.key4_db, p.key4_db_wal.as_deref(), b"")?;
+    let master = derive_master_key(&p.key4_db, p.key4_db_wal.as_deref(), b"")?;
     let logins = parse_logins(&p.logins_json)?;
     let profile = BrowserProfile {
         browser: Browser::Firefox,
@@ -43,8 +44,8 @@ pub fn extract_profile(p: &FirefoxProfile) -> Result<Vec<SavedPassword>> {
     let mut out = Vec::new();
     for l in logins {
         if let (Some(u), Some(pw)) = (
-            decrypt_login(&l.username_pkcs11, &_master),
-            decrypt_login(&l.password_pkcs11, &_master),
+            decrypt_login(&l.username_pkcs11, &master),
+            decrypt_login(&l.password_pkcs11, &master),
         ) {
             out.push(SavedPassword {
                 profile: profile.clone(),
@@ -62,13 +63,17 @@ pub(crate) fn parse_logins(json: &str) -> Result<Vec<LoginEntry>> {
     #[derive(Deserialize)]
     struct Login {
         hostname: String,
-        #[serde(rename = "encryptedUsername")] encrypted_username: String,
-        #[serde(rename = "encryptedPassword")] encrypted_password: String,
+        #[serde(rename = "encryptedUsername")]
+        encrypted_username: String,
+        #[serde(rename = "encryptedPassword")]
+        encrypted_password: String,
     }
     #[derive(Deserialize)]
-    struct Root { logins: Vec<Login> }
-    let r: Root = serde_json::from_str(json)
-        .map_err(|e| Error::Parse(format!("logins.json: {}", e)))?;
+    struct Root {
+        logins: Vec<Login>,
+    }
+    let r: Root =
+        serde_json::from_str(json).map_err(|e| Error::Parse(format!("logins.json: {e}")))?;
     Ok(r.logins
         .into_iter()
         .filter_map(|l| {
@@ -83,7 +88,11 @@ pub(crate) fn parse_logins(json: &str) -> Result<Vec<LoginEntry>> {
 
 /// Read the metadata table out of key4.db, derive the master AES key from the
 /// (empty) master password. Currently errors with "NSS derive not yet implemented".
-fn derive_master_key(key4_db: &[u8], wal: Option<&[u8]>, _master_password: &[u8]) -> Result<Vec<u8>> {
+fn derive_master_key(
+    key4_db: &[u8],
+    wal: Option<&[u8]>,
+    _master_password: &[u8],
+) -> Result<Vec<u8>> {
     let pager = match wal {
         Some(w) => Pager::open_with_wal(key4_db, w)?,
         None => Pager::open(key4_db)?,
@@ -95,9 +104,13 @@ fn derive_master_key(key4_db: &[u8], wal: Option<&[u8]>, _master_password: &[u8]
     let mut global_salt: Vec<u8> = Vec::new();
     let mut password_check: Vec<u8> = Vec::new();
     walk_table(&pager, meta_root, |_r, cols| {
-        if cols.get(0).and_then(Value::as_text) == Some("password") {
-            if let Some(b) = cols.get(1).and_then(Value::as_blob) { global_salt = b.to_vec(); }
-            if let Some(b) = cols.get(2).and_then(Value::as_blob) { password_check = b.to_vec(); }
+        if cols.first().and_then(Value::as_text) == Some("password") {
+            if let Some(b) = cols.get(1).and_then(Value::as_blob) {
+                global_salt = b.to_vec();
+            }
+            if let Some(b) = cols.get(2).and_then(Value::as_blob) {
+                password_check = b.to_vec();
+            }
         }
         Ok(())
     })?;
@@ -110,7 +123,7 @@ fn derive_master_key(key4_db: &[u8], wal: Option<&[u8]>, _master_password: &[u8]
     Err(Error::Parse("NSS derive not yet implemented".into()))
 }
 
-fn decrypt_login(_blob: &[u8], _master: &[u8]) -> Option<String> {
+const fn decrypt_login(_blob: &[u8], _master: &[u8]) -> Option<String> {
     // ASN.1: SEQUENCE { OID 3desCBC, IV, ciphertext }. 3DES-CBC decrypt with master key.
     // Strip PKCS#7 padding. Return UTF-8.
     None
@@ -132,7 +145,7 @@ mod tests {
 
     #[test]
     fn parse_logins_rejects_invalid_json() {
-        let r = parse_logins(r#"{not json"#);
+        let r = parse_logins(r"{not json");
         assert!(r.is_err());
     }
 

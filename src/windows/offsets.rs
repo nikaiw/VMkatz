@@ -8,7 +8,6 @@ pub enum WindowsBitness {
 /// EPROCESS field offsets for a given Windows version/architecture.
 /// Some fields document struct layout for future use and may not be read yet.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct EprocessOffsets {
     pub bitness: WindowsBitness,
     pub directory_table_base: u64,
@@ -22,7 +21,6 @@ pub struct EprocessOffsets {
 /// PEB / LDR offsets for enumerating loaded DLLs.
 /// Stable across Windows 7-11 x64.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct LdrOffsets {
     pub peb_ldr: u64,
     pub ldr_in_load_order: u64,
@@ -249,22 +247,22 @@ pub const X64_LDR: LdrOffsets = LdrOffsets {
 /// Ordered by likelihood (most common first). Pre-Vista offsets are last to avoid
 /// false matches on modern VMs.
 pub const ALL_EPROCESS_OFFSETS: &[EprocessOffsets] = &[
-    WIN10_X64_EPROCESS,        // Win10 2004+ / Win11 21H2-23H2 (most common)
-    WIN11_24H2_X64_EPROCESS,   // Win11 24H2+ / Server 2025
-    WIN10_1903_X64_EPROCESS,   // Win10 1903/1909 (SectionBaseAddress=0x3C8)
-    WIN10_1703_X64_EPROCESS,   // Win10 1703-1809 (PID=0x2E0)
-    WIN10_1607_X64_EPROCESS,   // Win10 1511/1607 (PID=0x2E8, filename=0x450)
-    WIN10_1507_X64_EPROCESS,   // Win10 1507 only (filename=0x448)
-    WIN81_X64_EPROCESS,        // Win8.1
-    WIN8_X64_EPROCESS,         // Win8
-    WIN7_X64_EPROCESS,         // Win7
-    VISTA_X64_EPROCESS,        // Vista SP0-SP2
-    WIN10_LATE_X86_EPROCESS,   // Win10 1703-22H2 x86
-    WIN10_EARLY_X86_EPROCESS,  // Win10 1507-1607 x86
-    WIN8_X86_EPROCESS,         // Win8/8.1 x86
-    WIN7_X86_EPROCESS,         // Win7 x86
-    VISTA_X86_EPROCESS,        // Vista x86
-    WIN2003_X64_EPROCESS,      // Win2003 x64
-    WIN2003_X86_EPROCESS,      // Win2003 x86
-    WINXP_X86_EPROCESS,        // WinXP x86
+    WIN10_X64_EPROCESS,       // Win10 2004+ / Win11 21H2-23H2 (most common)
+    WIN11_24H2_X64_EPROCESS,  // Win11 24H2+ / Server 2025
+    WIN10_1903_X64_EPROCESS,  // Win10 1903/1909 (SectionBaseAddress=0x3C8)
+    WIN10_1703_X64_EPROCESS,  // Win10 1703-1809 (PID=0x2E0)
+    WIN10_1607_X64_EPROCESS,  // Win10 1511/1607 (PID=0x2E8, filename=0x450)
+    WIN10_1507_X64_EPROCESS,  // Win10 1507 only (filename=0x448)
+    WIN81_X64_EPROCESS,       // Win8.1
+    WIN8_X64_EPROCESS,        // Win8
+    WIN7_X64_EPROCESS,        // Win7
+    VISTA_X64_EPROCESS,       // Vista SP0-SP2
+    WIN10_LATE_X86_EPROCESS,  // Win10 1703-22H2 x86
+    WIN10_EARLY_X86_EPROCESS, // Win10 1507-1607 x86
+    WIN8_X86_EPROCESS,        // Win8/8.1 x86
+    WIN7_X86_EPROCESS,        // Win7 x86
+    VISTA_X86_EPROCESS,       // Vista x86
+    WIN2003_X64_EPROCESS,     // Win2003 x64
+    WIN2003_X86_EPROCESS,     // Win2003 x86
+    WINXP_X86_EPROCESS,       // WinXP x86
 ];

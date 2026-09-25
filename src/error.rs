@@ -43,7 +43,6 @@ pub enum VmkatzError {
 
     #[error("Parse error: {0}")]
     Parse(String),
-
 }
 
 pub type Result<T> = std::result::Result<T, VmkatzError>;

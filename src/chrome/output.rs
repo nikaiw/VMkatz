@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::chrome::types::{ChromeFindings, ChromeSource};
 
 #[derive(Debug, Clone, Copy)]
@@ -57,25 +59,27 @@ fn render_pretty(f: &ChromeFindings) -> String {
     }
     let mut out = String::new();
     for ((user, prof, browser), (pws, mut cks, afs)) in groups {
-        out.push_str(&format!("[Chrome] {}/{} ({})\n", user, prof, browser));
+        let _ = writeln!(out, "[Chrome] {user}/{prof} ({browser})");
         for p in pws {
-            out.push_str(&format!(
-                "  password  {}  {}  {}  [{}]\n",
+            let _ = writeln!(
+                out,
+                "  password  {}  {}  {}  [{}]",
                 p.url,
                 p.username,
                 p.password,
                 src_tag(&p.source)
-            ));
+            );
         }
         cks.sort_by(|a, b| a.host.cmp(&b.host));
         for c in cks {
-            out.push_str(&format!(
-                "  cookie    {}  {}  {}  [{}]\n",
+            let _ = writeln!(
+                out,
+                "  cookie    {}  {}  {}  [{}]",
                 c.host,
                 c.name,
                 truncate(&c.value, 32),
                 src_tag(&c.source)
-            ));
+            );
         }
         for a in afs {
             let kind = match a.kind {
@@ -83,17 +87,14 @@ fn render_pretty(f: &ChromeFindings) -> String {
                 crate::chrome::types::AutofillKind::CreditCard => "card",
                 crate::chrome::types::AutofillKind::Address => "addr",
             };
-            let fields: Vec<String> = a
-                .fields
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-            out.push_str(&format!(
-                "  autofill  {}  {}  [{}]\n",
+            let fields: Vec<String> = a.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let _ = writeln!(
+                out,
+                "  autofill  {}  {}  [{}]",
                 kind,
                 fields.join(" "),
                 src_tag(&a.source)
-            ));
+            );
         }
     }
     out
@@ -101,10 +102,10 @@ fn render_pretty(f: &ChromeFindings) -> String {
 
 fn src_tag(s: &ChromeSource) -> String {
     match s {
-        ChromeSource::Memory { pid, process } => format!("Memory pid={} {}", pid, process),
+        ChromeSource::Memory { pid, process } => format!("Memory pid={pid} {process}"),
         ChromeSource::DiskDpapi => "DiskDpapi".into(),
         ChromeSource::DiskAbe => "DiskAbe".into(),
-        ChromeSource::HybridMemKey { mk_guid } => format!("HybridMemKey {}", mk_guid),
+        ChromeSource::HybridMemKey { mk_guid } => format!("HybridMemKey {mk_guid}"),
     }
 }
 
@@ -139,7 +140,7 @@ mod tests {
             source: ChromeSource::DiskDpapi,
         });
         f.cookies.push(Cookie {
-            profile: profile.clone(),
+            profile,
             host: ".t.example".into(),
             name: "SESSION".into(),
             value: "AbCdEf".into(),

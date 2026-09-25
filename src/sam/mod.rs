@@ -1,12 +1,12 @@
 pub mod bootkey;
 pub mod cache;
+mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
 pub mod lsa;
 mod ntfs_fallback;
-mod partition;
 mod ntfs_reader;
-mod disk_fallbacks;
+mod partition;
 mod vmdk_scan;
 
 pub mod aes_xts;
@@ -14,10 +14,10 @@ pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
 // Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
-pub use partition::{find_ntfs_partitions, is_bitlocker_partition};
-pub use ntfs_reader::{find_entry, read_file_data, PartitionReader};
+pub use ntfs_reader::{PartitionReader, find_entry, read_file_data};
 #[cfg(feature = "chrome")]
 pub use ntfs_reader::{list_directory, navigate_to_dir};
+pub use partition::{find_ntfs_partitions, is_bitlocker_partition};
 
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -49,12 +49,12 @@ pub struct SamEntry {
 // Account Control Bit flags (from SAM per-user F value).
 impl SamEntry {
     /// Account is disabled (ACB_DISABLED).
-    pub fn is_disabled(&self) -> bool {
+    pub const fn is_disabled(&self) -> bool {
         self.acb_flags & 0x0001 != 0
     }
 
     /// Password not required (ACB_PWNOTREQ).
-    pub fn password_not_required(&self) -> bool {
+    pub const fn password_not_required(&self) -> bool {
         self.acb_flags & 0x0004 != 0
     }
 }
@@ -75,7 +75,7 @@ pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMaster
     match crate::disk::open_disk(path) {
         Ok(mut disk) => dpapi_masterkey::extract_from_disk(&mut disk),
         Err(e) => {
-            log::info!("Cannot open disk for DPAPI scan: {}", e);
+            log::info!("Cannot open disk for DPAPI scan: {e}");
             Vec::new()
         }
     }
@@ -122,13 +122,13 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
     for &partition_offset in &partitions {
         // Try unencrypted first
         if !is_bitlocker_partition(reader, partition_offset) {
-            log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
+            log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
             match ntfs_reader::read_hive_files(reader, partition_offset) {
                 Ok((sam_data, system_data, security_data)) => {
-                    return process_hive_data(sam_data, system_data, security_data);
+                    return process_hive_data(&sam_data, &system_data, security_data.as_deref());
                 }
                 Err(e) => {
-                    log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                    log::info!("Partition at 0x{partition_offset:x}: {e}");
                 }
             }
             continue;
@@ -147,7 +147,7 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
             fvek_keys,
             |bl_reader, _offset| {
                 ntfs_reader::read_hive_files(bl_reader, 0)
-                    .and_then(|(sam, sys, sec)| process_hive_data(sam, sys, sec))
+                    .and_then(|(sam, sys, sec)| process_hive_data(&sam, &sys, sec.as_deref()))
             },
         ) {
             return Ok(secrets);
@@ -169,10 +169,7 @@ fn extract_ntds_with_bitlocker<R: Read + Seek>(
 
     for &partition_offset in &partitions {
         if !is_bitlocker_partition(reader, partition_offset) {
-            log::info!(
-                "Trying NTDS on NTFS partition at offset 0x{:x}",
-                partition_offset
-            );
+            log::info!("Trying NTDS on NTFS partition at offset 0x{partition_offset:x}");
             match ntfs_reader::read_ntds_artifacts(reader, partition_offset) {
                 Ok((ntds_data, system_data)) => {
                     return Ok(NtdsArtifacts {
@@ -182,7 +179,7 @@ fn extract_ntds_with_bitlocker<R: Read + Seek>(
                     });
                 }
                 Err(e) => {
-                    log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                    log::info!("Partition at 0x{partition_offset:x}: {e}");
                 }
             }
             continue;
@@ -233,22 +230,22 @@ where
     F: Fn(&mut bitlocker_decrypt::BitLockerReader<&mut R>, u64) -> Result<T>,
 {
     for (i, key) in fvek_keys.iter().enumerate() {
-        let xts_key = match bitlocker_decrypt::build_xts_key(key) {
-            Some(k) => k,
-            None => {
-                log::info!(
-                    "BitLocker: skipping FVEK #{} — unsupported method 0x{:04x} ({})",
-                    i,
-                    key.method,
-                    key.cipher
-                );
-                continue;
-            }
+        let Some(xts_key) = bitlocker_decrypt::build_xts_key(key) else {
+            log::info!(
+                "BitLocker: skipping FVEK #{} — unsupported method 0x{:04x} ({})",
+                i,
+                key.method,
+                key.cipher
+            );
+            continue;
         };
 
         // Validate by decrypting sector 0 and checking NTFS signature
-        let mut bl_reader =
-            bitlocker_decrypt::BitLockerReader::new(&mut *reader, partition_offset, xts_key.clone());
+        let mut bl_reader = bitlocker_decrypt::BitLockerReader::new(
+            &mut *reader,
+            partition_offset,
+            xts_key.clone(),
+        );
 
         if !bl_reader.validate_ntfs_signature() {
             log::info!(
@@ -271,11 +268,7 @@ where
         match extract_fn(&mut bl_reader, partition_offset) {
             Ok(result) => return Some(result),
             Err(e) => {
-                log::warn!(
-                    "BitLocker: FVEK #{} decrypted NTFS header but extraction failed: {}",
-                    i,
-                    e
-                );
+                log::warn!("BitLocker: FVEK #{i} decrypted NTFS header but extraction failed: {e}");
             }
         }
     }
@@ -289,7 +282,7 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
     match extract_secrets_from_reader(&mut disk) {
         Ok(secrets) => return Ok(secrets),
         Err(e) => {
-            log::info!("Standard extraction failed: {}", e);
+            log::info!("Standard extraction failed: {e}");
         }
     }
 
@@ -307,14 +300,14 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
         match vmdk_scan::scan_vmdk_grains_for_hives(&mut vmdk) {
             Ok(((sam_data, system_data, security_data), scattered_bootkey)) => {
                 return process_hive_data_with_bootkey(
-                    sam_data,
-                    system_data,
-                    security_data,
+                    &sam_data,
+                    &system_data,
+                    security_data.as_deref(),
                     scattered_bootkey,
                 );
             }
             Err(e) => {
-                log::info!("VMDK grain scan failed: {}", e);
+                log::info!("VMDK grain scan failed: {e}");
                 return Err(e);
             }
         }
@@ -332,17 +325,17 @@ pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskS
     let mut bitlocker_found = false;
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }
-        log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
+        log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
         match ntfs_reader::read_hive_files(reader, partition_offset) {
             Ok((sam_data, system_data, security_data)) => {
-                return process_hive_data(sam_data, system_data, security_data);
+                return process_hive_data(&sam_data, &system_data, security_data.as_deref());
             }
             Err(e) => {
-                log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
         }
     }
@@ -363,17 +356,17 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
 
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }
-        log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
+        log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
         match ntfs_reader::read_hive_files(reader, partition_offset) {
             Ok((sam_data, system_data, security_data)) => {
-                return process_hive_data(sam_data, system_data, security_data);
+                return process_hive_data(&sam_data, &system_data, security_data.as_deref());
             }
             Err(e) => {
-                log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
         }
     }
@@ -382,10 +375,10 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
     log::info!("NTFS approach failed, trying raw regf scan fallback");
     match disk_fallbacks::scan_for_hives(reader) {
         Ok((sam_data, system_data, security_data)) => {
-            return process_hive_data(sam_data, system_data, security_data);
+            return process_hive_data(&sam_data, &system_data, security_data.as_deref());
         }
         Err(e) => {
-            log::info!("Raw regf scan failed: {}", e);
+            log::info!("Raw regf scan failed: {e}");
         }
     }
 
@@ -395,10 +388,10 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
     log::info!("Trying hbin-based fallback scan for fragmented hives");
     match disk_fallbacks::scan_for_hbin_roots(reader) {
         Ok((sam_data, system_data, security_data)) => {
-            process_hive_data(sam_data, system_data, security_data)
+            process_hive_data(&sam_data, &system_data, security_data.as_deref())
         }
         Err(e) => {
-            log::info!("hbin scan failed: {}", e);
+            log::info!("hbin scan failed: {e}");
             if bitlocker_found {
                 Err(crate::error::VmkatzError::DecryptionError(
                     "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
@@ -417,14 +410,11 @@ fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<
 
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{:x} is BitLocker-encrypted", partition_offset);
+            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }
-        log::info!(
-            "Trying NTDS extraction on NTFS partition at offset 0x{:x}",
-            partition_offset
-        );
+        log::info!("Trying NTDS extraction on NTFS partition at offset 0x{partition_offset:x}");
         match ntfs_reader::read_ntds_artifacts(reader, partition_offset) {
             Ok((ntds_data, system_data)) => {
                 return Ok(NtdsArtifacts {
@@ -434,7 +424,7 @@ fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<
                 });
             }
             Err(e) => {
-                log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+                log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
         }
     }
@@ -451,18 +441,18 @@ fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<
 
 /// Process extracted hive data into DiskSecrets.
 fn process_hive_data(
-    sam_data: Vec<u8>,
-    system_data: Vec<u8>,
-    security_data: Option<Vec<u8>>,
+    sam_data: &[u8],
+    system_data: &[u8],
+    security_data: Option<&[u8]>,
 ) -> Result<DiskSecrets> {
     process_hive_data_with_bootkey(sam_data, system_data, security_data, None)
 }
 
 /// Process extracted hive data with an optional pre-extracted bootkey.
 fn process_hive_data_with_bootkey(
-    sam_data: Vec<u8>,
-    system_data: Vec<u8>,
-    security_data: Option<Vec<u8>>,
+    sam_data: &[u8],
+    system_data: &[u8],
+    security_data: Option<&[u8]>,
     precomputed_bootkey: Option<[u8; 16]>,
 ) -> Result<DiskSecrets> {
     log::info!(
@@ -477,15 +467,15 @@ fn process_hive_data_with_bootkey(
             log::info!("Using precomputed bootkey: {}", hex::encode(bk));
             bk
         }
-        None => bootkey::extract_bootkey(&system_data)?,
+        None => bootkey::extract_bootkey(system_data)?,
     };
     log::info!("Bootkey: {}", hex::encode(boot_key));
 
     // Extract SAM hashes
-    let sam_entries = hashes::extract_hashes(&sam_data, &boot_key)?;
+    let sam_entries = hashes::extract_hashes(sam_data, &boot_key)?;
 
     // Extract LSA secrets from SECURITY hive (optional)
-    let (lsa_secrets, cached_credentials) = if let Some(sec_data) = &security_data {
+    let (lsa_secrets, cached_credentials) = if let Some(sec_data) = security_data {
         log::info!("SECURITY hive: {} bytes", sec_data.len());
         let secrets = match lsa::extract_lsa_secrets(sec_data, &boot_key) {
             Ok(secrets) => {
@@ -493,7 +483,7 @@ fn process_hive_data_with_bootkey(
                 secrets
             }
             Err(e) => {
-                log::warn!("LSA secrets extraction failed: {}", e);
+                log::warn!("LSA secrets extraction failed: {e}");
                 Vec::new()
             }
         };
@@ -548,7 +538,7 @@ fn extract_dcc2_from_secrets(
             creds
         }
         Err(e) => {
-            log::warn!("DCC2 extraction failed: {}", e);
+            log::warn!("DCC2 extraction failed: {e}");
             Vec::new()
         }
     }
