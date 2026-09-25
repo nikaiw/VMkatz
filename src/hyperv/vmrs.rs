@@ -8,6 +8,18 @@
 //! - [0..46]: Primary header (magic 0x01282014)
 //! - [4096..4142]: Backup header (same format, alternate writes)
 //! - [data_offset..]: Data region containing ObjectTable, KeyTables, values
+//!
+//! Memory reconstruction is byte-exact: every RamBlock decompresses (XPRESS) to
+//! a full 1 MB page and the physical extent is rebuilt from the sparse block
+//! indices. This yields the guest's *root-partition physical* memory.
+//!
+//! LIMITATION (VBS / nested-EPT): on build 26100 (Server 2025 / Win11 24H2)
+//! Virtualization-Based Security is on by default. The saved physical memory is
+//! then VTL0 guest-physical: the guest's CR3 page tables hold GPAs that require a
+//! second EPT/SLAT translation before they map to offsets in this file. Direct
+//! VA->PA walking therefore finds no EPROCESS list. Reaching processes on such
+//! images requires locating the VTL0 EPT PML4 and doing GVA->GPA->root-PA
+//! translation (not yet implemented). Non-VBS guests translate directly.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -238,12 +250,91 @@ impl VmrsLayer {
             )));
         }
 
-        // Read the root ObjectTable from data_start
-        self.parse_object_table(data_start)?;
+        // Read the root ObjectTable from data_start. Some VMRS versions (e.g.
+        // 0x400) put a root superblock at data_offset instead of an ObjectTable,
+        // so this can fail or yield nothing — fall back to scanning the whole
+        // data region for ObjectTables (header [flags:4][count:4] + CRC-valid
+        // 18-byte entries).
+        match self.parse_object_table(data_start) {
+            Ok(()) if !self.object_entries.is_empty() => {}
+            Ok(()) => {
+                log::debug!("VMRS: no entries at data_offset, scanning for ObjectTables");
+                self.scan_object_tables()?;
+            }
+            Err(e) => {
+                log::debug!("VMRS: ObjectTable at data_offset unusable ({e}), scanning");
+                self.scan_object_tables()?;
+            }
+        }
 
         // Now parse all KeyTables referenced by the ObjectTable
         self.parse_key_tables()?;
 
+        Ok(())
+    }
+
+    /// Scan the whole data region for ObjectTables. Used when `data_offset`
+    /// points to a root superblock rather than a plain ObjectTable.
+    ///
+    /// An ObjectTable is `[flags:u32][count:u32]` followed by `count` 18-byte
+    /// entries, each self-validating via its embedded CRC32. We locate tables by
+    /// finding an 8-byte header whose declared count fits and whose first few
+    /// entries pass CRC, then collect every entry. The 32-bit per-entry CRC makes
+    /// false positives negligible.
+    fn scan_object_tables(&mut self) -> Result<()> {
+        let region =
+            self.read_file_bytes(self.header.data_offset, self.header.data_size as usize)?;
+        let n = region.len();
+        let entry_crc_ok = |e: &[u8]| -> bool {
+            let stored = u32::from_le_bytes(e[1..5].try_into().unwrap());
+            if stored == 0 {
+                return false;
+            }
+            let mut buf = [0u8; 18];
+            buf.copy_from_slice(e);
+            buf[1..5].fill(0);
+            hvs_crc32(&buf) == stored
+        };
+
+        let mut tables = 0usize;
+        let mut off = 0usize;
+        while off + 8 <= n {
+            let count = u32::from_le_bytes(region[off + 4..off + 8].try_into().unwrap()) as usize;
+            if count == 0 || count > 100_000 || off + 8 + count * 18 > n {
+                off += 1;
+                continue;
+            }
+            // Confirm this is a real table header: first up-to-8 entries must pass CRC.
+            let probe = count.min(8);
+            let base = off + 8;
+            let ok = (0..probe).all(|i| entry_crc_ok(&region[base + i * 18..base + (i + 1) * 18]));
+            if !ok {
+                off += 1;
+                continue;
+            }
+            for i in 0..count {
+                let e = &region[base + i * 18..base + (i + 1) * 18];
+                let entry = ObjectTableEntry {
+                    entry_type: e[0],
+                    crc32: u32::from_le_bytes(e[1..5].try_into().unwrap()),
+                    file_offset: u64::from_le_bytes(e[5..13].try_into().unwrap()),
+                    size: u32::from_le_bytes(e[13..17].try_into().unwrap()),
+                    flags: e[17],
+                };
+                // Skip empty slots: KeyTable reference indices count only populated
+                // entries (matches how the root ObjectTable is enumerated).
+                if entry.entry_type != 0 || entry.file_offset != 0 || entry.size != 0 {
+                    self.object_entries.push(entry);
+                }
+            }
+            tables += 1;
+            off = base + count * 18;
+        }
+
+        log::info!(
+            "VMRS: scanned {tables} ObjectTables, {} entries",
+            self.object_entries.len()
+        );
         Ok(())
     }
 
@@ -411,42 +502,70 @@ impl VmrsLayer {
                     format!("{parent_path}/{key_name}")
                 };
 
-                // Extract value info based on type
-                match entry_type {
-                    3 | 4 | 5 | 9 => {
-                        // Fixed-size value (8 bytes) at entry offset 12
-                        // Store as inline: the value is at base_file_offset + offset + 12
-                        self.key_values.insert(
-                            full_path.clone(),
-                            (base_file_offset + offset as u64 + 12, 8),
-                        );
+                // Reference entry (flag bit 0 set): the value is a 12-byte descriptor
+                // that directly locates the data blob (this is how RamBlock<N> keys
+                // point at their compressed page data). Per HyperVStorage::GetValueInternal
+                // (reversed from vmwp.exe/vmsavedstatedumpprovider), for such an entry:
+                //   value_size  = u32 at entry + 0x15 + name_length
+                //   file_offset = u64 at entry + 0x19 + name_length
+                // The name occupies [offset+21 .. offset+21+name_length], so the 12-byte
+                // reference struct { u32 size; u64 file_offset } follows it directly.
+                let entry_flags = data[offset + 1];
+                let is_reference = entry_flags & 1 != 0;
+                let ref_off = offset + 21 + name_length; // 0x15 + name_length
+                let resolved_reference = if is_reference && ref_off + 12 <= total {
+                    let size = u32::from_le_bytes(data[ref_off..ref_off + 4].try_into().unwrap());
+                    let file_offset =
+                        u64::from_le_bytes(data[ref_off + 4..ref_off + 12].try_into().unwrap());
+                    if file_offset != 0 && size != 0 {
+                        Some((file_offset, size))
+                    } else {
+                        None
                     }
-                    6 | 7 => {
-                        // Variable-size value
-                        let value_size_offset = offset + 21 + name_length;
-                        if value_size_offset + 4 <= total {
-                            let value_size = u32::from_le_bytes(
-                                data[value_size_offset..value_size_offset + 4]
-                                    .try_into()
-                                    .unwrap(),
+                } else {
+                    None
+                };
+
+                // Extract value info based on type
+                if let Some((foff, size)) = resolved_reference {
+                    self.key_values.insert(full_path.clone(), (foff, size));
+                } else {
+                    match entry_type {
+                        3 | 4 | 5 | 9 => {
+                            // Fixed-size value (8 bytes) at entry offset 12
+                            // Store as inline: the value is at base_file_offset + offset + 12
+                            self.key_values.insert(
+                                full_path.clone(),
+                                (base_file_offset + offset as u64 + 12, 8),
                             );
-                            let value_data_offset = value_size_offset + 4;
-                            if value_size > 0 {
-                                self.key_values.insert(
-                                    full_path.clone(),
-                                    (base_file_offset + value_data_offset as u64, value_size),
+                        }
+                        6 | 7 => {
+                            // Variable-size value
+                            let value_size_offset = offset + 21 + name_length;
+                            if value_size_offset + 4 <= total {
+                                let value_size = u32::from_le_bytes(
+                                    data[value_size_offset..value_size_offset + 4]
+                                        .try_into()
+                                        .unwrap(),
                                 );
+                                let value_data_offset = value_size_offset + 4;
+                                if value_size > 0 {
+                                    self.key_values.insert(
+                                        full_path.clone(),
+                                        (base_file_offset + value_data_offset as u64, value_size),
+                                    );
+                                }
                             }
                         }
+                        8 => {
+                            // 4-byte value at entry offset 12
+                            self.key_values.insert(
+                                full_path.clone(),
+                                (base_file_offset + offset as u64 + 12, 4),
+                            );
+                        }
+                        _ => {}
                     }
-                    8 => {
-                        // 4-byte value at entry offset 12
-                        self.key_values.insert(
-                            full_path.clone(),
-                            (base_file_offset + offset as u64 + 12, 4),
-                        );
-                    }
-                    _ => {}
                 }
 
                 // Check for child key table reference
@@ -551,39 +670,49 @@ impl VmrsLayer {
             "" // Legacy format, prefix varies
         };
 
-        // Count RAM blocks by probing keys
+        let _ = prefix;
+        // RamBlock<N> keys are sparse (gaps for never-touched RAM), so the guest's
+        // physical extent is (max index + 1) * 1MB — NOT the key count. Using the
+        // count truncates high memory (e.g. kernel pool above the count), which made
+        // the System EPROCESS unreachable.
         let mut block_count = 0u64;
-        let format_modern = format!("{prefix}RamBlock");
+        let mut max_block = 0u64;
         for key in self.key_values.keys() {
-            if key.starts_with(&format_modern) || key.contains("RamBlock") {
-                block_count += 1;
+            if let Some(pos) = key.rfind("RamBlock") {
+                let digits: String = key[pos + "RamBlock".len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(idx) = digits.parse::<u64>() {
+                    max_block = max_block.max(idx);
+                    block_count += 1;
+                }
             }
         }
 
         if block_count == 0 {
-            // Try to determine from partition state or just count large entries
             block_count = self
                 .object_entries
                 .iter()
                 .filter(|e| e.size > 0 && e.size as usize <= RAM_BLOCK_SIZE && e.entry_type != 0)
                 .count() as u64;
             if block_count > 10 {
-                // Subtract a few for non-RAM entries (partition state, etc.)
                 block_count = block_count.saturating_sub(5);
             }
+            max_block = block_count.saturating_sub(1);
         }
 
         self.ram_block_count = block_count;
 
-        // Build simple identity mapping for now
-        // Each block = 1MB = 256 pages (4096 bytes each)
+        // Physical extent spans block 0 .. max_block inclusive.
         let pages_per_block = (RAM_BLOCK_SIZE / 4096) as u64;
         if block_count > 0 {
+            let blocks_extent = max_block + 1;
             self.memory_chunks.push(GpaMemoryChunk {
                 start_page_index: 0,
-                page_count: block_count * pages_per_block,
+                page_count: blocks_extent * pages_per_block,
             });
-            self.phys_size = block_count * RAM_BLOCK_SIZE as u64;
+            self.phys_size = blocks_extent * RAM_BLOCK_SIZE as u64;
         }
     }
 
@@ -736,6 +865,94 @@ fn hvs_crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Plain XPRESS (LZ77) decompression — `RtlDecompressBufferEx` with
+/// `COMPRESSION_FORMAT_XPRESS` (3), per [MS-XCA] §2.4. This is what Hyper-V's
+/// `VmCompressUnpack` uses for each saved-state RAM page (NOT LZNT1). Writes
+/// decompressed bytes into `out` and returns the count written.
+fn xpress_decompress(input: &[u8], out: &mut [u8]) -> usize {
+    let mut in_pos = 0usize;
+    let mut out_pos = 0usize;
+    let mut flags: u32 = 0;
+    let mut flag_count = 0u32;
+    let mut last_len_halfbyte = 0usize;
+
+    loop {
+        if flag_count == 0 {
+            if in_pos + 4 > input.len() {
+                break;
+            }
+            flags = u32::from_le_bytes(input[in_pos..in_pos + 4].try_into().unwrap());
+            in_pos += 4;
+            flag_count = 32;
+        }
+        let is_match = flags & 0x8000_0000 != 0;
+        flags <<= 1;
+        flag_count -= 1;
+
+        if !is_match {
+            if in_pos >= input.len() || out_pos >= out.len() {
+                break;
+            }
+            out[out_pos] = input[in_pos];
+            in_pos += 1;
+            out_pos += 1;
+            continue;
+        }
+
+        // Match: 16-bit (length:3, offset:13)
+        if in_pos + 2 > input.len() {
+            break;
+        }
+        let match_bytes = u16::from_le_bytes([input[in_pos], input[in_pos + 1]]) as usize;
+        in_pos += 2;
+        let match_offset = (match_bytes >> 3) + 1;
+        let mut match_length = match_bytes & 7;
+        if match_length == 7 {
+            if last_len_halfbyte == 0 {
+                if in_pos >= input.len() {
+                    break;
+                }
+                match_length = (input[in_pos] & 0xf) as usize;
+                last_len_halfbyte = in_pos;
+                in_pos += 1;
+            } else {
+                match_length = (input[last_len_halfbyte] >> 4) as usize;
+                last_len_halfbyte = 0;
+            }
+            if match_length == 15 {
+                if in_pos >= input.len() {
+                    break;
+                }
+                match_length = input[in_pos] as usize;
+                in_pos += 1;
+                if match_length == 255 {
+                    if in_pos + 2 > input.len() {
+                        break;
+                    }
+                    match_length = u16::from_le_bytes([input[in_pos], input[in_pos + 1]]) as usize;
+                    in_pos += 2;
+                    match_length = match_length.wrapping_sub(15 + 7);
+                }
+                match_length += 15;
+            }
+            match_length += 7;
+        }
+        match_length += 3;
+
+        if match_offset > out_pos {
+            break; // invalid back-reference
+        }
+        for _ in 0..match_length {
+            if out_pos >= out.len() {
+                break;
+            }
+            out[out_pos] = out[out_pos - match_offset];
+            out_pos += 1;
+        }
+    }
+    out_pos
+}
+
 /// Decompress a VmCompressUnpack-encoded buffer into a 1MB block.
 ///
 /// Format: sequence of tagged pages:
@@ -743,7 +960,7 @@ fn hvs_crc32(data: &[u8]) -> u32 {
 /// - 0xFFFFFFFE: fill 1 page (4KB) with 8-byte repeating pattern
 /// - 0xFFFFFFFD: fill N pages with pattern (read count, then pattern)
 /// - 0xFFFFFFFC: variable page size
-/// - other: compressed_size — if 4096, raw copy; else LZNT1 decompress
+/// - other: compressed_size — if page size, raw copy; else XPRESS decompress
 fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
     let mut output = vec![0u8; RAM_BLOCK_SIZE];
     let mut out_offset = 0usize;
@@ -777,48 +994,57 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                 }
             }
             0xFFFFFFFD => {
-                // Fill N pages with pattern
+                // Fill N pages with an 8-byte pattern. Layout per VmCompressUnpack:
+                // [pattern: u64][count: u32] (pattern FIRST, then count).
                 if in_offset + 12 > data.len() {
                     break;
                 }
+                let pattern = data[in_offset..in_offset + 8].to_vec();
                 let count =
-                    u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap()) as usize;
-                in_offset += 4;
-                let pattern = &data[in_offset..in_offset + 8];
-                in_offset += 8;
+                    u32::from_le_bytes(data[in_offset + 8..in_offset + 12].try_into().unwrap())
+                        as usize;
+                in_offset += 12;
                 for _ in 0..count {
-                    if out_offset >= RAM_BLOCK_SIZE {
+                    let page_end = (out_offset + 4096).min(RAM_BLOCK_SIZE);
+                    if out_offset >= page_end {
                         break;
                     }
-                    let page_end = (out_offset + 4096).min(RAM_BLOCK_SIZE);
-                    while out_offset + 8 <= page_end {
-                        output[out_offset..out_offset + 8].copy_from_slice(pattern);
-                        out_offset += 8;
-                    }
+                    let mut k = 0;
                     while out_offset < page_end {
-                        output[out_offset] = pattern[(out_offset - (page_end - 4096)) % 8];
+                        output[out_offset] = pattern[k % 8];
                         out_offset += 1;
+                        k += 1;
                     }
                 }
             }
             0xFFFFFFFC => {
-                // Variable page size: read page_size, then compressed data
-                if in_offset + 4 > data.len() {
+                // Variable-size page. Layout per VmCompressUnpack:
+                // [uncompressed_size: u32 (<=0xfff)][compressed_size: u32][data].
+                // Output advances by uncompressed_size (NOT a full 4096 page).
+                if in_offset + 8 > data.len() {
                     break;
                 }
-                let page_size =
+                let uncomp =
                     u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap()) as usize;
-                in_offset += 4;
-                if page_size == 0 || in_offset + page_size > data.len() {
+                let comp =
+                    u32::from_le_bytes(data[in_offset + 4..in_offset + 8].try_into().unwrap())
+                        as usize;
+                in_offset += 8;
+                if uncomp == 0 || comp > uncomp || in_offset + comp > data.len() {
                     break;
                 }
-                // Decompress with LZNT1
-                let decompressed = lznt1_decompress(&data[in_offset..in_offset + page_size], 4096);
-                let copy_len = decompressed.len().min(RAM_BLOCK_SIZE - out_offset);
-                output[out_offset..out_offset + copy_len]
-                    .copy_from_slice(&decompressed[..copy_len]);
-                out_offset += 4096; // Always advance by page size
-                in_offset += page_size;
+                let end = (out_offset + uncomp).min(RAM_BLOCK_SIZE);
+                if comp == uncomp {
+                    let n = end - out_offset;
+                    output[out_offset..end].copy_from_slice(&data[in_offset..in_offset + n]);
+                } else {
+                    xpress_decompress(
+                        &data[in_offset..in_offset + comp],
+                        &mut output[out_offset..end],
+                    );
+                }
+                out_offset += uncomp;
+                in_offset += comp;
             }
             compressed_size => {
                 let compressed_size = compressed_size as usize;
@@ -833,15 +1059,15 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                     out_offset += 4096;
                     in_offset += 4096;
                 } else if compressed_size > 0 && compressed_size < 4096 {
-                    // LZNT1 compressed page
+                    // XPRESS compressed page (RtlDecompressBufferEx format 3)
                     if in_offset + compressed_size > data.len() {
                         break;
                     }
-                    let decompressed =
-                        lznt1_decompress(&data[in_offset..in_offset + compressed_size], 4096);
-                    let copy_len = decompressed.len().min(RAM_BLOCK_SIZE - out_offset);
-                    output[out_offset..out_offset + copy_len]
-                        .copy_from_slice(&decompressed[..copy_len]);
+                    let end = (out_offset + 4096).min(RAM_BLOCK_SIZE);
+                    xpress_decompress(
+                        &data[in_offset..in_offset + compressed_size],
+                        &mut output[out_offset..end],
+                    );
                     out_offset += 4096;
                     in_offset += compressed_size;
                 } else {
@@ -860,112 +1086,6 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
     output
 }
 
-/// LZNT1 decompression (Windows RtlDecompressBuffer algorithm 2/COMPRESSION_FORMAT_LZNT1).
-///
-/// LZNT1 format:
-/// - Data is split into chunks, each starting with a 2-byte header
-/// - Chunk header: bit 15 = compressed flag, bits 0-11 = chunk data size - 1
-/// - Uncompressed chunk: raw bytes follow
-/// - Compressed chunk: mix of flag bytes and literal/backreference tokens
-fn lznt1_decompress(input: &[u8], max_output: usize) -> Vec<u8> {
-    let mut output = Vec::with_capacity(max_output);
-    let mut in_pos = 0;
-
-    while in_pos + 2 <= input.len() && output.len() < max_output {
-        let chunk_header = u16::from_le_bytes(input[in_pos..in_pos + 2].try_into().unwrap());
-        in_pos += 2;
-
-        if chunk_header == 0 {
-            break;
-        }
-
-        let chunk_size = ((chunk_header & 0x0FFF) + 1) as usize;
-        let is_compressed = (chunk_header & 0x8000) != 0;
-
-        if in_pos + chunk_size > input.len() {
-            break;
-        }
-
-        if is_compressed {
-            // Compressed chunk
-            let chunk_end = in_pos + chunk_size;
-            let chunk_start_output = output.len();
-
-            while in_pos < chunk_end && output.len() < max_output {
-                if in_pos >= chunk_end {
-                    break;
-                }
-                let flags = input[in_pos];
-                in_pos += 1;
-
-                for bit in 0..8 {
-                    if in_pos >= chunk_end || output.len() >= max_output {
-                        break;
-                    }
-
-                    if (flags >> bit) & 1 == 0 {
-                        // Literal byte
-                        output.push(input[in_pos]);
-                        in_pos += 1;
-                    } else {
-                        // Backreference
-                        if in_pos + 2 > chunk_end {
-                            in_pos = chunk_end;
-                            break;
-                        }
-                        let ref_token =
-                            u16::from_le_bytes(input[in_pos..in_pos + 2].try_into().unwrap());
-                        in_pos += 2;
-
-                        // Calculate displacement and length bits based on output position
-                        // within the current chunk
-                        let pos_in_chunk = output.len() - chunk_start_output;
-                        let displacement_bits = lznt1_displacement_bits(pos_in_chunk);
-                        let length_bits = 16 - displacement_bits;
-                        let length_mask = (1u16 << length_bits) - 1;
-
-                        let displacement = ((ref_token >> length_bits) + 1) as usize;
-                        let length = ((ref_token & length_mask) + 3) as usize;
-
-                        // Copy from back-reference
-                        for _ in 0..length {
-                            if output.len() >= max_output {
-                                break;
-                            }
-                            if displacement > output.len() {
-                                output.push(0);
-                            } else {
-                                let byte = output[output.len() - displacement];
-                                output.push(byte);
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Uncompressed chunk
-            let copy_len = chunk_size.min(max_output - output.len());
-            output.extend_from_slice(&input[in_pos..in_pos + copy_len]);
-            in_pos += chunk_size;
-        }
-    }
-
-    output
-}
-
-/// LZNT1 displacement bits for a given position in the uncompressed chunk.
-/// Per MS-XCA §2.4.1.1.1: 4 bits up to pos 15, then +1 bit each time pos
-/// reaches the next power of two (16, 32, 64, ...).
-const fn lznt1_displacement_bits(pos_in_chunk: usize) -> u32 {
-    let mut bits = 4u32;
-    let mut threshold = 16usize;
-    while threshold <= pos_in_chunk && bits < 12 {
-        bits += 1;
-        threshold <<= 1;
-    }
-    bits
-}
-
 /// Check if a file starts with the VMRS magic.
 pub fn is_vmrs_file(path: &Path) -> bool {
     let Ok(mut f) = fs::File::open(path) else {
@@ -976,4 +1096,38 @@ pub fn is_vmrs_file(path: &Path) -> bool {
         return false;
     }
     u32::from_le_bytes(buf) == VMRS_MAGIC
+}
+
+#[cfg(test)]
+mod xpress_tests {
+    use super::xpress_decompress;
+
+    // Plain XPRESS (MS-XCA §2.4): "AB" then a match (offset 2, length 3) => "ABABA".
+    // flags=0x20000000 (bit29 set = 3rd symbol is a match); match u16 = (off-1<<3)|(len-3).
+    #[test]
+    fn xpress_match_basic() {
+        let input = [0x00, 0x00, 0x00, 0x20, b'A', b'B', 0x08, 0x00];
+        let mut out = [0u8; 5];
+        let n = xpress_decompress(&input, &mut out);
+        assert_eq!(&out[..n], b"ABABA", "got {:?}", &out[..n]);
+    }
+
+    // All-literal: flags=0 => 4 literal bytes.
+    #[test]
+    fn xpress_literals() {
+        let input = [0x00, 0x00, 0x00, 0x00, b'W', b'X', b'Y', b'Z'];
+        let mut out = [0u8; 4];
+        let n = xpress_decompress(&input, &mut out);
+        assert_eq!(&out[..n], b"WXYZ");
+    }
+
+    // RLE via offset-1 match: "A" then match(off1,len4) => "AAAAA".
+    #[test]
+    fn xpress_rle() {
+        // match u16 = ((1-1)<<3)|(4-3) = 1
+        let input = [0x00, 0x00, 0x00, 0x40, b'A', 0x01, 0x00];
+        let mut out = [0u8; 5];
+        let n = xpress_decompress(&input, &mut out);
+        assert_eq!(&out[..n], b"AAAAA", "got {:?}", &out[..n]);
+    }
 }
