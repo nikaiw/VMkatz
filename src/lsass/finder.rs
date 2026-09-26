@@ -384,6 +384,37 @@ fn assign_kerberos_key_groups(
     }
 }
 
+/// Attach carved Kerberos tickets to a credential: prefer one in the same domain,
+/// else the first credential that already holds Kerberos data. Deduplicates by blob.
+fn attach_carved_tickets(
+    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    carved: Vec<crate::lsass::types::KerberosTicket>,
+) {
+    for ticket in carved {
+        let domain_lower = ticket.domain_name.to_lowercase();
+        let key = all_creds
+            .iter()
+            .find(|(_, c)| {
+                c.kerberos.as_ref().is_some_and(|k| {
+                    k.domain.to_lowercase() == domain_lower
+                        || k.tickets
+                            .iter()
+                            .any(|t| t.domain_name.to_lowercase() == domain_lower)
+                })
+            })
+            .or_else(|| all_creds.iter().find(|(_, c)| c.kerberos.is_some()))
+            .map(|(&k, _)| k);
+        if let Some(krb) = key
+            .and_then(|k| all_creds.get_mut(&k))
+            .and_then(|c| c.kerberos.as_mut())
+        {
+            if !krb.tickets.iter().any(|t| t.ticket_blob == ticket.ticket_blob) {
+                krb.tickets.push(ticket);
+            }
+        }
+    }
+}
+
 /// Fill well-known LUID names, sort by LUID.
 fn finalize_credentials(
     mut all_creds: std::collections::HashMap<u64, Credential>,
@@ -908,6 +939,40 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                 status.kerberos = ProviderStatus::Ok;
                 assign_kerberos_key_groups(&mut all_creds, key_groups);
             }
+        }
+    }
+
+    // Ticket carve fallback: the session-table (RTL_AVL_TABLE) pattern does not
+    // resolve on every lsasrv build (e.g. Server 2019 17763), so the walk yields no
+    // tickets even when they are resident. When no tickets came out of the normal
+    // path, scan the process's present pages for KIWI_KERBEROS_INTERNAL_TICKET
+    // structures directly. Runs only in that case to avoid the full-memory scan.
+    let have_tickets = all_creds
+        .values()
+        .filter_map(|c| c.kerberos.as_ref())
+        .any(|k| !k.tickets.is_empty());
+    if !have_tickets {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let walker = crate::paging::translate::PageTableWalker::new(phys);
+        walker.enumerate_present_pages(lsass.dtb, |m| {
+            if let Some(last) = ranges.last_mut() {
+                if m.vaddr == last.0 + last.1 {
+                    last.1 += m.size;
+                    return;
+                }
+            }
+            ranges.push((m.vaddr, m.size));
+        });
+        let carved = crate::lsass::kerberos::carve_kerberos_tickets(
+            &lsass_vmem,
+            &ranges,
+            Arch::X64,
+            &[],
+        );
+        if !carved.is_empty() {
+            log::info!("Kerberos: carved {} tickets from resident memory", carved.len());
+            status.kerberos = ProviderStatus::Ok;
+            attach_carved_tickets(&mut all_creds, carved);
         }
     }
 

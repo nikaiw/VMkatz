@@ -270,6 +270,22 @@ const TICKET_OFFSETS_10_X86: TicketOffsets = TicketOffsets {
     ticket_value: 0x98,
 };
 
+/// Validate that `addr` looks like a live Kerberos session `RTL_AVL_TABLE`: a
+/// plausible element count and a balanced-tree root that points into the heap.
+/// Rejects the unrelated globals a code pattern can resolve to on some builds
+/// (Server 2019 17763's first pattern site reads as elements=0).
+fn avl_table_is_valid(vmem: &dyn VirtualMemory, addr: u64, arch: Arch) -> bool {
+    let ps = arch.ptr_size();
+    let num_elem_off = if arch == Arch::X64 { 0x2Cu64 } else { 0x18 };
+    let num = vmem.read_virt_u32(addr + num_elem_off).unwrap_or(0);
+    if num == 0 || num > 100_000 {
+        return false;
+    }
+    // Right child = balanced-tree root; must be a readable heap pointer.
+    let root = read_ptr(vmem, addr + ps * 2, arch).unwrap_or(0);
+    patterns::is_heap_ptr(root) && vmem.read_virt_u64(root).is_ok()
+}
+
 /// Extract Kerberos credentials from kerberos.dll (unified x64/x86).
 pub fn extract_kerberos_credentials(
     vmem: &dyn VirtualMemory,
@@ -297,38 +313,66 @@ pub fn extract_kerberos_credentials(
             "KerbGlobalLogonSessionTable_x86",
         ),
     };
-    let (pattern_addr, _) = match patterns::find_pattern(
-        vmem,
-        text_base,
-        text.virtual_size,
-        pattern_list,
-        pattern_label,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            log::info!("Could not find Kerberos pattern: {e}");
-            return Ok(results);
-        }
-    };
-
     let table_addr = match arch {
-        Arch::X64 => patterns::resolve_rip_relative(vmem, pattern_addr, 6)?,
-        Arch::X86 => {
-            let ds = pe.find_section(".data");
-            if let Some(ds) = ds {
-                let data_base = kerberos_base + u64::from(ds.virtual_address);
-                let data_end = data_base + u64::from(ds.virtual_size);
-                patterns::find_list_via_abs(
-                    vmem,
-                    pattern_addr,
-                    kerberos_base,
-                    data_base,
-                    data_end,
-                    "kerberos_x86",
-                )?
-            } else {
-                return Ok(results);
+        // Several code sites match the LEA-table pattern, and on some builds
+        // (e.g. Server 2019 17763) the first match resolves to an unrelated global
+        // whose RTL_AVL_TABLE reads as empty. Try every match site of every variant
+        // and keep the first whose target validates as a real session table.
+        Arch::X64 => {
+            let data = vmem.read_virt_bytes(text_base, text.virtual_size as usize)?;
+            let mut table = None;
+            'sites: for pattern in pattern_list {
+                let mut from = 0usize;
+                while let Some(rel) = data[from..]
+                    .windows(pattern.len())
+                    .position(|w| w == *pattern)
+                {
+                    let code_addr = text_base + (from + rel) as u64;
+                    if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 6) {
+                        if avl_table_is_valid(vmem, cand, arch) {
+                            log::info!(
+                                "{pattern_label}: validated session table at 0x{cand:x} (site 0x{code_addr:x})"
+                            );
+                            table = Some(cand);
+                            break 'sites;
+                        }
+                    }
+                    from += rel + 1;
+                }
             }
+            let Some(t) = table else {
+                log::info!("Kerberos: no valid session table among pattern sites");
+                return Ok(results);
+            };
+            t
+        }
+        Arch::X86 => {
+            let (pattern_addr, _) = match patterns::find_pattern(
+                vmem,
+                text_base,
+                text.virtual_size,
+                pattern_list,
+                pattern_label,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::info!("Could not find Kerberos pattern: {e}");
+                    return Ok(results);
+                }
+            };
+            let Some(ds) = pe.find_section(".data") else {
+                return Ok(results);
+            };
+            let data_base = kerberos_base + u64::from(ds.virtual_address);
+            let data_end = data_base + u64::from(ds.virtual_size);
+            patterns::find_list_via_abs(
+                vmem,
+                pattern_addr,
+                kerberos_base,
+                data_base,
+                data_end,
+                "kerberos_x86",
+            )?
         }
     };
     log::info!("Kerberos session table (RTL_AVL_TABLE) at 0x{table_addr:x} (arch={arch:?})");
