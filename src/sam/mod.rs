@@ -4,6 +4,7 @@ mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
 pub mod lsa;
+pub mod mem_hive;
 mod ntfs_fallback;
 mod ntfs_reader;
 mod partition;
