@@ -229,12 +229,14 @@ struct Args {
     #[arg(long)]
     vmfs_list: bool,
 
-    /// Carve SAM/SYSTEM/SECURITY registry hives straight from guest physical
-    /// memory and extract local NT hashes + LSA secrets. Needs no page tables or
-    /// process list, so it works even when Credential Guard hides the LSASS cache.
+    /// Skip carving SAM/SYSTEM/SECURITY registry hives from physical memory. By
+    /// default that carve runs first on a memory snapshot (local NT hashes + LSA
+    /// secrets, no page tables — works under Credential Guard) and, when it finds
+    /// credentials, is the whole result; this flag disables it and goes straight to
+    /// the LSASS-cache pipeline.
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
-    mem_registry: bool,
+    no_mem_registry: bool,
 }
 
 impl Args {
@@ -2341,7 +2343,9 @@ fn run_carve<L: PhysicalMemory>(
 
 /// Carve SAM/SYSTEM/SECURITY registry hives directly from physical memory and
 /// print the recovered bootkey, local NT hashes and LSA secrets. Independent of
-/// the process list, so it works under Credential Guard.
+/// the process list, so it works under Credential Guard. Returns `true` when it
+/// recovered credentials (so the caller can stop), `false` when nothing usable was
+/// found (so the caller falls through to the LSASS-cache pipeline).
 #[cfg(all(
     feature = "sam",
     any(
@@ -2351,14 +2355,17 @@ fn run_carve<L: PhysicalMemory>(
         feature = "hyperv"
     )
 ))]
-fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> anyhow::Result<()> {
+fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> bool {
     let c = get_colors(args);
     eprintln!("{}[*] Carving registry hives from physical memory...{}", c.cyan, c.reset);
     let creds = vmkatz::sam::mem_hive::extract_from_memory(layer);
 
     let Some(bootkey) = creds.bootkey else {
-        anyhow::bail!("mem-registry: could not recover bootkey / hives from memory");
+        return false;
     };
+    if creds.sam_hashes.is_empty() && creds.lsa_secrets.is_empty() {
+        return false;
+    }
     eprintln!("{}[+] Bootkey: {}{}", c.green, hex::encode(bootkey), c.reset);
 
     match args.format.as_str() {
@@ -2376,7 +2383,7 @@ fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> anyhow::Result
         }
         export_dpapi_backup_keys(&creds.lsa_secrets);
     }
-    Ok(())
+    true
 }
 
 #[cfg(any(
@@ -2399,11 +2406,16 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 
     let layer = make_layer()?;
 
-    // Registry-hive carving from physical memory: needs no page tables or process
-    // list, so run it (and stop) before the LSASS pipeline when requested.
+    // Registry-hive carving from physical memory runs first by default (needs no
+    // page tables or process list, works under Credential Guard). When it recovers
+    // credentials that is the whole result; otherwise fall through to the LSASS
+    // pipeline. `--no-mem-registry` skips it.
     #[cfg(feature = "sam")]
-    if args.mem_registry {
-        return run_mem_registry(&layer, args);
+    if !args.no_mem_registry {
+        if run_mem_registry(&layer, args) {
+            return Ok(());
+        }
+        eprintln!("[*] Registry carve found nothing usable — trying the LSASS cache");
     }
 
     // -- Phase 1: Direct L1 scan for System process --

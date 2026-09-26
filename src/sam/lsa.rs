@@ -167,7 +167,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
 
     // Enumerate secrets
     let Ok(secrets_key) = policy.subkey(&hive, "Secrets") else {
-        log::warn!("Policy\\Secrets key not found");
+        log::debug!("Policy\\Secrets key not found");
         return Ok(Vec::new());
     };
 
@@ -179,17 +179,17 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
 
         // Read CurrVal subkey's default value
         let Ok(curr_val) = secret_key.subkey(&hive, "CurrVal") else {
-            log::warn!("Secret '{secret_name}': no CurrVal subkey");
+            log::debug!("Secret '{secret_name}': no CurrVal subkey");
             continue;
         };
 
         let Ok(encrypted) = curr_val.value(&hive, "") else {
-            log::warn!("Secret '{secret_name}': no default value in CurrVal");
+            log::debug!("Secret '{secret_name}': no default value in CurrVal");
             continue;
         };
 
         if encrypted.is_empty() {
-            log::warn!("Secret '{secret_name}': empty CurrVal");
+            log::debug!("Secret '{secret_name}': empty CurrVal");
             continue;
         }
 
@@ -197,7 +197,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
             match decrypt_secret_modern(&encrypted, &lsa_key) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("Secret '{secret_name}': decryption failed: {e}");
+                    log::debug!("Secret '{secret_name}': decryption failed: {e}");
                     continue;
                 }
             }
@@ -205,7 +205,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
             match decrypt_secret_legacy(&encrypted, &lsa_key) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("Secret '{secret_name}': decryption failed: {e}");
+                    log::debug!("Secret '{secret_name}': decryption failed: {e}");
                     continue;
                 }
             }
@@ -513,7 +513,7 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
                 machine_key,
             };
         }
-        log::warn!("DPAPI_SYSTEM: expected 44 bytes, got {}", data.len());
+        log::debug!("DPAPI_SYSTEM: expected 44 bytes, got {}", data.len());
     }
 
     // DPAPI domain backup keys: BCKUPKEY_P (preferred GUID) and BCKUPKEY_{GUID} (RSA key)

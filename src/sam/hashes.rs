@@ -44,14 +44,14 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
 
         // Parse RID from hex key name (e.g., "000001F4" = 500)
         let Ok(rid) = u32::from_str_radix(key_name, 16) else {
-            log::warn!("Skipping non-hex user key: {key_name}");
+            log::debug!("Skipping non-hex user key: {key_name}");
             continue;
         };
 
         let v_data = match user_key.value(&hive, "V") {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("RID {rid}: no V value: {e}");
+                log::debug!("RID {rid}: no V value: {e}");
                 continue;
             }
         };
@@ -82,7 +82,7 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
                 entries.push(entry);
             }
             Err(e) => {
-                log::warn!("RID {rid}: hash extraction failed: {e}");
+                log::debug!("RID {rid}: hash extraction failed: {e}");
             }
         }
     }
@@ -256,7 +256,7 @@ fn decrypt_sam_hash(
             rc4(&rc4_key, encrypted)
         }
         _ => {
-            log::warn!("Unknown SAM_HASH revision: 0x{revision:04x}");
+            log::debug!("Unknown SAM_HASH revision: 0x{revision:04x}");
             return Ok([0u8; 16]);
         }
     };
