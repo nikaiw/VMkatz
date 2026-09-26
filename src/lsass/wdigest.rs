@@ -66,40 +66,28 @@ pub fn extract_wdigest_credentials_arch(
         ),
     };
 
-    // Pattern scan for l_LogSessList, fall back to .data section scan
+    // The paired MOV/LEA reference is specific to the list traversal loop.
+    // Older builds retain the original pattern and .data fallbacks.
     let list_addr = match pe.find_section(".text") {
         Some(text) => {
             let text_base = wdigest_base + u64::from(text.virtual_address);
-            match patterns::find_pattern(
-                vmem,
-                text_base,
-                text.virtual_size,
-                pattern_list,
-                pattern_label,
-            ) {
-                Ok((pattern_addr, _)) => {
-                    let resolved = resolve_list_addr(vmem, &pe, wdigest_base, pattern_addr, arch);
-                    match resolved {
-                        Ok(addr) => {
-                            let flink = read_ptr(vmem, addr, arch).unwrap_or(0);
-                            if flink != 0 && flink != addr && is_valid_user_ptr(flink, arch) {
-                                addr
-                            } else {
-                                log::info!(
-                                    "Pattern-resolved l_LogSessList at 0x{addr:x} has invalid flink, falling back to .data scan"
-                                );
-                                find_wdigest_list_in_data(vmem, &pe, wdigest_base, offsets, arch)?
-                            }
-                        }
-                        Err(_) => {
-                            find_wdigest_list_in_data(vmem, &pe, wdigest_base, offsets, arch)?
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::info!("Code pattern scan failed: {e}");
-                    find_wdigest_list_in_data(vmem, &pe, wdigest_base, offsets, arch)?
-                }
+            if let Some(addr) = (arch == Arch::X64)
+                .then(|| find_wdigest_list_via_pair(vmem, text_base, text.virtual_size, offsets))
+                .flatten()
+            {
+                addr
+            } else {
+                find_wdigest_list_via_text_pattern(
+                    vmem,
+                    &pe,
+                    wdigest_base,
+                    text_base,
+                    text.virtual_size,
+                    pattern_list,
+                    pattern_label,
+                    offsets,
+                    arch,
+                )?
             }
         }
         None => find_wdigest_list_in_data(vmem, &pe, wdigest_base, offsets, arch)?,
@@ -149,6 +137,91 @@ pub fn extract_wdigest_credentials_arch(
         with_passwords
     );
     Ok(results)
+}
+
+fn find_wdigest_list_via_pair(
+    vmem: &dyn VirtualMemory,
+    text_base: u64,
+    text_size: u32,
+    offsets: &WdigestOffsets,
+) -> Option<u64> {
+    let data = vmem.read_virt_bytes(text_base, text_size as usize).ok()?;
+    for i in 0..data.len().saturating_sub(14 + 0x18) {
+        let mov =
+            matches!(data[i], 0x48 | 0x4C) && data[i + 1] == 0x8B && data[i + 2] & 0xC7 == 0x05;
+        let lea =
+            matches!(data[i + 7], 0x48 | 0x4C) && data[i + 8] == 0x8D && data[i + 9] & 0xC7 == 0x05;
+        if !mov || !lea {
+            continue;
+        }
+        let near_cmp = data[i + 14..i + 14 + 0x18]
+            .windows(2)
+            .any(|bytes| bytes == [0x48, 0x3B]);
+        if !near_cmp {
+            continue;
+        }
+        let Ok(mov_addr) = patterns::resolve_rip_relative(vmem, text_base + i as u64, 3) else {
+            continue;
+        };
+        let Ok(lea_addr) = patterns::resolve_rip_relative(vmem, text_base + i as u64 + 7, 3) else {
+            continue;
+        };
+        if mov_addr != lea_addr {
+            continue;
+        }
+        let flink = vmem.read_virt_u64(mov_addr).unwrap_or(0);
+        if flink == mov_addr {
+            return Some(mov_addr);
+        }
+        if !is_valid_user_ptr(flink, Arch::X64)
+            || vmem.read_virt_u64(flink + 8).ok() != Some(mov_addr)
+        {
+            continue;
+        }
+        let luid = vmem.read_virt_u64(flink + offsets.luid).unwrap_or(0);
+        if luid != 0 && u32::try_from(luid).is_ok() {
+            return Some(mov_addr);
+        }
+    }
+    None
+}
+
+fn find_wdigest_list_via_text_pattern(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    wdigest_base: u64,
+    text_base: u64,
+    text_size: u32,
+    pattern_list: &[&[u8]],
+    pattern_label: &str,
+    offsets: &WdigestOffsets,
+    arch: Arch,
+) -> Result<u64> {
+    let addr = match patterns::find_pattern(vmem, text_base, text_size, pattern_list, pattern_label)
+    {
+        Ok((pattern_addr, _)) => {
+            let resolved = resolve_list_addr(vmem, pe, wdigest_base, pattern_addr, arch);
+            match resolved {
+                Ok(addr) => {
+                    let flink = read_ptr(vmem, addr, arch).unwrap_or(0);
+                    if flink != 0 && flink != addr && is_valid_user_ptr(flink, arch) {
+                        addr
+                    } else {
+                        log::info!(
+                            "Pattern-resolved l_LogSessList at 0x{addr:x} has invalid flink, falling back to .data scan"
+                        );
+                        find_wdigest_list_in_data(vmem, pe, wdigest_base, offsets, arch)?
+                    }
+                }
+                Err(_) => find_wdigest_list_in_data(vmem, pe, wdigest_base, offsets, arch)?,
+            }
+        }
+        Err(e) => {
+            log::info!("Code pattern scan failed: {e}");
+            find_wdigest_list_in_data(vmem, pe, wdigest_base, offsets, arch)?
+        }
+    };
+    Ok(addr)
 }
 
 /// Resolve the list address from a pattern match using arch-appropriate instructions.

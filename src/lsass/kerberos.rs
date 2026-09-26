@@ -1816,6 +1816,19 @@ fn build_ticket(
     asn1_application(1, &body)
 }
 
+/// Encode the complete ASN.1 Ticket for a credential cache. `ticket_blob`
+/// contains only the encrypted cipher bytes read from LSASS.
+pub fn build_ticket_der(ticket: &KerberosTicket) -> Vec<u8> {
+    build_ticket(
+        &ticket.service_name,
+        ticket.service_name_type,
+        &ticket.domain_name,
+        ticket.ticket_enc_type,
+        ticket.ticket_kvno,
+        &ticket.ticket_blob,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_enc_krb_cred_part(
     client_name: &[String],

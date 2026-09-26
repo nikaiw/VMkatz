@@ -2835,13 +2835,13 @@ fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
             }
         }
         let mut count = 0;
-        for (ticket, username, _domain) in &all_tickets {
+        for (index, (ticket, username, _domain)) in all_tickets.iter().enumerate() {
             if ticket.kirbi.is_empty() {
                 continue;
             }
             let svc = ticket.service_name.join("-");
             let filename = format!(
-                "{}_{}_{}.kirbi",
+                "{}_{index:03}_{}_{}.kirbi",
                 sanitize_filename(username),
                 ticket.ticket_type,
                 sanitize_filename(&svc)
@@ -3132,9 +3132,10 @@ fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::Ker
     // Authdata: count (u32) = 0
     out.extend_from_slice(&0u32.to_be_bytes());
 
-    // Ticket (the actual encrypted ticket blob)
-    out.extend_from_slice(&(ticket.ticket_blob.len() as u32).to_be_bytes());
-    out.extend_from_slice(&ticket.ticket_blob);
+    // A ccache stores the complete ASN.1 Ticket, not just its encrypted cipher.
+    let ticket_der = vmkatz::lsass::build_ticket_der(ticket);
+    out.extend_from_slice(&(ticket_der.len() as u32).to_be_bytes());
+    out.extend_from_slice(&ticket_der);
 
     // Second ticket: length = 0
     out.extend_from_slice(&0u32.to_be_bytes());

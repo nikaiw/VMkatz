@@ -29,6 +29,7 @@ pub use crypto::base64_encode;
 pub(crate) mod dpapi;
 pub mod finder;
 pub(crate) mod kerberos;
+pub use kerberos::build_ticket_der;
 pub(crate) mod livessp;
 pub(crate) mod msv;
 pub(crate) mod patterns;

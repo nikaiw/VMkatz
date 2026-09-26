@@ -83,6 +83,12 @@ pub static MSV_LOGON_SESSION_PATTERNS: &[&[u8]] = &[
     &[0x33, 0xF6, 0x45, 0x89, 0x2F, 0x4C, 0x8B, 0xF3],
 ];
 
+/// Build 26100: LsapCreateLsaLogonSession hashes a LUID into lsasrv's
+/// LogonSessionList. The count load precedes this division sequence.
+pub static LSASRV_LOGON_SESSION_PATTERNS: &[&[u8]] = &[&[
+    0x33, 0xD2, 0x48, 0xF7, 0xF1, 0x8B, 0xDA, 0x48, 0x8D, 0x04, 0x5B, 0x48, 0xC1, 0xE0, 0x05,
+]];
+
 /// Pattern to find l_LogSessList in wdigest.dll.
 /// These patterns appear in SpAcceptCredentials near the list reference.
 /// Win7 through Win11 — CMP instructions use same encoding across versions.

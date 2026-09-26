@@ -599,8 +599,14 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
 
     // MSV sessions + credentials
     if let Some(msv) = &dlls.msv1_0 {
-        let mut sessions =
-            crate::lsass::msv::extract_msv_sessions(&vmem, msv.base, msv.size, build_number, arch);
+        let mut sessions = crate::lsass::msv::extract_msv_sessions(
+            &vmem,
+            msv.base,
+            msv.size,
+            Some((lsasrv.base, lsasrv.size)),
+            build_number,
+            arch,
+        );
         log::info!("MSV x86 sessions discovered: {}", sessions.len());
         if let Some(lsasrv_mod) = dlls.lsasrv {
             crate::lsass::msv::enrich_sessions_from_lsasrv(
@@ -617,6 +623,7 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
             &vmem,
             msv.base,
             msv.size,
+            Some((lsasrv.base, lsasrv.size)),
             &keys,
             build_number,
             arch,
@@ -781,6 +788,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             &lsass_vmem,
             msv.base,
             msv.size,
+            Some((lsasrv.base, lsasrv.size)),
             build_number,
             Arch::X64,
         );
@@ -803,11 +811,13 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             &lsass_vmem,
             msv.base,
             msv.size,
+            Some((lsasrv.base, lsasrv.size)),
             &keys,
             build_number,
             Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
+            Ok(_) if build_number >= 26100 => Vec::new(),
             Ok(_) => {
                 log::info!("MSV: Standard extraction found nothing, trying physical LUID scan...");
                 scan_phys_for_msv_credentials(
@@ -819,6 +829,10 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                     &keys,
                     Arch::X64,
                 )
+            }
+            Err(e) if build_number >= 26100 => {
+                log::info!("MSV 26100 extraction failed: {e}");
+                Vec::new()
             }
             Err(e) => {
                 log::info!("MSV extraction failed: {e}, trying physical scan...");
@@ -1723,6 +1737,7 @@ pub fn extract_credentials_from_minidump(
             vmem,
             msv.base,
             msv.size,
+            Some((lsasrv.base, lsasrv.size)),
             effective_build,
             arch,
         );
@@ -1740,6 +1755,7 @@ pub fn extract_credentials_from_minidump(
             vmem,
             msv.base,
             msv.size,
+            Some((lsasrv.base, lsasrv.size)),
             &keys,
             effective_build,
             arch,
@@ -1756,6 +1772,9 @@ pub fn extract_credentials_from_minidump(
                     });
                     entry.msv = Some(msv_cred);
                 }
+            }
+            Ok(_) | Err(_) if effective_build >= 26100 && arch == Arch::X64 => {
+                status.msv = ProviderStatus::Empty;
             }
             Ok(_) | Err(_) => {
                 log::info!("MSV list walk returned empty, trying vmem region scan fallback...");
