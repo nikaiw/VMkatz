@@ -95,28 +95,31 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
     let mut lsa_cands: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut base = 0u64;
+    // SIMD search for the "Lsa" key name; the NK header sits 0x4C bytes before it.
+    // Far cheaper than testing every 4-byte offset for an "nk" signature.
+    let lsa_finder = memchr::memmem::Finder::new(b"Lsa");
     while base < ps {
         let n = ((ps - base) as usize).min(buf.len());
         if phys.read_phys(base, &mut buf[..n]).is_err() {
             base += buf.len() as u64;
             continue;
         }
-        // Byte-step scan for Control\Lsa NK cells: name "Lsa", a sane subkey count
-        // and a subkey list (excludes the many leaf "Lsa" keys elsewhere).
+        // Locate Control\Lsa NK cells (name "Lsa", 0x4C bytes past the "nk" header)
+        // with a sane subkey count and a subkey list (excludes leaf "Lsa" keys).
         if lsa_cands.len() < 256 {
-            let mut j = 0usize;
-            while j + 0x80 <= n {
-                if &buf[j..j + 2] == b"nk"
-                    && u16::from_le_bytes([buf[j + 0x48], buf[j + 0x49]]) == 3
-                    && buf[j + 0x4C..j + 0x4F].eq_ignore_ascii_case(b"Lsa")
+            for p in lsa_finder.find_iter(&buf[..n]) {
+                let Some(j) = p.checked_sub(0x4C) else { continue };
+                if j + 0x80 > n
+                    || &buf[j..j + 2] != b"nk"
+                    || u16::from_le_bytes([buf[j + 0x48], buf[j + 0x49]]) != 3
                 {
-                    let subs = u32::from_le_bytes(buf[j + 0x14..j + 0x18].try_into().unwrap());
-                    let list = u32::from_le_bytes(buf[j + 0x1C..j + 0x20].try_into().unwrap());
-                    if (4..=64).contains(&subs) && list != 0xFFFF_FFFF {
-                        lsa_cands.push((buf[j..j + 0x80].to_vec(), base + j as u64));
-                    }
+                    continue;
                 }
-                j += 4;
+                let subs = u32::from_le_bytes(buf[j + 0x14..j + 0x18].try_into().unwrap());
+                let list = u32::from_le_bytes(buf[j + 0x1C..j + 0x20].try_into().unwrap());
+                if (4..=64).contains(&subs) && list != 0xFFFF_FFFF {
+                    lsa_cands.push((buf[j..j + 0x80].to_vec(), base + j as u64));
+                }
             }
         }
         let mut off = 0usize;
@@ -482,7 +485,7 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
     // reassembly yielding the most records. Copies differ (transaction logs, stale
     // snapshots); only the freshest complete copy holds every SAM user, so the
     // highest-scoring reassembly — not the first that parses — is kept.
-    let sam_roots = root_candidates(phys, &runs, &locs, "SAM");
+    let sam_roots = root_candidates(phys, &runs, &locs, "SAM", "SAM");
     if let Some((buf, n)) = best_reassembly(phys, &runs, &sam_roots, hive_total(&locs, "SAM"), |b| {
         extract_hashes(b, &bk).map_or(0, |h| h.len())
     }) {
@@ -491,7 +494,7 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
             creds.sam_hashes = h;
         }
     }
-    let sec_roots = root_candidates(phys, &runs, &locs, "SECURITY");
+    let sec_roots = root_candidates(phys, &runs, &locs, "SECURITY", "Policy");
     if let Some((buf, _)) = best_reassembly(phys, &runs, &sec_roots, hive_total(&locs, "SECURITY"), |b| {
         extract_lsa_secrets(b, &bk).map_or(0, |v| v.len())
     }) {
@@ -505,16 +508,25 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
 
 /// The root NK cells of every base block matching `hive`, as (root offset, root
 /// cell, root GPA) — one per copy resident in memory. Deduplicated by (offset, GPA).
+/// A base block's root offset (~0x20) collides with the root of every other hive
+/// copy in the bin pool, so only roots that actually have the expected top-level
+/// child (`top_child`: "SAM" or "Policy") are kept — a cheap one-level probe that
+/// prunes the dozens of unrelated roots before the expensive whole-tree walk.
 fn root_candidates(
     phys: &impl PhysicalMemory,
     runs: &RunIndex,
     locs: &[HiveLoc],
     hive: &str,
+    top_child: &str,
 ) -> Vec<(u64, Vec<u8>, u64)> {
     let mut out: Vec<(u64, Vec<u8>, u64)> = Vec::new();
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut add = |off: u64, cell: Vec<u8>, gpa: u64| {
-        if cell.len() >= 0x50 - 4 && &cell[0..2] == b"nk" && seen.insert((off, gpa)) {
+        if cell.len() >= 0x50 - 4
+            && &cell[0..2] == b"nk"
+            && root_has_child(phys, runs, &cell, top_child)
+            && seen.insert((off, gpa))
+        {
             out.push((off, cell, gpa));
         }
     };
@@ -527,6 +539,32 @@ fn root_candidates(
         }
     }
     out
+}
+
+/// Cheap one-level probe: does `root`'s subkey list resolve to at least one child
+/// NK named `name` (in any resident copy)? Used to reject unrelated hive roots
+/// before the expensive whole-tree reassembly walk.
+fn root_has_child(phys: &impl PhysicalMemory, runs: &RunIndex, root: &[u8], name: &str) -> bool {
+    if root.len() < 0x50 || &root[0..2] != b"nk" {
+        return false;
+    }
+    let list_off = u32_at(root, 0x1C);
+    if list_off == 0xFFFF_FFFF {
+        return false;
+    }
+    for (list, _) in cells_with_gpa(phys, runs, u64::from(list_off)) {
+        if !matches!(list.get(0..2), Some(b"lf" | b"lh" | b"li" | b"ri")) {
+            continue;
+        }
+        for (coff, _) in subkey_list_entries(phys, runs, &list, 0) {
+            if cells_with_gpa(phys, runs, u64::from(coff)).iter().any(|(c, _)| {
+                c.len() >= 0x50 && &c[0..2] == b"nk" && nk_name(c).eq_ignore_ascii_case(name)
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Buffer size for reassembling a hive: the largest matching base-block length,
