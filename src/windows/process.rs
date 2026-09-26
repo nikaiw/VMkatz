@@ -367,8 +367,12 @@ pub fn enumerate_processes(
     });
 
     let mut current_flink = head_flink;
+    // Guard against loops on the Flink VA chain.
     let mut visited = std::collections::HashSet::new();
-    visited.insert(system.eprocess_phys + offsets.active_process_links);
+    // Guard against re-recording an EPROCESS (the list is circular and loops back
+    // to System, whose ActiveProcessLinks VA differs from the head Flink).
+    let mut visited_eproc = std::collections::HashSet::new();
+    visited_eproc.insert(system.eprocess_phys);
 
     // Create appropriate page table walker based on bitness
     let (x64_walker, pae_walker) = match offsets.bitness {
@@ -408,6 +412,11 @@ pub fn enumerate_processes(
         }
         let eprocess_phys = flink_phys - offsets.active_process_links;
 
+        // Stop if we've looped back to an EPROCESS already recorded (e.g. System).
+        if !visited_eproc.insert(eprocess_phys) {
+            break;
+        }
+
         // Read process info
         let pid = match reader.read_pid(phys, eprocess_phys) {
             Ok(p) => p,
@@ -426,15 +435,25 @@ pub fn enumerate_processes(
             }
         };
 
-        // Skip PID 0 (System Idle Process) and implausible PIDs. Windows PIDs are
-        // 32-bit, so a value above u32::MAX marks a corrupt/torn link (e.g. a
-        // truncated final entry) rather than a real process.
-        if pid != 0 && u32::try_from(pid).is_ok() {
+        // Validate the entry before recording it. A torn/corrupt link (e.g. the
+        // truncated final entry of a saved-state list) shows up as an out-of-range
+        // PID, an unaligned or out-of-range DirectoryTableBase, or a non-printable
+        // name. Windows PIDs are 32-bit and every live process has a page-aligned
+        // in-range DTB, so such entries are skipped (not recorded) while the walk
+        // continues — the visited set still bounds it.
+        let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
+        let dtb_base = dtb & PAGE_PHYS_MASK;
+        let dtb_ok = dtb_base != 0 && dtb_base < phys.phys_size() && dtb.trailing_zeros() >= 12;
+        // Skip PID 0 (System Idle Process) too.
+        if pid != 0 && u32::try_from(pid).is_ok() && dtb_ok {
             let short_name = reader
                 .read_image_name(phys, eprocess_phys)
                 .unwrap_or_else(|_| "<unknown>".to_string());
+            if short_name.is_empty() {
+                current_flink = next_flink;
+                continue;
+            }
 
-            let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
             let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
 
             // Try full name from PEB if available (fixes 15-char truncation)

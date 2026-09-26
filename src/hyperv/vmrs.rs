@@ -849,20 +849,125 @@ impl VmrsLayer {
 
             // RamBlock indices are contiguous RAM offsets, but a Hyper-V guest's
             // GPA space has a low MMIO gap: RAM that would sit under it is remapped
-            // above 4 GB. When total RAM exceeds the gap base, GPA above 4 GB maps to
-            // RAM offset (gpa - gap_size); the GPA span therefore exceeds RAM size.
-            // Without this, high-memory page-table entries (e.g. the nonpaged pool
-            // holding EPROCESS structures) translate to out-of-range physical
-            // addresses and the process list can't be walked.
-            if ram_size > MMIO_GAP_BASE {
-                self.mmio_gap_base = MMIO_GAP_BASE;
-                self.mmio_gap_size = MMIO_GAP_END - MMIO_GAP_BASE;
-                // GPA span = 4 GB + (RAM above the gap base).
-                self.phys_size = MMIO_GAP_END + (ram_size - MMIO_GAP_BASE);
+            // above 4 GB. GPA above 4 GB maps to RAM offset (gpa - gap_size), so the
+            // GPA span exceeds RAM size. Without this, high-memory page-table entries
+            // (e.g. the nonpaged pool holding EPROCESS structures) translate to
+            // out-of-range physical addresses and the process list can't be walked.
+            //
+            // The gap base differs by VM generation (Gen1 = 0xF800_0000; Gen2 varies),
+            // so derive its size from the guest's own page tables when RAM extends
+            // above 4 GB, and fall back to the Gen1 default otherwise.
+            let gap_size =
+                self.detect_mmio_gap_size(ram_size)
+                    .unwrap_or(if ram_size > MMIO_GAP_BASE {
+                        MMIO_GAP_END - MMIO_GAP_BASE
+                    } else {
+                        0
+                    });
+            if gap_size > 0 {
+                self.mmio_gap_base = MMIO_GAP_END - gap_size;
+                self.mmio_gap_size = gap_size;
+                // GPA span = 4 GB + (RAM remapped above 4 GB).
+                self.phys_size = MMIO_GAP_END + (ram_size - self.mmio_gap_base);
             } else {
                 self.phys_size = ram_size;
             }
+            log::info!(
+                "VMRS: RAM {} MB, MMIO gap base={:#x} size={:#x}, GPA span {} MB",
+                ram_size / (1024 * 1024),
+                self.mmio_gap_base,
+                self.mmio_gap_size,
+                self.phys_size / (1024 * 1024)
+            );
         }
+    }
+
+    /// Derive the low MMIO gap size from the guest's page tables, generation-agnostic.
+    ///
+    /// A Windows CR3 is a PML4 page with a recursive self-map entry whose PFN is the
+    /// page's own guest-physical address. For a PML4 stored at RAM offset `r` at or
+    /// above the gap, that GPA is `r + gap_size`, so `gap_size = self_map_gpa - r`.
+    /// RAM offsets >= 4 GB are always above the gap (which ends at 4 GB), so scanning
+    /// there and taking the agreed delta yields the exact gap for any generation.
+    /// Returns `None` when RAM does not extend past 4 GB or no consensus is found
+    /// (callers then fall back to the Gen1 default).
+    fn detect_mmio_gap_size(&self, ram_size: u64) -> Option<u64> {
+        const HIGH: u64 = 0x1_0000_0000; // 4 GB — RAM offsets here are above any gap
+        const MAX_GAP: u64 = 0x4000_0000; // 1 GB upper bound on the gap
+        const SCAN_CAP: u64 = 1024; // blocks to scan before giving up
+        const MIN_PML4: u32 = 8; // PML4 pages to sample before trusting a majority
+        if ram_size <= HIGH {
+            return None;
+        }
+        let block_sz = RAM_BLOCK_SIZE as u64;
+        let start_block = HIGH / block_sz;
+        let end_block = ram_size / block_sz;
+        let mut votes: HashMap<u64, u32> = HashMap::new();
+        let mut pml4_seen = 0u32;
+        let mut scanned = 0u64;
+        // The self-map delta appears in EVERY process PML4 (once each), while a
+        // coincidental kernel-entry delta shows up in only a few — so the true gap
+        // is the value a clear majority of sampled PML4 pages agree on.
+        let mut candidates: Vec<u64> = Vec::new();
+        for block in start_block..end_block {
+            let Ok(data) = self.read_ram_block(block) else {
+                continue;
+            };
+            scanned += 1;
+            let base = block * block_sz;
+            for page in 0..(RAM_BLOCK_SIZE / 4096) {
+                let po = page * 4096;
+                if po + 4096 > data.len() {
+                    break;
+                }
+                let pg = &data[po..po + 4096];
+                let r = base + po as u64;
+                let mut kernel = 0u32;
+                candidates.clear();
+                for i in 0..512 {
+                    let e = u64::from_le_bytes(pg[i * 8..i * 8 + 8].try_into().unwrap());
+                    if e & 1 == 0 {
+                        continue;
+                    }
+                    if i >= 256 {
+                        kernel += 1;
+                    }
+                    // Self-map candidate: entry PFN (a GPA) just above this page's
+                    // RAM offset, by a small, 2 MB-aligned amount (the gap).
+                    let pfn_gpa = e & 0x000F_FFFF_FFFF_F000;
+                    if pfn_gpa > r {
+                        let d = pfn_gpa - r;
+                        if d <= MAX_GAP && d.is_multiple_of(0x20_0000) && !candidates.contains(&d) {
+                            candidates.push(d);
+                        }
+                    }
+                }
+                // A real PML4 has several shared kernel-half entries plus the self-map.
+                if kernel >= 6 && !candidates.is_empty() {
+                    pml4_seen += 1;
+                    for &d in &candidates {
+                        *votes.entry(d).or_default() += 1;
+                    }
+                }
+            }
+            // Trust a value only once enough PML4s are sampled and one holds a
+            // strict majority of them (the self-map is in 100% of real PML4s).
+            if pml4_seen >= MIN_PML4 {
+                if let Some((&d, &c)) = votes.iter().max_by_key(|(_, c)| **c) {
+                    if c * 2 > pml4_seen {
+                        return Some(d);
+                    }
+                }
+            }
+            if scanned >= SCAN_CAP {
+                break;
+            }
+        }
+        votes
+            .into_iter()
+            .filter(|&(_, c)| pml4_seen > 0 && c * 2 > pml4_seen)
+            .max_by_key(|&(_, c)| c)
+            .map(|(d, _)| d)
     }
 
     /// Map a guest physical address to a flat RAM offset (into the RamBlock space),
