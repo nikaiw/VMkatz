@@ -426,8 +426,10 @@ pub fn enumerate_processes(
             }
         };
 
-        // Skip PID 0 (System Idle Process) - has no valid DTB, PEB, or name
-        if pid != 0 {
+        // Skip PID 0 (System Idle Process) and implausible PIDs. Windows PIDs are
+        // 32-bit, so a value above u32::MAX marks a corrupt/torn link (e.g. a
+        // truncated final entry) rather than a real process.
+        if pid != 0 && u32::try_from(pid).is_ok() {
             let short_name = reader
                 .read_image_name(phys, eprocess_phys)
                 .unwrap_or_else(|_| "<unknown>".to_string());

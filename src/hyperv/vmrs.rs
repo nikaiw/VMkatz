@@ -10,16 +10,20 @@
 //! - [data_offset..]: Data region containing ObjectTable, KeyTables, values
 //!
 //! Memory reconstruction is byte-exact: every RamBlock decompresses (XPRESS) to
-//! a full 1 MB page and the physical extent is rebuilt from the sparse block
-//! indices. This yields the guest's *root-partition physical* memory.
+//! a full 1 MB page. Two subtleties are essential for virtual-address translation:
 //!
-//! LIMITATION (VBS / nested-EPT): on build 26100 (Server 2025 / Win11 24H2)
-//! Virtualization-Based Security is on by default. The saved physical memory is
-//! then VTL0 guest-physical: the guest's CR3 page tables hold GPAs that require a
-//! second EPT/SLAT translation before they map to offsets in this file. Direct
-//! VA->PA walking therefore finds no EPROCESS list. Reaching processes on such
-//! images requires locating the VTL0 EPT PML4 and doing GVA->GPA->root-PA
-//! translation (not yet implemented). Non-VBS guests translate directly.
+//! 1. RamBlock references live in several KeyTable copies — ObjectTable-referenced
+//!    leaves, tables inline in the data region, and a set near the file start. The
+//!    low-memory leaf (RamBlock0..15) and ~200 scattered indices appear only in the
+//!    inline/early tables, so all of them must be swept (see
+//!    [`VmrsLayer::parse_ramblock_references`]); otherwise kernel page tables (e.g.
+//!    behind KUSER_SHARED_DATA) are missing and translation fails.
+//!
+//! 2. RamBlock indices are contiguous RAM offsets, but the guest's GPA space has a
+//!    low MMIO gap: RAM under it is remapped above 4 GB. read_phys therefore maps
+//!    GPA -> RAM offset across the gap (see [`VmrsLayer::gpa_to_ram_offset`]).
+//!    Without this, high-memory page-table entries translate out of range and the
+//!    EPROCESS list can't be walked.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,6 +38,16 @@ const VMRS_MAGIC: u32 = 0x01282014;
 const HEADER_SIZE: usize = 46;
 const BACKUP_HEADER_OFFSET: u64 = 4096;
 const RAM_BLOCK_SIZE: usize = 0x100000; // 1 MB
+
+/// Hyper-V Gen1 low MMIO gap: RAM that would sit at [0xF800_0000, 0x1_0000_0000)
+/// is remapped above 4 GB. Applied only when total RAM exceeds the gap base.
+const MMIO_GAP_BASE: u64 = 0xF800_0000;
+const MMIO_GAP_END: u64 = 0x1_0000_0000;
+
+/// RamBlock reference sweep: scan chunk size and the overlap padding that keeps
+/// each entry (21-byte header + name + 12-byte reference) within one buffer.
+const SWEEP_CHUNK: usize = 32 * 1024 * 1024;
+const SWEEP_PAD: usize = 64;
 
 /// Parsed HyperVStorage header (46 bytes). `magic` and the CRC32 are validated
 /// at parse time via locals, so they are not stored here.
@@ -90,8 +104,13 @@ pub struct VmrsLayer {
     ram_block_count: u64,
     /// Memory chunks for GPA mapping.
     memory_chunks: Vec<GpaMemoryChunk>,
-    /// Total physical memory size in bytes.
+    /// Total physical (GPA) address span in bytes, including any MMIO gap.
     phys_size: u64,
+    /// Base GPA of the low MMIO gap (0 = no gap; RAM is a flat identity map).
+    mmio_gap_base: u64,
+    /// Size of the low MMIO gap in bytes. RAM at GPA >= `mmio_gap_base +
+    /// mmio_gap_size` is stored at file RAM-offset `gpa - mmio_gap_size`.
+    mmio_gap_size: u64,
 }
 
 struct VmrsInner {
@@ -135,6 +154,8 @@ impl VmrsLayer {
             ram_block_count: 0,
             memory_chunks: Vec::new(),
             phys_size: 0,
+            mmio_gap_base: 0,
+            mmio_gap_size: 0,
         };
 
         // Parse the data region
@@ -270,6 +291,115 @@ impl VmrsLayer {
         // Now parse all KeyTables referenced by the ObjectTable
         self.parse_key_tables()?;
 
+        // Some RAM blocks (the low-memory leaf covering RamBlock0..15 plus scattered
+        // indices) live in KeyTables not referenced by any ObjectTable entry — inline
+        // in the data region, near the file start, or in backup copies. Without them
+        // low guest physical memory (e.g. the kernel page tables backing
+        // KUSER_SHARED_DATA) is missing and virtual-address translation fails. Sweep
+        // the file to recover every RamBlock reference.
+        self.parse_ramblock_references()?;
+
+        Ok(())
+    }
+
+    /// Recover every `RamBlock<N>` reference by sweeping the whole file.
+    ///
+    /// A VMRS stores its KeyTables in several places: ObjectTable-referenced leaf
+    /// tables (handled by [`Self::parse_key_tables`]), a primary set inline in the
+    /// data region, an early set near the start of the file (the first blocks
+    /// flushed during save), and backup copies. The low-memory leaf (RamBlock0..15)
+    /// and ~200 scattered indices live only in the inline/early tables, so without
+    /// them low guest physical memory — including the kernel page tables backing
+    /// KUSER_SHARED_DATA — is absent and virtual-address translation fails. Missing
+    /// a page-table page also yields garbage PFNs that translate out of range.
+    ///
+    /// Rather than locate every KeyTable header exactly, scan the file for
+    /// `RamBlock<N>` entries and resolve each in place. A RamBlock entry is a
+    /// reference entry (type 7, flag bit0 set) whose NUL-terminated name is
+    /// immediately followed by the 12-byte descriptor `{ u32 size; u64 file_offset }`
+    /// (see [`Self::walk_key_entries`]). Strict checks (exact name-length field,
+    /// entry type/flags, reference bounds) reject the rare coincidental "RamBlock"
+    /// byte sequence inside compressed page data. Inserts keep the first valid
+    /// reference, so entries already found via KeyTables are preserved.
+    fn parse_ramblock_references(&mut self) -> Result<()> {
+        let file_size = {
+            let mut inner = self.inner.borrow_mut();
+            crate::utils::file_size(&mut inner.file)?
+        };
+        let before = self.key_values.len();
+        let needle = b"RamBlock";
+        let finder = memchr::memmem::Finder::new(needle);
+
+        // Chunked scan with padding so each match's full entry (21-byte header
+        // before the name, plus name and 12-byte reference after) is in-buffer.
+        let mut start = 0u64;
+        while start < file_size {
+            let lo = start.saturating_sub(SWEEP_PAD as u64);
+            let hi = (start + SWEEP_CHUNK as u64 + SWEEP_PAD as u64).min(file_size);
+            let buf = self.read_file_bytes(lo, (hi - lo) as usize)?;
+            let core_begin = (start - lo) as usize;
+            let core_end = ((start + SWEEP_CHUNK as u64).min(file_size) - lo) as usize;
+
+            for m in finder.find_iter(&buf) {
+                // Only own matches whose name starts in this chunk's core.
+                if m < core_begin || m >= core_end {
+                    continue;
+                }
+                let name_start = m;
+                let mut j = name_start + needle.len();
+                let ds = j;
+                while j < buf.len() && buf[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == ds || j - ds > 7 {
+                    continue;
+                }
+                let Ok(index) = std::str::from_utf8(&buf[ds..j])
+                    .unwrap_or("")
+                    .parse::<u64>()
+                else {
+                    continue;
+                };
+                if name_start < 21 {
+                    continue;
+                }
+                let entry_off = name_start - 21;
+                let name_bytes = j - name_start; // "RamBlock" + digits, no NUL
+                let name_length = buf[entry_off + 20] as usize;
+                // Reference entry, reference flag set, NUL-terminated name length.
+                if buf[entry_off] != 7
+                    || buf[entry_off + 1] & 1 == 0
+                    || name_length != name_bytes + 1
+                {
+                    continue;
+                }
+                let ref_off = entry_off + 21 + name_length;
+                if ref_off + 12 > buf.len() {
+                    continue;
+                }
+                let size = u32::from_le_bytes(buf[ref_off..ref_off + 4].try_into().unwrap());
+                let file_offset =
+                    u64::from_le_bytes(buf[ref_off + 4..ref_off + 12].try_into().unwrap());
+                if size == 0
+                    || size as usize > RAM_BLOCK_SIZE
+                    || file_offset == 0
+                    || file_offset + u64::from(size) > file_size
+                {
+                    continue;
+                }
+                self.key_values
+                    .entry(format!("RamBlock{index}"))
+                    .or_insert((file_offset, size));
+            }
+
+            start += SWEEP_CHUNK as u64;
+        }
+
+        log::info!(
+            "VMRS: RamBlock reference sweep recovered {} additional blocks (total {})",
+            self.key_values.len() - before,
+            self.key_values.len()
+        );
         Ok(())
     }
 
@@ -449,14 +579,16 @@ impl VmrsLayer {
         Ok(())
     }
 
-    /// Walk key entries in a flat array, building the key path map.
+    /// Walk key entries in a flat array, building the key path map. Returns the
+    /// offset at which walking stopped (table end), so a caller scanning several
+    /// concatenated tables can resume past this one.
     fn walk_key_entries(
         &mut self,
         data: &[u8],
         start: usize,
         base_file_offset: u64,
         parent_path: &str,
-    ) {
+    ) -> usize {
         let total = data.len();
         let mut offset = start;
 
@@ -593,6 +725,7 @@ impl VmrsLayer {
 
             offset += entry_total_size;
         }
+        offset
     }
 
     /// Find an ObjectTableEntry by some reference (try as index, then as offset).
@@ -708,12 +841,42 @@ impl VmrsLayer {
         let pages_per_block = (RAM_BLOCK_SIZE / 4096) as u64;
         if block_count > 0 {
             let blocks_extent = max_block + 1;
+            let ram_size = blocks_extent * RAM_BLOCK_SIZE as u64;
             self.memory_chunks.push(GpaMemoryChunk {
                 start_page_index: 0,
                 page_count: blocks_extent * pages_per_block,
             });
-            self.phys_size = blocks_extent * RAM_BLOCK_SIZE as u64;
+
+            // RamBlock indices are contiguous RAM offsets, but a Hyper-V guest's
+            // GPA space has a low MMIO gap: RAM that would sit under it is remapped
+            // above 4 GB. When total RAM exceeds the gap base, GPA above 4 GB maps to
+            // RAM offset (gpa - gap_size); the GPA span therefore exceeds RAM size.
+            // Without this, high-memory page-table entries (e.g. the nonpaged pool
+            // holding EPROCESS structures) translate to out-of-range physical
+            // addresses and the process list can't be walked.
+            if ram_size > MMIO_GAP_BASE {
+                self.mmio_gap_base = MMIO_GAP_BASE;
+                self.mmio_gap_size = MMIO_GAP_END - MMIO_GAP_BASE;
+                // GPA span = 4 GB + (RAM above the gap base).
+                self.phys_size = MMIO_GAP_END + (ram_size - MMIO_GAP_BASE);
+            } else {
+                self.phys_size = ram_size;
+            }
         }
+    }
+
+    /// Map a guest physical address to a flat RAM offset (into the RamBlock space),
+    /// accounting for the low MMIO gap. Returns `None` for addresses inside the gap
+    /// (MMIO, no backing RAM).
+    const fn gpa_to_ram_offset(&self, gpa: u64) -> Option<u64> {
+        if self.mmio_gap_size == 0 || gpa < self.mmio_gap_base {
+            return Some(gpa);
+        }
+        let gap_end = self.mmio_gap_base + self.mmio_gap_size;
+        if gpa < gap_end {
+            return None; // inside the MMIO gap
+        }
+        Some(gpa - self.mmio_gap_size)
     }
 
     /// Read bytes from the file at a given offset.
@@ -813,8 +976,19 @@ impl PhysicalMemory for VmrsLayer {
         let mut addr = phys_addr;
 
         while !remaining.is_empty() {
-            let block_index = addr / RAM_BLOCK_SIZE as u64;
-            let block_offset = (addr % RAM_BLOCK_SIZE as u64) as usize;
+            // Translate GPA -> flat RAM offset (skipping the MMIO gap). The gap base
+            // is 1 MB-aligned, so a single block never straddles it.
+            let Some(ram_offset) = self.gpa_to_ram_offset(addr) else {
+                // Inside the MMIO gap: no backing RAM.
+                let to_gap_end = (self.mmio_gap_base + self.mmio_gap_size).saturating_sub(addr);
+                let to_copy = remaining.len().min(to_gap_end.max(1) as usize);
+                remaining[..to_copy].fill(0);
+                remaining = &mut remaining[to_copy..];
+                addr += to_copy as u64;
+                continue;
+            };
+            let block_index = ram_offset / RAM_BLOCK_SIZE as u64;
+            let block_offset = (ram_offset % RAM_BLOCK_SIZE as u64) as usize;
             let available = RAM_BLOCK_SIZE - block_offset;
             let to_copy = remaining.len().min(available);
 
