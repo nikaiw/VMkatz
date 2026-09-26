@@ -42,6 +42,21 @@ pub trait PhysicalMemory {
     fn is_truncated(&self) -> bool {
         false
     }
+
+    /// Scan all physical memory in parallel, invoking `f(gpa, bytes)` for each
+    /// backing region (e.g. one decompressed RAM block) from worker threads. The
+    /// callback must be `Sync` and its work per region independent (order is not
+    /// preserved), and returns `true` to ask the layer to keep that region cached
+    /// (regions holding data a later pass will re-read). Returns `false` when the
+    /// implementation has no parallel path, so the caller falls back to a
+    /// sequential `read_phys` sweep.
+    ///
+    /// This exists so formats whose reads decompress (Hyper-V VMRS) can spread the
+    /// decompression across cores instead of doing it one block at a time on the
+    /// single scanning thread.
+    fn par_scan(&self, _f: &(dyn Fn(u64, &[u8]) -> bool + Sync)) -> bool {
+        false
+    }
 }
 
 /// Read from a process's virtual address space (page-table-translated).

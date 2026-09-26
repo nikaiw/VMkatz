@@ -111,11 +111,16 @@ pub struct VmrsLayer {
     /// Size of the low MMIO gap in bytes. RAM at GPA >= `mmio_gap_base +
     /// mmio_gap_size` is stored at file RAM-offset `gpa - mmio_gap_size`.
     mmio_gap_size: u64,
+    /// Path to the .vmrs file, so parallel workers can open their own handles.
+    path: std::path::PathBuf,
 }
 
 struct VmrsInner {
     file: fs::File,
     block_cache: HashMap<u64, Vec<u8>>,
+    /// FIFO of cached block indices, for single-entry eviction (clearing the whole
+    /// cache thrashes the random access done during registry-hive reconstruction).
+    cache_order: std::collections::VecDeque<u64>,
     cache_limit: usize,
 }
 
@@ -146,7 +151,10 @@ impl VmrsLayer {
             inner: RefCell::new(VmrsInner {
                 file,
                 block_cache: HashMap::new(),
-                cache_limit: 64,
+                cache_order: std::collections::VecDeque::new(),
+                // 1 GB of decompressed blocks: enough to keep registry-hive bins and
+                // page tables hot during the random access of reconstruction/walking.
+                cache_limit: 1024,
             }),
             header,
             object_entries: Vec::new(),
@@ -156,6 +164,7 @@ impl VmrsLayer {
             phys_size: 0,
             mmio_gap_base: 0,
             mmio_gap_size: 0,
+            path: path.to_path_buf(),
         };
 
         // Parse the data region
@@ -1060,12 +1069,18 @@ impl VmrsLayer {
             vm_compress_unpack(&raw_data)
         };
 
-        // Cache the result
+        // Cache the result with single-entry FIFO eviction.
         let mut inner = self.inner.borrow_mut();
-        if inner.block_cache.len() >= inner.cache_limit {
-            inner.block_cache.clear();
+        while inner.block_cache.len() >= inner.cache_limit {
+            if let Some(old) = inner.cache_order.pop_front() {
+                inner.block_cache.remove(&old);
+            } else {
+                break;
+            }
         }
-        inner.block_cache.insert(block_index, block.clone());
+        if inner.block_cache.insert(block_index, block.clone()).is_none() {
+            inner.cache_order.push_back(block_index);
+        }
 
         Ok(block)
     }
@@ -1097,6 +1112,27 @@ impl PhysicalMemory for VmrsLayer {
             let available = RAM_BLOCK_SIZE - block_offset;
             let to_copy = remaining.len().min(available);
 
+            // Fast path: on a cache hit copy the needed slice directly, avoiding a
+            // full 1 MB block clone. Reassembly issues thousands of tiny reads, so
+            // cloning the whole block per read would dominate the run time.
+            {
+                let inner = self.inner.borrow();
+                if let Some(block) = inner.block_cache.get(&block_index) {
+                    let end = (block_offset + to_copy).min(block.len());
+                    if block_offset < block.len() {
+                        let copy_len = end - block_offset;
+                        remaining[..copy_len].copy_from_slice(&block[block_offset..end]);
+                        remaining[copy_len..to_copy].fill(0);
+                    } else {
+                        remaining[..to_copy].fill(0);
+                    }
+                    drop(inner);
+                    remaining = &mut remaining[to_copy..];
+                    addr += to_copy as u64;
+                    continue;
+                }
+            }
+
             match self.read_ram_block(block_index) {
                 Ok(block) => {
                     let end = (block_offset + to_copy).min(block.len());
@@ -1125,6 +1161,110 @@ impl PhysicalMemory for VmrsLayer {
 
     fn phys_size(&self) -> u64 {
         self.phys_size
+    }
+
+    /// Decompress and scan every RAM block in parallel. Each block's location is
+    /// resolved up front (from the immutable key/object tables), then worker
+    /// threads — each with its own file handle and positioned reads — pull blocks
+    /// off a shared counter, decompress, and hand the bytes to `f` at the block's
+    /// GPA. XPRESS decompression is the scan's bottleneck, so this spreads it over
+    /// all cores; block scans are independent, so no ordering is needed.
+    fn par_scan(&self, f: &(dyn Fn(u64, &[u8]) -> bool + Sync)) -> bool {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if self.ram_block_count == 0 {
+            return false;
+        }
+        // Object-table fallback list (used when RamBlock<N> keys are absent).
+        let ram_entries: Vec<(u64, u32)> = self
+            .object_entries
+            .iter()
+            .filter(|e| {
+                e.size > 0
+                    && e.size as usize <= RAM_BLOCK_SIZE
+                    && e.file_offset > 0
+                    && e.entry_type != 0
+                    && e.entry_type != 2
+                    && e.entry_type != 4
+            })
+            .map(|e| (e.file_offset, e.size))
+            .collect();
+        // Resolve every block to (index, gpa, file_offset, compressed_size) up front.
+        let mut jobs: Vec<(u64, u64, u64, u32)> = Vec::new();
+        for bi in 0..self.ram_block_count {
+            let loc = [
+                format!("savedstate/RamBlock{bi}"),
+                format!("/savedstate/RamBlock{bi}"),
+                format!("RamBlock{bi}"),
+                format!("savedstate/RamMemoryBlock{bi}"),
+                format!("/savedstate/RamMemoryBlock{bi}"),
+            ]
+            .iter()
+            .find_map(|k| self.key_values.get(k.as_str()).copied())
+            .or_else(|| ram_entries.get(bi as usize).copied());
+            if let Some((foff, csize)) = loc {
+                let ram_offset = bi * RAM_BLOCK_SIZE as u64;
+                let gpa = if self.mmio_gap_size == 0 || ram_offset < self.mmio_gap_base {
+                    ram_offset
+                } else {
+                    ram_offset + self.mmio_gap_size
+                };
+                jobs.push((bi, gpa, foff, csize));
+            }
+        }
+        if jobs.is_empty() {
+            return false;
+        }
+
+        let path = &self.path;
+        let counter = AtomicUsize::new(0);
+        // Blocks the callback flagged (they hold hive bins) are kept so the later
+        // reassembly reads hit the cache instead of re-decompressing — that random
+        // re-decompression, not the scan, is what a cold cache makes pathological.
+        let keep: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+        let nthreads = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZeroUsize::get)
+            .min(jobs.len());
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                s.spawn(|| {
+                    let Ok(fh) = fs::File::open(path) else {
+                        return;
+                    };
+                    loop {
+                        let idx = counter.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(bi, gpa, foff, csize)) = jobs.get(idx) else {
+                            break;
+                        };
+                        let mut raw = vec![0u8; csize as usize];
+                        if fh.read_exact_at(&mut raw, foff).is_err() {
+                            continue;
+                        }
+                        let block = if csize as usize == RAM_BLOCK_SIZE {
+                            raw
+                        } else {
+                            vm_compress_unpack(&raw)
+                        };
+                        if f(gpa, &block) {
+                            keep.lock().unwrap().push((bi, block));
+                        }
+                    }
+                });
+            }
+        });
+
+        // Warm the cache with the retained hive blocks and raise the limit so they
+        // are not evicted during reassembly.
+        let kept = keep.into_inner().unwrap();
+        let mut inner = self.inner.borrow_mut();
+        inner.cache_limit = inner.cache_limit.max(kept.len() + 16);
+        for (bi, block) in kept {
+            if inner.block_cache.insert(bi, block).is_none() {
+                inner.cache_order.push_back(bi);
+            }
+        }
+        true
     }
 }
 

@@ -86,96 +86,130 @@ pub struct MemoryHiveCreds {
 /// bins ("hbin"), which are page-aligned. Returns the wanted base blocks and a
 /// map of hive-file-offset -> candidate bins.
 fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAnchor>) {
-    let ps = phys.phys_size();
-    let mut locs = Vec::new();
-    let mut bins: Vec<Hbin> = Vec::new();
-    // Physically-located Control\Lsa NK cells (head bytes + GPA). The bootkey is read
-    // by anchoring on one of these directly, which sidesteps the ambiguity of
-    // navigating root -> ControlSet -> Control across the many stale SYSTEM copies.
-    let mut lsa_cands: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut base = 0u64;
     // SIMD search for the "Lsa" key name; the NK header sits 0x4C bytes before it.
-    // Far cheaper than testing every 4-byte offset for an "nk" signature.
-    let lsa_finder = memchr::memmem::Finder::new(b"Lsa");
-    while base < ps {
-        let n = ((ps - base) as usize).min(buf.len());
-        if phys.read_phys(base, &mut buf[..n]).is_err() {
+    let finder = memchr::memmem::Finder::new(b"Lsa");
+    let locs = std::sync::Mutex::new(Vec::new());
+    let bins = std::sync::Mutex::new(Vec::new());
+    let lsa = std::sync::Mutex::new(Vec::new());
+    let collect = |gpa: u64, buf: &[u8]| -> bool {
+        let (l, b, a) = scan_chunk(buf, gpa, &finder);
+        let has_bins = !b.is_empty();
+        if !l.is_empty() {
+            locs.lock().unwrap().extend(l);
+        }
+        if has_bins {
+            bins.lock().unwrap().extend(b);
+        }
+        if !a.is_empty() {
+            lsa.lock().unwrap().extend(a);
+        }
+        // Keep blocks that hold hive bins cached: reassembly re-reads exactly these.
+        has_bins
+    };
+
+    // Prefer the layer's parallel sweep (VMRS decompresses each block on its own
+    // core); fall back to a sequential 1 MB read sweep for flat/mmap layers.
+    if !phys.par_scan(&collect) {
+        let ps = phys.phys_size();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut base = 0u64;
+        while base < ps {
+            let n = ((ps - base) as usize).min(buf.len());
+            if phys.read_phys(base, &mut buf[..n]).is_ok() {
+                collect(base, &buf[..n]);
+            }
             base += buf.len() as u64;
+        }
+    }
+
+    let mut locs = locs.into_inner().unwrap();
+    let bins = bins.into_inner().unwrap();
+    let mut lsa = lsa.into_inner().unwrap();
+    lsa.truncate(256);
+    locs.sort_by_key(|h| !h.sequence_ok); // clean copies first
+    (locs, bins, lsa)
+}
+
+/// Scan one memory chunk starting at guest physical `base_gpa` for hive base
+/// blocks (`regf`), cell bins (`hbin`, page-aligned) and Control\Lsa NK anchor
+/// cells. Pure over `buf`, so it runs on the sequential sweep or on a worker
+/// thread of a parallel [`PhysicalMemory::par_scan`] alike.
+fn scan_chunk(
+    buf: &[u8],
+    base_gpa: u64,
+    finder: &memchr::memmem::Finder,
+) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAnchor>) {
+    let n = buf.len();
+    let mut locs = Vec::new();
+    let mut bins = Vec::new();
+    let mut lsa = Vec::new();
+
+    // Control\Lsa NK cells (name "Lsa", 0x4C bytes past the "nk" header) with a
+    // sane subkey count and a subkey list (excludes leaf "Lsa" keys).
+    for p in finder.find_iter(buf) {
+        let Some(j) = p.checked_sub(0x4C) else { continue };
+        if j + 0x80 > n
+            || &buf[j..j + 2] != b"nk"
+            || u16::from_le_bytes([buf[j + 0x48], buf[j + 0x49]]) != 3
+        {
             continue;
         }
-        // Locate Control\Lsa NK cells (name "Lsa", 0x4C bytes past the "nk" header)
-        // with a sane subkey count and a subkey list (excludes leaf "Lsa" keys).
-        if lsa_cands.len() < 256 {
-            for p in lsa_finder.find_iter(&buf[..n]) {
-                let Some(j) = p.checked_sub(0x4C) else { continue };
-                if j + 0x80 > n
-                    || &buf[j..j + 2] != b"nk"
-                    || u16::from_le_bytes([buf[j + 0x48], buf[j + 0x49]]) != 3
-                {
-                    continue;
-                }
-                let subs = u32::from_le_bytes(buf[j + 0x14..j + 0x18].try_into().unwrap());
-                let list = u32::from_le_bytes(buf[j + 0x1C..j + 0x20].try_into().unwrap());
-                if (4..=64).contains(&subs) && list != 0xFFFF_FFFF {
-                    lsa_cands.push((buf[j..j + 0x80].to_vec(), base + j as u64));
-                }
-            }
+        let subs = u32::from_le_bytes(buf[j + 0x14..j + 0x18].try_into().unwrap());
+        let list = u32::from_le_bytes(buf[j + 0x1C..j + 0x20].try_into().unwrap());
+        if (4..=64).contains(&subs) && list != 0xFFFF_FFFF {
+            lsa.push((buf[j..j + 0x80].to_vec(), base_gpa + j as u64));
         }
-        let mut off = 0usize;
-        while off + 0x20 <= n {
-            let gpa = base + off as u64;
-            match &buf[off..off + 4] {
-                b"regf" => {
-                    let seq1 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
-                    let seq2 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
-                    let length = u64::from(u32::from_le_bytes(
-                        buf[off + 0x28..off + 0x2c].try_into().unwrap(),
-                    ));
-                    if off + 0x30 + 64 <= n && (BASE_BLOCK..=MAX_HIVE).contains(&(length + BASE_BLOCK))
-                    {
-                        let name: String = buf[off + 0x30..off + 0x30 + 64]
-                            .chunks(2)
-                            .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
-                            .take_while(|&u| u != 0)
-                            .filter_map(|u| char::from_u32(u32::from(u)))
-                            .collect();
-                        let basename = name.rsplit(['\\', '/']).next().unwrap_or("");
-                        if WANTED.iter().any(|w| basename.eq_ignore_ascii_case(w)) {
-                            locs.push(HiveLoc {
-                                name: basename.to_ascii_uppercase(),
-                                gpa,
-                                length,
-                                sequence_ok: seq1 == seq2,
-                            });
-                        }
-                    }
-                }
-                b"hbin" => {
-                    let file_offset =
-                        u64::from(u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()));
-                    let size =
-                        u64::from(u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()));
-                    if (PAGE..=MAX_BIN).contains(&size)
-                        && size.is_multiple_of(PAGE)
-                        && file_offset.is_multiple_of(PAGE)
-                        && file_offset < MAX_HIVE
-                    {
-                        bins.push(Hbin {
+    }
+
+    let mut off = 0usize;
+    while off + 0x20 <= n {
+        let gpa = base_gpa + off as u64;
+        match &buf[off..off + 4] {
+            b"regf" => {
+                let seq1 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+                let seq2 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+                let length = u64::from(u32::from_le_bytes(
+                    buf[off + 0x28..off + 0x2c].try_into().unwrap(),
+                ));
+                if off + 0x30 + 64 <= n && (BASE_BLOCK..=MAX_HIVE).contains(&(length + BASE_BLOCK)) {
+                    let name: String = buf[off + 0x30..off + 0x30 + 64]
+                        .chunks(2)
+                        .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+                        .take_while(|&u| u != 0)
+                        .filter_map(|u| char::from_u32(u32::from(u)))
+                        .collect();
+                    let basename = name.rsplit(['\\', '/']).next().unwrap_or("");
+                    if WANTED.iter().any(|w| basename.eq_ignore_ascii_case(w)) {
+                        locs.push(HiveLoc {
+                            name: basename.to_ascii_uppercase(),
                             gpa,
-                            file_offset,
-                            size,
+                            length,
+                            sequence_ok: seq1 == seq2,
                         });
                     }
                 }
-                _ => {}
             }
-            off += PAGE as usize; // regf/hbin blocks are page-aligned
+            b"hbin" => {
+                let file_offset =
+                    u64::from(u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()));
+                let size = u64::from(u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()));
+                if (PAGE..=MAX_BIN).contains(&size)
+                    && size.is_multiple_of(PAGE)
+                    && file_offset.is_multiple_of(PAGE)
+                    && file_offset < MAX_HIVE
+                {
+                    bins.push(Hbin {
+                        gpa,
+                        file_offset,
+                        size,
+                    });
+                }
+            }
+            _ => {}
         }
-        base += buf.len() as u64;
+        off += PAGE as usize; // regf/hbin blocks are page-aligned
     }
-    locs.sort_by_key(|h| !h.sequence_ok); // clean copies first
-    (locs, bins, lsa_cands)
+    (locs, bins, lsa)
 }
 
 /// Coalesce bins into runs contiguous in both physical address and hive offset.
