@@ -274,23 +274,43 @@ const TICKET_OFFSETS_10_X86: TicketOffsets = TicketOffsets {
 /// plausible element count and a balanced-tree root that points into the heap.
 /// Rejects the unrelated globals a code pattern can resolve to on some builds
 /// (Server 2019 17763's first pattern site reads as elements=0).
-fn avl_table_is_valid(vmem: &dyn VirtualMemory, addr: u64, arch: Arch) -> bool {
+fn avl_table_is_valid(
+    vmem: &dyn VirtualMemory,
+    addr: u64,
+    arch: Arch,
+    mod_base: u64,
+    mod_span: u64,
+) -> bool {
     let ps = arch.ptr_size();
     let num_elem_off = if arch == Arch::X64 { 0x2Cu64 } else { 0x18 };
     let num = vmem.read_virt_u32(addr + num_elem_off).unwrap_or(0);
-    if num == 0 || num > 100_000 {
+    // Logon-session tables hold at most a few thousand entries; a garbage global
+    // that happens to match the LEA+CALL shape usually reads a huge/zero count.
+    if num == 0 || num > 65_535 {
         return false;
     }
-    // Right child = balanced-tree root; must be a readable heap pointer.
+    // BalancedRoot.RightChild = tree root; must be a readable heap pointer.
     let root = read_ptr(vmem, addr + ps * 2, arch).unwrap_or(0);
-    patterns::is_heap_ptr(root) && vmem.read_virt_u64(root).is_ok()
+    if !patterns::is_heap_ptr(root) || vmem.read_virt_u64(root).is_err() {
+        return false;
+    }
+    // Structural discriminator (x64): RTL_AVL_TABLE.CompareRoutine (+0x48) is
+    // KerbpCompareLogonSessions, which lives inside kerberos.dll. A coincidental
+    // global almost never has a same-module code pointer at that offset.
+    if arch == Arch::X64 {
+        let cmp = read_ptr(vmem, addr + 0x48, arch).unwrap_or(0);
+        if cmp < mod_base || cmp >= mod_base.saturating_add(mod_span) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extract Kerberos credentials from kerberos.dll (unified x64/x86).
 pub fn extract_kerberos_credentials(
     vmem: &dyn VirtualMemory,
     kerberos_base: u64,
-    _kerberos_size: u32,
+    kerberos_size: u32,
     keys: &CryptoKeys,
     arch: Arch,
 ) -> Result<Vec<(u64, KerberosCredential)>> {
@@ -321,23 +341,62 @@ pub fn extract_kerberos_credentials(
         Arch::X64 => {
             let data = vmem.read_virt_bytes(text_base, text.virtual_size as usize)?;
             let mut table = None;
-            'sites: for pattern in pattern_list {
-                let mut from = 0usize;
-                while let Some(rel) = data[from..]
-                    .windows(pattern.len())
-                    .position(|w| w == *pattern)
+            // Primary, build-independent finder: the session table is passed in RCX
+            // to an Rtl*GenericTableAvl call, i.e. `LEA RCX,[rip+disp]` (48 8D 0D ..)
+            // immediately followed by `CALL qword ptr [rip+disp]` (48 FF 15 ..). MSVC
+            // emits a redundant REX.W (48) prefix on the indirect call, so the bytes
+            // are `48 FF 15`, not `FF 15`. Resolve the LEA target and validate it as a
+            // real RTL_AVL_TABLE — this matches the lookup/insert/enumerate sites on
+            // every build seen, unlike the fixed mov+lea prologue patterns which shift
+            // between versions. Validation must be strict (see avl_table_is_valid):
+            // several unrelated globals also match the LEA+call shape.
+            let mod_span = if kerberos_size == 0 {
+                0x40_0000u64
+            } else {
+                u64::from(kerberos_size)
+            };
+            let mut i = 0usize;
+            while i + 10 <= data.len() {
+                if data[i] == 0x48
+                    && data[i + 1] == 0x8D
+                    && data[i + 2] == 0x0D
+                    && data[i + 7] == 0x48
+                    && data[i + 8] == 0xFF
+                    && data[i + 9] == 0x15
                 {
-                    let code_addr = text_base + (from + rel) as u64;
-                    if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 6) {
-                        if avl_table_is_valid(vmem, cand, arch) {
+                    let code_addr = text_base + i as u64;
+                    if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 3) {
+                        if avl_table_is_valid(vmem, cand, arch, kerberos_base, mod_span) {
                             log::info!(
-                                "{pattern_label}: validated session table at 0x{cand:x} (site 0x{code_addr:x})"
+                                "{pattern_label}: validated session table at 0x{cand:x} (LEA+call site 0x{code_addr:x})"
                             );
                             table = Some(cand);
-                            break 'sites;
+                            break;
                         }
                     }
-                    from += rel + 1;
+                }
+                i += 1;
+            }
+            // Fallback: the older fixed mov+lea prologue patterns.
+            if table.is_none() {
+                'sites: for pattern in pattern_list {
+                    let mut from = 0usize;
+                    while let Some(rel) = data[from..]
+                        .windows(pattern.len())
+                        .position(|w| w == *pattern)
+                    {
+                        let code_addr = text_base + (from + rel) as u64;
+                        if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 6) {
+                            if avl_table_is_valid(vmem, cand, arch, kerberos_base, mod_span) {
+                                log::info!(
+                                    "{pattern_label}: validated session table at 0x{cand:x} (site 0x{code_addr:x})"
+                                );
+                                table = Some(cand);
+                                break 'sites;
+                            }
+                        }
+                        from += rel + 1;
+                    }
                 }
             }
             let Some(t) = table else {
@@ -829,6 +888,21 @@ fn extract_single_ticket(
         ticket_kvno,
         &ticket_blob,
     );
+
+    // Classify by the ticket's own service name rather than which cache list it
+    // came from: the per-session cache lists are not reliably ordered by type
+    // across builds. A krbtgt/* server means a TGT; anything else is a service
+    // ticket (TGS). Fall back to the list-derived hint only when there is no name.
+    let ticket_type = if service_name
+        .first()
+        .is_some_and(|s| s.eq_ignore_ascii_case("krbtgt"))
+    {
+        KerberosTicketType::Tgt
+    } else if service_name.is_empty() {
+        ticket_type
+    } else {
+        KerberosTicketType::Tgs
+    };
 
     Some(KerberosTicket {
         ticket_type,
@@ -1379,8 +1453,6 @@ pub fn scan_vmem_for_kerberos_keys(
     all_key_groups
 }
 
-/// Carve orphaned Kerberos tickets from LSASS virtual memory.
-///
 /// Scans for `_KERB_TICKET_INFO` structures that are no longer reachable via the
 /// AVL tree (freed sessions, logged-out users whose memory is still resident).
 /// Returns tickets not already present in `existing_tickets`.
