@@ -151,6 +151,29 @@ const TICKET_OFFSETS_1607: TicketOffsets = TicketOffsets {
     ticket_value: 0x138,
 };
 
+/// Ticket offsets for Server 2025 / Win11 24H2+ (build 26100).
+/// Header (service/domain/target/client/flags/key) is identical to 1607, but the
+/// tail from the timestamps onward is shifted +0x10 (an extra 16 bytes appear
+/// between the session key and StartTime). Reverse-engineered from a live cifs
+/// ticket in a DC25 (Server 2025 26100) memory dump.
+const TICKET_OFFSETS_26100: TicketOffsets = TicketOffsets {
+    service_name_ptr: 0x20,
+    domain_name: 0x30,
+    target_domain_name: 0x40,
+    client_name_ptr: 0x90,
+    ticket_flags: 0xA0,
+    key_type: 0xB4,
+    key_length: 0xB8,
+    key_value: 0xC0,
+    start_time: 0xF8,
+    end_time: 0x100,
+    renew_until: 0x108,
+    ticket_enc_type: 0x134,
+    ticket_kvno: 0x138,
+    ticket_length: 0x140,
+    ticket_value: 0x148,
+};
+
 /// Ticket offsets for Win10 1507-1511 / Win11 (KIWI_KERBEROS_INTERNAL_TICKET_10).
 /// Same as _6 but with KDCServer+unk10586_d LSA_UNICODE_STRINGs before ClientName.
 const TICKET_OFFSETS_10: TicketOffsets = TicketOffsets {
@@ -462,20 +485,7 @@ pub fn extract_kerberos_credentials(
     let (offsets, variant_idx) = detect_kerb_offsets(vmem, &nodes, arch);
 
     // Select ticket and key entry offsets based on variant and arch
-    let ticket_offsets = match arch {
-        Arch::X64 => match variant_idx {
-            0 | 1 => &TICKET_OFFSETS_1607,
-            2 => &TICKET_OFFSETS_10,
-            _ => &TICKET_OFFSETS_6,
-        },
-        Arch::X86 => {
-            if variant_idx == 0 {
-                &TICKET_OFFSETS_1607_X86
-            } else {
-                &TICKET_OFFSETS_10_X86
-            }
-        }
-    };
+    let ticket_offsets = ticket_offsets_for(variant_idx, arch);
     let key_entry_offsets = match arch {
         Arch::X64 => match variant_idx {
             0 | 1 => &KEY_ENTRY_1607,
@@ -1000,6 +1010,15 @@ fn detect_kerb_offsets(
     };
     // OrderedPointer: at ptr_size * 4 (0x20 on x64, 0x10 on x86)
     let ordered_ptr_off = arch.ptr_size() * 4;
+    // Some variants share luid/credentials offsets and differ only in the ticket
+    // cache / key list / ticket-entry layout (e.g. variant 0 vs variant 5, which
+    // both use luid=0x48/cred=0x88). Returning the first luid+username match then
+    // locks onto the wrong one. Score each candidate variant instead: how many of
+    // its three ticket-cache LIST_ENTRY heads are structurally valid, plus a large
+    // bonus when a populated list's first node actually parses into a real ticket
+    // using that variant's entry offsets (this is what separates 26100 from 1607).
+    // Keep the best; lowest index breaks ties so 17763 still resolves to variant 0.
+    let mut best: Option<(usize, i32)> = None;
     for node_ptr in nodes {
         let entry = match read_ptr(vmem, node_ptr + ordered_ptr_off, arch) {
             Ok(p) if is_valid_user_ptr(p, arch) => p,
@@ -1014,23 +1033,84 @@ fn detect_kerb_offsets(
             }
             let cred_addr = entry + variant.credentials;
             let username = read_ustring(vmem, cred_addr, arch).unwrap_or_default();
-            if !username.is_empty() && username.len() < 256 {
-                log::debug!(
-                    "Kerberos: auto-detected variant {} (luid=0x{:x} cred=0x{:x} pwd=0x{:x})",
-                    idx,
-                    variant.luid,
-                    variant.credentials,
-                    variant.cred_password
-                );
-                return (variant, idx);
+            if username.is_empty() || username.len() >= 256 {
+                continue;
+            }
+            let lists = [variant.tickets_1, variant.tickets_2, variant.tickets_3];
+            let mut score: i32 = lists
+                .iter()
+                .map(|&off| i32::from(is_ticket_list_head(vmem, entry + off, arch)))
+                .sum();
+            let toff = ticket_offsets_for(idx, arch);
+            for &off in &lists {
+                let flink = read_ptr(vmem, entry + off, arch).unwrap_or(0);
+                if is_valid_user_ptr(flink, arch)
+                    && flink != entry + off
+                    && extract_single_ticket(vmem, flink, KerberosTicketType::Tgs, toff, arch)
+                        .is_some()
+                {
+                    score += 10;
+                    break;
+                }
+            }
+            if best.is_none_or(|(_, bs)| score > bs) {
+                best = Some((idx, score));
             }
         }
+        if matches!(best, Some((_, s)) if s >= 10) {
+            break;
+        }
+    }
+    if let Some((idx, score)) = best {
+        log::debug!(
+            "Kerberos: auto-detected variant {idx} (luid=0x{:x} cred=0x{:x} score={score})",
+            variants[idx].luid,
+            variants[idx].credentials,
+        );
+        return (&variants[idx], idx);
     }
     log::warn!(
         "Kerberos: could not auto-detect offset variant from {} AVL nodes, defaulting to variant 0",
         nodes.len()
     );
     (&variants[0], 0)
+}
+
+/// A `KERB_TICKET_CACHE` LIST_ENTRY head is valid when it is either empty (Flink
+/// points back at the head) or populated with a heap node whose Blink points back
+/// at the head. A wrong offset lands mid-field and satisfies neither.
+fn is_ticket_list_head(vmem: &dyn VirtualMemory, head: u64, arch: Arch) -> bool {
+    let Ok(flink) = read_ptr(vmem, head, arch) else {
+        return false;
+    };
+    if flink == head {
+        return true;
+    }
+    if !is_valid_user_ptr(flink, arch) {
+        return false;
+    }
+    read_ptr(vmem, flink + arch.ptr_size(), arch).is_ok_and(|blink| blink == head)
+}
+
+/// Ticket-entry offset set for a detected session variant index.
+const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static TicketOffsets {
+    match arch {
+        Arch::X64 => match variant_idx {
+            0 => &TICKET_OFFSETS_1607,
+            // Variant 1 is Win11 24H2 / Server 2025 (build 26100): the session
+            // layout matches variant 1 but the ticket-entry tail is shifted +0x10.
+            1 => &TICKET_OFFSETS_26100,
+            2 => &TICKET_OFFSETS_10,
+            _ => &TICKET_OFFSETS_6,
+        },
+        Arch::X86 => {
+            if variant_idx == 0 {
+                &TICKET_OFFSETS_1607_X86
+            } else {
+                &TICKET_OFFSETS_10_X86
+            }
+        }
+    }
 }
 
 pub fn extract_kerb_password(
