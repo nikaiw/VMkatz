@@ -817,7 +817,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
-            Ok(_) if build_number >= 26100 => Vec::new(),
+            Ok(_) if build_number == 26100 => Vec::new(),
             Ok(_) => {
                 log::info!("MSV: Standard extraction found nothing, trying physical LUID scan...");
                 scan_phys_for_msv_credentials(
@@ -830,7 +830,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                     Arch::X64,
                 )
             }
-            Err(e) if build_number >= 26100 => {
+            Err(e) if build_number == 26100 => {
                 log::info!("MSV 26100 extraction failed: {e}");
                 Vec::new()
             }
@@ -1773,7 +1773,7 @@ pub fn extract_credentials_from_minidump(
                     entry.msv = Some(msv_cred);
                 }
             }
-            Ok(_) | Err(_) if effective_build >= 26100 && arch == Arch::X64 => {
+            Ok(_) | Err(_) if effective_build == 26100 && arch == Arch::X64 => {
                 status.msv = ProviderStatus::Empty;
             }
             Ok(_) | Err(_) => {

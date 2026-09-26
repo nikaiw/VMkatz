@@ -146,7 +146,10 @@ fn find_wdigest_list_via_pair(
     offsets: &WdigestOffsets,
 ) -> Option<u64> {
     let data = vmem.read_virt_bytes(text_base, text_size as usize).ok()?;
-    for i in 0..data.len().saturating_sub(14 + 0x18) {
+    if data.len() < 14 + 0x30 + 2 {
+        return None;
+    }
+    for i in 0..=data.len() - (14 + 0x30 + 2) {
         let mov =
             matches!(data[i], 0x48 | 0x4C) && data[i + 1] == 0x8B && data[i + 2] & 0xC7 == 0x05;
         let lea =
@@ -158,6 +161,12 @@ fn find_wdigest_list_via_pair(
             .windows(2)
             .any(|bytes| bytes == [0x48, 0x3B]);
         if !near_cmp {
+            continue;
+        }
+        // WPP_GLOBAL_Control also has MOV/LEA/CMP pairs and can look like an
+        // empty LIST_ENTRY. WDigest's traversal compares the entry LUID at
+        // +0x20 through the register loaded by MOV; WPP does not.
+        if !has_wdigest_luid_compare(&data, i) {
             continue;
         }
         let Ok(mov_addr) = patterns::resolve_rip_relative(vmem, text_base + i as u64, 3) else {
@@ -184,6 +193,19 @@ fn find_wdigest_list_via_pair(
         }
     }
     None
+}
+
+fn has_wdigest_luid_compare(data: &[u8], pair_offset: usize) -> bool {
+    let entry_register = (data[pair_offset + 2] >> 3) & 7;
+    let entry_register_high = data[pair_offset] & 0x04 != 0;
+    (pair_offset + 14..pair_offset + 14 + 0x30).any(|j| {
+        if data[j] != 0x39 || data[j + 1] & 0xC7 != (0x40 | entry_register) || data[j + 2] != 0x20 {
+            return false;
+        }
+        let cmp_register_high =
+            j > 0 && (0x40..=0x4F).contains(&data[j - 1]) && data[j - 1] & 0x01 != 0;
+        cmp_register_high == entry_register_high
+    })
 }
 
 fn find_wdigest_list_via_text_pattern(
@@ -311,4 +333,23 @@ fn find_wdigest_list_in_data(
             true
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_wdigest_luid_compare;
+
+    #[test]
+    fn rejects_wpp_pair_but_accepts_wdigest_loop() {
+        // Both sequences are from wdigest.dll 26100.712. The WPP sentinel
+        // reads +0x1c; the logon-session loop compares the LUID at +0x20.
+        let wpp = hex::decode("488b0db3390400488d05ac390400483bc87422f6411c01").unwrap();
+        let wdigest = hex::decode("488b0557ba0300488d3550ba0300483bc674118b4b20394820").unwrap();
+        let mut wpp = wpp;
+        let mut wdigest = wdigest;
+        wpp.resize(0x50, 0);
+        wdigest.resize(0x50, 0);
+        assert!(!has_wdigest_luid_compare(&wpp, 0));
+        assert!(has_wdigest_luid_compare(&wdigest, 0));
+    }
 }

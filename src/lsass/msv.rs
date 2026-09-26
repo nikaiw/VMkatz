@@ -274,7 +274,7 @@ pub fn extract_msv_sessions(
 
     // Pattern scan for LogonSessionList (x64 only — x86 uses .data scan).
     // The pattern resolves both the list base address and the bucket count.
-    let lsasrv_table = if arch == Arch::X64 && build_number >= 26100 {
+    let lsasrv_table = if arch == Arch::X64 && build_number == 26100 {
         lsasrv.and_then(|(base, size)| find_lsasrv_logon_session_table(vmem, base, size).ok())
     } else {
         None
@@ -843,7 +843,7 @@ pub fn extract_msv_credentials(
         MSV_OFFSET_VARIANTS_X86
     };
 
-    if arch == Arch::X64 && build_number >= 26100 {
+    if arch == Arch::X64 && build_number == 26100 {
         if let Some((base, size)) = lsasrv {
             if let Ok((table, count)) = find_lsasrv_logon_session_table(vmem, base, size) {
                 log::info!("MSV: lsasrv LogonSessionList at 0x{table:x}, {count} buckets");
