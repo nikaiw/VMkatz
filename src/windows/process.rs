@@ -435,12 +435,16 @@ pub fn enumerate_processes(
             }
         };
 
-        // Validate the entry before recording it. A torn/corrupt link (e.g. the
-        // truncated final entry of a saved-state list) shows up as an out-of-range
-        // PID, an unaligned or out-of-range DirectoryTableBase, or a non-printable
-        // name. Windows PIDs are 32-bit and every live process has a page-aligned
-        // in-range DTB, so such entries are skipped (not recorded) while the walk
-        // continues — the visited set still bounds it.
+        // Validate the entry before recording it. Every ActiveProcessLinks ring
+        // contains one node that is NOT an EPROCESS: the PsActiveProcessHead sentinel,
+        // a _LIST_ENTRY in ntoskrnl's .data. Interpreting it as an EPROCESS (head -
+        // active_process_links) reads arbitrary kernel data — an out-of-range PID, an
+        // unaligned/out-of-range DirectoryTableBase, or an empty name. The same checks
+        // also reject a genuinely torn link. Such a node is skipped (not recorded) and
+        // the walk continues; it then reaches an already-seen EPROCESS (the ring loops
+        // back to System) and the visited_eproc guard terminates cleanly, so the full
+        // ring is traversed. Windows PIDs are 32-bit and every live process has a
+        // page-aligned in-range DTB and a non-empty name.
         let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
         let dtb_base = dtb & PAGE_PHYS_MASK;
         let dtb_ok = dtb_base != 0 && dtb_base < phys.phys_size() && dtb.trailing_zeros() >= 12;
