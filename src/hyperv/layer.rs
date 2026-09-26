@@ -64,4 +64,9 @@ impl PhysicalMemory for HypervLayer {
     fn phys_size(&self) -> u64 {
         self.size
     }
+
+    fn advise_scanned(&self, phys_addr: u64, len: u64) {
+        // Identity mapping: guest physical address == file offset.
+        self.mmap.advise_dontneed(phys_addr, len);
+    }
 }

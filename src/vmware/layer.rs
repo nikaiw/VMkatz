@@ -296,4 +296,14 @@ impl PhysicalMemory for VmwareLayer {
     fn is_truncated(&self) -> bool {
         self.truncated
     }
+
+    fn advise_scanned(&self, phys_addr: u64, len: u64) {
+        // Translate the range start to its VMEM file offset. Regions are
+        // page-contiguous, so within one region the file offset advances with
+        // the guest address; a range spanning a region boundary just drops the
+        // leading region's pages (DONTNEED is best-effort and non-destructive).
+        if let Ok(offset) = self.guest_phys_to_vmem_offset(phys_addr) {
+            self.data.advise_dontneed(offset, len);
+        }
+    }
 }

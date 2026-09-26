@@ -240,4 +240,15 @@ impl PhysicalMemory for QemuElfLayer {
     fn phys_size(&self) -> u64 {
         self.phys_end
     }
+
+    fn advise_scanned(&self, phys_addr: u64, len: u64) {
+        // Drop the just-scanned range, clamped to the segment it starts in so we
+        // never advise past this segment's file extent (DONTNEED is best-effort).
+        if let Some(seg) = self.find_segment(phys_addr) {
+            let offset_in_seg = phys_addr - seg.gpa_start;
+            let avail = seg.file_size - offset_in_seg;
+            let file_off = seg.file_offset + offset_in_seg;
+            self.mmap.advise_dontneed(file_off, len.min(avail));
+        }
+    }
 }

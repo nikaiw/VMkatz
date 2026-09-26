@@ -204,6 +204,9 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
             }
         }
 
+        // Chunk consumed into chunk_buf — release its backing pages so RSS stays
+        // near one chunk instead of the whole image on mmap-backed layers.
+        phys.advise_scanned(addr, read_len as u64);
         addr += read_len as u64;
     }
 
@@ -334,6 +337,8 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
                 }
             }
 
+            // Release the L1 pages we just scanned to bound RSS on mmap layers.
+            l1.advise_scanned(l1_addr, read_len as u64);
             region_off += read_len as u64;
         }
     }

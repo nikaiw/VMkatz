@@ -163,6 +163,9 @@ pub fn extract_bitlocker_keys<M: PhysicalMemory>(mem: &M) -> Vec<BitLockerKey> {
             off += 1;
         }
 
+        // Release the scanned chunk (FVEK extraction above already read what it
+        // needed) so RSS stays bounded on mmap layers during this full sweep.
+        mem.advise_scanned(chunk_addr, read_len as u64);
         chunk_addr += read_len as u64;
     }
 

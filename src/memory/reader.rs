@@ -57,6 +57,16 @@ pub trait PhysicalMemory {
     fn par_scan(&self, _f: &(dyn Fn(u64, &[u8]) -> bool + Sync)) -> bool {
         false
     }
+
+    /// Hint that the physical range `[phys_addr, phys_addr + len)` has just been
+    /// scanned and won't be re-read soon, so the backing store may reclaim it.
+    ///
+    /// Default no-op. mmap-backed layers translate this to the file offset and
+    /// `madvise(DONTNEED)`, so a full-memory sweep keeps resident memory near one
+    /// scan window instead of growing RSS to the whole image — important on a
+    /// memory-constrained host (e.g. an ESXi userworld). Layers that decompress
+    /// on read (Hyper-V VMRS) manage their own cache and leave this a no-op.
+    fn advise_scanned(&self, _phys_addr: u64, _len: u64) {}
 }
 
 /// Read from a process's virtual address space (page-table-translated).

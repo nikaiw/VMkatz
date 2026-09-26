@@ -99,11 +99,21 @@ pub fn file_size(file: &mut std::fs::File) -> std::io::Result<u64> {
 
 /// File-backed memory: mmap when available, pread fallback for platforms
 /// where mmap is unsupported (e.g. ESXi 6.5 VMkernel returns EINVAL on VMFS).
+///
+/// Memory profile: the mmap variant keeps whatever pages the scan has faulted
+/// resident until told otherwise, so a full-image sweep would grow RSS to the
+/// image size. Callers doing large sequential scans call [`advise_dontneed`] on
+/// each range as they finish with it, which drops those pages and bounds RSS to
+/// roughly one scan window. The pread variant is intrinsically low-memory (each
+/// read only touches the caller's buffer), which is why it stays the safe path
+/// on old ESXi where mmap is unavailable.
+///
+/// [`advise_dontneed`]: MappedFile::advise_dontneed
 #[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
 pub enum MappedFile {
     Mmap(memmap2::Mmap),
-    /// Fallback: file handle for pread-based access.
-    /// The Vec is a read buffer used by `slice()` — grown on demand.
+    /// Fallback: pread-based access via a shared file handle. No image bytes are
+    /// held resident — each `read_at` copies straight into the caller's buffer.
     Pread {
         file: std::sync::Mutex<std::fs::File>,
         size: u64,
@@ -191,6 +201,58 @@ impl MappedFile {
     pub const fn is_pread(&self) -> bool {
         matches!(self, Self::Pread { .. })
     }
+
+    /// Tell the kernel the pages backing `[offset, offset + len)` won't be needed
+    /// again soon, so it can reclaim them. Used by large sequential scans to drop
+    /// each chunk once consumed, keeping resident memory near one scan window
+    /// instead of the whole image — the key to not ballooning RSS on a
+    /// memory-constrained host (e.g. an ESXi userworld).
+    ///
+    /// No-op on the pread fallback (nothing is resident there) and best-effort on
+    /// mmap (an advisory syscall; harmless if the platform ignores it).
+    pub fn advise_dontneed(&self, offset: u64, len: u64) {
+        // Round the range inward to page boundaries: only whole pages fully
+        // inside the scanned span are dropped, never a partial page that may
+        // share bytes with data still in use.
+        const PAGE: u64 = 4096;
+        let Self::Mmap(m) = self else { return };
+        let map_len = m.len() as u64;
+        if len == 0 || offset >= map_len {
+            return;
+        }
+        let end = offset.saturating_add(len).min(map_len);
+        let start = offset.div_ceil(PAGE) * PAGE;
+        let aligned_end = (end / PAGE) * PAGE;
+        if aligned_end <= start {
+            return;
+        }
+        // SAFETY: `m` is a read-only, file-backed mapping. MADV_DONTNEED on such a
+        // mapping discards only clean resident pages; a later access transparently
+        // re-faults them from the file with no data loss. (memmap2 gates this as
+        // `unchecked` because on a *dirty private* mapping it would lose writes —
+        // not our case.)
+        unsafe {
+            let _ = m.unchecked_advise_range(
+                memmap2::UncheckedAdvice::DontNeed,
+                start as usize,
+                (aligned_end - start) as usize,
+            );
+        }
+    }
+}
+
+/// Best-effort available-RAM figure from `/proc/meminfo` (present on Linux and the
+/// ESXi userworld). Returns `None` when it can't be read/parsed.
+#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+fn available_memory_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
 }
 
 #[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
@@ -234,7 +296,30 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
     let mmap_result = unsafe { memmap2::MmapOptions::new().len(size as usize).map(file) };
 
     match mmap_result {
-        Ok(m) => Ok(MappedFile::Mmap(m)),
+        Ok(m) => {
+            // The scans read the image front-to-back, so hint sequential access:
+            // the kernel reads ahead (faster) and may drop pages behind the cursor.
+            // Combined with the explicit `advise_dontneed` calls the scan loops
+            // make, this keeps resident memory near one scan window. Best-effort.
+            let _ = m.advise(memmap2::Advice::Sequential);
+
+            // Guardrail: on a memory-constrained host (notably an ESXi userworld)
+            // a large image can pressure the memory scheduler. We already bound RSS
+            // via drop-behind, but warn so the operator can prefer an off-host scan.
+            if let Some(avail) = available_memory_bytes() {
+                if size > avail {
+                    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+                    eprintln!(
+                        "[!] image is {:.1} GB but only {:.1} GB RAM is available — \
+                         scanned pages are released as they're consumed to bound memory; \
+                         on a constrained host prefer copying the image off-host to scan",
+                        size as f64 / GB,
+                        avail as f64 / GB,
+                    );
+                }
+            }
+            Ok(MappedFile::Mmap(m))
+        }
         Err(mmap_err) => {
             eprintln!(
                 "[!] mmap failed for '{}' ({:.1} MB): {} — falling back to file I/O (slower)",
