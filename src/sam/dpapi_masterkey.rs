@@ -17,7 +17,7 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use des::TdesEde3;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use sha2::Sha512;
+use sha2::{Sha256, Sha512};
 
 use crate::error::{Result, VmkatzError};
 
@@ -36,6 +36,8 @@ const MIN_DECRYPTED_LEN: usize = 64;
 const CALG_3DES: u32 = 0x6603;
 const CALG_AES_256: u32 = 0x6610;
 const CALG_SHA1: u32 = 0x8004;
+/// CALG_HMAC: legacy tag for a SHA1-based MK hash; normalized to `CALG_SHA1`.
+const CALG_HMAC: u32 = 0x8009;
 const CALG_SHA_512: u32 = 0x800E;
 
 /// Minimum master key file size: 128-byte header + 32-byte sub-header.
@@ -218,7 +220,10 @@ pub fn extract_mk_section(file_bytes: &[u8]) -> Option<MasterKeyDecryptInput> {
     if mk_end > file_bytes.len() {
         return None;
     }
-    let mk = parse_masterkey_section(&file_bytes[mk_start..mk_end]).ok()?;
+    let mut mk = parse_masterkey_section(&file_bytes[mk_start..mk_end]).ok()?;
+    if mk.alg_hash == CALG_HMAC {
+        mk.alg_hash = CALG_SHA1;
+    }
     // Validate alg pair is one we can dispatch on.
     let (_c, _h) = (cipher_name(mk.alg_crypt)?, hash_name(mk.alg_hash)?);
     if mk.ciphertext.is_empty() || mk.rounds == 0 || mk.rounds > MAX_PBKDF2_ROUNDS {
@@ -265,6 +270,40 @@ fn user_local_prekey_pw(password: &str, sid: &str) -> Result<[u8; 20]> {
     let pwd_sha1 = Sha1::digest(&pwd_utf16);
     let msg = sid_utf16le_with_nul(sid);
     let mut mac = HmacSha1::new_from_slice(&pwd_sha1)
+        .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
+    mac.update(&msg);
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&tag);
+    Ok(out)
+}
+
+/// SID as UTF-16LE, no trailing NUL (PBKDF2 salt for the domain derivation).
+fn sid_utf16le(sid: &str) -> Vec<u8> {
+    sid.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// NT hash = MD4(UTF-16LE password).
+fn ntlm_hash(password: &str) -> [u8; 16] {
+    use md4::{Digest, Md4};
+    let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let digest = Md4::digest(&pwd_utf16);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Domain DPAPI pre-key (Win10 1607+): PBKDF2-HMAC-SHA256 over the NT hash, then
+/// HMAC-SHA1 with the SID. Fallback when the legacy `HMAC-SHA1(nt_hash, sid)` fails.
+fn user_domain_prekey_pbkdf2(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
+    use pbkdf2::pbkdf2_hmac;
+    let salt = sid_utf16le(sid);
+    let mut tmp = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(nt_hash, &salt, 10_000, &mut tmp);
+    let mut tmp2 = [0u8; 16];
+    pbkdf2_hmac::<Sha256>(&tmp, &salt, 1, &mut tmp2);
+    let msg = sid_utf16le_with_nul(sid);
+    let mut mac = HmacSha1::new_from_slice(&tmp2)
         .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
     mac.update(&msg);
     let tag = mac.finalize().into_bytes();
@@ -469,18 +508,31 @@ pub fn decrypt_local_user_masterkey(
     sid: &str,
 ) -> Result<Vec<u8>> {
     let pre_key = user_local_prekey(nt_hash, sid)?;
-    decrypt_masterkey_with_prekey(file_bytes, &pre_key)
+    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &pre_key) {
+        return Ok(mk);
+    }
+    // Fall back to the modern domain PBKDF2 derivation.
+    let pk2 = user_domain_prekey_pbkdf2(nt_hash, sid)?;
+    decrypt_masterkey_with_prekey(file_bytes, &pk2)
 }
 
-/// Decrypt a user DPAPI masterkey file using a known cleartext password
-/// (typically sourced from LSA `DefaultPassword` or a memory snapshot).
+/// Decrypt a user DPAPI masterkey file from a known password. Tries the local
+/// SHA1 pre-key, then the legacy NTLM and PBKDF2 domain pre-keys.
 pub fn decrypt_local_user_masterkey_pw(
     file_bytes: &[u8],
     password: &str,
     sid: &str,
 ) -> Result<Vec<u8>> {
     let pre_key = user_local_prekey_pw(password, sid)?;
-    decrypt_masterkey_with_prekey(file_bytes, &pre_key)
+    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &pre_key) {
+        return Ok(mk);
+    }
+    let nt_hash = ntlm_hash(password);
+    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &user_local_prekey(&nt_hash, sid)?) {
+        return Ok(mk);
+    }
+    let pk2 = user_domain_prekey_pbkdf2(&nt_hash, sid)?;
+    decrypt_masterkey_with_prekey(file_bytes, &pk2)
 }
 
 /// Decrypt a SYSTEM DPAPI masterkey file (S-1-5-18) using the LSA
@@ -768,6 +820,72 @@ mod tests {
         assert!(!is_guid_filename("CREDHIST"));
         assert!(!is_guid_filename("Preferred"));
         assert!(!is_guid_filename("12345678-1234-1234-1234-12345678ZZZZ"));
+    }
+
+    /// 3DES-CBC encrypt without padding, for test fixtures.
+    fn tdes_cbc_encrypt(key: &[u8], iv: &[u8; 8], pt: &[u8]) -> Vec<u8> {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        type Enc = cbc::Encryptor<TdesEde3>;
+        let mut buf = pt.to_vec();
+        let n = buf.len();
+        Enc::new(key.into(), iv.into())
+            .encrypt_padded_mut::<NoPadding>(&mut buf, n)
+            .unwrap();
+        buf
+    }
+
+    /// Synthesize a domain MK file protected by the modern PBKDF2 pre-key, with
+    /// legacy 3DES/SHA1 crypto and the CALG_HMAC hash tag. Returns (file, mk).
+    fn build_pbkdf2_domain_mk(nt_hash: &[u8; 16], sid: &str) -> (Vec<u8>, [u8; 64]) {
+        use hmac::Mac;
+        let salt = [0x3Cu8; 16];
+        let rounds: u32 = 300;
+        let pre_key = user_domain_prekey_pbkdf2(nt_hash, sid).unwrap();
+        let derived = dpapi_derive_key_sha1(&pre_key, &salt, 32, rounds);
+        let des3_key = &derived[..24];
+        let iv: [u8; 8] = derived[24..32].try_into().unwrap();
+
+        let mk_bytes = [0xB4u8; 64];
+        let hmac_salt = [0x29u8; 16];
+        let mut k1 = HmacSha1::new_from_slice(&pre_key).unwrap();
+        k1.update(&hmac_salt);
+        let key2 = k1.finalize().into_bytes();
+        let mut k2 = HmacSha1::new_from_slice(&key2).unwrap();
+        k2.update(&mk_bytes);
+        let stored_hmac = k2.finalize().into_bytes();
+
+        // Layout: hmacSalt(16) || hmac(20) || pad(4) || mk(64) = 104 (multiple of 8).
+        let mut cleartext = Vec::with_capacity(104);
+        cleartext.extend_from_slice(&hmac_salt);
+        cleartext.extend_from_slice(&stored_hmac);
+        cleartext.extend_from_slice(&[0u8; 4]);
+        cleartext.extend_from_slice(&mk_bytes);
+
+        let cipher = tdes_cbc_encrypt(des3_key, &iv, &cleartext);
+        let file = build_mk_file(
+            2,
+            "aaaabbbb-cccc-dddd-eeee-ffff00001177",
+            2,
+            &salt,
+            rounds,
+            CALG_HMAC,
+            CALG_3DES,
+            &cipher,
+        );
+        (file, mk_bytes)
+    }
+
+    #[test]
+    fn domain_user_masterkey_pbkdf2_roundtrip() {
+        let nt_hash = ntlm_hash("S0meDomainPw!");
+        let sid = "S-1-5-21-1111-2222-3333-1177";
+        let (file, mk_bytes) = build_pbkdf2_domain_mk(&nt_hash, sid);
+        // Password path falls through SHA1 -> legacy NTLM -> PBKDF2.
+        let via_pw = decrypt_local_user_masterkey_pw(&file, "S0meDomainPw!", sid).unwrap();
+        assert_eq!(via_pw, mk_bytes);
+        // NT-hash path falls through legacy NTLM -> PBKDF2.
+        let via_nt = decrypt_local_user_masterkey(&file, &nt_hash, sid).unwrap();
+        assert_eq!(via_nt, mk_bytes);
     }
 
     #[test]
