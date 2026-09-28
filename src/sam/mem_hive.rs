@@ -486,6 +486,20 @@ fn walk_children(
     }
 }
 
+/// Recover only the bootkey from physical memory (no page tables needed).
+///
+/// Scans for hive bins + the `Control\Lsa` NK cell and reads its `JD/Skew1/GBG/Data`
+/// class-name nibbles by physical proximity. More robust than reading a mapped SYSTEM
+/// hive whose bins may be paged out, so the CM hive-map walk falls back to this.
+pub fn recover_bootkey(phys: &impl PhysicalMemory) -> Option<[u8; 16]> {
+    let (locs, bins, lsa_cands) = scan_memory(phys);
+    if locs.is_empty() {
+        return None;
+    }
+    let runs = RunIndex::new(build_runs(bins));
+    guided_bootkey(phys, &runs, &lsa_cands)
+}
+
 /// Reconstruct SAM/SYSTEM/SECURITY hives from memory and extract credentials.
 /// Requires no page tables or kernel symbols — purely physical.
 pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {

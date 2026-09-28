@@ -85,12 +85,20 @@ pub fn extract_from_cm_map<L: PhysicalMemory>(layer: &L, dtb: u64) -> MemoryHive
     };
 
     let hives = scan_hives(layer, &rv);
-    let Some(system) = hives.get("SYSTEM") else {
-        log::debug!("cm_hive: no SYSTEM hive materialized via CM map");
-        return creds;
-    };
-    let Ok(bk) = extract_bootkey(system) else {
-        log::debug!("cm_hive: bootkey extraction from mapped SYSTEM failed");
+    // Bootkey: prefer the mapped SYSTEM hive, but fall back to a physical Lsa-cell
+    // scan (mem_hive::recover_bootkey) when SYSTEM's bins are paged out of the image
+    // — so SAM/SECURITY still decrypt as long as THEIR blocks are resident.
+    let bk = hives
+        .get("SYSTEM")
+        .and_then(|s| extract_bootkey(s).ok())
+        .or_else(|| {
+            log::info!(
+                "cm_hive: bootkey from mapped SYSTEM unavailable — trying physical bootkey scan"
+            );
+            crate::sam::mem_hive::recover_bootkey(layer)
+        });
+    let Some(bk) = bk else {
+        log::debug!("cm_hive: bootkey unrecoverable (mapped SYSTEM + physical scan)");
         return creds;
     };
     creds.bootkey = Some(bk);
