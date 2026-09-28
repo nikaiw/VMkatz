@@ -6,11 +6,13 @@ use crate::error::{Result, VmkatzError as Error};
 use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use des::TdesEde3;
 use hmac::{Hmac, Mac};
 use sha1::{Digest, Sha1};
 use sha2::Sha512;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+type TdesCbcDec = cbc::Decryptor<TdesEde3>;
 
 // Sanity caps on variable-length fields to prevent length-bomb allocations.
 const MAX_DESC: usize = 4096;
@@ -144,8 +146,16 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
 /// Entropy is appended to the salt in the session-key HMAC (per impacket
 /// `DPAPI_BLOB.decrypt` / `CryptUnprotectData`'s `pOptionalEntropy`). CNG "Software
 /// KSP" private-key blobs are protected with entropy `xT5rZW5qVVbrvpuA\0`.
-pub fn decrypt_blob_entropy(blob: &DpapiBlob<'_>, masterkey: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
+pub fn decrypt_blob_entropy(
+    blob: &DpapiBlob<'_>,
+    masterkey: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>> {
     type HmacSha512 = Hmac<Sha512>;
+    // Legacy combo (pre-Win8 / some domain accounts): 3DES (0x6603) + SHA1 (0x8004).
+    if blob.crypt_alg == 0x6603 && blob.hmac_alg == 0x8004 {
+        return decrypt_blob_legacy_3des_sha1(blob, masterkey, entropy);
+    }
     // Modern combo: crypt_alg = CALG_AES_256 (0x6610), hmac_alg = CALG_SHA512 (0x800E).
     if blob.crypt_alg != 0x6610 || blob.hmac_alg != 0x800E {
         return Err(Error::Parse(format!(
@@ -182,8 +192,117 @@ pub fn decrypt_blob_entropy(blob: &DpapiBlob<'_>, masterkey: &[u8], entropy: &[u
     Ok(pt.to_vec())
 }
 
+/// Legacy DPAPI blob decrypt: 3DES-CBC + HMAC-SHA1 (per impacket `DPAPI_BLOB`).
+/// Session key = HMAC-SHA1(SHA1(mk), salt+entropy), expanded via CryptDeriveKey
+/// (ipad/opad) since 20 < 24. Zero IV, no unpad (v10 key = first 32 bytes).
+fn decrypt_blob_legacy_3des_sha1(
+    blob: &DpapiBlob<'_>,
+    masterkey: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>> {
+    type HmacSha1 = Hmac<Sha1>;
+    let mk_sha1 = Sha1::digest(masterkey);
+    let mut h = HmacSha1::new_from_slice(&mk_sha1).map_err(|_| Error::Parse("hmac key".into()))?;
+    h.update(blob.salt);
+    if !entropy.is_empty() {
+        h.update(entropy);
+    }
+    let session = h.finalize().into_bytes(); // 20 bytes
+
+    let mut ext = session.to_vec();
+    ext.resize(session.len() + 64, 0);
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= ext[i];
+        opad[i] ^= ext[i];
+    }
+    let mut derived = Vec::with_capacity(40);
+    derived.extend_from_slice(&Sha1::digest(ipad));
+    derived.extend_from_slice(&Sha1::digest(opad));
+
+    let key = &derived[..24];
+    let iv = [0u8; 8];
+    if !blob.cipher_text.len().is_multiple_of(8) {
+        return Err(Error::Parse(
+            "dpapi 3des ciphertext not block-aligned".into(),
+        ));
+    }
+    let mut buf = blob.cipher_text.to_vec();
+    let cipher = TdesCbcDec::new(key.into(), (&iv).into());
+    let pt = cipher
+        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .map_err(|_| Error::Parse("dpapi 3des decrypt".into()))?;
+    Ok(pt.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Sha1, decrypt_blob, parse_blob};
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
+    use hmac::{Hmac, Mac};
+    use sha1::Digest;
+    type TdesCbcEnc = cbc::Encryptor<des::TdesEde3>;
+
+    /// Encrypt `v10_key` into a synthetic legacy (3DES/SHA1) DPAPI blob under
+    /// `mk`, mirroring `decrypt_blob_legacy_3des_sha1` (zero IV, no entropy).
+    fn build_legacy_blob(mk: &[u8], salt: &[u8; 16], v10_key: &[u8; 32]) -> Vec<u8> {
+        type HmacSha1 = Hmac<Sha1>;
+        let key_hash = Sha1::digest(mk);
+        let mut h = HmacSha1::new_from_slice(&key_hash).unwrap();
+        h.update(salt);
+        let session = h.finalize().into_bytes();
+        let mut ext = session.to_vec();
+        ext.resize(session.len() + 64, 0);
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..64 {
+            ipad[i] ^= ext[i];
+            opad[i] ^= ext[i];
+        }
+        let mut derived = Vec::with_capacity(40);
+        derived.extend_from_slice(&Sha1::digest(ipad));
+        derived.extend_from_slice(&Sha1::digest(opad));
+        let mut buf = v10_key.to_vec();
+        let n = buf.len();
+        TdesCbcEnc::new(derived[..24].into(), (&[0u8; 8]).into())
+            .encrypt_padded_mut::<NoPadding>(&mut buf, n)
+            .unwrap();
+
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes()); // version
+        b.extend_from_slice(&[0u8; 16]); // provider guid
+        b.extend_from_slice(&0u32.to_le_bytes()); // mk version
+        b.extend_from_slice(&[0u8; 16]); // mk guid
+        b.extend_from_slice(&0u32.to_le_bytes()); // flags
+        b.extend_from_slice(&0u32.to_le_bytes()); // description len
+        b.extend_from_slice(&0x6603u32.to_le_bytes()); // crypt_alg = 3DES
+        b.extend_from_slice(&0u32.to_le_bytes()); // crypt_alg len
+        b.extend_from_slice(&16u32.to_le_bytes()); // salt len
+        b.extend_from_slice(salt);
+        b.extend_from_slice(&0u32.to_le_bytes()); // hmac_key len
+        b.extend_from_slice(&0x8004u32.to_le_bytes()); // hmac_alg = SHA1
+        b.extend_from_slice(&0u32.to_le_bytes()); // hmac_alg len
+        b.extend_from_slice(&0u32.to_le_bytes()); // hmac len
+        b.extend_from_slice(&(buf.len() as u32).to_le_bytes()); // data len
+        b.extend_from_slice(&buf);
+        b.extend_from_slice(&0u32.to_le_bytes()); // sign len
+        b
+    }
+
+    #[test]
+    fn legacy_3des_sha1_blob_roundtrip() {
+        let mk = [0x42u8; 64];
+        let salt = [0x9Cu8; 16];
+        let v10_key = [0xA7u8; 32];
+        let raw = build_legacy_blob(&mk, &salt, &v10_key);
+        let blob = parse_blob(&raw).expect("parse");
+        assert_eq!(blob.crypt_alg, 0x6603);
+        assert_eq!(blob.hmac_alg, 0x8004);
+        let pt = decrypt_blob(&blob, &mk).expect("legacy 3des decrypt");
+        assert_eq!(&pt[..32], &v10_key);
+    }
+
     #[test]
     fn guid_format() {
         let g = [
