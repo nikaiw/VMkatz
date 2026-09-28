@@ -43,7 +43,7 @@ pub fn run_reader<R: std::io::Read + std::io::Seek>(
     extra_passwords: &[String],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles_in_reader(reader)?;
-    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets, extra_passwords);
+    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets, extra_passwords, &[]);
     log::info!(
         "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
         user_kr.len(),
@@ -59,18 +59,20 @@ pub fn run_reader<R: std::io::Read + std::io::Seek>(
 }
 
 pub fn run_disk(disk_path: &Path) -> Result<DiscoverySummary> {
-    run_disk_with_passwords(disk_path, &[])
+    run_disk_with_passwords(disk_path, &[], &[])
 }
 
-/// Same as `run_disk` but supplies extra password candidates to try when
-/// decrypting user MK files (in addition to LSA-recovered plaintext).
+/// Same as `run_disk` but supplies extra password candidates and NT-hash
+/// candidates (`SID` → NT hash) to try when decrypting user MK files, in
+/// addition to LSA-recovered plaintext and local-SAM NT hashes.
 pub fn run_disk_with_passwords(
     disk_path: &Path,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles(disk_path)?;
     let (user_kr, system_kr) =
-        match build_keyrings_from_disk_with_passwords(disk_path, extra_passwords) {
+        match build_keyrings_from_disk_with_passwords(disk_path, extra_passwords, extra_nt_hashes) {
             Ok(p) => p,
             Err(e) => {
                 log::info!("[chrome] disk-only keyrings unavailable: {e}");
@@ -150,8 +152,9 @@ pub fn build_keyrings_from_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     secrets: &crate::sam::DiskSecrets,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> (HybridKeyring, HybridKeyring) {
-    build_keyrings_with_secrets(reader, secrets, extra_passwords)
+    build_keyrings_with_secrets(reader, secrets, extra_passwords, extra_nt_hashes)
 }
 
 /// Build a `HybridKeyring` from any iterator of `(guid, masterkey_bytes)` pairs —
@@ -419,12 +422,13 @@ fn is_version_dir(name: &str) -> bool {
 /// pre-key. Failed MKs are skipped with an info log so a single bad file
 /// doesn't abort the whole walk.
 pub fn build_keyrings_from_disk(disk_path: &Path) -> Result<(HybridKeyring, HybridKeyring)> {
-    build_keyrings_from_disk_with_passwords(disk_path, &[])
+    build_keyrings_from_disk_with_passwords(disk_path, &[], &[])
 }
 
 pub fn build_keyrings_from_disk_with_passwords(
     disk_path: &Path,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<(HybridKeyring, HybridKeyring)> {
     let secrets = crate::sam::extract_disk_secrets(disk_path)?;
     let mut disk = crate::disk::open_disk(disk_path)?;
@@ -432,6 +436,7 @@ pub fn build_keyrings_from_disk_with_passwords(
         &mut disk,
         &secrets,
         extra_passwords,
+        extra_nt_hashes,
     ))
 }
 
@@ -443,6 +448,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
     secrets: &crate::sam::DiskSecrets,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> (HybridKeyring, HybridKeyring) {
     let mut nt_hash_by_rid: HashMap<u32, [u8; 16]> = HashMap::new();
     for entry in &secrets.sam_entries {
@@ -562,7 +568,23 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                             return Some(k);
                         }
                     }
-                    // Fallback: NT-hash direct chain (works for DOMAIN users).
+                    // NT-hash chain (works for DOMAIN users). First try any hash
+                    // supplied for this exact SID — e.g. MSV NT hashes recovered
+                    // from LSASS memory, or `--chrome-nthash`. A domain user's NT
+                    // hash is NOT in the local SAM, so this is the only NT-hash
+                    // source that covers them.
+                    for (h_sid, nt_hash) in extra_nt_hashes {
+                        if h_sid == sid {
+                            if let Ok(k) =
+                                crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                                    file_bytes, nt_hash, sid,
+                                )
+                            {
+                                return Some(k);
+                            }
+                        }
+                    }
+                    // Fallback: local-SAM NT hash matched by RID.
                     let rid: u32 = sid.rsplit('-').next()?.parse().ok()?;
                     let nt_hash = nt_hash_by_rid.get(&rid)?;
                     crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(

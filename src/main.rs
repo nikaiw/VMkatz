@@ -205,6 +205,13 @@ struct Args {
     #[arg(long, value_name = "PASSWORD")]
     chrome_password: Vec<String>,
 
+    /// Extra NT-hash candidate for the DPAPI masterkey NTLM path, as
+    /// `SID:HEX` (repeatable). Needed for DOMAIN users, whose NT hash isn't in
+    /// the local SAM — source it from NTDS.dit, LSASS, or a pivot. Example:
+    /// `--chrome-nthash S-1-5-21-...-1103:aad3b435b51404eeaad3b435b51404ee`.
+    #[arg(long, value_name = "SID:HEX")]
+    chrome_nthash: Vec<String>,
+
     /// Also scan running chrome.exe / msedge.exe / brave.exe process memory
     /// for cookies and saved passwords (ChromeKatz-style). Uses heuristic
     /// pattern matching, so the disk-side decrypt is more reliable; this
@@ -631,6 +638,29 @@ fn merge_findings(
     dst.autofill.append(&mut extra.autofill);
 }
 
+/// Parse `--chrome-nthash SID:HEX` specs into `(SID, 16-byte NT hash)` pairs.
+/// Malformed entries are logged and skipped rather than aborting the run.
+#[cfg(feature = "chrome")]
+fn parse_chrome_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
+    let mut out: Vec<(String, [u8; 16])> = Vec::new();
+    for spec in specs {
+        let Some((sid, hex_str)) = spec.split_once(':') else {
+            log::warn!("--chrome-nthash: expected SID:HEX, got {spec:?}");
+            continue;
+        };
+        let Ok(bytes) = hex::decode(hex_str.trim()) else {
+            log::warn!("--chrome-nthash: invalid hex in {spec:?}");
+            continue;
+        };
+        let Ok(nt_hash) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+            log::warn!("--chrome-nthash: NT hash must be 16 bytes in {spec:?}");
+            continue;
+        };
+        out.push((sid.to_string(), nt_hash));
+    }
+    out
+}
+
 /// Run the hybrid chrome flow: open the disk once, extract SAM/LSA secrets +
 /// build disk-side DPAPI keyrings, combine them with the mem-side keyring, and
 /// run chrome discovery + decrypt — all sharing the same file handle.
@@ -644,11 +674,16 @@ fn run_chrome_hybrid(
     disk_path: &Path,
     mem_keyring: &vmkatz::chrome::hybrid::HybridKeyring,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> anyhow::Result<vmkatz::chrome::runner::DiscoverySummary> {
     let mut disk = vmkatz::disk::open_disk(disk_path)?;
     let secrets = vmkatz::sam::extract_secrets_from_reader(&mut disk)?;
-    let (disk_user_kr, disk_sys_kr) =
-        vmkatz::chrome::runner::build_keyrings_from_reader(&mut disk, &secrets, extra_passwords);
+    let (disk_user_kr, disk_sys_kr) = vmkatz::chrome::runner::build_keyrings_from_reader(
+        &mut disk,
+        &secrets,
+        extra_passwords,
+        extra_nt_hashes,
+    );
     let user_resolver = vmkatz::chrome::hybrid::ComposedResolver {
         primary: mem_keyring,
         fallback: &disk_user_kr,
@@ -970,8 +1005,12 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(feature = "chrome")]
     {
         if args.chrome {
-            match vmkatz::chrome::runner::run_disk_with_passwords(input_path, &args.chrome_password)
-            {
+            let chrome_nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
+            match vmkatz::chrome::runner::run_disk_with_passwords(
+                input_path,
+                &args.chrome_password,
+                &chrome_nt_hashes,
+            ) {
                 Ok(summary) => {
                     if !summary.profiles.is_empty() || !summary.findings.is_empty() {
                         found_anything = true;
@@ -2727,6 +2766,50 @@ fn run_with_system<L: PhysicalMemory>(
                 .collect();
             let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
 
+            // Feed every plaintext password LSASS gave us (WDigest / Kerberos /
+            // TsPkg / SSP / LiveSSP / CredMan) into the DPAPI masterkey decrypt
+            // as extra candidates, alongside `--chrome-password`. This lets the
+            // SHA1 pre-key path unlock a (domain or local) user's on-disk
+            // masterkey from a memory-recovered password even when that user's
+            // DPAPI masterkey isn't sitting in the LSASS cache (`mem_keyring`).
+            let mut chrome_passwords: Vec<String> = args.chrome_password.clone();
+            for c in &credentials {
+                let provider_pw = [
+                    c.wdigest.as_ref().map(|w| &w.password),
+                    c.kerberos.as_ref().map(|k| &k.password),
+                    c.tspkg.as_ref().map(|t| &t.password),
+                    c.ssp.as_ref().map(|s| &s.password),
+                    c.livessp.as_ref().map(|l| &l.password),
+                ];
+                for pw in provider_pw.into_iter().flatten() {
+                    if !pw.is_empty() {
+                        chrome_passwords.push(pw.clone());
+                    }
+                }
+                for cm in &c.credman {
+                    if !cm.password.is_empty() {
+                        chrome_passwords.push(cm.password.clone());
+                    }
+                }
+            }
+            chrome_passwords.sort();
+            chrome_passwords.dedup();
+
+            // NT-hash candidates for the DPAPI masterkey NTLM path: MSV NT hashes
+            // recovered from LSASS (keyed by the session SID — a domain user's NT
+            // hash is never in the local SAM), plus any `--chrome-nthash SID:hex`.
+            let mut chrome_nt_hashes: Vec<(String, [u8; 16])> =
+                parse_chrome_nthashes(&args.chrome_nthash);
+            for c in &credentials {
+                if let Some(msv) = &c.msv {
+                    if !c.sid.is_empty() && msv.nt_hash != [0u8; 16] {
+                        chrome_nt_hashes.push((c.sid.clone(), msv.nt_hash));
+                    }
+                }
+            }
+            chrome_nt_hashes.sort();
+            chrome_nt_hashes.dedup();
+
             // In-process scan: walk every chromium browser/utility process,
             // dump its mapped userland through the page-table walker, and run
             // the heuristic password / cookie scans on the bytes. Opt-in
@@ -2746,7 +2829,8 @@ fn run_with_system<L: PhysicalMemory>(
 
             if let Some(disk_str) = args.disk.as_deref() {
                 let disk_path = std::path::Path::new(disk_str);
-                match run_chrome_hybrid(disk_path, &mem_keyring, &args.chrome_password) {
+                match run_chrome_hybrid(disk_path, &mem_keyring, &chrome_passwords, &chrome_nt_hashes)
+                {
                     Ok(mut summary) => {
                         merge_findings(&mut summary.findings, mem_findings);
                         let out =
