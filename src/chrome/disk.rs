@@ -124,8 +124,18 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     let v20 = if let (Some(appb), Some(sys)) =
         (ls.app_bound_encrypted_key.as_deref(), system_resolver)
     {
-        match crate::chrome::abe::unwrap_app_bound_with_resolvers(appb, user_resolver, sys, key_map)
-        {
+        // The Chrome ≥ ~140 "v3" app-bound key is XOR-masked with a machine NCrypt
+        // (CNG Software-KSP) AES key. Recover it from the CNG key files gathered at
+        // discovery, decrypting each under the SYSTEM masterkey resolver. Empty for
+        // Edge/older Chrome, which don't use the NCrypt path.
+        let ksp_keys = crate::chrome::cng_ksp::resolve_ksp_aes_keys(&key_map.cng_ksp_files, sys);
+        match crate::chrome::abe::unwrap_app_bound_with_resolvers(
+            appb,
+            user_resolver,
+            sys,
+            key_map,
+            &ksp_keys,
+        ) {
             Ok(k) => Some(k),
             Err(e) => {
                 log::info!("[chrome] {} v20 unwrap failed: {}", p.profile.path, e);

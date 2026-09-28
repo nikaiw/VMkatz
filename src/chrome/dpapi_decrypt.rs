@@ -136,6 +136,15 @@ fn utf16le(b: &[u8]) -> String {
 
 /// Decrypt a DPAPI blob using a cleartext masterkey (typically 64 bytes).
 pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
+    decrypt_blob_entropy(blob, masterkey, &[])
+}
+
+/// Decrypt a DPAPI blob with an optional application entropy value.
+///
+/// Entropy is appended to the salt in the session-key HMAC (per impacket
+/// `DPAPI_BLOB.decrypt` / `CryptUnprotectData`'s `pOptionalEntropy`). CNG "Software
+/// KSP" private-key blobs are protected with entropy `xT5rZW5qVVbrvpuA\0`.
+pub fn decrypt_blob_entropy(blob: &DpapiBlob<'_>, masterkey: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     type HmacSha512 = Hmac<Sha512>;
     // Modern combo: crypt_alg = CALG_AES_256 (0x6610), hmac_alg = CALG_SHA512 (0x800E).
     if blob.crypt_alg != 0x6610 || blob.hmac_alg != 0x800E {
@@ -146,7 +155,7 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
     }
     // DPAPI BLOB session-key derivation (per impacket dpapi.py DPAPI_BLOB.decrypt):
     //   keyHash    = SHA1(masterkey)
-    //   sessionKey = HMAC-SHA512(keyHash, salt)
+    //   sessionKey = HMAC-SHA512(keyHash, salt || entropy)
     //   derivedKey = sessionKey  (no further transform for SHA-512/AES-256)
     //   AES-256-CBC decrypt with key=derivedKey[:32] and IV = ALL ZEROS
     // The IV is NOT derived from sessionKey bytes — that's the masterkey-FILE
@@ -155,6 +164,9 @@ pub fn decrypt_blob(blob: &DpapiBlob<'_>, masterkey: &[u8]) -> Result<Vec<u8>> {
     let mut h =
         HmacSha512::new_from_slice(&mk_sha1).map_err(|_| Error::Parse("hmac key".into()))?;
     h.update(blob.salt);
+    if !entropy.is_empty() {
+        h.update(entropy);
+    }
     let session = h.finalize().into_bytes();
 
     let key = &session[..32];

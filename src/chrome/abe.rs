@@ -17,20 +17,33 @@
 //! optional caller-supplied keys for the other flags. Flag-3 (ChaCha20) is
 //! out of scope.
 
+use aes::Aes256;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use cbc::cipher::block_padding::NoPadding;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
-use crate::chrome::abe_keys::BrowserKeyMap;
+use crate::chrome::abe_keys::{AbeKey, BrowserKeyMap};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::error::{Result, VmkatzError as Error};
 
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
+
+/// AEAD algorithm enum from the elevation-service key table (`AbeKey.algo`).
+const ALGO_AES_GCM: u8 = 2;
+const ALGO_CHACHA20: u8 = 4;
+
 /// Strip "APPB", run the two DPAPI layers via caller closures, then unwrap the
 /// flag-byte-driven inner blob to return the 32-byte v20 AES-GCM key.
+///
+/// `ksp_keys` are candidate machine NCrypt AES keys (see [`crate::chrome::cng_ksp`])
+/// needed only for the flag=0 "v3" path; pass `&[]` when unavailable.
 pub fn unwrap_app_bound_key<FU, FS>(
     appb: &[u8],
     decrypt_user: FU,
     decrypt_system: FS,
     key_map: &BrowserKeyMap,
+    ksp_keys: &[[u8; 32]],
 ) -> Result<[u8; 32]>
 where
     FU: FnOnce(&[u8]) -> Result<Vec<u8>>,
@@ -42,20 +55,31 @@ where
     let inner = &appb[4..];
     let layer1 = decrypt_user(inner)?;
     let layer2 = decrypt_system(&layer1)?;
-    decrypt_aes_encrypted_key(&layer2, key_map)
+    decrypt_aes_encrypted_key(&layer2, key_map, ksp_keys)
 }
 
 /// Convenience wrapper: same as `decrypt_aes_encrypted_key` but uses the
-/// hardcoded Chrome 135 fallback keys.
+/// hardcoded Chrome 135 fallback keys and no NCrypt keys.
 pub fn decrypt_aes_encrypted_key_with_fallback(aes_encrypted_key: &[u8]) -> Result<[u8; 32]> {
-    decrypt_aes_encrypted_key(aes_encrypted_key, &BrowserKeyMap::fallback())
+    decrypt_aes_encrypted_key(aes_encrypted_key, &BrowserKeyMap::fallback(), &[])
 }
 
-/// Given the output of the two DPAPI layers, parse the `<flag><nonce><ct><tag>`
-/// envelope and AES-256-GCM-decrypt to recover the 32-byte v20 key.
+/// Recover the 32-byte v20 key from the two-DPAPI-layer output.
+///
+/// Handles three inner shapes:
+///
+/// - Edge: `cipher` is 32 raw key bytes (no inner crypto).
+/// - Chrome flag=1 (61 bytes): `version(1)|nonce(12)|ct(32)|tag(16)`; the version
+///   byte's static key is the AEAD key directly.
+/// - Chrome flag=0 / "v3" (93 bytes): `version(1)|wrapped(32)|nonce(12)|ct(32)|tag(16)`;
+///   the AEAD key is `NCryptDecrypt(ksp_key, wrapped) XOR static_key`.
+///
+/// AAD is empty for all versions. AEAD is AES-256-GCM (algo 2) or, when supported,
+/// ChaCha20-Poly1305 (algo 4).
 pub fn decrypt_aes_encrypted_key(
     aes_encrypted_key: &[u8],
     key_map: &BrowserKeyMap,
+    ksp_keys: &[[u8; 32]],
 ) -> Result<[u8; 32]> {
     // Layout (after SYSTEM-DPAPI decrypt, post-PKCS#7-strip):
     //   header_len(u32 LE) || flag(u8) || install_path((header_len - 1) bytes)
@@ -65,37 +89,107 @@ pub fn decrypt_aes_encrypted_key(
 
     // Edge (Microsoft) stores the v20 key inline as 32 raw bytes — no inner crypto.
     if cipher.len() == 32 {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(cipher);
-        return Ok(key);
+        return cipher.try_into().map_err(|_| Error::Parse("ABE edge key len".into()));
     }
-    // Chrome (Google) inner format: version(1) || nonce(12) || ct(32) || tag(16) = 61 bytes.
-    // The version byte indexes a static AES-256-GCM key embedded in elevation_service.exe.
-    if cipher.len() == 61 {
-        let version = cipher[0];
-        let key = key_map
-            .resolve(version)
-            .ok_or_else(|| Error::Parse(format!("Chrome ABE version {version} unknown")))?;
-        let nonce = &cipher[1..13];
-        let ct = &cipher[13..];
-        let gcm = Aes256Gcm::new((&key).into());
-        let pt = gcm
-            .decrypt(Nonce::from_slice(nonce), ct)
-            .map_err(|_| Error::Parse("Chrome ABE inner GCM auth fail".into()))?;
-        if pt.len() != 32 {
+    if cipher.is_empty() {
+        return Err(Error::Parse("ABE empty cipher".into()));
+    }
+
+    // Chrome: the leading byte is the version, indexing the elevation-service key
+    // table. `flag` selects whether the table key is the AEAD key directly (flag=1)
+    // or an XOR mask over an NCrypt-derived key (flag=0, the Chrome ≥ ~140 "v3" path).
+    let version = cipher[0];
+    let entry = key_map.resolve_entry(version).ok_or_else(|| {
+        Error::Parse(format!("Chrome ABE version {version} not in key table"))
+    })?;
+
+    if entry.flag == 0 {
+        // v3: version(1) | wrapped(32) | nonce(12) | ct(32) | tag(16) = 93.
+        if cipher.len() < 1 + 32 + 12 + 16 {
             return Err(Error::Parse(format!(
-                "Chrome ABE pt_len={} (want 32)",
-                pt.len()
+                "Chrome ABE v3 cipher_len={} too short (need >= 61)",
+                cipher.len()
             )));
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&pt);
-        return Ok(out);
+        return decrypt_v3_multi(cipher, ksp_keys, &entry);
     }
-    Err(Error::Parse(format!(
-        "ABE cipher_len={} unsupported (need 32 = Edge raw key or 61 = Chrome wrapped)",
-        cipher.len()
-    )))
+
+    // flag=1: version(1) | nonce(12) | ct | tag(16); static key is the AEAD key.
+    if cipher.len() < 1 + 12 + 16 {
+        return Err(Error::Parse(format!(
+            "Chrome ABE cipher_len={} too short",
+            cipher.len()
+        )));
+    }
+    let pt = aead_open(entry.algo, &entry.key, &cipher[1..13], &cipher[13..])?;
+    pt.as_slice()
+        .try_into()
+        .map_err(|_| Error::Parse(format!("Chrome ABE plaintext len {} (want 32)", pt.len())))
+}
+
+/// Recover the flag=0 ("v3") key. For each candidate machine NCrypt AES key,
+/// `AES-256-CBC-decrypt(ksp_key, wrapped, IV=0) XOR static_key` yields the AES-GCM
+/// key; the GCM tag then validates which KSP key (normally there is exactly one).
+fn decrypt_v3_multi(cipher: &[u8], ksp_keys: &[[u8; 32]], entry: &AbeKey) -> Result<[u8; 32]> {
+    if ksp_keys.is_empty() {
+        return Err(Error::Parse(
+            "Chrome ABE v3 needs the machine NCrypt (CNG Software-KSP) key — none recovered".into(),
+        ));
+    }
+    let wrapped = &cipher[1..33];
+    let nonce = &cipher[33..45];
+    let ct_tag = &cipher[45..];
+    let mut last = Error::Parse("Chrome ABE v3: no KSP key authenticated".into());
+    for ksp in ksp_keys {
+        let ncrypt_out = match aes256_cbc_decrypt_zero_iv(ksp, wrapped) {
+            Ok(v) => v,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        let mut aead_key = [0u8; 32];
+        for i in 0..32 {
+            aead_key[i] = ncrypt_out[i] ^ entry.key[i];
+        }
+        match aead_open(entry.algo, &aead_key, nonce, ct_tag) {
+            Ok(pt) => {
+                return pt
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Parse("Chrome ABE v3 plaintext len".into()));
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// AES-256-CBC decrypt with a zero IV and no padding (input must be a 16-byte
+/// multiple). Models `NCryptDecrypt` on a Software-KSP AES key.
+fn aes256_cbc_decrypt_zero_iv(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
+        return Err(Error::Parse("ABE NCrypt input not block-aligned".into()));
+    }
+    let iv = [0u8; 16];
+    let mut buf = data.to_vec();
+    let pt = Aes256CbcDec::new(key.into(), (&iv).into())
+        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .map_err(|_| Error::Parse("ABE NCrypt AES-CBC decrypt".into()))?;
+    Ok(pt.to_vec())
+}
+
+/// AEAD-open `ct_tag` (ciphertext followed by 16-byte tag) with empty AAD.
+fn aead_open(algo: u8, key: &[u8; 32], nonce: &[u8], ct_tag: &[u8]) -> Result<Vec<u8>> {
+    match algo {
+        ALGO_AES_GCM => Aes256Gcm::new(key.into())
+            .decrypt(Nonce::from_slice(nonce), ct_tag)
+            .map_err(|_| Error::Parse("Chrome ABE inner GCM auth fail".into())),
+        ALGO_CHACHA20 => Err(Error::Parse(
+            "Chrome ABE ChaCha20-Poly1305 (algo 4 / v2) not yet supported".into(),
+        )),
+        other => Err(Error::Parse(format!("Chrome ABE unknown AEAD algo {other}"))),
+    }
 }
 
 /// PKCS#7-strip then split `[header_len][flag][path][cipher_len][cipher]`.
@@ -198,6 +292,7 @@ pub fn unwrap_app_bound_with_resolvers<R, S>(
     user_resolver: &R,
     system_resolver: &S,
     key_map: &BrowserKeyMap,
+    ksp_keys: &[[u8; 32]],
 ) -> Result<[u8; 32]>
 where
     R: crate::chrome::disk::MasterkeyResolver,
@@ -220,6 +315,7 @@ where
         |user_blob| decrypt_layer(user_blob, AbeLayer::User, &collect),
         |system_blob| decrypt_layer(system_blob, AbeLayer::System, &collect),
         key_map,
+        ksp_keys,
     )
 }
 
@@ -325,6 +421,13 @@ fn strip_pkcs7(pt: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::abe_keys::CHROME_135_V3;
+    use aes::Aes256;
+    use aes_gcm::aead::Aead;
+    use cbc::cipher::block_padding::NoPadding;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
     #[test]
     fn rejects_non_appb() {
@@ -333,23 +436,28 @@ mod tests {
             |_| Ok(vec![0u8; 32]),
             |_| Ok(vec![0u8; 32]),
             &BrowserKeyMap::fallback(),
+            &[],
         );
         assert!(r.is_err());
     }
 
-    /// Build an Edge-style flag=2 aes_encrypted_key with the v20 key embedded raw.
-    fn build_edge_aes_encrypted_key(v20_key: &[u8; 32], path: &[u8]) -> Vec<u8> {
+    /// Wrap an inner `cipher` in the `header_len|flag|path|cipher_len|cipher` +
+    /// PKCS#7 envelope the two DPAPI layers produce.
+    fn build_aes_encrypted_key(flag: u8, path: &[u8], cipher: &[u8]) -> Vec<u8> {
         let header_len = (path.len() as u32) + 1;
         let mut buf = Vec::new();
         buf.extend_from_slice(&header_len.to_le_bytes());
-        buf.push(0x02);
+        buf.push(flag);
         buf.extend_from_slice(path);
-        buf.extend_from_slice(&32u32.to_le_bytes());
-        buf.extend_from_slice(v20_key);
-        // PKCS#7 pad to a multiple of 16.
+        buf.extend_from_slice(&(cipher.len() as u32).to_le_bytes());
+        buf.extend_from_slice(cipher);
         let pad = 16 - (buf.len() % 16);
         buf.extend(std::iter::repeat_n(pad as u8, pad));
         buf
+    }
+
+    fn build_edge_aes_encrypted_key(v20_key: &[u8; 32], path: &[u8]) -> Vec<u8> {
+        build_aes_encrypted_key(0x02, path, v20_key)
     }
 
     #[test]
@@ -375,8 +483,113 @@ mod tests {
             |_| Ok(b"opaque_system_dpapi_blob".to_vec()),
             move |_| Ok(aes_key_clone),
             &BrowserKeyMap::fallback(),
+            &[],
         )
         .unwrap();
         assert_eq!(key, v20_key);
+    }
+
+    /// Chrome flag=1 (61-byte) path: version(1)|nonce(12)|ct(32)|tag(16), key =
+    /// the version byte's static AES-GCM key.
+    #[test]
+    fn chrome_v1_61byte_gcm_roundtrip() {
+        let map = BrowserKeyMap::fallback();
+        let v1 = map.resolve(1).unwrap();
+        let v20_key = [0x5Au8; 32];
+        let nonce = [0x11u8; 12];
+        let ct_tag = Aes256Gcm::new((&v1).into())
+            .encrypt(Nonce::from_slice(&nonce), v20_key.as_slice())
+            .unwrap();
+        let mut cipher = vec![1u8];
+        cipher.extend_from_slice(&nonce);
+        cipher.extend_from_slice(&ct_tag);
+        assert_eq!(cipher.len(), 61);
+        let blob = build_aes_encrypted_key(0x01, b"C:\\Chrome", &cipher);
+        assert_eq!(decrypt_aes_encrypted_key(&blob, &map, &[]).unwrap(), v20_key);
+    }
+
+    /// Build a synthetic flag=0 "v3" cipher for arbitrary ksp/static/v20 keys, so
+    /// the NCrypt-derive + AES-GCM algorithm is validated without lab material.
+    fn build_v3_cipher(
+        ksp_key: &[u8; 32],
+        static_v3: &[u8; 32],
+        v20_key: &[u8; 32],
+        nonce: &[u8; 12],
+    ) -> Vec<u8> {
+        // aead_key = CBC-dec(ksp, wrapped) XOR static  =>  wrapped = CBC-enc(ksp, aead_key XOR static)
+        let mut ncrypt_out = [0u8; 32];
+        for i in 0..32 {
+            ncrypt_out[i] = v20_gcm_key_placeholder(v20_key)[i] ^ static_v3[i];
+        }
+        let mut wrapped = ncrypt_out;
+        Aes256CbcEnc::new(ksp_key.into(), (&[0u8; 16]).into())
+            .encrypt_padded_mut::<NoPadding>(&mut wrapped, 32)
+            .unwrap();
+        let ct_tag = Aes256Gcm::new((&v20_gcm_key_placeholder(v20_key)).into())
+            .encrypt(Nonce::from_slice(nonce), v20_key.as_slice())
+            .unwrap();
+        let mut cipher = vec![3u8];
+        cipher.extend_from_slice(&wrapped);
+        cipher.extend_from_slice(nonce);
+        cipher.extend_from_slice(&ct_tag);
+        cipher
+    }
+
+    // The AEAD (GCM) key for the synthetic test — any 32 bytes; derived
+    // deterministically from v20_key so the roundtrip is self-consistent.
+    fn v20_gcm_key_placeholder(v20_key: &[u8; 32]) -> [u8; 32] {
+        let mut k = *v20_key;
+        k[0] ^= 0xFF;
+        k
+    }
+
+    #[test]
+    fn chrome_v3_ncrypt_derived_roundtrip_synthetic() {
+        let ksp_key = [0x27u8; 32];
+        let static_v3 = CHROME_135_V3;
+        let v20_key = [0x91u8; 32];
+        let nonce = [0x42u8; 12];
+        let cipher = build_v3_cipher(&ksp_key, &static_v3, &v20_key, &nonce);
+        assert_eq!(cipher.len(), 93);
+        let map = BrowserKeyMap::fallback();
+        let blob = build_aes_encrypted_key(0x00, b"C:\\Chrome", &cipher);
+        // Wrong KSP key fails, correct one succeeds (GCM tag validates).
+        assert!(decrypt_aes_encrypted_key(&blob, &map, &[[0u8; 32]]).is_err());
+        assert_eq!(
+            decrypt_aes_encrypted_key(&blob, &map, &[ksp_key]).unwrap(),
+            v20_key
+        );
+        // v3 with no KSP key available is a clear error, not a panic.
+        assert!(decrypt_aes_encrypted_key(&blob, &map, &[]).is_err());
+    }
+
+    /// Self-validating vector captured from a real Chrome 154 install (lab VM).
+    /// Proves the byte layout + AES-CBC(zero-IV) NCrypt mode + XOR + GCM match
+    /// actual `elevation_service.exe` output. The recovered key AES-256-GCM-
+    /// decrypted the real v20 Login Data blob to the known plaintext.
+    #[test]
+    fn chrome_v3_real_vector() {
+        let ksp_key: [u8; 32] =
+            hex::decode("59a1a29f0778eb9a8d581ca7c259594004887b700acc3ed51f343f9aa8506d56")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        // The 93-byte inner `cipher` (after the header/PKCS#7 strip).
+        let cipher = hex::decode(
+            "0361fa8683fda07c8a45aab2a060a6f80c40fab0fde0a9b1b58d9d2a4d4dbea412\
+30c925cd20d83b979b13d52d171a268f2661b161c83715ad1429da739bdbcfbf3e3\
+8e43612b7def5cd32cc16d6a6eb6191e1265498aa5d83c1725501",
+        )
+        .unwrap();
+        assert_eq!(cipher.len(), 93);
+        let expected: [u8; 32] =
+            hex::decode("9cbf9857dc7c7f70548ecef02a6882c086ac562aa563a86bce5929c9618a869b")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let map = BrowserKeyMap::fallback(); // v3 entry: flag=0, algo=2, CHROME_135_V3
+        let blob = build_aes_encrypted_key(0x00, b"C:\\Program Files\\Google\\Chrome", &cipher);
+        let got = decrypt_aes_encrypted_key(&blob, &map, &[ksp_key]).unwrap();
+        assert_eq!(got, expected);
     }
 }

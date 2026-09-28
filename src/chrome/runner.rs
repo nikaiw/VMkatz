@@ -281,7 +281,11 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
             log::info!("[chrome] no profiles on NTFS partition at 0x{part_offset:x}");
             continue;
         }
-        let key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
+        let mut key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
+        // Gather machine CNG Software-KSP key files (needed to unwrap the Chrome
+        // "v3" app-bound key); resolved to AES keys later, once the SYSTEM
+        // masterkey resolver is available (see chrome::cng_ksp / disk::derive_keys).
+        key_map.cng_ksp_files = crate::chrome::cng_ksp::read_cng_ksp_files(&ntfs, &mut part_reader);
         return Ok((profiles, key_map));
     }
 
@@ -347,6 +351,7 @@ fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
     let mut merged = BrowserKeyMap {
         entries: Vec::new(),
         fallback: false,
+        cng_ksp_files: Vec::new(),
     };
     for (browser, parent_dir, exe_name) in ELEVATION_PATHS {
         let Ok(app_dir) = crate::sam::navigate_to_dir(ntfs, &root, reader, parent_dir) else {

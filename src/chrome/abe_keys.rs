@@ -34,22 +34,47 @@ pub const CHROME_135_V3: [u8; 32] = [
     0x03, 0xA2, 0x9E, 0x90, 0x27, 0x4F, 0xB2, 0xFC, 0xF5, 0x9B, 0xA4, 0xB7, 0x5C, 0x39, 0x23, 0x90,
 ];
 
-/// Maps an ABE version byte to a 32-byte AES-256-GCM key.
+/// One entry of the Chrome elevation-service key table (56 bytes on disk):
+/// `version(+0)`, `flag(+8)`, `algo(+0xC)`, `key(+0x10, 32 bytes)`.
+///
+/// `flag`: 1 = the 32-byte `key` is used DIRECTLY as the AEAD key; 0 = the `key`
+/// is only an XOR mask and the real AEAD key is derived from a machine NCrypt key
+/// (Chrome ≥ ~140 "v3" path — see `abe::decrypt_aes_encrypted_key`).
+/// `algo`: 2 = AES-256-GCM, 4 = ChaCha20-Poly1305.
+#[derive(Debug, Clone, Copy)]
+pub struct AbeKey {
+    pub version: u8,
+    pub flag: u8,
+    pub algo: u8,
+    pub key: [u8; 32],
+}
+
+/// Maps an ABE version byte to its key-table entry.
 #[derive(Debug, Clone, Default)]
 pub struct BrowserKeyMap {
-    /// (version, key) pairs.
-    pub entries: Vec<(u8, [u8; 32])>,
+    /// Key-table entries, keyed by version byte.
+    pub entries: Vec<AbeKey>,
     /// True when these are the hardcoded fallback (not from the user's binary).
     pub fallback: bool,
+    /// Raw bytes of candidate machine CNG "Software KSP" key files (from
+    /// `%ProgramData%\Microsoft\Crypto\SystemKeys` / `Keys`) that hold the NCrypt
+    /// AES key used to unwrap the flag=0 (v3) app-bound key. Populated at discovery
+    /// time; resolved to the AES key by [`crate::chrome::cng_ksp`] when a v3 blob is hit.
+    pub cng_ksp_files: Vec<Vec<u8>>,
 }
 
 impl BrowserKeyMap {
-    /// Look up the AES key for an ABE version byte.
+    /// Look up the AES key bytes for an ABE version byte.
     pub fn resolve(&self, version: u8) -> Option<[u8; 32]> {
         self.entries
             .iter()
-            .find(|&&(v, _)| v == version)
-            .map(|&(_, k)| k)
+            .find(|e| e.version == version)
+            .map(|e| e.key)
+    }
+
+    /// Look up the full key-table entry for an ABE version byte.
+    pub fn resolve_entry(&self, version: u8) -> Option<AbeKey> {
+        self.entries.iter().find(|e| e.version == version).copied()
     }
 
     /// Returns true if no entries were found.
@@ -66,31 +91,39 @@ impl BrowserKeyMap {
                 return Self {
                     entries: hits,
                     fallback: false,
+                    cng_ksp_files: Vec::new(),
                 };
             }
         }
         Self::fallback()
     }
 
-    /// Hardcoded Chrome 135.0.7049.115 keys.
+    /// Hardcoded Chrome 135.0.7049.115 keys. flag/algo mirror the real table:
+    /// v1 = AES-GCM/direct, v2 = ChaCha20/direct, v3 = AES-GCM/NCrypt-derived.
     pub fn fallback() -> Self {
         Self {
-            entries: vec![(1, CHROME_135_V1), (2, CHROME_135_V2), (3, CHROME_135_V3)],
+            entries: vec![
+                AbeKey { version: 1, flag: 1, algo: 2, key: CHROME_135_V1 },
+                AbeKey { version: 2, flag: 1, algo: 4, key: CHROME_135_V2 },
+                AbeKey { version: 3, flag: 0, algo: 2, key: CHROME_135_V3 },
+            ],
             fallback: true,
+            cng_ksp_files: Vec::new(),
         }
     }
 
-    /// Merge another map's entries in. Existing `(version, key)` slots are kept;
-    /// the merged map's entries with the same version are dropped (first wins).
-    /// Returns `true` if at least one entry was added.
+    /// Merge another map's entries in. Existing version slots are kept; the merged
+    /// map's entries with the same version are dropped (first wins). CNG KSP files
+    /// are unioned. Returns `true` if at least one key entry was added.
     pub fn merge(&mut self, other: Self) -> bool {
         let mut added = false;
-        for (v, k) in other.entries {
-            if !self.entries.iter().any(|&(ev, _)| ev == v) {
-                self.entries.push((v, k));
+        for e in other.entries {
+            if !self.entries.iter().any(|ev| ev.version == e.version) {
+                self.entries.push(e);
                 added = true;
             }
         }
+        self.cng_ksp_files.extend(other.cng_ksp_files);
         added
     }
 }
@@ -138,18 +171,18 @@ fn locate_rdata(pe: &[u8]) -> Option<&[u8]> {
 
 const STRIDE: usize = 56;
 
-/// Returns `(version, key)` pairs for each plausible 3-entry table in `rdata`.
-fn scan_for_key_table(rdata: &[u8]) -> Vec<(u8, [u8; 32])> {
-    let mut hits: Vec<(u8, [u8; 32])> = Vec::new();
+/// Returns the key-table entries for each plausible 3-entry table in `rdata`.
+fn scan_for_key_table(rdata: &[u8]) -> Vec<AbeKey> {
+    let mut hits: Vec<AbeKey> = Vec::new();
     if rdata.len() < STRIDE * 3 {
         return hits;
     }
     let mut i = 0;
     while i + STRIDE * 3 <= rdata.len() {
         if let Some(entries) = try_table_at(&rdata[i..]) {
-            for (v, k) in entries {
-                if !hits.iter().any(|&(ev, _)| ev == v) {
-                    hits.push((v, k));
+            for e in entries {
+                if !hits.iter().any(|h| h.version == e.version) {
+                    hits.push(e);
                 }
             }
             i += STRIDE * 3;
@@ -161,7 +194,9 @@ fn scan_for_key_table(rdata: &[u8]) -> Vec<(u8, [u8; 32])> {
 }
 
 /// Try to interpret `buf[..168]` as three consecutive `ChromeAbeKeyEntry`.
-fn try_table_at(buf: &[u8]) -> Option<Vec<(u8, [u8; 32])>> {
+/// `+0x8` = flag (1 = static key direct, 0 = NCrypt-derived), `+0xC` = algo
+/// (2 = AES-256-GCM, 4 = ChaCha20-Poly1305).
+fn try_table_at(buf: &[u8]) -> Option<Vec<AbeKey>> {
     if buf.len() < STRIDE * 3 {
         return None;
     }
@@ -177,10 +212,10 @@ fn try_table_at(buf: &[u8]) -> Option<Vec<(u8, [u8; 32])>> {
         if e[1..8].iter().any(|&b| b != 0) {
             return None;
         }
-        // Two small u32 metadata values.
-        let m1 = u32::from_le_bytes(e[8..12].try_into().unwrap());
-        let m2 = u32::from_le_bytes(e[12..16].try_into().unwrap());
-        if m1 > 32 || m2 > 32 {
+        // flag (+8) and algo (+0xC): both are small enums (flag 0/1, algo 2/4).
+        let flag = u32::from_le_bytes(e[8..12].try_into().unwrap());
+        let algo = u32::from_le_bytes(e[12..16].try_into().unwrap());
+        if flag > 32 || algo > 32 {
             return None;
         }
         // Entropy gate on the 32 key bytes: distinct byte values >= 20.
@@ -189,7 +224,12 @@ fn try_table_at(buf: &[u8]) -> Option<Vec<(u8, [u8; 32])>> {
             return None;
         }
         // Trail bytes (e[48..56]) can be zero or a sentinel/pointer; don't gate on them.
-        out.push((v, key));
+        out.push(AbeKey {
+            version: v,
+            flag: flag as u8,
+            algo: algo as u8,
+            key,
+        });
     }
     Some(out)
 }
@@ -327,17 +367,24 @@ mod tests {
         assert_eq!(map.resolve(2), Some(CHROME_135_V2));
         assert_eq!(map.resolve(3), Some(CHROME_135_V3));
         assert_eq!(map.resolve(4), None);
+        // v1 = AES-GCM/direct, v2 = ChaCha/direct, v3 = AES-GCM/NCrypt-derived.
+        assert_eq!(map.resolve_entry(1).map(|e| (e.flag, e.algo)), Some((1, 2)));
+        assert_eq!(map.resolve_entry(2).map(|e| (e.flag, e.algo)), Some((1, 4)));
+        assert_eq!(map.resolve_entry(3).map(|e| (e.flag, e.algo)), Some((0, 2)));
     }
 
     #[test]
     fn merge_first_wins() {
+        let mk = |v: u8, k: u8| AbeKey { version: v, flag: 1, algo: 2, key: [k; 32] };
         let mut a = BrowserKeyMap {
-            entries: vec![(1, [0x11u8; 32])],
+            entries: vec![mk(1, 0x11)],
             fallback: false,
+            cng_ksp_files: Vec::new(),
         };
         let b = BrowserKeyMap {
-            entries: vec![(1, [0x22u8; 32]), (2, [0x33u8; 32])],
+            entries: vec![mk(1, 0x22), mk(2, 0x33)],
             fallback: false,
+            cng_ksp_files: Vec::new(),
         };
         let added = a.merge(b);
         assert!(added);

@@ -72,6 +72,7 @@
 pub mod abe;
 pub mod abe_keys;
 pub mod blob;
+pub mod cng_ksp;
 pub mod cookie_monster;
 pub mod disk;
 pub mod dpapi_decrypt;
