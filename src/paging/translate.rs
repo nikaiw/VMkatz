@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 
 use crate::error::{Result, VmkatzError};
 use crate::memory::{PhysicalMemory, VirtualMemory};
@@ -369,32 +370,65 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
     ///
     /// Reads entire 4KB page table pages (512 entries) at once instead of
     /// individual 8-byte reads, reducing I/O calls by ~500x per table level.
-    pub fn enumerate_present_pages<F>(&self, cr3: u64, mut callback: F)
+    pub fn enumerate_present_pages<F>(&self, cr3: u64, callback: F)
+    where
+        F: FnMut(PageMapping),
+    {
+        // User-mode half only (PML4 entries 0..256).
+        self.enumerate_range(cr3, 0, 256, callback);
+    }
+
+    /// Enumerate present pages across the WHOLE address space (user + kernel),
+    /// producing canonical (sign-extended) virtual addresses for the top half.
+    /// Kernel space (PML4 >= 256) is shared across processes, so any valid CR3 works.
+    pub fn enumerate_all_present_pages<F>(&self, cr3: u64, callback: F)
+    where
+        F: FnMut(PageMapping),
+    {
+        self.enumerate_range(cr3, 0, 512, callback);
+    }
+
+    fn enumerate_range<F>(&self, cr3: u64, pml4_start: u64, pml4_end: u64, mut callback: F)
     where
         F: FnMut(PageMapping),
     {
         let pml4_base = cr3 & PAGE_PHYS_MASK;
+        let mut table_buf = [0u8; 4096]; // reused for PML4/PDPT/PD/PT pages
+        // Kernel page tables are heavily shared/aliased across PML4 entries and the
+        // recursive self-map; without this a full-space walk re-reads the same tables
+        // millions of times and explodes. Skip any table page already walked.
+        let mut visited: HashSet<u64> = HashSet::new();
 
-        // Read PML4 table (only first 256 entries = user-mode half = 2KB)
-        let mut pml4_buf = [0u8; 256 * 8];
-        if self.phys.read_phys(pml4_base, &mut pml4_buf).is_err() {
+        // Canonicalize a top-half virtual address (bit 47 set → sign-extend).
+        let canon = |v: u64| -> u64 {
+            if v & (1 << 47) != 0 {
+                v | 0xFFFF_0000_0000_0000
+            } else {
+                v
+            }
+        };
+
+        if self.phys.read_phys(pml4_base, &mut table_buf).is_err() {
             return;
         }
+        let pml4_buf = table_buf;
 
-        let mut table_buf = [0u8; 4096]; // reused for PDPT/PD/PT pages
-
-        for pml4_idx in 0..256u64 {
+        for pml4_idx in pml4_start..pml4_end {
             let pml4e = PageTableEntry(read_pte_from_buf(&pml4_buf, pml4_idx as usize));
             if !pml4e.is_present() {
                 continue;
             }
 
-            // Read entire PDPT page (512 entries)
             let pdpt_base = pml4e.frame_addr();
+            // Skip the recursive self-map entry (PFN == this PML4). Descending into
+            // it re-reads the paging hierarchy as data and explodes the walk (the
+            // PTE_BASE region), producing bogus mappings.
+            if pdpt_base == pml4_base || !visited.insert(pdpt_base) {
+                continue;
+            }
             if self.phys.read_phys(pdpt_base, &mut table_buf).is_err() {
                 continue;
             }
-            // Copy PDPT since table_buf will be reused for PD
             let pdpt_buf = table_buf;
 
             for pdpt_idx in 0..512u64 {
@@ -403,7 +437,7 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
                     continue;
                 }
                 if pdpte.is_large_page() {
-                    let vaddr = (pml4_idx << 39) | (pdpt_idx << 30);
+                    let vaddr = canon((pml4_idx << 39) | (pdpt_idx << 30));
                     let paddr = pdpte.raw() & LARGE_1GB_MASK;
                     callback(PageMapping {
                         vaddr,
@@ -413,8 +447,10 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
                     continue;
                 }
 
-                // Read entire PD page
                 let pd_base = pdpte.frame_addr();
+                if !visited.insert(pd_base) {
+                    continue;
+                }
                 if self.phys.read_phys(pd_base, &mut table_buf).is_err() {
                     continue;
                 }
@@ -426,7 +462,7 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
                         continue;
                     }
                     if pde.is_large_page() {
-                        let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21);
+                        let vaddr = canon((pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21));
                         let paddr = pde.raw() & LARGE_2MB_MASK;
                         callback(PageMapping {
                             vaddr,
@@ -436,8 +472,10 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
                         continue;
                     }
 
-                    // Read entire PT page
                     let pt_base = pde.frame_addr();
+                    if !visited.insert(pt_base) {
+                        continue;
+                    }
                     if self.phys.read_phys(pt_base, &mut table_buf).is_err() {
                         continue;
                     }
@@ -445,10 +483,12 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
                     for pt_idx in 0..512u64 {
                         let pte = PageTableEntry(read_pte_from_buf(&table_buf, pt_idx as usize));
                         if pte.is_present() || pte.is_transition() {
-                            let vaddr = (pml4_idx << 39)
-                                | (pdpt_idx << 30)
-                                | (pd_idx << 21)
-                                | (pt_idx << 12);
+                            let vaddr = canon(
+                                (pml4_idx << 39)
+                                    | (pdpt_idx << 30)
+                                    | (pd_idx << 21)
+                                    | (pt_idx << 12),
+                            );
                             let paddr = pte.frame_addr();
                             callback(PageMapping {
                                 vaddr,
