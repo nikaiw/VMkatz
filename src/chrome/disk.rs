@@ -32,9 +32,10 @@ impl<S: std::hash::BuildHasher> MasterkeyResolver
     }
 }
 
-/// Per-profile decryption keys, derived from `Local State`.
+/// Per-profile keys from `Local State`. Either may be absent — they unlock
+/// independent blobs (v10/v11 DPAPI vs v20 App-Bound), so keep whichever we get.
 struct ProfileKeys {
-    v10: [u8; 32],
+    v10: Option<[u8; 32]>,
     v20: Option<[u8; 32]>,
 }
 
@@ -120,7 +121,13 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     let ls_bytes = p.artifacts.local_state.as_ref()?;
     let ls_str = std::str::from_utf8(ls_bytes).ok()?;
     let ls = local_state::parse(ls_str).ok()?;
-    let v10 = derive_v10_key(ls.encrypted_key.as_deref()?, user_resolver)?;
+    // Derive v10 and v20 independently: they unlock different blobs, so one
+    // failing must not suppress the other (e.g. keep v10 autofill/cookies even
+    // when the v20 app-bound unwrap fails, and vice versa).
+    let v10 = ls
+        .encrypted_key
+        .as_deref()
+        .and_then(|k| derive_v10_key(k, user_resolver));
     let v20 = if let (Some(appb), Some(sys)) =
         (ls.app_bound_encrypted_key.as_deref(), system_resolver)
     {
@@ -142,6 +149,9 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     } else {
         None
     };
+    if v10.is_none() && v20.is_none() {
+        return None;
+    }
     Some(ProfileKeys { v10, v20 })
 }
 
@@ -177,11 +187,11 @@ fn decrypt_value_aad(
     aad: &[u8],
 ) -> Option<(Vec<u8>, ChromeSource)> {
     match classify(blob) {
-        BlobScheme::V10 | BlobScheme::V11 => {
-            crate::chrome::blob::decrypt_v10_aad(blob, &keys.v10, aad)
-                .ok()
-                .map(|pt| (pt, ChromeSource::DiskDpapi))
-        }
+        BlobScheme::V10 | BlobScheme::V11 => keys
+            .v10
+            .as_ref()
+            .and_then(|k| crate::chrome::blob::decrypt_v10_aad(blob, k, aad).ok())
+            .map(|pt| (pt, ChromeSource::DiskDpapi)),
         BlobScheme::V20 => keys
             .v20
             .as_ref()
@@ -198,8 +208,17 @@ fn derive_v10_key<R: MasterkeyResolver>(raw: &[u8], mkr: &R) -> Option<[u8; 32]>
         return None;
     }
     let blob = parse_blob(&raw[5..]).ok()?;
-    let mk = mkr.resolve(&blob.mk_guid_str)?;
-    let pt = decrypt_blob(&blob, &mk).ok()?;
+    let Some(mk) = mkr.resolve(&blob.mk_guid_str) else {
+        log::info!("[chrome] v10: no masterkey for GUID {}", blob.mk_guid_str);
+        return None;
+    };
+    let pt = match decrypt_blob(&blob, &mk) {
+        Ok(p) => p,
+        Err(e) => {
+            log::info!("[chrome] v10: decrypt_blob failed: {e}");
+            return None;
+        }
+    };
     // pt is CBC plaintext with PKCS#7 padding; the v10 key is the first 32 bytes.
     if pt.len() < 32 {
         return None;
