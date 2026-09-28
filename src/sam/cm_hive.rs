@@ -54,11 +54,23 @@ fn utf16(b: &[u8]) -> String {
 }
 
 /// Calibrated map layout for one hive: the `_HMAP_DIRECTORY` VA and the
-/// `_HMAP_TABLE` entry stride. `PermanentBinAddress` is at entry+0x8, `BlockOffset`
-/// at entry+0 (validated against a live "hbin").
+/// How an `_HMAP_ENTRY` encodes the address of its 4 KB block. Self-calibrated
+/// against a live "hbin", so the walk spans Windows versions.
+#[derive(Clone, Copy)]
+enum EntryScheme {
+    /// Win8.1+/10/11: `BlockOffset` @+0, `PermanentBinAddress` @+8 (low bits flags).
+    /// block VA = (PermanentBinAddress & ~0xF) + BlockOffset.
+    PermBin,
+    /// Win7/Vista: `BlockAddress` @+0 is the 4 KB block VA directly.
+    BlockAddr,
+}
+
+/// Calibrated `_HMAP` layout: the `_HMAP_DIRECTORY` VA, the `_HMAP_TABLE` entry
+/// stride, and how entries encode their block address.
 struct MapLayout {
     map_va: u64,
     stride: u64,
+    scheme: EntryScheme,
 }
 
 /// Recover bootkey + SAM hashes + LSA secrets by materializing the hives via the CM map.
@@ -150,6 +162,7 @@ fn materialize<L: PhysicalMemory>(
     let length = u32at(&base_block, 0x28) as usize;
     let name = utf16(&base_block[0x30..0x70]);
     let base = name.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_uppercase();
+    log::debug!("cm_hive: _HHIVE @{hhive_phys:#x} name={name:?} len={length:#x}");
     if !WANTED.contains(&base.as_str()) || length == 0 || length > MAX_HIVE {
         return None;
     }
@@ -199,19 +212,21 @@ fn calibrate(
             continue;
         }
         for stride in [0x18u64, 0x10, 0x20] {
-            let layout = MapLayout { map_va, stride };
-            if (0..=probes).any(|i| {
-                read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
-            }) {
-                return Some(layout);
+            for scheme in [EntryScheme::PermBin, EntryScheme::BlockAddr] {
+                let layout = MapLayout { map_va, stride, scheme };
+                if (0..=probes).any(|i| {
+                    read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
+                }) {
+                    return Some(layout);
+                }
             }
         }
     }
     None
 }
 
-/// Read the 4 KB hive block covering cell offset `off` through the map:
-/// `Directory[off>>21] -> Table[(off>>12)&0x1FF] -> BlockOffset + PermanentBinAddress`.
+/// Read the 4 KB hive block for cell offset `off` (which is 4 KB-aligned here):
+/// `Directory[off>>21] -> Table[(off>>12)&0x1FF]`, decoded per the entry scheme.
 fn read_block(
     rv: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     layout: &MapLayout,
@@ -224,13 +239,17 @@ fn read_block(
     }
     let ent_va = table_va + (((off >> 12) & 0x1FF) as u64) * layout.stride;
     let ent = rv(ent_va, 0x18)?;
-    let block_off = u64at(&ent, 0); // this block's offset within its bin
-    let bin = u64at(&ent, 8) & !0xF; // PermanentBinAddress (low bits are flags)
-    if bin == 0 {
+    let block_va = match layout.scheme {
+        // (PermanentBinAddress & ~0xF) + BlockOffset. The block VA is user-range in
+        // the Registry process (Win10 1803+); the caller's DTB maps it.
+        EntryScheme::PermBin => (u64at(&ent, 8) & !0xF).checked_add(u64at(&ent, 0))?,
+        // BlockAddress is the 4 KB block VA directly (Win7/Vista, System space).
+        EntryScheme::BlockAddr => u64at(&ent, 0) & !0xFFF,
+    };
+    if block_va == 0 {
         return None;
     }
-    // `bin` is a user-range VA in the Registry process; the caller's DTB maps it.
-    rv(bin + block_off, 0x1000)
+    rv(block_va, 0x1000)
 }
 
 #[cfg(test)]
