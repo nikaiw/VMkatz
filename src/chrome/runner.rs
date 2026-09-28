@@ -285,9 +285,7 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
             continue;
         }
         let mut key_map = build_keymap_from_partition(&ntfs, &mut part_reader);
-        // Gather machine CNG Software-KSP key files (needed to unwrap the Chrome
-        // "v3" app-bound key); resolved to AES keys later, once the SYSTEM
-        // masterkey resolver is available (see chrome::cng_ksp / disk::derive_keys).
+        // CNG Software-KSP key files for the Chrome "v3" unwrap (resolved in derive_keys).
         key_map.cng_ksp_files = crate::chrome::cng_ksp::read_cng_ksp_files(&ntfs, &mut part_reader);
         return Ok((profiles, key_map));
     }

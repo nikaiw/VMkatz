@@ -2458,12 +2458,9 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     #[cfg(feature = "sam")]
     if !args.no_mem_registry {
         let found = run_mem_registry(&layer, args);
-        // When --chrome is requested the browser-secret decrypt runs later, in the
-        // LSASS pipeline (run_with_system), and needs the DPAPI masterkey cache from
-        // LSASS. A successful registry carve must NOT short-circuit that path, or the
-        // hybrid chrome flow silently never runs unless the user passes
-        // --no-mem-registry. Only treat the carve as the whole result when chrome
-        // wasn't asked for.
+        // With --chrome, the browser decrypt runs later in the LSASS pipeline, so a
+        // successful carve must not short-circuit it (else the hybrid flow needs
+        // --no-mem-registry). Treat the carve as the whole result only without --chrome.
         #[cfg(feature = "chrome")]
         let keep_going_for_chrome = args.chrome;
         #[cfg(not(feature = "chrome"))]
@@ -2673,12 +2670,9 @@ fn run_with_system<L: PhysicalMemory>(
         }
     }
 
-    // Registry recovery via the Configuration Manager hive-map. Authoritative where
-    // the page-table-free signature carve fails (hives fragmented to scattered pages
-    // whose offsets collide across hives). The hive bins are mapped in the Registry
-    // minimal process (Win10 1803+), so translate with its DTB; kernel VAs for the
-    // map structures resolve in any DTB. Runs when we reach here (i.e. the signature
-    // carve in run_with_layer already fell through, or was skipped).
+    // Registry recovery via the CM hive-map — resolves hives the signature carve
+    // can't (fragmented to scattered pages). Bins are mapped in the Registry process
+    // (Win10 1803+), so translate with its DTB. Runs after the carve fell through.
     #[cfg(feature = "sam")]
     if !args.no_mem_registry && !args.list_processes {
         let reg_dtb = processes

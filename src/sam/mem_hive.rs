@@ -542,13 +542,9 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
             creds.sam_hashes = h;
         }
     }
-    // SECURITY: score reassemblies by LSA-secret CORRECTNESS, not just count.
-    // Several stale/partial SECURITY copies share the bin pool; a reassembly that
-    // mixes cells across copies decrypts every secret with a wrong LSA key, yielding
-    // the right-length-but-garbage output that used to be printed as mojibake.
-    // `lsa_reassembly_score` rejects those (DPAPI_SYSTEM is a shared-key anchor), and
-    // the final gate drops the result rather than emit garbage when no copy verifies
-    // (e.g. a partial memory dump that doesn't contain a consistent SECURITY hive).
+    // SECURITY: score by LSA-secret correctness, not count — a reassembly that mixes
+    // cells across stale copies decrypts every secret with a wrong LSA key (garbage).
+    // The score + final gate reject that rather than emit mojibake (see below).
     let sec_roots = root_candidates(phys, &runs, &locs, "SECURITY", "Policy");
     if let Some((buf, _)) = best_reassembly(phys, &runs, &sec_roots, hive_total(&locs, "SECURITY"), |b| {
         lsa_reassembly_score(&extract_lsa_secrets(b, &bk).unwrap_or_default())

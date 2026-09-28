@@ -1,24 +1,12 @@
-//! Recover SAM / SYSTEM / SECURITY from a live memory image via the Configuration
+//! Recover SAM / SYSTEM / SECURITY from a memory image via the Configuration
 //! Manager hive map (`_HHIVE` / `_HMAP`).
 //!
-//! Robust where the signature-scan reassembly ([`crate::sam::mem_hive`]) fails: the
-//! CM map gives an unambiguous, per-hive-instance translation from a hive-cell
-//! offset to the memory page holding it, so there is no cross-hive offset collision
-//! and no need to guess which scattered page belongs to which hive.
-//!
-//! Mechanics: scan physical memory for the `_HHIVE` signature (`0xBEE0BEE0`); for a
-//! wanted hive, follow `Storage[Stable].Map` (a directory of `_HMAP_TABLE`s) to get
-//! each 4 KB block's address and materialize a contiguous hive image, which the
-//! existing `regf` parser + extractors consume. On Win10 1803+ the hive bins are
-//! mapped into the **Registry** minimal process's address space (user-range VAs),
-//! so translation uses that process's DTB (kernel VAs for the map structures resolve
-//! in any DTB, since the kernel half is shared).
-//!
-//! Struct field offsets vary by build, so they are **self-calibrated** per hive:
-//! `BaseBlock` is the pointer whose target is `regf`, and the `(Map, entry-stride)`
-//! pair is the one for which hive offset 0 translates to a page starting `hbin`.
-//! Needs page tables (a DTB), unlike the signature carve — so it runs only once the
-//! System (and Registry) process has been located.
+//! Unlike the signature carve ([`crate::sam::mem_hive`]), the map gives an
+//! unambiguous per-hive offset -> page translation, so it works even when a hive is
+//! fragmented into scattered pages. Bins are mapped in the Registry process (Win10
+//! 1803+), so translation uses its DTB; the map structures are kernel VAs and resolve
+//! in any DTB. Field offsets are self-calibrated per hive (see [`calibrate`]), so it
+//! is version-agnostic. Needs page tables, so it runs after System/Registry are found.
 
 use std::collections::HashMap;
 
@@ -53,15 +41,12 @@ fn utf16(b: &[u8]) -> String {
         .collect()
 }
 
-/// Calibrated map layout for one hive: the `_HMAP_DIRECTORY` VA and the
-/// How an `_HMAP_ENTRY` encodes the address of its 4 KB block. Self-calibrated
-/// against a live "hbin", so the walk spans Windows versions.
+/// How an `_HMAP_ENTRY` encodes its 4 KB block address (self-calibrated).
 #[derive(Clone, Copy)]
 enum EntryScheme {
-    /// Win8.1+/10/11: `BlockOffset` @+0, `PermanentBinAddress` @+8 (low bits flags).
-    /// block VA = (PermanentBinAddress & ~0xF) + BlockOffset.
+    /// Win8.1+: block = (PermanentBinAddress@+8 & ~0xF) + BlockOffset@+0.
     PermBin,
-    /// Win7/Vista: `BlockAddress` @+0 is the 4 KB block VA directly.
+    /// Win7/Vista: BlockAddress@+0 is the block VA directly.
     BlockAddr,
 }
 
@@ -85,9 +70,8 @@ pub fn extract_from_cm_map<L: PhysicalMemory>(layer: &L, dtb: u64) -> MemoryHive
     };
 
     let hives = scan_hives(layer, &rv);
-    // Bootkey: prefer the mapped SYSTEM hive, but fall back to a physical Lsa-cell
-    // scan (mem_hive::recover_bootkey) when SYSTEM's bins are paged out of the image
-    // — so SAM/SECURITY still decrypt as long as THEIR blocks are resident.
+    // Prefer the mapped SYSTEM hive; fall back to a physical Lsa-cell scan when its
+    // bins are paged out, so SAM/SECURITY still decrypt if their blocks are resident.
     let bk = hives
         .get("SYSTEM")
         .and_then(|s| extract_bootkey(s).ok())
@@ -170,14 +154,13 @@ fn materialize<L: PhysicalMemory>(
     let length = u32at(&base_block, 0x28) as usize;
     let name = utf16(&base_block[0x30..0x70]);
     let base = name.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_uppercase();
-    log::debug!("cm_hive: _HHIVE @{hhive_phys:#x} name={name:?} len={length:#x}");
     if !WANTED.contains(&base.as_str()) || length == 0 || length > MAX_HIVE {
         return None;
     }
 
     let Some(layout) = calibrate(rv, &hh, length) else {
-        // The _HHIVE (and base block) are resident but no bin resolves to "hbin",
-        // i.e. this hive's bin views are paged out of the image — nothing to map.
+        // Base block resident but no bin resolves to "hbin" — this hive's views are
+        // paged out of the image.
         log::info!("cm_hive: {base} present but its bins are not resident — skipping");
         return None;
     };
@@ -199,21 +182,16 @@ fn materialize<L: PhysicalMemory>(
     Some((base, img))
 }
 
-/// Find the `Storage[Stable]` map layout by validating that a hive block resolves
-/// to a bin ("hbin"). Tries each u32 field equal to the hive length as `Length` (so
-/// `Map` is the following qword) and each plausible entry stride. Because the first
-/// block may be paged out, it checks the first several 4 KB offsets and accepts the
-/// layout if any resolves to "hbin" (each bin starts with that magic).
+/// Find the `Storage[Stable]` map layout structurally: try every kernel-VA pointer
+/// in the `_HHIVE` as the `Map`, with each candidate stride and entry scheme, and
+/// accept the one whose `dir -> table -> entry -> bin` chain resolves one of the
+/// first blocks to "hbin". Probes several offsets since the first may be paged out.
 fn calibrate(
     rv: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     hh: &[u8],
     length: usize,
 ) -> Option<MapLayout> {
     let probes = (length / 0x1000).min(64);
-    // Every 8-aligned kernel-VA pointer in the _HHIVE is a candidate `Map`
-    // (_HMAP_DIRECTORY). Keying on `Length` is fragile (Storage.Length can differ
-    // from the base-block length), so validate structurally instead: a real Map's
-    // dir[0] -> table -> entry -> bin chain resolves some early offset to "hbin".
     for o in (0x40..hh.len().saturating_sub(8)).step_by(8) {
         let map_va = u64at(hh, o);
         if !is_kernel_va(map_va) {
