@@ -408,7 +408,11 @@ fn attach_carved_tickets(
             .and_then(|k| all_creds.get_mut(&k))
             .and_then(|c| c.kerberos.as_mut())
         {
-            if !krb.tickets.iter().any(|t| t.ticket_blob == ticket.ticket_blob) {
+            if !krb
+                .tickets
+                .iter()
+                .any(|t| t.ticket_blob == ticket.ticket_blob)
+            {
                 krb.tickets.push(ticket);
             }
         }
@@ -977,14 +981,13 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             }
             ranges.push((m.vaddr, m.size));
         });
-        let carved = crate::lsass::kerberos::carve_kerberos_tickets(
-            &lsass_vmem,
-            &ranges,
-            Arch::X64,
-            &[],
-        );
+        let carved =
+            crate::lsass::kerberos::carve_kerberos_tickets(&lsass_vmem, &ranges, Arch::X64, &[]);
         if !carved.is_empty() {
-            log::info!("Kerberos: carved {} tickets from resident memory", carved.len());
+            log::info!(
+                "Kerberos: carved {} tickets from resident memory",
+                carved.len()
+            );
             status.kerberos = ProviderStatus::Ok;
             attach_carved_tickets(&mut all_creds, carved);
         }

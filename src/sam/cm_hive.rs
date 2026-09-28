@@ -66,7 +66,9 @@ pub fn extract_from_cm_map<L: PhysicalMemory>(layer: &L, dtb: u64) -> MemoryHive
     let mut creds = MemoryHiveCreds::default();
     let walker = PageTableWalker::new(layer);
     let rv = |va: u64, n: usize| -> Option<Vec<u8>> {
-        layer.read_phys_bytes(walker.translate(dtb, va).ok()?, n).ok()
+        layer
+            .read_phys_bytes(walker.translate(dtb, va).ok()?, n)
+            .ok()
     };
 
     let hives = scan_hives(layer, &rv);
@@ -94,7 +96,10 @@ pub fn extract_from_cm_map<L: PhysicalMemory>(layer: &L, dtb: u64) -> MemoryHive
         Some(Err(e)) => log::info!("cm_hive: SAM parse failed: {e}"),
         None => log::info!("cm_hive: no SAM hive found via CM map"),
     }
-    match hives.get("SECURITY").map(|sec| extract_lsa_secrets(sec, &bk)) {
+    match hives
+        .get("SECURITY")
+        .map(|sec| extract_lsa_secrets(sec, &bk))
+    {
         Some(Ok(s)) => {
             log::info!("cm_hive: extracted {} LSA secret(s) via CM map", s.len());
             creds.lsa_secrets = s;
@@ -153,7 +158,11 @@ fn materialize<L: PhysicalMemory>(
         .find_map(|va| rv(va, BASE_BLOCK).filter(|b| &b[0..4] == b"regf"))?;
     let length = u32at(&base_block, 0x28) as usize;
     let name = utf16(&base_block[0x30..0x70]);
-    let base = name.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_uppercase();
+    let base = name
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
     if !WANTED.contains(&base.as_str()) || length == 0 || length > MAX_HIVE {
         return None;
     }
@@ -199,7 +208,11 @@ fn calibrate(
         }
         for stride in [0x18u64, 0x10, 0x20] {
             for scheme in [EntryScheme::PermBin, EntryScheme::BlockAddr] {
-                let layout = MapLayout { map_va, stride, scheme };
+                let layout = MapLayout {
+                    map_va,
+                    stride,
+                    scheme,
+                };
                 if (0..=probes).any(|i| {
                     read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
                 }) {

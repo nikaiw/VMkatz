@@ -89,7 +89,9 @@ pub fn decrypt_aes_encrypted_key(
 
     // Edge (Microsoft) stores the v20 key inline as 32 raw bytes — no inner crypto.
     if cipher.len() == 32 {
-        return cipher.try_into().map_err(|_| Error::Parse("ABE edge key len".into()));
+        return cipher
+            .try_into()
+            .map_err(|_| Error::Parse("ABE edge key len".into()));
     }
     if cipher.is_empty() {
         return Err(Error::Parse("ABE empty cipher".into()));
@@ -99,9 +101,9 @@ pub fn decrypt_aes_encrypted_key(
     // table. `flag` selects whether the table key is the AEAD key directly (flag=1)
     // or an XOR mask over an NCrypt-derived key (flag=0, the Chrome ≥ ~140 "v3" path).
     let version = cipher[0];
-    let entry = key_map.resolve_entry(version).ok_or_else(|| {
-        Error::Parse(format!("Chrome ABE version {version} not in key table"))
-    })?;
+    let entry = key_map
+        .resolve_entry(version)
+        .ok_or_else(|| Error::Parse(format!("Chrome ABE version {version} not in key table")))?;
 
     if entry.flag == 0 {
         // v3: version(1) | wrapped(32) | nonce(12) | ct(32) | tag(16) = 93.
@@ -188,7 +190,9 @@ fn aead_open(algo: u8, key: &[u8; 32], nonce: &[u8], ct_tag: &[u8]) -> Result<Ve
         ALGO_CHACHA20 => Err(Error::Parse(
             "Chrome ABE ChaCha20-Poly1305 (algo 4 / v2) not yet supported".into(),
         )),
-        other => Err(Error::Parse(format!("Chrome ABE unknown AEAD algo {other}"))),
+        other => Err(Error::Parse(format!(
+            "Chrome ABE unknown AEAD algo {other}"
+        ))),
     }
 }
 
@@ -505,7 +509,10 @@ mod tests {
         cipher.extend_from_slice(&ct_tag);
         assert_eq!(cipher.len(), 61);
         let blob = build_aes_encrypted_key(0x01, b"C:\\Chrome", &cipher);
-        assert_eq!(decrypt_aes_encrypted_key(&blob, &map, &[]).unwrap(), v20_key);
+        assert_eq!(
+            decrypt_aes_encrypted_key(&blob, &map, &[]).unwrap(),
+            v20_key
+        );
     }
 
     /// Build a synthetic flag=0 "v3" cipher for arbitrary ksp/static/v20 keys, so

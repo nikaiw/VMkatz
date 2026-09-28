@@ -103,9 +103,24 @@ impl BrowserKeyMap {
     pub fn fallback() -> Self {
         Self {
             entries: vec![
-                AbeKey { version: 1, flag: 1, algo: 2, key: CHROME_135_V1 },
-                AbeKey { version: 2, flag: 1, algo: 4, key: CHROME_135_V2 },
-                AbeKey { version: 3, flag: 0, algo: 2, key: CHROME_135_V3 },
+                AbeKey {
+                    version: 1,
+                    flag: 1,
+                    algo: 2,
+                    key: CHROME_135_V1,
+                },
+                AbeKey {
+                    version: 2,
+                    flag: 1,
+                    algo: 4,
+                    key: CHROME_135_V2,
+                },
+                AbeKey {
+                    version: 3,
+                    flag: 0,
+                    algo: 2,
+                    key: CHROME_135_V3,
+                },
             ],
             fallback: true,
             cng_ksp_files: Vec::new(),
@@ -375,7 +390,12 @@ mod tests {
 
     #[test]
     fn merge_first_wins() {
-        let mk = |v: u8, k: u8| AbeKey { version: v, flag: 1, algo: 2, key: [k; 32] };
+        let mk = |v: u8, k: u8| AbeKey {
+            version: v,
+            flag: 1,
+            algo: 2,
+            key: [k; 32],
+        };
         let mut a = BrowserKeyMap {
             entries: vec![mk(1, 0x11)],
             fallback: false,

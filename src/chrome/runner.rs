@@ -71,17 +71,20 @@ pub fn run_disk_with_passwords(
     extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles(disk_path)?;
-    let (user_kr, system_kr) =
-        match build_keyrings_from_disk_with_passwords(disk_path, extra_passwords, extra_nt_hashes) {
-            Ok(p) => p,
-            Err(e) => {
-                log::info!("[chrome] disk-only keyrings unavailable: {e}");
-                return Ok(DiscoverySummary {
-                    profiles,
-                    findings: ChromeFindings::default(),
-                });
-            }
-        };
+    let (user_kr, system_kr) = match build_keyrings_from_disk_with_passwords(
+        disk_path,
+        extra_passwords,
+        extra_nt_hashes,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            log::info!("[chrome] disk-only keyrings unavailable: {e}");
+            return Ok(DiscoverySummary {
+                profiles,
+                findings: ChromeFindings::default(),
+            });
+        }
+    };
     log::info!(
         "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
         user_kr.len(),
@@ -573,11 +576,9 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                     // source that covers them.
                     for (h_sid, nt_hash) in extra_nt_hashes {
                         if h_sid == sid {
-                            if let Ok(k) =
-                                crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
-                                    file_bytes, nt_hash, sid,
-                                )
-                            {
+                            if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                                file_bytes, nt_hash, sid,
+                            ) {
                                 return Some(k);
                             }
                         }

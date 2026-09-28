@@ -1078,7 +1078,11 @@ impl VmrsLayer {
                 break;
             }
         }
-        if inner.block_cache.insert(block_index, block.clone()).is_none() {
+        if inner
+            .block_cache
+            .insert(block_index, block.clone())
+            .is_none()
+        {
             inner.cache_order.push_back(block_index);
         }
 

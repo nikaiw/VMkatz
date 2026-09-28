@@ -28,7 +28,6 @@
 //! disambiguate its deep bootkey path. No kernel struct offsets or page tables are
 //! required for any of this.
 
-
 use std::collections::HashMap;
 
 use crate::memory::PhysicalMemory;
@@ -147,7 +146,9 @@ fn scan_chunk(
     // Control\Lsa NK cells (name "Lsa", 0x4C bytes past the "nk" header) with a
     // sane subkey count and a subkey list (excludes leaf "Lsa" keys).
     for p in finder.find_iter(buf) {
-        let Some(j) = p.checked_sub(0x4C) else { continue };
+        let Some(j) = p.checked_sub(0x4C) else {
+            continue;
+        };
         if j + 0x80 > n
             || &buf[j..j + 2] != b"nk"
             || u16::from_le_bytes([buf[j + 0x48], buf[j + 0x49]]) != 3
@@ -171,7 +172,8 @@ fn scan_chunk(
                 let length = u64::from(u32::from_le_bytes(
                     buf[off + 0x28..off + 0x2c].try_into().unwrap(),
                 ));
-                if off + 0x30 + 64 <= n && (BASE_BLOCK..=MAX_HIVE).contains(&(length + BASE_BLOCK)) {
+                if off + 0x30 + 64 <= n && (BASE_BLOCK..=MAX_HIVE).contains(&(length + BASE_BLOCK))
+                {
                     let name: String = buf[off + 0x30..off + 0x30 + 64]
                         .chunks(2)
                         .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
@@ -190,9 +192,12 @@ fn scan_chunk(
                 }
             }
             b"hbin" => {
-                let file_offset =
-                    u64::from(u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()));
-                let size = u64::from(u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()));
+                let file_offset = u64::from(u32::from_le_bytes(
+                    buf[off + 4..off + 8].try_into().unwrap(),
+                ));
+                let size = u64::from(u32::from_le_bytes(
+                    buf[off + 8..off + 12].try_into().unwrap(),
+                ));
                 if (PAGE..=MAX_BIN).contains(&size)
                     && size.is_multiple_of(PAGE)
                     && file_offset.is_multiple_of(PAGE)
@@ -222,10 +227,7 @@ fn build_runs(mut bins: Vec<Hbin>) -> Vec<Run> {
         let mut end_gpa = start.gpa + start.size;
         let mut end_off = start.file_offset + start.size;
         let mut j = i + 1;
-        while j < bins.len()
-            && bins[j].gpa == end_gpa
-            && bins[j].file_offset == end_off
-        {
+        while j < bins.len() && bins[j].gpa == end_gpa && bins[j].file_offset == end_off {
             end_gpa += bins[j].size;
             end_off += bins[j].size;
             j += 1;
@@ -303,7 +305,11 @@ fn place_cell(
         let Ok(cell) = phys.read_phys_bytes(addr, abs as usize) else {
             continue;
         };
-        if !want.is_empty() && !want.iter().any(|w| cell.len() >= 4 + w.len() && &cell[4..4 + w.len()] == *w) {
+        if !want.is_empty()
+            && !want
+                .iter()
+                .any(|w| cell.len() >= 4 + w.len() && &cell[4..4 + w.len()] == *w)
+        {
             continue;
         }
         let dist = run.start_gpa.abs_diff(anchor);
@@ -534,9 +540,11 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
     // snapshots); only the freshest complete copy holds every SAM user, so the
     // highest-scoring reassembly — not the first that parses — is kept.
     let sam_roots = root_candidates(phys, &runs, &locs, "SAM", "SAM");
-    if let Some((buf, n)) = best_reassembly(phys, &runs, &sam_roots, hive_total(&locs, "SAM"), |b| {
-        extract_hashes(b, &bk).map_or(0, |h| h.len())
-    }) {
+    if let Some((buf, n)) =
+        best_reassembly(phys, &runs, &sam_roots, hive_total(&locs, "SAM"), |b| {
+            extract_hashes(b, &bk).map_or(0, |h| h.len())
+        })
+    {
         if let Ok(h) = extract_hashes(&buf, &bk) {
             log::info!("mem_hive: extracted {} SAM account(s) (score {n})", h.len());
             creds.sam_hashes = h;
@@ -546,9 +554,13 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
     // cells across stale copies decrypts every secret with a wrong LSA key (garbage).
     // The score + final gate reject that rather than emit mojibake (see below).
     let sec_roots = root_candidates(phys, &runs, &locs, "SECURITY", "Policy");
-    if let Some((buf, _)) = best_reassembly(phys, &runs, &sec_roots, hive_total(&locs, "SECURITY"), |b| {
-        lsa_reassembly_score(&extract_lsa_secrets(b, &bk).unwrap_or_default())
-    }) {
+    if let Some((buf, _)) = best_reassembly(
+        phys,
+        &runs,
+        &sec_roots,
+        hive_total(&locs, "SECURITY"),
+        |b| lsa_reassembly_score(&extract_lsa_secrets(b, &bk).unwrap_or_default()),
+    ) {
         if let Ok(s) = extract_lsa_secrets(&buf, &bk) {
             if lsa_secrets_verified(&s) {
                 log::info!("mem_hive: extracted {} LSA secret(s)", s.len());
@@ -571,8 +583,7 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
 fn dpapi_system_valid(secrets: &[LsaSecret]) -> Option<bool> {
     secrets.iter().find_map(|s| match &s.parsed {
         LsaSecretType::DpapiSystem { .. } => Some(
-            s.raw_data.len() == 44
-                && u32::from_le_bytes(s.raw_data[0..4].try_into().unwrap()) == 1,
+            s.raw_data.len() == 44 && u32::from_le_bytes(s.raw_data[0..4].try_into().unwrap()) == 1,
         ),
         _ => None,
     })
@@ -646,9 +657,12 @@ fn root_has_child(phys: &impl PhysicalMemory, runs: &RunIndex, root: &[u8], name
             continue;
         }
         for (coff, _) in subkey_list_entries(phys, runs, &list, 0) {
-            if cells_with_gpa(phys, runs, u64::from(coff)).iter().any(|(c, _)| {
-                c.len() >= 0x50 && &c[0..2] == b"nk" && nk_name(c).eq_ignore_ascii_case(name)
-            }) {
+            if cells_with_gpa(phys, runs, u64::from(coff))
+                .iter()
+                .any(|(c, _)| {
+                    c.len() >= 0x50 && &c[0..2] == b"nk" && nk_name(c).eq_ignore_ascii_case(name)
+                })
+            {
                 return true;
             }
         }
@@ -668,7 +682,6 @@ fn hive_total(locs: &[HiveLoc], hive: &str) -> usize {
         .max(0x2_0000);
     (BASE_BLOCK + len) as usize
 }
-
 
 /// Reassemble the hive from each candidate root and return the buffer with the
 /// highest `score` (0 = unusable).
@@ -911,12 +924,7 @@ fn child_by_name(
 /// The class-name hex bytes of an NK cell, choosing the class cell physically
 /// nearest `anchor` that decodes as hex (the Lsa `JD`/`Skew1`/`GBG`/`Data` keys
 /// carry bootkey nibbles as their class name).
-fn class_hex(
-    phys: &impl PhysicalMemory,
-    ix: &RunIndex,
-    nk: &[u8],
-    anchor: u64,
-) -> Option<Vec<u8>> {
+fn class_hex(phys: &impl PhysicalMemory, ix: &RunIndex, nk: &[u8], anchor: u64) -> Option<Vec<u8>> {
     let class_off = u32_at(nk, 0x30);
     let class_len = u16_at(nk, 0x4A) as usize;
     if class_off == 0xFFFF_FFFF || class_len == 0 {

@@ -2396,7 +2396,10 @@ fn run_carve<L: PhysicalMemory>(
 ))]
 fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> bool {
     let c = get_colors(args);
-    eprintln!("{}[*] Carving registry hives from physical memory...{}", c.cyan, c.reset);
+    eprintln!(
+        "{}[*] Carving registry hives from physical memory...{}",
+        c.cyan, c.reset
+    );
     let creds = vmkatz::sam::mem_hive::extract_from_memory(layer);
     print_registry_creds(&creds, args)
 }
@@ -2411,7 +2414,12 @@ fn print_registry_creds(creds: &vmkatz::sam::mem_hive::MemoryHiveCreds, args: &A
     if creds.sam_hashes.is_empty() && creds.lsa_secrets.is_empty() {
         return false;
     }
-    eprintln!("{}[+] Bootkey: {}{}", c.green, hex::encode(bootkey), c.reset);
+    eprintln!(
+        "{}[+] Bootkey: {}{}",
+        c.green,
+        hex::encode(bootkey),
+        c.reset
+    );
 
     match args.format.as_str() {
         "ntlm" => print_sam_ntlm(&creds.sam_hashes),
@@ -2846,8 +2854,12 @@ fn run_with_system<L: PhysicalMemory>(
 
             if let Some(disk_str) = args.disk.as_deref() {
                 let disk_path = std::path::Path::new(disk_str);
-                match run_chrome_hybrid(disk_path, &mem_keyring, &chrome_passwords, &chrome_nt_hashes)
-                {
+                match run_chrome_hybrid(
+                    disk_path,
+                    &mem_keyring,
+                    &chrome_passwords,
+                    &chrome_nt_hashes,
+                ) {
                     Ok(mut summary) => {
                         merge_findings(&mut summary.findings, mem_findings);
                         let out =
