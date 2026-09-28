@@ -2412,10 +2412,23 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     // pipeline. `--no-mem-registry` skips it.
     #[cfg(feature = "sam")]
     if !args.no_mem_registry {
-        if run_mem_registry(&layer, args) {
+        let found = run_mem_registry(&layer, args);
+        // When --chrome is requested the browser-secret decrypt runs later, in the
+        // LSASS pipeline (run_with_system), and needs the DPAPI masterkey cache from
+        // LSASS. A successful registry carve must NOT short-circuit that path, or the
+        // hybrid chrome flow silently never runs unless the user passes
+        // --no-mem-registry. Only treat the carve as the whole result when chrome
+        // wasn't asked for.
+        #[cfg(feature = "chrome")]
+        let keep_going_for_chrome = args.chrome;
+        #[cfg(not(feature = "chrome"))]
+        let keep_going_for_chrome = false;
+        if found && !keep_going_for_chrome {
             return Ok(());
         }
-        eprintln!("[*] Registry carve found nothing usable — trying the LSASS cache");
+        if !found {
+            eprintln!("[*] Registry carve found nothing usable — trying the LSASS cache");
+        }
     }
 
     // -- Phase 1: Direct L1 scan for System process --
