@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use crate::memory::PhysicalMemory;
 use crate::sam::SamEntry;
 use crate::sam::hashes::extract_hashes;
-use crate::sam::lsa::{LsaSecret, extract_lsa_secrets};
+use crate::sam::lsa::{LsaSecret, LsaSecretType, extract_lsa_secrets};
 
 const PAGE: u64 = 0x1000;
 const BASE_BLOCK: u64 = 0x1000;
@@ -528,16 +528,61 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
             creds.sam_hashes = h;
         }
     }
+    // SECURITY: score reassemblies by LSA-secret CORRECTNESS, not just count.
+    // Several stale/partial SECURITY copies share the bin pool; a reassembly that
+    // mixes cells across copies decrypts every secret with a wrong LSA key, yielding
+    // the right-length-but-garbage output that used to be printed as mojibake.
+    // `lsa_reassembly_score` rejects those (DPAPI_SYSTEM is a shared-key anchor), and
+    // the final gate drops the result rather than emit garbage when no copy verifies
+    // (e.g. a partial memory dump that doesn't contain a consistent SECURITY hive).
     let sec_roots = root_candidates(phys, &runs, &locs, "SECURITY", "Policy");
     if let Some((buf, _)) = best_reassembly(phys, &runs, &sec_roots, hive_total(&locs, "SECURITY"), |b| {
-        extract_lsa_secrets(b, &bk).map_or(0, |v| v.len())
+        lsa_reassembly_score(&extract_lsa_secrets(b, &bk).unwrap_or_default())
     }) {
         if let Ok(s) = extract_lsa_secrets(&buf, &bk) {
-            log::info!("mem_hive: extracted {} LSA secret(s)", s.len());
-            creds.lsa_secrets = s;
+            if lsa_secrets_verified(&s) {
+                log::info!("mem_hive: extracted {} LSA secret(s)", s.len());
+                creds.lsa_secrets = s;
+            } else {
+                log::info!(
+                    "mem_hive: SECURITY reassembly failed the DPAPI_SYSTEM validity check \
+                     (stale/partial copy) — not reporting garbage LSA secrets"
+                );
+            }
         }
     }
     creds
+}
+
+/// DPAPI_SYSTEM always decrypts to 44 bytes whose first dword (version) is 1. All
+/// LSA secrets share one LSA key, so a wrong key (from a mixed/stale SECURITY
+/// reassembly) corrupts DPAPI_SYSTEM too — making it a reliable correctness anchor.
+/// Returns `None` when no DPAPI_SYSTEM secret is present (can't judge).
+fn dpapi_system_valid(secrets: &[LsaSecret]) -> Option<bool> {
+    secrets.iter().find_map(|s| match &s.parsed {
+        LsaSecretType::DpapiSystem { .. } => Some(
+            s.raw_data.len() == 44
+                && u32::from_le_bytes(s.raw_data[0..4].try_into().unwrap()) == 1,
+        ),
+        _ => None,
+    })
+}
+
+/// Score a SECURITY reassembly by LSA-secret correctness. A DPAPI_SYSTEM that
+/// fails the version check means the LSA key is wrong → reject (score 0). A valid
+/// DPAPI_SYSTEM strongly outranks a copy without one.
+fn lsa_reassembly_score(secrets: &[LsaSecret]) -> usize {
+    match dpapi_system_valid(secrets) {
+        Some(false) => 0,
+        Some(true) => 1000 + secrets.len(),
+        None => secrets.len(),
+    }
+}
+
+/// Accept a SECURITY reassembly's secrets only if it has some and its DPAPI_SYSTEM
+/// (when present) verifies — i.e. never surface garbage decrypted with a wrong key.
+fn lsa_secrets_verified(secrets: &[LsaSecret]) -> bool {
+    !secrets.is_empty() && dpapi_system_valid(secrets) != Some(false)
 }
 
 /// The root NK cells of every base block matching `hive`, as (root offset, root
@@ -923,5 +968,59 @@ fn hive_key(name: &str) -> &'static str {
         "SAM" => "SAM",
         "SECURITY" => "SECURITY",
         _ => "SYSTEM",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dpapi_secret(version: u32) -> LsaSecret {
+        let mut raw = vec![0u8; 44];
+        raw[0..4].copy_from_slice(&version.to_le_bytes());
+        LsaSecret {
+            name: "DPAPI_SYSTEM".into(),
+            raw_data: raw,
+            parsed: LsaSecretType::DpapiSystem {
+                user_key: [0u8; 20],
+                machine_key: [0u8; 20],
+            },
+        }
+    }
+
+    fn text_secret(name: &str) -> LsaSecret {
+        LsaSecret {
+            name: name.into(),
+            raw_data: b"whatever".to_vec(),
+            parsed: LsaSecretType::DefaultPassword {
+                password: "x".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn valid_dpapi_system_is_accepted_and_outranks() {
+        let good = vec![dpapi_secret(1), text_secret("DefaultPassword")];
+        assert_eq!(dpapi_system_valid(&good), Some(true));
+        assert!(lsa_secrets_verified(&good));
+        assert!(lsa_reassembly_score(&good) >= 1000);
+    }
+
+    #[test]
+    fn wrong_lsa_key_dpapi_system_is_rejected() {
+        // A wrong LSA key corrupts DPAPI_SYSTEM's version dword → reject the whole
+        // reassembly, so mojibake secrets are never surfaced.
+        let garbage = vec![dpapi_secret(0x8ab21f9c), text_secret("_SC_thing")];
+        assert_eq!(dpapi_system_valid(&garbage), Some(false));
+        assert!(!lsa_secrets_verified(&garbage));
+        assert_eq!(lsa_reassembly_score(&garbage), 0);
+    }
+
+    #[test]
+    fn no_dpapi_system_keeps_count_based_behavior() {
+        let secrets = vec![text_secret("DefaultPassword")];
+        assert_eq!(dpapi_system_valid(&secrets), None);
+        assert!(lsa_secrets_verified(&secrets));
+        assert_eq!(lsa_reassembly_score(&secrets), 1);
     }
 }
