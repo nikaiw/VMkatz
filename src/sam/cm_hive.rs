@@ -82,17 +82,21 @@ pub fn extract_from_cm_map<L: PhysicalMemory>(layer: &L, dtb: u64) -> MemoryHive
         return creds;
     };
     creds.bootkey = Some(bk);
-    if let Some(sam) = hives.get("SAM") {
-        if let Ok(h) = extract_hashes(sam, &bk) {
+    match hives.get("SAM").map(|sam| extract_hashes(sam, &bk)) {
+        Some(Ok(h)) => {
             log::info!("cm_hive: extracted {} SAM account(s) via CM map", h.len());
             creds.sam_hashes = h;
         }
+        Some(Err(e)) => log::info!("cm_hive: SAM parse failed: {e}"),
+        None => log::info!("cm_hive: no SAM hive found via CM map"),
     }
-    if let Some(sec) = hives.get("SECURITY") {
-        if let Ok(s) = extract_lsa_secrets(sec, &bk) {
+    match hives.get("SECURITY").map(|sec| extract_lsa_secrets(sec, &bk)) {
+        Some(Ok(s)) => {
             log::info!("cm_hive: extracted {} LSA secret(s) via CM map", s.len());
             creds.lsa_secrets = s;
         }
+        Some(Err(e)) => log::info!("cm_hive: SECURITY parse failed: {e}"),
+        None => log::info!("cm_hive: no SECURITY hive found via CM map"),
     }
     creds
 }
@@ -150,7 +154,12 @@ fn materialize<L: PhysicalMemory>(
         return None;
     }
 
-    let layout = calibrate(rv, &hh, length)?;
+    let Some(layout) = calibrate(rv, &hh, length) else {
+        // The _HHIVE (and base block) are resident but no bin resolves to "hbin",
+        // i.e. this hive's bin views are paged out of the image — nothing to map.
+        log::info!("cm_hive: {base} present but its bins are not resident — skipping");
+        return None;
+    };
     let mut img = vec![0u8; BASE_BLOCK + length];
     img[..BASE_BLOCK].copy_from_slice(&base_block);
     let mut off = 0usize;
@@ -162,32 +171,38 @@ fn materialize<L: PhysicalMemory>(
         }
         off += 0x1000;
     }
-    log::debug!(
-        "cm_hive: {base}: {filled}/{} blocks via CM map (len {length:#x})",
-        length / 0x1000
+    log::info!(
+        "cm_hive: {base}: mapped {filled}/{} blocks (len {length:#x})",
+        length.div_ceil(0x1000)
     );
     Some((base, img))
 }
 
-/// Find the `Storage[Stable]` map layout by validating that hive offset 0 resolves
-/// to a page starting with "hbin". Tries each u32 field equal to the hive length as
-/// `Length` (so `Map` is the following qword) and each plausible entry stride.
+/// Find the `Storage[Stable]` map layout by validating that a hive block resolves
+/// to a bin ("hbin"). Tries each u32 field equal to the hive length as `Length` (so
+/// `Map` is the following qword) and each plausible entry stride. Because the first
+/// block may be paged out, it checks the first several 4 KB offsets and accepts the
+/// layout if any resolves to "hbin" (each bin starts with that magic).
 fn calibrate(
     rv: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     hh: &[u8],
     length: usize,
 ) -> Option<MapLayout> {
-    for o in (0x40..hh.len().saturating_sub(0x10)).step_by(4) {
-        if u32at(hh, o) as usize != length {
-            continue;
-        }
-        let map_va = u64at(hh, o + 8); // _DUAL: Length @ +0, Map @ +8
+    let probes = (length / 0x1000).min(64);
+    // Every 8-aligned kernel-VA pointer in the _HHIVE is a candidate `Map`
+    // (_HMAP_DIRECTORY). Keying on `Length` is fragile (Storage.Length can differ
+    // from the base-block length), so validate structurally instead: a real Map's
+    // dir[0] -> table -> entry -> bin chain resolves some early offset to "hbin".
+    for o in (0x40..hh.len().saturating_sub(8)).step_by(8) {
+        let map_va = u64at(hh, o);
         if !is_kernel_va(map_va) {
             continue;
         }
         for stride in [0x18u64, 0x10, 0x20] {
             let layout = MapLayout { map_va, stride };
-            if read_block(rv, &layout, 0).is_some_and(|b| &b[0..4] == b"hbin") {
+            if (0..=probes).any(|i| {
+                read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
+            }) {
                 return Some(layout);
             }
         }
