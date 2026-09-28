@@ -148,13 +148,23 @@ fn derive_keys<R: MasterkeyResolver, S: MasterkeyResolver>(
     Some(ProfileKeys { v10, v20 })
 }
 
+/// Shortest possible encrypted value: a 3-byte scheme prefix, a 12-byte GCM
+/// nonce and a 16-byte GCM tag (with empty plaintext). Anything shorter that
+/// merely starts with `v10`/`v11`/`v20` is a false positive, such as a
+/// `username_value` of "v20user".
+const MIN_CHROME_BLOB_LEN: usize = 3 + 12 + 16;
+
 /// SQLite type affinity can land a v10/v11/v20 blob in a TEXT column. Treat both
-/// when scanning row columns for the encrypted value.
+/// when scanning row columns for the encrypted value. Gate on a minimum length so
+/// a plaintext field that happens to begin with a scheme prefix (a username like
+/// "v20user", a URL, etc.) isn't mistaken for the encrypted column — otherwise
+/// `find_map` would grab it before the real `password_value`.
 fn is_chrome_blob(b: &[u8]) -> bool {
-    matches!(
-        classify(b),
-        BlobScheme::V10 | BlobScheme::V11 | BlobScheme::V20
-    )
+    b.len() >= MIN_CHROME_BLOB_LEN
+        && matches!(
+            classify(b),
+            BlobScheme::V10 | BlobScheme::V11 | BlobScheme::V20
+        )
 }
 
 /// Try v10/v11 then v20 against `blob`; return plaintext + which scheme produced it
@@ -414,5 +424,22 @@ mod tests {
         kr.insert("guid1".into(), vec![1, 2, 3]);
         assert_eq!(kr.resolve("guid1"), Some(vec![1, 2, 3]));
         assert_eq!(kr.resolve("guid2"), None);
+    }
+
+    #[test]
+    fn is_chrome_blob_rejects_short_prefix_collisions() {
+        // A username_value that merely starts with a scheme prefix must not be
+        // mistaken for the encrypted column (regression: Edge v20 password not
+        // decrypted because `find_map` grabbed the "v20user" username first).
+        assert!(!is_chrome_blob(b"v20user"));
+        assert!(!is_chrome_blob(b"v10"));
+        assert!(!is_chrome_blob(b"v11abc"));
+        // A full-length v20 blob (prefix + 12-byte nonce + >=16-byte tag) passes.
+        let mut blob = b"v20".to_vec();
+        blob.extend_from_slice(&[0u8; MIN_CHROME_BLOB_LEN - 3]);
+        assert!(is_chrome_blob(&blob));
+        // Non-matching prefix is still rejected regardless of length.
+        let junk = vec![0x41u8; 64];
+        assert!(!is_chrome_blob(&junk));
     }
 }
