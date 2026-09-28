@@ -1,5 +1,6 @@
 pub mod bootkey;
 pub mod cache;
+pub mod cm_hive;
 mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;

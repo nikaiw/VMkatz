@@ -2398,7 +2398,13 @@ fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> bool {
     let c = get_colors(args);
     eprintln!("{}[*] Carving registry hives from physical memory...{}", c.cyan, c.reset);
     let creds = vmkatz::sam::mem_hive::extract_from_memory(layer);
+    print_registry_creds(&creds, args)
+}
 
+/// Print bootkey + SAM hashes + LSA secrets recovered from a memory image (by the
+/// signature carve or the CM hive-map walk). Returns true if anything was printed.
+fn print_registry_creds(creds: &vmkatz::sam::mem_hive::MemoryHiveCreds, args: &Args) -> bool {
+    let c = get_colors(args);
     let Some(bootkey) = creds.bootkey else {
         return false;
     };
@@ -2665,6 +2671,23 @@ fn run_with_system<L: PhysicalMemory>(
                 p.pid, p.dtb, p.peb_vaddr, p.name
             );
         }
+    }
+
+    // Registry recovery via the Configuration Manager hive-map. Authoritative where
+    // the page-table-free signature carve fails (hives fragmented to scattered pages
+    // whose offsets collide across hives). The hive bins are mapped in the Registry
+    // minimal process (Win10 1803+), so translate with its DTB; kernel VAs for the
+    // map structures resolve in any DTB. Runs when we reach here (i.e. the signature
+    // carve in run_with_layer already fell through, or was skipped).
+    #[cfg(feature = "sam")]
+    if !args.no_mem_registry && !args.list_processes {
+        let reg_dtb = processes
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("Registry"))
+            .map_or(system.dtb, |p| p.dtb);
+        eprintln!("[*] Recovering registry hives via CM hive-map...");
+        let creds = vmkatz::sam::cm_hive::extract_from_cm_map(layer, reg_dtb);
+        print_registry_creds(&creds, args);
     }
 
     if args.list_processes {
