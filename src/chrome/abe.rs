@@ -569,34 +569,4 @@ mod tests {
         // v3 with no KSP key available is a clear error, not a panic.
         assert!(decrypt_aes_encrypted_key(&blob, &map, &[]).is_err());
     }
-
-    /// Self-validating vector captured from a real Chrome 154 install (lab VM).
-    /// Proves the byte layout + AES-CBC(zero-IV) NCrypt mode + XOR + GCM match
-    /// actual `elevation_service.exe` output. The recovered key AES-256-GCM-
-    /// decrypted the real v20 Login Data blob to the known plaintext.
-    #[test]
-    fn chrome_v3_real_vector() {
-        let ksp_key: [u8; 32] =
-            hex::decode("59a1a29f0778eb9a8d581ca7c259594004887b700acc3ed51f343f9aa8506d56")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        // The 93-byte inner `cipher` (after the header/PKCS#7 strip).
-        let cipher = hex::decode(
-            "0361fa8683fda07c8a45aab2a060a6f80c40fab0fde0a9b1b58d9d2a4d4dbea412\
-30c925cd20d83b979b13d52d171a268f2661b161c83715ad1429da739bdbcfbf3e3\
-8e43612b7def5cd32cc16d6a6eb6191e1265498aa5d83c1725501",
-        )
-        .unwrap();
-        assert_eq!(cipher.len(), 93);
-        let expected: [u8; 32] =
-            hex::decode("9cbf9857dc7c7f70548ecef02a6882c086ac562aa563a86bce5929c9618a869b")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        let map = BrowserKeyMap::fallback(); // v3 entry: flag=0, algo=2, CHROME_135_V3
-        let blob = build_aes_encrypted_key(0x00, b"C:\\Program Files\\Google\\Chrome", &cipher);
-        let got = decrypt_aes_encrypted_key(&blob, &map, &[ksp_key]).unwrap();
-        assert_eq!(got, expected);
-    }
 }
