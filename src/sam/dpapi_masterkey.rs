@@ -666,7 +666,7 @@ pub fn extract_masterkey_hashes_from_partition<R: Read + Seek>(
 ) -> Vec<DpapiMasterKeyHash> {
     let mut results = Vec::new();
 
-    let mut part_reader = super::ntfs_reader::PartitionReader::new(reader, partition_offset);
+    let mut part_reader = crate::fs::PartitionReader::new(reader, partition_offset);
 
     let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
         Ok(n) => n,
@@ -695,14 +695,12 @@ pub fn extract_masterkey_hashes_from_partition<R: Read + Seek>(
     );
 
     // Find Users directory
-    let Ok(users_dir) = super::ntfs_reader::find_entry(&ntfs, &root, &mut part_reader, "Users")
-    else {
+    let Ok(users_dir) = crate::fs::find_entry(&ntfs, &root, &mut part_reader, "Users") else {
         return results;
     };
 
     // Scan each user profile: Users\{user}\AppData\Roaming\Microsoft\Protect
-    let Ok(user_entries) = super::ntfs_reader::list_directory(&ntfs, &users_dir, &mut part_reader)
-    else {
+    let Ok(user_entries) = crate::fs::list_directory(&ntfs, &users_dir, &mut part_reader) else {
         return results;
     };
 
@@ -742,12 +740,11 @@ fn scan_protect_dir<'n, R: Read + Seek>(
     username: &str,
     results: &mut Vec<DpapiMasterKeyHash>,
 ) {
-    let Ok(protect_dir) = super::ntfs_reader::navigate_to_dir(ntfs, base_dir, reader, protect_path)
-    else {
+    let Ok(protect_dir) = crate::fs::navigate_to_dir(ntfs, base_dir, reader, protect_path) else {
         return;
     };
 
-    let Ok(sid_entries) = super::ntfs_reader::list_directory(ntfs, &protect_dir, reader) else {
+    let Ok(sid_entries) = crate::fs::list_directory(ntfs, &protect_dir, reader) else {
         return;
     };
 
@@ -756,12 +753,11 @@ fn scan_protect_dir<'n, R: Read + Seek>(
             continue;
         }
 
-        let Ok(sid_dir) = super::ntfs_reader::find_entry(ntfs, &protect_dir, reader, sid_name)
-        else {
+        let Ok(sid_dir) = crate::fs::find_entry(ntfs, &protect_dir, reader, sid_name) else {
             continue;
         };
 
-        let Ok(mk_entries) = super::ntfs_reader::list_directory(ntfs, &sid_dir, reader) else {
+        let Ok(mk_entries) = crate::fs::list_directory(ntfs, &sid_dir, reader) else {
             continue;
         };
 
@@ -770,12 +766,11 @@ fn scan_protect_dir<'n, R: Read + Seek>(
                 continue;
             }
 
-            let Ok(mk_file) = super::ntfs_reader::find_entry(ntfs, &sid_dir, reader, mk_name)
-            else {
+            let Ok(mk_file) = crate::fs::find_entry(ntfs, &sid_dir, reader, mk_name) else {
                 continue;
             };
 
-            let Ok(mk_data) = super::ntfs_reader::read_file_data(&mk_file, reader) else {
+            let Ok(mk_data) = crate::fs::read_file_data(&mk_file, reader) else {
                 continue;
             };
 

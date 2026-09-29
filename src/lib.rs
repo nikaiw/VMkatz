@@ -6,6 +6,7 @@ pub mod disk;
 #[cfg(feature = "dump")]
 pub mod dump;
 pub mod error;
+pub mod fs;
 #[cfg(feature = "hyperv")]
 pub mod hyperv;
 pub mod lsass;

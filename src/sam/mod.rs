@@ -8,7 +8,6 @@ pub mod lsa;
 pub mod mem_hive;
 mod ntfs_fallback;
 mod ntfs_reader;
-mod partition;
 mod vmdk_scan;
 
 pub mod aes_xts;
@@ -16,10 +15,10 @@ pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
 // Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
-pub use ntfs_reader::{PartitionReader, find_entry, read_file_data};
+pub use crate::fs::{PartitionReader, find_entry, read_file_data};
+pub use crate::fs::{find_ntfs_partitions, is_bitlocker_partition};
 #[cfg(feature = "chrome")]
-pub use ntfs_reader::{list_directory, navigate_to_dir};
-pub use partition::{find_ntfs_partitions, is_bitlocker_partition};
+pub use crate::fs::{list_directory, navigate_to_dir};
 
 use std::io::{Read, Seek};
 use std::path::Path;
