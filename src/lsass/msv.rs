@@ -2101,7 +2101,8 @@ fn extract_primary_credential(
         let lm_off = offsets.lm_hash;
         let sha1_off = offsets.sha1_hash;
 
-        if decrypted.len() >= sha1_off + 20 {
+        let need = (nt_off + 16).max(lm_off + 16).max(sha1_off + 20);
+        if decrypted.len() >= need {
             let mut nt_hash = [0u8; 16];
             let mut lm_hash = [0u8; 16];
             let mut sha1_hash = [0u8; 20];
@@ -2147,7 +2148,10 @@ fn extract_primary_credential(
         let lm_off = offsets.lm_hash;
         let sha1_off = offsets.sha1_hash;
 
-        if decrypted.len() < sha1_off + 20 {
+        // Gate on the largest field end — sha1 is not always the last (variant 4
+        // has sha1 before nt/lm), so `sha1_off + 20` alone can under-check.
+        let need = (nt_off + 16).max(lm_off + 16).max(sha1_off + 20);
+        if decrypted.len() < need {
             continue;
         }
 

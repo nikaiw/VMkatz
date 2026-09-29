@@ -1165,7 +1165,7 @@ fn validate_primary_decryption(decrypted: &[u8]) -> bool {
         let nt_off = offsets.nt_hash;
         let sha1_off = offsets.sha1_hash;
 
-        if decrypted.len() < sha1_off + 20 {
+        if decrypted.len() < (nt_off + 16).max(sha1_off + 20) {
             continue;
         }
 
@@ -1466,7 +1466,7 @@ fn extract_hashes_from_decrypted(decrypted: &[u8]) -> Option<MsvCredential> {
         let lm_off = offsets.lm_hash;
         let sha1_off = offsets.sha1_hash;
 
-        if decrypted.len() < sha1_off + 20 {
+        if decrypted.len() < (nt_off + 16).max(lm_off + 16).max(sha1_off + 20) {
             continue;
         }
 
@@ -1532,3 +1532,21 @@ fn carve_dpapi_entries(
 }
 
 use crate::utils::sha1_digest as sha1_hash;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: variant 4's sha1 offset is < its nt/lm offsets, so gating on
+    // `sha1_off + 20` alone copied nt/lm out of bounds (guaranteed panic at
+    // certain lengths). No decrypted length may panic. Non-zero fill so the
+    // copies actually execute (past the all-zero NT-hash skip).
+    #[test]
+    fn primary_cred_extract_never_oob() {
+        for len in 0..=256usize {
+            let buf = vec![0xABu8; len];
+            let _ = extract_hashes_from_decrypted(&buf);
+            let _ = validate_primary_decryption(&buf);
+        }
+    }
+}
