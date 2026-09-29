@@ -15,7 +15,6 @@ pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
 use crate::fs::{find_ntfs_partitions, is_bitlocker_partition};
-#[cfg(feature = "chrome")]
 use std::io::{Read, Seek};
 use std::path::Path;
 
