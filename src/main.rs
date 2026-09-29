@@ -2463,8 +2463,12 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     // page tables or process list, works under Credential Guard). When it recovers
     // credentials that is the whole result; otherwise fall through to the LSASS
     // pipeline. `--no-mem-registry` skips it.
+    // `true` when the signature carve already recovered creds — the later CM
+    // hive-map pass (in run_with_system) is then redundant and gets skipped.
     #[cfg(feature = "sam")]
-    if !args.no_mem_registry {
+    let mem_registry_carved = if args.no_mem_registry {
+        false
+    } else {
         let found = run_mem_registry(&layer, args);
         // With --chrome, the browser decrypt runs later in the LSASS pipeline, so a
         // successful carve must not short-circuit it (else the hybrid flow needs
@@ -2479,7 +2483,10 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
         if !found {
             eprintln!("[*] Registry carve found nothing usable — trying the LSASS cache");
         }
-    }
+        found
+    };
+    #[cfg(not(feature = "sam"))]
+    let mem_registry_carved = false;
 
     // -- Phase 1: Direct L1 scan for System process --
     let t_system = std::time::Instant::now();
@@ -2494,6 +2501,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                 verbose,
                 pagefile,
                 disk_path,
+                mem_registry_carved,
             )
         }
         #[cfg(feature = "carve")]
@@ -2594,6 +2602,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                             verbose,
                             pagefile,
                             disk_path,
+                            mem_registry_carved,
                         );
                     }
                     Err(e) => {
@@ -2653,6 +2662,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     feature = "qemu",
     feature = "hyperv"
 ))]
+#[cfg_attr(not(feature = "sam"), allow(unused_variables))]
 fn run_with_system<L: PhysicalMemory>(
     layer: &L,
     system: &vmkatz::windows::process::Process,
@@ -2661,6 +2671,7 @@ fn run_with_system<L: PhysicalMemory>(
     verbose: bool,
     pagefile: PagefileRef<'_>,
     disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
+    mem_registry_carved: bool,
 ) -> anyhow::Result<()> {
     // Enumerate all processes
     let t_enum = std::time::Instant::now();
@@ -2680,9 +2691,10 @@ fn run_with_system<L: PhysicalMemory>(
 
     // Registry recovery via the CM hive-map — resolves hives the signature carve
     // can't (fragmented to scattered pages). Bins are mapped in the Registry process
-    // (Win10 1803+), so translate with its DTB. Runs after the carve fell through.
+    // (Win10 1803+), so translate with its DTB. Skipped when the carve already
+    // succeeded, since it is an extra (partly sequential) full-memory pass.
     #[cfg(feature = "sam")]
-    if !args.no_mem_registry && !args.list_processes {
+    if !args.no_mem_registry && !args.list_processes && !mem_registry_carved {
         let reg_dtb = processes
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case("Registry"))
