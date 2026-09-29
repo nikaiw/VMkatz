@@ -512,25 +512,26 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
         // (user-context for SYSTEM, pre-key = DPAPI_SYSTEM.machine_key — confusing
         // but verified empirically on Win10).
         if let Some((user_key, machine_key)) = &dpapi_system {
-            decrypt_mks_in_protect(
+            let mut sys_items = Vec::new();
+            collect_mks_in_protect(
                 &ntfs,
                 &root,
                 &mut part_reader,
                 "Windows\\System32\\Microsoft\\Protect",
-                |sid, sub, file_bytes| {
-                    if sid != "S-1-5-18" {
-                        return None;
-                    }
-                    let pre_key = if sub.is_empty() {
-                        user_key
-                    } else {
-                        machine_key
-                    };
-                    crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
-                },
-                &mut system_kr,
-                "system",
+                &mut sys_items,
             );
+            let sys_fn = |sid: &str, sub: &str, file_bytes: &[u8]| {
+                if sid != "S-1-5-18" {
+                    return None;
+                }
+                let pre_key = if sub.is_empty() {
+                    user_key
+                } else {
+                    machine_key
+                };
+                crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
+            };
+            decrypt_collected(&sys_items, &sys_fn, &mut system_kr, "system");
         }
 
         // User masterkeys: Users\<user>\AppData\Roaming\Microsoft\Protect\<SID>\<guid>
@@ -542,6 +543,9 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
             continue;
         };
 
+        // Collect every user's MK files first (sequential I/O), then decrypt the
+        // whole set in parallel — each MK is independent, thousands of HMAC rounds.
+        let mut user_items = Vec::new();
         for (user_name, is_dir) in user_entries {
             if !is_dir {
                 continue;
@@ -554,57 +558,56 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                 continue;
             }
             let protect_path = format!("{user_name}\\AppData\\Roaming\\Microsoft\\Protect");
-
-            decrypt_mks_in_protect(
+            collect_mks_in_protect(
                 &ntfs,
                 &users_dir,
                 &mut part_reader,
                 &protect_path,
-                |sid, _sub, file_bytes| {
-                    // NT-hash paths first — one derivation each, and they cover the
-                    // usual success cases. The plaintext-password sweep is tried last
-                    // because it is the costliest (per candidate: multiple MK
-                    // derivations) and rarely holds the MK owner's password.
-                    //
-                    // Any hash supplied for this exact SID — MSV NT hashes from LSASS
-                    // memory or `--chrome-nthash`. A domain user's NT hash is not in
-                    // the local SAM, so this is the only source that covers them.
-                    for (h_sid, nt_hash) in extra_nt_hashes {
-                        if h_sid == sid {
-                            if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
-                                file_bytes, nt_hash, sid,
-                            ) {
-                                return Some(k);
-                            }
-                        }
-                    }
-                    // Local-SAM NT hash matched by RID.
-                    if let Some(nt_hash) = sid
-                        .rsplit('-')
-                        .next()
-                        .and_then(|r| r.parse::<u32>().ok())
-                        .and_then(|rid| nt_hash_by_rid.get(&rid))
-                    {
-                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
-                            file_bytes, nt_hash, sid,
-                        ) {
-                            return Some(k);
-                        }
-                    }
-                    // Last resort: every plaintext password from LSA / `--chrome-password`.
-                    for pw in &password_candidates {
-                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
-                            file_bytes, pw, sid,
-                        ) {
-                            return Some(k);
-                        }
-                    }
-                    None
-                },
-                &mut user_kr,
-                &user_name,
+                &mut user_items,
             );
         }
+        let user_fn = |sid: &str, _sub: &str, file_bytes: &[u8]| {
+            // NT-hash paths first — one derivation each, and they cover the usual
+            // success cases. The plaintext-password sweep is tried last because it
+            // is the costliest (per candidate: multiple MK derivations) and rarely
+            // holds the MK owner's password.
+            //
+            // Any hash supplied for this exact SID — MSV NT hashes from LSASS memory
+            // or `--chrome-nthash`. A domain user's NT hash is not in the local SAM,
+            // so this is the only source that covers them.
+            for (h_sid, nt_hash) in extra_nt_hashes {
+                if h_sid == sid {
+                    if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                        file_bytes, nt_hash, sid,
+                    ) {
+                        return Some(k);
+                    }
+                }
+            }
+            // Local-SAM NT hash matched by RID.
+            if let Some(nt_hash) = sid
+                .rsplit('-')
+                .next()
+                .and_then(|r| r.parse::<u32>().ok())
+                .and_then(|rid| nt_hash_by_rid.get(&rid))
+            {
+                if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                    file_bytes, nt_hash, sid,
+                ) {
+                    return Some(k);
+                }
+            }
+            // Last resort: every plaintext password from LSA / `--chrome-password`.
+            for pw in &password_candidates {
+                if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
+                    file_bytes, pw, sid,
+                ) {
+                    return Some(k);
+                }
+            }
+            None
+        };
+        decrypt_collected(&user_items, &user_fn, &mut user_kr, "user");
 
         // First partition that yielded any MKs wins; stop scanning.
         if !user_kr.is_empty() || !system_kr.is_empty() {
@@ -615,20 +618,21 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     (user_kr, system_kr)
 }
 
-/// Walk `Protect\<SID>\<GUID>` under `base_dir`. For each MK file, call
-/// `decrypt_fn(sid, bytes)`; on success, insert the cleartext key into `out`
-/// under its file-name GUID. Failures log at info level and continue.
-fn decrypt_mks_in_protect<'n, R, F>(
+/// One collected masterkey file: `(sid, sub, guid_name, file_bytes)`.
+/// `sub` is `""` or `"User"` (the SYSTEM user-context subdir).
+type CollectedMk = (String, String, String, Vec<u8>);
+
+/// Walk `Protect\<SID>\<GUID>` under `base_dir`, appending each MK file to
+/// `out`. Pure I/O (the NTFS reader is not `Sync`); the CPU-bound decryption
+/// runs separately in [`decrypt_collected`].
+fn collect_mks_in_protect<'n, R>(
     ntfs: &'n ntfs::Ntfs,
     base_dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
     protect_path: &str,
-    mut decrypt_fn: F,
-    out: &mut HybridKeyring,
-    label: &str,
+    out: &mut Vec<CollectedMk>,
 ) where
     R: std::io::Read + std::io::Seek,
-    F: FnMut(&str, &str, &[u8]) -> Option<Vec<u8>>,
 {
     let Ok(protect_dir) = crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) else {
         return;
@@ -646,9 +650,9 @@ fn decrypt_mks_in_protect<'n, R, F>(
         let Ok(mk_entries) = crate::sam::list_directory(ntfs, &sid_dir, reader) else {
             continue;
         };
-        // Collect MK files in this SID dir AND in its optional `User\` subdir.
-        // The `User\` subdir under S-1-5-18 holds user-context MKs used by SYSTEM
-        // processes — Chrome's elevation_service.exe wraps the v20 key with one.
+        // MK files in this SID dir AND in its optional `User\` subdir. The `User\`
+        // subdir under S-1-5-18 holds user-context MKs used by SYSTEM processes —
+        // Chrome's elevation_service.exe wraps the v20 key with one.
         let mut mks_to_try: Vec<(String, String)> = Vec::new();
         for (name, is_dir) in &mk_entries {
             if !is_dir && is_mk_guid(name) {
@@ -682,36 +686,56 @@ fn decrypt_mks_in_protect<'n, R, F>(
             let Ok(mk_data) = crate::sam::read_file_data(&mk_file, reader) else {
                 continue;
             };
-            match decrypt_fn(&sid, &sub, &mk_data) {
-                Some(clear) => {
-                    log::info!(
-                        "[chrome] decrypted {} MK: SID={}{} GUID={}",
-                        label,
-                        sid,
-                        if sub.is_empty() {
-                            String::new()
-                        } else {
-                            format!("/{sub}")
-                        },
-                        mk_name
-                    );
-                    out.insert(mk_name.to_lowercase(), clear);
-                }
-                None => {
-                    log::info!(
-                        "[chrome] MK decrypt failed: ctx={} SID={}{} GUID={}",
-                        label,
-                        sid,
-                        if sub.is_empty() {
-                            String::new()
-                        } else {
-                            format!("/{sub}")
-                        },
-                        mk_name
-                    );
-                }
-            }
+            out.push((sid.clone(), sub, mk_name, mk_data));
         }
+    }
+}
+
+/// Decrypt collected MK files in parallel. Each MK is independent CPU work
+/// (several thousand-round HMAC derivations per candidate), so the set is split
+/// across the available cores. Successes are inserted into `out` keyed by
+/// lowercase GUID; `decrypt_fn` must be pure and `Sync`.
+fn decrypt_collected<F>(items: &[CollectedMk], decrypt_fn: &F, out: &mut HybridKeyring, label: &str)
+where
+    F: Fn(&str, &str, &[u8]) -> Option<Vec<u8>> + Sync,
+{
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if items.is_empty() {
+        return;
+    }
+    let counter = AtomicUsize::new(0);
+    let found: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+    let nthreads = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(items.len());
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| {
+                loop {
+                    let idx = counter.fetch_add(1, Ordering::Relaxed);
+                    let Some((sid, sub, name, bytes)) = items.get(idx) else {
+                        break;
+                    };
+                    let ctx = if sub.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{sub}")
+                    };
+                    if let Some(clear) = decrypt_fn(sid, sub, bytes) {
+                        log::info!("[chrome] decrypted {label} MK: SID={sid}{ctx} GUID={name}");
+                        found.lock().unwrap().push((name.to_lowercase(), clear));
+                    } else {
+                        log::info!(
+                            "[chrome] MK decrypt failed: ctx={label} SID={sid}{ctx} GUID={name}"
+                        );
+                    }
+                }
+            });
+        }
+    });
+    for (guid, clear) in found.into_inner().unwrap() {
+        out.insert(guid, clear);
     }
 }
 
@@ -799,8 +823,34 @@ pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::disk::MasterkeyResolver;
     use crate::chrome::profile::ProfileArtifacts;
     use crate::chrome::types::{Browser, BrowserProfile};
+
+    // The parallel MK decrypt must process every item exactly once (no drops from
+    // the work-stealing) and key results by lowercase GUID.
+    #[test]
+    fn decrypt_collected_processes_all_items() {
+        let items: Vec<CollectedMk> = (0u8..200)
+            .map(|i| {
+                (
+                    format!("S-1-5-21-{i}"),
+                    String::new(),
+                    format!("guid-{i:03}"),
+                    vec![i],
+                )
+            })
+            .collect();
+        // Succeeds only for even payloads, returning the byte as the "key".
+        let f = |_sid: &str, _sub: &str, bytes: &[u8]| (bytes[0] % 2 == 0).then(|| vec![bytes[0]]);
+        let mut kr = HybridKeyring::new();
+        decrypt_collected(&items, &f, &mut kr, "test");
+        assert_eq!(kr.len(), 100);
+        for i in (0u8..200).step_by(2) {
+            assert_eq!(kr.resolve(&format!("guid-{i:03}")), Some(vec![i]));
+        }
+        assert_eq!(kr.resolve("guid-001"), None);
+    }
 
     fn fake_profile(user: &str, browser: Browser) -> DiscoveredProfile {
         DiscoveredProfile {
