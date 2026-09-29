@@ -561,19 +561,14 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                 &mut part_reader,
                 &protect_path,
                 |sid, _sub, file_bytes| {
-                    // Try every plaintext password from LSA (Win10+ local user chain).
-                    for pw in &password_candidates {
-                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
-                            file_bytes, pw, sid,
-                        ) {
-                            return Some(k);
-                        }
-                    }
-                    // NT-hash chain (works for DOMAIN users). First try any hash
-                    // supplied for this exact SID — e.g. MSV NT hashes recovered
-                    // from LSASS memory, or `--chrome-nthash`. A domain user's NT
-                    // hash is NOT in the local SAM, so this is the only NT-hash
-                    // source that covers them.
+                    // NT-hash paths first — one derivation each, and they cover the
+                    // usual success cases. The plaintext-password sweep is tried last
+                    // because it is the costliest (per candidate: multiple MK
+                    // derivations) and rarely holds the MK owner's password.
+                    //
+                    // Any hash supplied for this exact SID — MSV NT hashes from LSASS
+                    // memory or `--chrome-nthash`. A domain user's NT hash is not in
+                    // the local SAM, so this is the only source that covers them.
                     for (h_sid, nt_hash) in extra_nt_hashes {
                         if h_sid == sid {
                             if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
@@ -583,13 +578,28 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                             }
                         }
                     }
-                    // Fallback: local-SAM NT hash matched by RID.
-                    let rid: u32 = sid.rsplit('-').next()?.parse().ok()?;
-                    let nt_hash = nt_hash_by_rid.get(&rid)?;
-                    crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
-                        file_bytes, nt_hash, sid,
-                    )
-                    .ok()
+                    // Local-SAM NT hash matched by RID.
+                    if let Some(nt_hash) = sid
+                        .rsplit('-')
+                        .next()
+                        .and_then(|r| r.parse::<u32>().ok())
+                        .and_then(|rid| nt_hash_by_rid.get(&rid))
+                    {
+                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                            file_bytes, nt_hash, sid,
+                        ) {
+                            return Some(k);
+                        }
+                    }
+                    // Last resort: every plaintext password from LSA / `--chrome-password`.
+                    for pw in &password_candidates {
+                        if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
+                            file_bytes, pw, sid,
+                        ) {
+                            return Some(k);
+                        }
+                    }
+                    None
                 },
                 &mut user_kr,
                 &user_name,

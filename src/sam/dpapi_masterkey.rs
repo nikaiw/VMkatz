@@ -497,6 +497,12 @@ fn verify_mk_hmac_sha1(pre_key: &[u8], salt: &[u8], mk: &[u8], stored: &[u8]) ->
     h2.finalize().into_bytes().as_slice() == stored
 }
 
+/// True when the MK file has a domain-key section — the only case where the
+/// costly PBKDF2 domain pre-key is worth trying (local files never use it).
+fn is_domain_context(file_bytes: &[u8]) -> bool {
+    parse_header(file_bytes).is_ok_and(|h| h.domainkey_len > 0)
+}
+
 /// Decrypt a user DPAPI masterkey file (local-account, mode 15900 or 15300).
 ///
 /// `nt_hash` is the user's 16-byte NT hash from SAM.
@@ -511,13 +517,18 @@ pub fn decrypt_local_user_masterkey(
     if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &pre_key) {
         return Ok(mk);
     }
-    // Fall back to the modern domain PBKDF2 derivation.
-    let pk2 = user_domain_prekey_pbkdf2(nt_hash, sid)?;
-    decrypt_masterkey_with_prekey(file_bytes, &pk2)
+    // Modern domain PBKDF2 derivation — skip on local files (avoids 10k rounds).
+    if is_domain_context(file_bytes) {
+        let pk2 = user_domain_prekey_pbkdf2(nt_hash, sid)?;
+        return decrypt_masterkey_with_prekey(file_bytes, &pk2);
+    }
+    Err(VmkatzError::DecryptionError(
+        "masterkey decrypt failed".into(),
+    ))
 }
 
 /// Decrypt a user DPAPI masterkey file from a known password. Tries the local
-/// SHA1 pre-key, then the legacy NTLM and PBKDF2 domain pre-keys.
+/// SHA1 pre-key, then the legacy NTLM and (domain files only) PBKDF2 pre-keys.
 pub fn decrypt_local_user_masterkey_pw(
     file_bytes: &[u8],
     password: &str,
@@ -531,8 +542,13 @@ pub fn decrypt_local_user_masterkey_pw(
     if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &user_local_prekey(&nt_hash, sid)?) {
         return Ok(mk);
     }
-    let pk2 = user_domain_prekey_pbkdf2(&nt_hash, sid)?;
-    decrypt_masterkey_with_prekey(file_bytes, &pk2)
+    if is_domain_context(file_bytes) {
+        let pk2 = user_domain_prekey_pbkdf2(&nt_hash, sid)?;
+        return decrypt_masterkey_with_prekey(file_bytes, &pk2);
+    }
+    Err(VmkatzError::DecryptionError(
+        "masterkey decrypt failed".into(),
+    ))
 }
 
 /// Decrypt a SYSTEM DPAPI masterkey file (S-1-5-18) using the LSA
@@ -862,7 +878,7 @@ mod tests {
         cleartext.extend_from_slice(&mk_bytes);
 
         let cipher = tdes_cbc_encrypt(des3_key, &iv, &cleartext);
-        let file = build_mk_file(
+        let mut file = build_mk_file(
             2,
             "aaaabbbb-cccc-dddd-eeee-ffff00001177",
             2,
@@ -872,6 +888,8 @@ mod tests {
             CALG_3DES,
             &cipher,
         );
+        // Mark domain-context (domainkey_len at 0x78 > 0) so the PBKDF2 path runs.
+        file[0x78..0x80].copy_from_slice(&64u64.to_le_bytes());
         (file, mk_bytes)
     }
 
