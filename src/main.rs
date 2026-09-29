@@ -1103,6 +1103,16 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     use vmkatz::disk::DiskImage;
 
     let password = args.veeam_password.as_deref();
+
+    // Encrypted backup with no password: we can't reconstruct anything, but we
+    // can emit the password-wrapped keyset as a Hashcat target (mode 31200) for
+    // offline cracking. With --veeam-password we fall through to extraction.
+    if password.is_none()
+        && vmkatz::veeam::inspect_encryption(input_path).is_ok_and(|e| e.encrypted)
+    {
+        return emit_veeam_hashcat(input_path);
+    }
+
     let disks = vmkatz::veeam::list_disk_images(input_path, password)
         .context("failed to enumerate Veeam disk images")?;
     if disks.is_empty() {
@@ -1147,6 +1157,32 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     if !found_anything {
         anyhow::bail!("No SAM hashes or DPAPI master keys found in Veeam backup");
     }
+    Ok(())
+}
+
+/// Print the encrypted backup's password-wrapped keyset(s) as Hashcat mode-31200
+/// targets (`$vbk$*salt*iterations*verifier`). Crack, then re-run with
+/// `--veeam-password` to extract credentials.
+#[cfg(feature = "veeam")]
+fn emit_veeam_hashcat(input_path: &Path) -> anyhow::Result<()> {
+    let hashes = vmkatz::veeam::hashcat_hashes(input_path).with_context(|| {
+        format!(
+            "{} is encrypted but no Hashcat target could be built",
+            input_path.display()
+        )
+    })?;
+    eprintln!(
+        "[+] Encrypted Veeam backup — {} Hashcat target(s), mode {}:",
+        hashes.len(),
+        vmkatz::veeam::HASHCAT_VEEAM_VBK_MODE
+    );
+    for h in &hashes {
+        println!("{h}");
+    }
+    eprintln!(
+        "[*] Crack with: hashcat -m {} <hash> <wordlist>, then re-run with --veeam-password",
+        vmkatz::veeam::HASHCAT_VEEAM_VBK_MODE
+    );
     Ok(())
 }
 
