@@ -2232,17 +2232,16 @@ fn is_block_dev(path: &Path) -> bool {
     }
 }
 
-/// Format detection for LSASS memory snapshot files.
+/// Format detection for LSASS memory snapshot files. Guarded to the layer
+/// features that construct its variants; all are live under the default and
+/// `--all-features` builds. (A rare `--features <single-layer>` build may leave
+/// one variant unconstructed — a benign warning, not carried by CI.)
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
     feature = "qemu",
     feature = "hyperv"
 ))]
-// Variants are gated by different features (vmware/vbox/qemu/hyperv); some are
-// unconstructed under a given feature combo. A per-variant cfg matrix would be
-// brittle here (e.g. QemuElf is built unconditionally), so we allow at enum level.
-#[allow(dead_code)]
 enum LsassFormat {
     VBox,
     QemuElf,
