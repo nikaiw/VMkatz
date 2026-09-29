@@ -321,6 +321,12 @@ pub fn decrypt_masterkey_with_prekey(file_bytes: &[u8], pre_key: &[u8]) -> Resul
     let mk = extract_mk_section(file_bytes).ok_or_else(|| {
         VmkatzError::DecryptionError("malformed or unsupported DPAPI MK file".into())
     })?;
+    decrypt_mk_section(&mk, pre_key)
+}
+
+/// Derive + verify against an already-parsed MK section, so callers can parse the
+/// file once and try several pre-keys without re-parsing on each attempt.
+fn decrypt_mk_section(mk: &MasterKeyDecryptInput, pre_key: &[u8]) -> Result<Vec<u8>> {
     if mk.ciphertext.len() < 64 {
         return Err(VmkatzError::DecryptionError(
             "MK ciphertext shorter than 64 bytes".into(),
@@ -335,7 +341,7 @@ pub fn decrypt_masterkey_with_prekey(file_bytes: &[u8], pre_key: &[u8]) -> Resul
             let derived = dpapi_derive_key_sha512(pre_key, &mk.salt, 48, mk.rounds);
             let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
             let iv: [u8; 16] = derived[32..48].try_into().unwrap();
-            if mk.ciphertext.len() % 16 != 0 {
+            if !mk.ciphertext.len().is_multiple_of(16) {
                 return Err(VmkatzError::DecryptionError(
                     "AES MK ciphertext not block-aligned".into(),
                 ));
@@ -354,7 +360,7 @@ pub fn decrypt_masterkey_with_prekey(file_bytes: &[u8], pre_key: &[u8]) -> Resul
             let derived = dpapi_derive_key_sha1(pre_key, &mk.salt, 32, mk.rounds);
             let des3_key = &derived[..24];
             let iv = &derived[24..32];
-            if mk.ciphertext.len() % 8 != 0 {
+            if !mk.ciphertext.len().is_multiple_of(8) {
                 return Err(VmkatzError::DecryptionError(
                     "3DES MK ciphertext not block-aligned".into(),
                 ));
@@ -513,14 +519,17 @@ pub fn decrypt_local_user_masterkey(
     nt_hash: &[u8; 16],
     sid: &str,
 ) -> Result<Vec<u8>> {
+    let mk = extract_mk_section(file_bytes).ok_or_else(|| {
+        VmkatzError::DecryptionError("malformed or unsupported DPAPI MK file".into())
+    })?;
     let pre_key = user_local_prekey(nt_hash, sid)?;
-    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &pre_key) {
-        return Ok(mk);
+    if let Ok(clear) = decrypt_mk_section(&mk, &pre_key) {
+        return Ok(clear);
     }
     // Modern domain PBKDF2 derivation — skip on local files (avoids 10k rounds).
     if is_domain_context(file_bytes) {
         let pk2 = user_domain_prekey_pbkdf2(nt_hash, sid)?;
-        return decrypt_masterkey_with_prekey(file_bytes, &pk2);
+        return decrypt_mk_section(&mk, &pk2);
     }
     Err(VmkatzError::DecryptionError(
         "masterkey decrypt failed".into(),
@@ -534,17 +543,19 @@ pub fn decrypt_local_user_masterkey_pw(
     password: &str,
     sid: &str,
 ) -> Result<Vec<u8>> {
-    let pre_key = user_local_prekey_pw(password, sid)?;
-    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &pre_key) {
-        return Ok(mk);
+    let mk = extract_mk_section(file_bytes).ok_or_else(|| {
+        VmkatzError::DecryptionError("malformed or unsupported DPAPI MK file".into())
+    })?;
+    if let Ok(clear) = decrypt_mk_section(&mk, &user_local_prekey_pw(password, sid)?) {
+        return Ok(clear);
     }
     let nt_hash = ntlm_hash(password);
-    if let Ok(mk) = decrypt_masterkey_with_prekey(file_bytes, &user_local_prekey(&nt_hash, sid)?) {
-        return Ok(mk);
+    if let Ok(clear) = decrypt_mk_section(&mk, &user_local_prekey(&nt_hash, sid)?) {
+        return Ok(clear);
     }
     if is_domain_context(file_bytes) {
         let pk2 = user_domain_prekey_pbkdf2(&nt_hash, sid)?;
-        return decrypt_masterkey_with_prekey(file_bytes, &pk2);
+        return decrypt_mk_section(&mk, &pk2);
     }
     Err(VmkatzError::DecryptionError(
         "masterkey decrypt failed".into(),
