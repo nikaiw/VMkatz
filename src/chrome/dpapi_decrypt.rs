@@ -96,7 +96,7 @@ pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
     let mk_guid_str = crate::utils::format_guid(&mk_guid);
     let flags = read_u32(bytes, &mut cur)?;
     let desc_len = read_len(bytes, &mut cur, MAX_DESC, "description")?;
-    let description = utf16le(take(bytes, &mut cur, desc_len)?);
+    let description = crate::utils::utf16le_decode(take(bytes, &mut cur, desc_len)?);
     let crypt_alg = read_u32(bytes, &mut cur)?;
     let _crypt_alg_len = read_u32(bytes, &mut cur)?;
     let salt_len = read_len(bytes, &mut cur, MAX_SALT, "salt")?;
@@ -124,16 +124,6 @@ pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
         cipher_text,
         sign,
     })
-}
-
-fn utf16le(b: &[u8]) -> String {
-    let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
-        .trim_end_matches('\0')
-        .to_string()
 }
 
 /// Decrypt a DPAPI blob using a cleartext masterkey (typically 64 bytes).

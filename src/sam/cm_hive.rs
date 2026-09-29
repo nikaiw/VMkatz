@@ -33,13 +33,6 @@ fn u64at(b: &[u8], o: usize) -> u64 {
 fn is_kernel_va(v: u64) -> bool {
     (0xFFFF_8000_0000_0000..u64::MAX).contains(&v)
 }
-fn utf16(b: &[u8]) -> String {
-    b.chunks(2)
-        .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
-        .take_while(|&u| u != 0)
-        .filter_map(|u| char::from_u32(u32::from(u)))
-        .collect()
-}
 
 /// How an `_HMAP_ENTRY` encodes its 4 KB block address (self-calibrated).
 #[derive(Clone, Copy)]
@@ -157,7 +150,7 @@ fn materialize<L: PhysicalMemory>(
         .filter(|&va| is_kernel_va(va))
         .find_map(|va| rv(va, BASE_BLOCK).filter(|b| &b[0..4] == b"regf"))?;
     let length = u32at(&base_block, 0x28) as usize;
-    let name = utf16(&base_block[0x30..0x70]);
+    let name = crate::utils::utf16le_decode(&base_block[0x30..0x70]);
     let base = name
         .rsplit(['\\', '/'])
         .next()

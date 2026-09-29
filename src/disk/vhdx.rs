@@ -344,13 +344,13 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
         let key_abs = abs_offset + u64::from(kv.key_offset);
         file.seek(SeekFrom::Start(key_abs))?;
         let key_buf = super::read_exact_alloc(file, u64::from(kv.key_length))?;
-        let key = utf16le_to_string(&key_buf);
+        let key = crate::utils::utf16le_decode(&key_buf);
 
         // Read value (UTF-16LE)
         let val_abs = abs_offset + u64::from(kv.value_offset);
         file.seek(SeekFrom::Start(val_abs))?;
         let val_buf = super::read_exact_alloc(file, u64::from(kv.value_length))?;
-        let value = utf16le_to_string(&val_buf);
+        let value = crate::utils::utf16le_decode(&val_buf);
 
         match key.as_str() {
             "relative_path" => relative_path = Some(value),
@@ -361,11 +361,6 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
 
     // Prefer relative path for portability
     Ok(relative_path.or(absolute_path))
-}
-
-/// Convert UTF-16LE bytes to a String, stripping null terminator.
-fn utf16le_to_string(data: &[u8]) -> String {
-    crate::utils::utf16le_decode(data)
 }
 
 /// Resolve a parent path (possibly Windows-style) relative to the child VHDX.

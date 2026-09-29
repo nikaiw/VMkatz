@@ -106,7 +106,7 @@ pub trait VirtualMemory {
     /// Read a null-terminated UTF-16LE string.
     fn read_unicode_string(&self, addr: u64, max_len: usize) -> Result<String> {
         let data = self.read_virt_bytes(addr, max_len)?;
-        Ok(utf16le_to_string(&data))
+        Ok(crate::utils::utf16le_decode(&data))
     }
 
     /// Read a Windows UNICODE_STRING structure (Length u16, MaxLength u16, padding, Buffer ptr).
@@ -129,7 +129,7 @@ pub trait VirtualMemory {
             return Ok(String::new());
         }
         let data = self.read_virt_bytes(buffer_ptr, length)?;
-        Ok(utf16le_to_string(&data))
+        Ok(crate::utils::utf16le_decode(&data))
     }
 
     /// Read a 32-bit Windows UNICODE_STRING structure (Length u16, MaxLength u16, Buffer u32).
@@ -149,7 +149,7 @@ pub trait VirtualMemory {
             return Ok(String::new());
         }
         let data = self.read_virt_bytes(buffer_ptr, length)?;
-        Ok(utf16le_to_string(&data))
+        Ok(crate::utils::utf16le_decode(&data))
     }
 
     /// Read a UTF-16LE string given a buffer address and byte length directly.
@@ -158,11 +158,6 @@ pub trait VirtualMemory {
             return Ok(String::new());
         }
         let data = self.read_virt_bytes(buffer_ptr, byte_len)?;
-        Ok(utf16le_to_string(&data))
+        Ok(crate::utils::utf16le_decode(&data))
     }
-}
-
-/// Decode UTF-16LE bytes to String (shared impl in `crate::utils`).
-fn utf16le_to_string(data: &[u8]) -> String {
-    crate::utils::utf16le_decode(data)
 }
