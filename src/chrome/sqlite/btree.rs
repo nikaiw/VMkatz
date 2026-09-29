@@ -172,7 +172,11 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
         if next_ptr_end > page.len() {
             return Err(Error::Parse("overflow ptr truncated".into()));
         }
-        let mut buf = Vec::with_capacity(payload_size_us);
+        // A hostile cell can encode a huge payload_size; the actual bytes are
+        // bounded by the overflow chain (max_hops below). Cap the eager
+        // reservation to the input size — the Vec still grows if truly needed.
+        let cap = payload_size_us.min(pager.bytes.len().saturating_add(1));
+        let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(&page[payload_off..local_end]);
 
         let mut next = u32::from_be_bytes(page[local_end..next_ptr_end].try_into().unwrap());

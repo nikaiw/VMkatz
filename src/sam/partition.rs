@@ -96,7 +96,9 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     }
 
     let entry_lba = crate::utils::read_u64_le(&hdr, 0x48).unwrap_or(0);
-    let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0);
+    // Standard GPTs reserve 128 entries; cap at 4096 so a forged count can't spin
+    // the per-entry seek/read loop ~4e9 times.
+    let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0).min(4096);
     let entry_size = crate::utils::read_u32_le(&hdr, 0x54).unwrap_or(0);
 
     // GPT spec: entry_size is typically 128 bytes; reject invalid values

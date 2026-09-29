@@ -208,8 +208,11 @@ impl VmwareLayer {
 
         log::info!("Memory regions: {regions_count}");
 
-        // Cap allocation: regions_count comes from tag data and could be forged
-        let mut regions = Vec::with_capacity((regions_count as usize).min(4096));
+        // regions_count comes from tag data and could be forged; a real snapshot
+        // has a handful of regions. Cap the loop (not just the capacity) at 4096
+        // so a huge count can't spin ~4e9 iterations of linear tag scans.
+        let regions_count = regions_count.min(4096);
+        let mut regions = Vec::with_capacity(regions_count as usize);
         for i in 0..regions_count {
             let vmem_page = tags::find_tag(&all_tags, "regionPageNum", &[i]).map_or(0, |t| {
                 let off = t.data_offset;

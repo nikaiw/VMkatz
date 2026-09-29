@@ -163,7 +163,8 @@ fn scan_chunk(
     }
 
     let mut off = 0usize;
-    while off + 0x20 <= n {
+    // Need through the length field at off+0x28..0x2c below.
+    while off + 0x2c <= n {
         let gpa = base_gpa + off as u64;
         match &buf[off..off + 4] {
             b"regf" => {

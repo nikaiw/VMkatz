@@ -180,6 +180,11 @@ impl FileBackedResolver {
             if raw_size == 0 || raw_offset == 0 || virt_size == 0 {
                 continue;
             }
+            // VirtualSize is only file-bounded via raw_size; cap the padded
+            // allocation at 256 MiB so a crafted PE section can't request ~4 GB.
+            if virt_size > 256 * 1024 * 1024 {
+                continue;
+            }
             if raw_offset.saturating_add(raw_size) > pe_data.len() {
                 continue;
             }

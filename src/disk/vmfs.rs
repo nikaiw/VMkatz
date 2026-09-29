@@ -307,6 +307,15 @@ impl VmfsSuperblock {
         let ptr_block_shift = u16::from_le_bytes(buf[0x13E..0x140].try_into().unwrap());
         let sfb_addr_bits = u16::from_le_bytes(buf[0x140..0x142].try_into().unwrap());
 
+        // These sizing fields drive metadata allocations (fd_size, sub-block
+        // reads). Reject absurd values (real ones are a few KB) so a crafted
+        // superblock can't force a multi-GB allocation. Cap: 16 MiB.
+        if md_alignment > 16 * 1024 * 1024 || sub_block_size > 16 * 1024 * 1024 {
+            return Err(VmkatzError::DiskFormatError(format!(
+                "VMFS superblock metadata size out of range: mdAlign=0x{md_alignment:x} subBlock=0x{sub_block_size:x}"
+            )));
+        }
+
         log::info!(
             "{} '{}': blockSize=0x{:x}, mdAlign=0x{:x}, subBlockSize=0x{:x}",
             if is_vmfs6 { "VMFS-6" } else { "VMFS-5" },

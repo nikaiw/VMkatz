@@ -532,8 +532,14 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
     let num_gtes_per_gt = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap()); // numGTEsPerGT
     let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap()); // gdOffset (sectors)
 
-    // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt)
-    if grain_size == 0 || grain_size > MAX_GRAIN_SECTORS || num_gtes_per_gt == 0 {
+    // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt).
+    // Cap num_gtes_per_gt (standard is 512, so 1<<16 is generous) so the per-GT
+    // allocation (num_gtes*4) can't be driven to gigabytes by a crafted header.
+    if grain_size == 0
+        || grain_size > MAX_GRAIN_SECTORS
+        || num_gtes_per_gt == 0
+        || num_gtes_per_gt > (1 << 16)
+    {
         return Err(VmkatzError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Invalid VMDK header: grain_size={grain_size}, numGTEsPerGT={num_gtes_per_gt}"),

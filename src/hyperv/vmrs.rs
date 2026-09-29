@@ -993,12 +993,24 @@ impl VmrsLayer {
         Some(gpa - self.mmio_gap_size)
     }
 
-    /// Read bytes from the file at a given offset.
+    /// Read bytes from the file at a given offset. Bounded: the buffer grows only
+    /// as far as the file actually provides, so a bogus huge `size` from a header
+    /// field can't force a giant eager allocation.
     fn read_file_bytes(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
         let mut inner = self.inner.borrow_mut();
         inner.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; size];
-        inner.file.read_exact(&mut buf)?;
+        let mut buf = Vec::new();
+        inner
+            .file
+            .by_ref()
+            .take(size as u64)
+            .read_to_end(&mut buf)?;
+        if buf.len() != size {
+            return Err(VmkatzError::DiskFormatError(format!(
+                "VMRS read past end: wanted {size} bytes at {offset:#x}, got {}",
+                buf.len()
+            )));
+        }
         Ok(buf)
     }
 
