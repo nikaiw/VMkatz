@@ -244,6 +244,12 @@ struct Args {
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
     no_mem_registry: bool,
+
+    /// Password for an encrypted Veeam backup (VBK/VIB/VRB). Not needed for
+    /// unencrypted backups.
+    #[cfg(feature = "veeam")]
+    #[arg(long, value_name = "PASSWORD")]
+    veeam_password: Option<String>,
 }
 
 impl Args {
@@ -538,6 +544,15 @@ fn vmkatz_main() -> anyhow::Result<()> {
              vmkatz snapshot.vmsn            (VM memory snapshot)\n  \
              vmkatz disk.vmdk               (virtual disk image)"
         );
+    }
+
+    // Veeam backup containers: enumerate stored disk images and run the disk
+    // credential pipeline on each (before SAM auto-detect, which can't open them).
+    #[cfg(feature = "veeam")]
+    {
+        if vmkatz::veeam::is_veeam_path(input_path) {
+            return run_veeam(input_path, &args);
+        }
     }
 
     // Auto-detect SAM mode for disk images / block devices, or explicit --sam flag
@@ -1078,6 +1093,144 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Run the disk credential pipeline over every disk image stored in a Veeam
+/// backup. Each image is read on demand (reconstructed per block), so nothing is
+/// materialized to a temp file.
+#[cfg(feature = "veeam")]
+fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
+    use vmkatz::disk::DiskImage;
+
+    let password = args.veeam_password.as_deref();
+    let disks = vmkatz::veeam::list_disk_images(input_path, password)
+        .context("failed to enumerate Veeam disk images")?;
+    if disks.is_empty() {
+        anyhow::bail!(
+            "No bootable disk images in Veeam backup {} (encrypted? try --veeam-password)",
+            input_path.display()
+        );
+    }
+
+    let c = get_colors(args);
+    eprintln!(
+        "[+] Veeam backup: {} disk image(s) in {}",
+        disks.len(),
+        input_path.display()
+    );
+
+    let mut found_anything = false;
+    for entry in &disks {
+        let size_note = entry
+            .size
+            .map(|s| format!(" ({:.1} MiB)", s as f64 / (1024.0 * 1024.0)))
+            .unwrap_or_default();
+        eprintln!(
+            "\n{}=== disk image: {}{}{}",
+            c.green, entry.name, size_note, c.reset
+        );
+
+        let mut disk = match vmkatz::veeam::VbkDisk::open(input_path, &entry.path, password) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[!] cannot open {}: {e}", entry.name);
+                continue;
+            }
+        };
+        log::info!("[veeam] {} = {} bytes", entry.name, disk.disk_size());
+        match extract_and_print_reader(&mut disk, args, c) {
+            Ok(found) => found_anything |= found,
+            Err(e) => eprintln!("[!] extraction failed on {}: {e}", entry.name),
+        }
+    }
+
+    if !found_anything {
+        anyhow::bail!("No SAM hashes or DPAPI master keys found in Veeam backup");
+    }
+    Ok(())
+}
+
+/// Extract and print SAM/LSA/DCC2, DPAPI master keys, and (with `--chrome`)
+/// Chrome secrets from one already-open disk reader. Mirrors `run_sam`'s body but
+/// takes a borrowed reader, so a Veeam-stored image needn't be a real file.
+#[cfg(feature = "veeam")]
+fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    args: &Args,
+    c: &Colors,
+) -> anyhow::Result<bool> {
+    use std::io::SeekFrom;
+    let mut found_anything = false;
+
+    reader.seek(SeekFrom::Start(0))?;
+    match vmkatz::sam::extract_secrets_from_reader(reader) {
+        Ok(secrets) => {
+            found_anything = true;
+            match args.format.as_str() {
+                "ntlm" => print_sam_ntlm(&secrets.sam_entries),
+                "csv" => print_sam_csv(&secrets.sam_entries),
+                "hashcat" => print_sam_hashcat(&secrets.sam_entries),
+                "brief" => print_sam_brief(&secrets.sam_entries),
+                _ => print_sam_text(&secrets.sam_entries, c),
+            }
+            if !secrets.lsa_secrets.is_empty() {
+                match args.format.as_str() {
+                    "csv" => print_lsa_csv(&secrets.lsa_secrets),
+                    "hashcat" => {}
+                    _ => print_lsa_secrets(&secrets.lsa_secrets, c),
+                }
+            }
+            export_dpapi_backup_keys(&secrets.lsa_secrets);
+            if !secrets.cached_credentials.is_empty() {
+                match args.format.as_str() {
+                    "csv" => print_dcc2_csv(&secrets.cached_credentials),
+                    "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+                    _ => print_cached_credentials(&secrets.cached_credentials, c),
+                }
+            }
+
+            // Chrome reuses the secrets just extracted for keyring building.
+            #[cfg(feature = "chrome")]
+            {
+                if args.chrome {
+                    reader.seek(SeekFrom::Start(0))?;
+                    match vmkatz::chrome::runner::run_reader(
+                        reader,
+                        &secrets,
+                        &args.chrome_password,
+                    ) {
+                        Ok(summary) => {
+                            if !summary.profiles.is_empty() || !summary.findings.is_empty() {
+                                found_anything = true;
+                            }
+                            let out =
+                                vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                            if !out.trim().is_empty() {
+                                println!("{out}");
+                            }
+                        }
+                        Err(e) => log::warn!("chrome extraction failed: {e}"),
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("[!] SAM extraction failed: {e}"),
+    }
+
+    // DPAPI master key hashes (independent of SAM).
+    reader.seek(SeekFrom::Start(0))?;
+    let dpapi_hashes = vmkatz::sam::dpapi_masterkey::extract_from_disk(reader);
+    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
+    if !dpapi_hashes.is_empty() {
+        found_anything = true;
+        match args.format.as_str() {
+            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
+            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
+            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    Ok(found_anything)
 }
 
 // ---------------------------------------------------------------------------

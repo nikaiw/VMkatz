@@ -21,6 +21,9 @@ carve = []
 dump = []
 vmfs = ["sam"]
 chrome = ["sam", "dep:aes-gcm", "dep:serde_json", "dep:serde", "dep:hmac", "dep:sha1"]
+# Veeam backup (VBK/VIB/VRB) support: native module (src/veeam/) ported from
+# vbktool. Off by default (pulls the parse/decompress deps); `--features veeam`.
+veeam = ["sam", "dep:blake3", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:zeroize", "dep:md-5", "dep:sha2", "dep:sha1", "dep:pbkdf2", "dep:hmac", "dep:serde", "dep:serde_json"]
 
 [profile.release]
 opt-level = "z"
@@ -37,7 +40,7 @@ md4 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 aes = "0.8"
 des = "0.8"
-cbc = "0.1"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
@@ -50,6 +53,11 @@ serde = { version = "1", features = ["derive"], optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+blake3 = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
+lz4_flex = { version = "0.11", optional = true }
+zstd = { version = "0.13", optional = true }
+zeroize = { version = "1", features = ["derive"], optional = true }
 
 [lints.clippy]
 # pedantic + nursery at deny; lints that are just noise for a low-level

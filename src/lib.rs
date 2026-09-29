@@ -23,6 +23,8 @@ pub mod sam;
 pub mod utils;
 #[cfg(feature = "vbox")]
 pub mod vbox;
+#[cfg(feature = "veeam")]
+pub mod veeam;
 #[cfg(feature = "vmware")]
 pub mod vmware;
 pub mod windows;
