@@ -270,7 +270,7 @@ fn decrypt_sam_hash(
 }
 
 /// DES-ECB RID-based hash unwrapping.
-fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
+pub(crate) fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     let rid_bytes = rid.to_le_bytes();
 
     let key1_src = [

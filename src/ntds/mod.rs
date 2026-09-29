@@ -8,7 +8,7 @@
 pub mod ese;
 
 use crate::error::{Result, VmkatzError};
-use crate::sam::hashes::{aes128_cbc_decrypt, expand_des_key, md5_hash, rc4};
+use crate::sam::hashes::{aes128_cbc_decrypt, des_unwrap_hash, md5_hash, rc4};
 use ese::EseDb;
 
 /// High-level NTDS context extracted from disk artifacts.
@@ -464,57 +464,6 @@ fn decrypt_hash_history(blob: &[u8], pek: &[u8], rid: u32) -> Result<Vec<[u8; 16
     Ok(hashes)
 }
 
-/// DES-ECB RID-based hash unwrapping (same algorithm as SAM).
-fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
-    use des::cipher::generic_array::GenericArray;
-    use des::cipher::{BlockDecrypt, KeyInit};
-
-    let rid_bytes = rid.to_le_bytes();
-
-    let key1_src = [
-        rid_bytes[0],
-        rid_bytes[1],
-        rid_bytes[2],
-        rid_bytes[3],
-        rid_bytes[0],
-        rid_bytes[1],
-        rid_bytes[2],
-    ];
-    let key2_src = [
-        rid_bytes[3],
-        rid_bytes[0],
-        rid_bytes[1],
-        rid_bytes[2],
-        rid_bytes[3],
-        rid_bytes[0],
-        rid_bytes[1],
-    ];
-
-    let des_key1 = expand_des_key(key1_src);
-    let des_key2 = expand_des_key(key2_src);
-
-    let mut block1 = GenericArray::clone_from_slice(&encrypted[0..8]);
-    let mut block2 = GenericArray::clone_from_slice(&encrypted[8..16]);
-
-    let cipher1 = des::Des::new_from_slice(&des_key1)
-        .map_err(|e| VmkatzError::DecryptionError(format!("DES key1: {e}")))?;
-    let cipher2 = des::Des::new_from_slice(&des_key2)
-        .map_err(|e| VmkatzError::DecryptionError(format!("DES key2: {e}")))?;
-
-    cipher1.decrypt_block(&mut block1);
-    cipher2.decrypt_block(&mut block2);
-
-    let mut hash = [0u8; 16];
-    hash[..8].copy_from_slice(&block1);
-    hash[8..].copy_from_slice(&block2);
-    Ok(hash)
-}
-
-/// Expand 7-byte key material to 8-byte DES key with odd parity.
-///
-/// DES uses 56-bit keys packed into 8 bytes (7 data bits + 1 parity bit each).
-/// This distributes the 56 source bits into 8 key bytes, shifting each byte so
-/// that bits 7..1 carry key material and bit 0 is set for odd parity.
 /// Decode an AD string (UTF-16LE typically).
 fn decode_ad_string(data: &[u8]) -> String {
     if data.is_empty() {
