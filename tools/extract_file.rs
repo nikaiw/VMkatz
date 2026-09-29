@@ -18,16 +18,16 @@ fn main() -> anyhow::Result<()> {
     let path = &args[3];
 
     let mut disk = vmkatz::disk::open_disk(&disk_path)?;
-    let partitions = vmkatz::sam::find_ntfs_partitions(&mut disk).unwrap_or_default();
+    let partitions = vmkatz::fs::find_ntfs_partitions(&mut disk).unwrap_or_default();
     if partitions.is_empty() {
         anyhow::bail!("no NTFS partitions found");
     }
 
     for &part_offset in &partitions {
-        if vmkatz::sam::is_bitlocker_partition(&mut disk, part_offset) {
+        if vmkatz::fs::is_bitlocker_partition(&mut disk, part_offset) {
             continue;
         }
-        let mut part_reader = vmkatz::sam::PartitionReader::new(&mut disk, part_offset);
+        let mut part_reader = vmkatz::fs::PartitionReader::new(&mut disk, part_offset);
         let Ok(ntfs) = ntfs::Ntfs::new(&mut part_reader) else {
             continue;
         };
@@ -38,27 +38,27 @@ fn main() -> anyhow::Result<()> {
                 continue;
             };
             let parent_dir =
-                match vmkatz::sam::navigate_to_dir(&ntfs, &root, &mut part_reader, parent) {
+                match vmkatz::fs::navigate_to_dir(&ntfs, &root, &mut part_reader, parent) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("navigate {parent} fail at part 0x{part_offset:x}: {e}");
                         continue;
                     }
                 };
-            let file = match vmkatz::sam::find_entry(&ntfs, &parent_dir, &mut part_reader, name) {
+            let file = match vmkatz::fs::find_entry(&ntfs, &parent_dir, &mut part_reader, name) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("find {name} fail: {e}");
                     continue;
                 }
             };
-            let data = vmkatz::sam::read_file_data(&file, &mut part_reader)?;
+            let data = vmkatz::fs::read_file_data(&file, &mut part_reader)?;
             let out = &args[4];
             std::fs::write(out, &data)?;
             eprintln!("wrote {} bytes to {}", data.len(), out);
             return Ok(());
         }
-        let dir = match vmkatz::sam::navigate_to_dir(&ntfs, &root, &mut part_reader, path) {
+        let dir = match vmkatz::fs::navigate_to_dir(&ntfs, &root, &mut part_reader, path) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("navigate fail at part 0x{part_offset:x}: {e}");
@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
             }
         };
         if cmd == "ls" {
-            let entries = vmkatz::sam::list_directory(&ntfs, &dir, &mut part_reader)?;
+            let entries = vmkatz::fs::list_directory(&ntfs, &dir, &mut part_reader)?;
             for (name, is_dir) in entries {
                 println!("{}\t{}", if is_dir { "DIR " } else { "FILE" }, name);
             }

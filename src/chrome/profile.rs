@@ -126,7 +126,7 @@ pub fn discover_chromium<T: FileTree>(tree: &mut T) -> Result<Vec<DiscoveredProf
 
 use std::io::{Read, Seek};
 
-use crate::sam::{find_entry, list_directory, navigate_to_dir, read_file_data};
+use crate::fs::{find_entry, list_directory, navigate_to_dir, read_file_data};
 
 /// FileTree backed by a live NTFS filesystem accessed via the existing sam helpers.
 ///

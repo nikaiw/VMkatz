@@ -14,12 +14,8 @@ pub mod aes_xts;
 pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
-// Re-export pub(crate) items used by other modules (paging/pagefile, paging/filebacked)
-pub use crate::fs::{PartitionReader, find_entry, read_file_data};
-pub use crate::fs::{find_ntfs_partitions, is_bitlocker_partition};
+use crate::fs::{find_ntfs_partitions, is_bitlocker_partition};
 #[cfg(feature = "chrome")]
-pub use crate::fs::{list_directory, navigate_to_dir};
-
 use std::io::{Read, Seek};
 use std::path::Path;
 

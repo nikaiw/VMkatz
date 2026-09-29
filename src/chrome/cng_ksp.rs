@@ -56,20 +56,20 @@ pub fn read_cng_ksp_files<R: Read + Seek>(ntfs: &ntfs::Ntfs, reader: &mut R) -> 
     };
     let mut out = Vec::new();
     for dir in CRYPTO_DIRS {
-        let Ok(d) = crate::sam::navigate_to_dir(ntfs, &root, reader, dir) else {
+        let Ok(d) = crate::fs::navigate_to_dir(ntfs, &root, reader, dir) else {
             continue;
         };
-        let Ok(entries) = crate::sam::list_directory(ntfs, &d, reader) else {
+        let Ok(entries) = crate::fs::list_directory(ntfs, &d, reader) else {
             continue;
         };
         for (name, is_dir) in entries {
             if is_dir || out.len() >= MAX_FILES {
                 continue;
             }
-            let Ok(file) = crate::sam::find_entry(ntfs, &d, reader, &name) else {
+            let Ok(file) = crate::fs::find_entry(ntfs, &d, reader, &name) else {
                 continue;
             };
-            let Ok(bytes) = crate::sam::read_file_data(&file, reader) else {
+            let Ok(bytes) = crate::fs::read_file_data(&file, reader) else {
                 continue;
             };
             if bytes.len() <= MAX_FILE_LEN && find_dpapi_blobs(&bytes).next().is_some() {

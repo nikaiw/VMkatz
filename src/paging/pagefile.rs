@@ -154,7 +154,7 @@ fn extract_named_pagefile_data_runs(
     disk: &mut Box<dyn DiskImage>,
     filename: &str,
 ) -> Result<SinglePagefile> {
-    let partitions = crate::sam::find_ntfs_partitions(disk)?;
+    let partitions = crate::fs::find_ntfs_partitions(disk)?;
 
     for &partition_offset in &partitions {
         match try_extract_from_partition(disk, partition_offset, filename) {
@@ -176,7 +176,7 @@ fn try_extract_from_partition(
     partition_offset: u64,
     filename: &str,
 ) -> Result<SinglePagefile> {
-    let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
+    let mut part_reader = crate::fs::PartitionReader::new(disk, partition_offset);
 
     let ntfs = ntfs::Ntfs::new(&mut part_reader)
         .map_err(|e| VmkatzError::DecryptionError(format!("NTFS parse error: {e}")))?;
@@ -185,7 +185,7 @@ fn try_extract_from_partition(
         .root_directory(&mut part_reader)
         .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root dir error: {e}")))?;
 
-    let pagefile_entry = crate::sam::find_entry(&ntfs, &root, &mut part_reader, filename)?;
+    let pagefile_entry = crate::fs::find_entry(&ntfs, &root, &mut part_reader, filename)?;
 
     let data_item = pagefile_entry
         .data(&mut part_reader, "")

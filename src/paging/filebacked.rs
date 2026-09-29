@@ -32,7 +32,7 @@ impl FileBackedResolver {
     /// Build a resolver by reading DLL files from a disk image's NTFS System32.
     pub fn from_disk_and_modules(disk_path: &Path, modules: &[LoadedModule]) -> Result<Self> {
         let mut disk = disk::open_disk(disk_path)?;
-        let partitions = crate::sam::find_ntfs_partitions(&mut disk)?;
+        let partitions = crate::fs::find_ntfs_partitions(&mut disk)?;
 
         let mut sections = Vec::new();
 
@@ -62,7 +62,7 @@ impl FileBackedResolver {
         modules: &[LoadedModule],
         sections: &mut Vec<BackedSection>,
     ) -> Result<()> {
-        let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
+        let mut part_reader = crate::fs::PartitionReader::new(disk, partition_offset);
 
         let ntfs = ntfs::Ntfs::new(&mut part_reader)
             .map_err(|e| VmkatzError::DecryptionError(format!("NTFS: {e}")))?;
@@ -71,8 +71,8 @@ impl FileBackedResolver {
             .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root: {e}")))?;
 
         // Navigate to Windows\System32
-        let windows = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
-        let sys32 = crate::sam::find_entry(&ntfs, &windows, &mut part_reader, "System32")?;
+        let windows = crate::fs::find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
+        let sys32 = crate::fs::find_entry(&ntfs, &windows, &mut part_reader, "System32")?;
 
         let mut loaded_count = 0usize;
         for module in modules {
@@ -81,7 +81,7 @@ impl FileBackedResolver {
                 continue;
             }
 
-            match crate::sam::find_entry(&ntfs, &sys32, &mut part_reader, dll_name) {
+            match crate::fs::find_entry(&ntfs, &sys32, &mut part_reader, dll_name) {
                 Ok(file) => match Self::read_pe_sections(&file, &mut part_reader, module.base) {
                     Ok(secs) => {
                         let bytes: usize = secs.iter().map(|s| s.data.len()).sum();
@@ -120,7 +120,7 @@ impl FileBackedResolver {
         reader: &mut R,
         module_base: u64,
     ) -> Result<Vec<BackedSection>> {
-        let pe_data = crate::sam::read_file_data(file, reader)?;
+        let pe_data = crate::fs::read_file_data(file, reader)?;
         Self::parse_pe_sections(&pe_data, module_base)
     }
 

@@ -249,7 +249,7 @@ fn discover_profiles(disk_path: &Path) -> Result<(Vec<DiscoveredProfile>, Browse
 fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
 ) -> Result<(Vec<DiscoveredProfile>, BrowserKeyMap)> {
-    let partitions = crate::sam::find_ntfs_partitions(disk).unwrap_or_default();
+    let partitions = crate::fs::find_ntfs_partitions(disk).unwrap_or_default();
     if partitions.is_empty() {
         return Err(crate::error::VmkatzError::Parse(
             "no NTFS partitions found on disk".into(),
@@ -258,11 +258,11 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
 
     let mut last_err: Option<String> = None;
     for &part_offset in &partitions {
-        if crate::sam::is_bitlocker_partition(disk, part_offset) {
+        if crate::fs::is_bitlocker_partition(disk, part_offset) {
             log::info!("[chrome] partition at 0x{part_offset:x} is BitLocker, skipping");
             continue;
         }
-        let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
+        let mut part_reader = crate::fs::PartitionReader::new(disk, part_offset);
         let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
             Ok(n) => n,
             Err(e) => {
@@ -358,23 +358,23 @@ fn build_keymap_from_partition<R: std::io::Read + std::io::Seek>(
         cng_ksp_files: Vec::new(),
     };
     for (browser, parent_dir, exe_name) in ELEVATION_PATHS {
-        let Ok(app_dir) = crate::sam::navigate_to_dir(ntfs, &root, reader, parent_dir) else {
+        let Ok(app_dir) = crate::fs::navigate_to_dir(ntfs, &root, reader, parent_dir) else {
             continue;
         };
-        let Ok(version_entries) = crate::sam::list_directory(ntfs, &app_dir, reader) else {
+        let Ok(version_entries) = crate::fs::list_directory(ntfs, &app_dir, reader) else {
             continue;
         };
         for (ver_name, is_dir) in version_entries {
             if !is_dir || !is_version_dir(&ver_name) {
                 continue;
             }
-            let Ok(ver_dir) = crate::sam::find_entry(ntfs, &app_dir, reader, &ver_name) else {
+            let Ok(ver_dir) = crate::fs::find_entry(ntfs, &app_dir, reader, &ver_name) else {
                 continue;
             };
-            let Ok(exe_file) = crate::sam::find_entry(ntfs, &ver_dir, reader, exe_name) else {
+            let Ok(exe_file) = crate::fs::find_entry(ntfs, &ver_dir, reader, exe_name) else {
                 continue;
             };
-            let Ok(exe_bytes) = crate::sam::read_file_data(&exe_file, reader) else {
+            let Ok(exe_bytes) = crate::fs::read_file_data(&exe_file, reader) else {
                 continue;
             };
             let parsed = BrowserKeyMap::from_pe_or_fallback(&exe_bytes);
@@ -490,16 +490,16 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
         password_candidates.len()
     );
 
-    let partitions = crate::sam::find_ntfs_partitions(disk).unwrap_or_default();
+    let partitions = crate::fs::find_ntfs_partitions(disk).unwrap_or_default();
 
     let mut user_kr = HybridKeyring::new();
     let mut system_kr = HybridKeyring::new();
 
     for &part_offset in &partitions {
-        if crate::sam::is_bitlocker_partition(disk, part_offset) {
+        if crate::fs::is_bitlocker_partition(disk, part_offset) {
             continue;
         }
-        let mut part_reader = crate::sam::PartitionReader::new(disk, part_offset);
+        let mut part_reader = crate::fs::PartitionReader::new(disk, part_offset);
         let Ok(ntfs) = ntfs::Ntfs::new(&mut part_reader) else {
             continue;
         };
@@ -535,10 +535,10 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
         }
 
         // User masterkeys: Users\<user>\AppData\Roaming\Microsoft\Protect\<SID>\<guid>
-        let Ok(users_dir) = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Users") else {
+        let Ok(users_dir) = crate::fs::find_entry(&ntfs, &root, &mut part_reader, "Users") else {
             continue;
         };
-        let Ok(user_entries) = crate::sam::list_directory(&ntfs, &users_dir, &mut part_reader)
+        let Ok(user_entries) = crate::fs::list_directory(&ntfs, &users_dir, &mut part_reader)
         else {
             continue;
         };
@@ -634,20 +634,20 @@ fn collect_mks_in_protect<'n, R>(
 ) where
     R: std::io::Read + std::io::Seek,
 {
-    let Ok(protect_dir) = crate::sam::navigate_to_dir(ntfs, base_dir, reader, protect_path) else {
+    let Ok(protect_dir) = crate::fs::navigate_to_dir(ntfs, base_dir, reader, protect_path) else {
         return;
     };
-    let Ok(sids) = crate::sam::list_directory(ntfs, &protect_dir, reader) else {
+    let Ok(sids) = crate::fs::list_directory(ntfs, &protect_dir, reader) else {
         return;
     };
     for (sid, is_sid_dir) in sids {
         if !is_sid_dir || !sid.starts_with("S-1-5-") {
             continue;
         }
-        let Ok(sid_dir) = crate::sam::find_entry(ntfs, &protect_dir, reader, &sid) else {
+        let Ok(sid_dir) = crate::fs::find_entry(ntfs, &protect_dir, reader, &sid) else {
             continue;
         };
-        let Ok(mk_entries) = crate::sam::list_directory(ntfs, &sid_dir, reader) else {
+        let Ok(mk_entries) = crate::fs::list_directory(ntfs, &sid_dir, reader) else {
             continue;
         };
         // MK files in this SID dir AND in its optional `User\` subdir. The `User\`
@@ -659,8 +659,8 @@ fn collect_mks_in_protect<'n, R>(
                 mks_to_try.push((name.clone(), String::new()));
             }
         }
-        if let Ok(user_sub) = crate::sam::find_entry(ntfs, &sid_dir, reader, "User") {
-            if let Ok(user_entries) = crate::sam::list_directory(ntfs, &user_sub, reader) {
+        if let Ok(user_sub) = crate::fs::find_entry(ntfs, &sid_dir, reader, "User") {
+            if let Ok(user_entries) = crate::fs::list_directory(ntfs, &user_sub, reader) {
                 for (name, is_dir) in user_entries {
                     if !is_dir && is_mk_guid(&name) {
                         mks_to_try.push((name, "User".to_string()));
@@ -670,20 +670,20 @@ fn collect_mks_in_protect<'n, R>(
         }
         for (mk_name, sub) in mks_to_try {
             let mk_file = if sub.is_empty() {
-                match crate::sam::find_entry(ntfs, &sid_dir, reader, &mk_name) {
+                match crate::fs::find_entry(ntfs, &sid_dir, reader, &mk_name) {
                     Ok(f) => f,
                     Err(_) => continue,
                 }
             } else {
-                let Ok(user_sub) = crate::sam::find_entry(ntfs, &sid_dir, reader, &sub) else {
+                let Ok(user_sub) = crate::fs::find_entry(ntfs, &sid_dir, reader, &sub) else {
                     continue;
                 };
-                match crate::sam::find_entry(ntfs, &user_sub, reader, &mk_name) {
+                match crate::fs::find_entry(ntfs, &user_sub, reader, &mk_name) {
                     Ok(f) => f,
                     Err(_) => continue,
                 }
             };
-            let Ok(mk_data) = crate::sam::read_file_data(&mk_file, reader) else {
+            let Ok(mk_data) = crate::fs::read_file_data(&mk_file, reader) else {
                 continue;
             };
             out.push((sid.clone(), sub, mk_name, mk_data));
