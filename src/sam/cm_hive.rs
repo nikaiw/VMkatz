@@ -179,7 +179,11 @@ fn materialize<L: PhysicalMemory>(
     let mut filled = 0usize;
     while off < length {
         if let Some(block) = read_block(rv, &layout, off) {
-            img[BASE_BLOCK + off..BASE_BLOCK + off + 0x1000].copy_from_slice(&block);
+            // Clamp to the image tail and block length so a non-4K-aligned hive
+            // `length` (or a short block) can't overrun the buffer.
+            let dst = BASE_BLOCK + off;
+            let w = img.len().saturating_sub(dst).min(block.len());
+            img[dst..dst + w].copy_from_slice(&block[..w]);
             filled += 1;
         }
         off += 0x1000;
