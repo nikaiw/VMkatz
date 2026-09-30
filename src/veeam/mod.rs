@@ -1,11 +1,8 @@
-//! Veeam VBK/VIB/VRB backup access, ported from the internal `vbktool` project
-//! (read-only). Parses the backup format, enumerates stored disk images, and
-//! exposes their reconstructed bytes so vmkatz's own disk/credential pipeline
-//! can run on them. The CLI/TUI/preview/verify layers are not ported.
+//! Veeam VBK/VIB/VRB backup access (read-only): parse the format, enumerate
+//! stored disk images, and reconstruct their bytes for the credential pipeline.
 //!
-//! This module is vendored verbatim from vbktool and kept close to upstream, so
-//! it is exempted from vmkatz's own (pedantic/nursery) lint gate and its
-//! not-yet-used helpers; only the thin `disk` adapter below is vmkatz code.
+//! Vendored from the `vbktool` project and kept close to upstream, so it is
+//! exempted from vmkatz's lint gate; only `disk` is vmkatz code.
 #![allow(
     clippy::all,
     clippy::pedantic,

@@ -1,10 +1,8 @@
-//! Adapter presenting a Veeam-stored disk image as a vmkatz [`DiskImage`].
+//! Present a Veeam-stored disk image as a vmkatz [`DiskImage`].
 //!
-//! A Veeam backup (VBK/VIB/VRB) is a container: its catalogue holds directories,
-//! metadata files (e.g. `summary.xml`) and one file per backed-up virtual/physical
-//! disk. [`list_disk_images`] enumerates the disk-image entries and [`VbkDisk`]
-//! wraps one so the existing credential pipeline can run on it without first
-//! extracting it to a temp file — reads are reconstructed on demand.
+//! A backup holds one file per backed-up disk plus metadata. [`list_disk_images`]
+//! picks out the disk images; [`VbkDisk`] wraps one so the credential pipeline
+//! reads it on demand, without extracting it to a temp file first.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -79,10 +77,8 @@ fn reader_looks_like_disk(reader: &LogicalFileReader) -> bool {
     n >= 512 + 8 && &boot[512..520] == b"EFI PART"
 }
 
-/// A Veeam-stored disk image presented as a flat, sector-addressable disk.
-///
-/// Owns its [`LogicalFileReader`]; reads are reconstructed on demand (decompressed
-/// and decrypted per block), so nothing is materialized to disk.
+/// A Veeam-stored disk image as a flat, sector-addressable disk. Owns its
+/// [`LogicalFileReader`]; each read is reconstructed (decompressed/decrypted).
 pub struct VbkDisk {
     reader: LogicalFileReader,
     pos: u64,

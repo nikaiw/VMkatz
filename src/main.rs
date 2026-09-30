@@ -1112,9 +1112,8 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the disk credential pipeline over every disk image stored in a Veeam
-/// backup. Each image is read on demand (reconstructed per block), so nothing is
-/// materialized to a temp file.
+/// Run the credential pipeline over every disk image in a Veeam backup.
+/// Images are read on demand — nothing is written to a temp file.
 #[cfg(feature = "veeam")]
 fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     use vmkatz::disk::DiskImage;
@@ -1135,9 +1134,8 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
         );
     }
 
-    // Encrypted backup with no password: we can't reconstruct anything, but we
-    // can emit the password-wrapped keyset as a Hashcat target (mode 31200) for
-    // offline cracking. With --veeam-password we fall through to extraction.
+    // Encrypted with no password: can't reconstruct — emit the Hashcat
+    // target for cracking. With --veeam-password we fall through instead.
     if password.is_none()
         && vmkatz::veeam::inspect_encryption(input_path).is_ok_and(|e| e.encrypted)
     {
@@ -1191,9 +1189,8 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print the encrypted backup's password-wrapped keyset(s) as Hashcat mode-31200
-/// targets (`$vbk$*salt*iterations*verifier`). Crack, then re-run with
-/// `--veeam-password` to extract credentials.
+/// Print the encrypted backup's wrapped keyset as a Hashcat target
+/// (`$vbk$*salt*iterations*verifier`, mode 31200) for offline cracking.
 #[cfg(feature = "veeam")]
 fn emit_veeam_hashcat(input_path: &Path) -> anyhow::Result<()> {
     let hashes = vmkatz::veeam::hashcat_hashes(input_path).with_context(|| {
@@ -1296,9 +1293,8 @@ fn run_veeam_extract(
     Ok(())
 }
 
-/// Extract and print SAM/LSA/DCC2, DPAPI master keys, and (with `--chrome`)
-/// Chrome secrets from one already-open disk reader. Mirrors `run_sam`'s body but
-/// takes a borrowed reader, so a Veeam-stored image needn't be a real file.
+/// Extract and print SAM/LSA/DCC2, DPAPI, and (with `--chrome`) Chrome
+/// secrets from one open disk reader — the reader-based twin of `run_sam`.
 #[cfg(feature = "veeam")]
 fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
