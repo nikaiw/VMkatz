@@ -108,10 +108,10 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 # Extract from Hyper-V saved state
 ./vmkatz guest.vmrs
 
-# Extract from Veeam backup (requires --features veeam)
-./vmkatz --features veeam backup.vbk
-./vmkatz --veeam-list backup.vbk               # List disk images in backup
-./vmkatz --veeam-extract backup.vbk             # Extract raw disk image
+# Extract from Veeam backup (build with --features veeam)
+./vmkatz backup.vbk
+./vmkatz --veeam-list backup.vbk               # List disk images
+./vmkatz --veeam-extract backup.vbk            # Extract raw disk
 ```
 
 ## Output Formats
@@ -236,12 +236,12 @@ binaries still decrypt.
 ./vmkatz --chrome --chrome-json disk.vmdk
 ```
 
-Use `--chrome-nthash <user:hash>` (repeatable) to inject cracked NT hashes
-for domain-account masterkey derivation (PBKDF2 key3 + legacy 3DES/SHA1).
+For domain users (whose credentials aren't in the local SAM), use
+`--chrome-password` with a known plaintext or `--chrome-nthash` with an NT
+hash to unlock their browser secrets.
 
-Status: Chromium decrypt (v10 + v20) is complete and validated on Win10,
-Win11 22H2/24H2/25H2, Win Server 2019/2022/2025, including Chrome 154 v20
-App-Bound v3 (CNG-KSP machine key) and domain-user DPAPI masterkeys.
+Status: Chromium decrypt (v10 + v20) validated on Win10 through Win Server 2025,
+including Chrome 154 v20 App-Bound v3 and domain-user DPAPI masterkeys.
 Firefox NSS plaintext decrypt is a scaffold — profile discovery works, but
 plaintext requires an NSS link that is not yet wired through.
 
