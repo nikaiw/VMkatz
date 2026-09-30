@@ -77,12 +77,21 @@ fn reader_looks_like_disk(reader: &LogicalFileReader) -> bool {
     n >= 512 + 8 && &boot[512..520] == b"EFI PART"
 }
 
+/// Chunk reconstructed and cached per cache miss. The pipeline reads NTFS
+/// structures with heavy locality (often byte-by-byte), and each `read_at`
+/// re-decompresses the containing block — so serve small reads from a cached
+/// chunk instead, or a byte-by-byte NTFS walk decompresses a block per byte.
+const CACHE_CHUNK: u64 = 64 * 1024;
+
 /// A Veeam-stored disk image as a flat, sector-addressable disk. Owns its
-/// [`LogicalFileReader`]; each read is reconstructed (decompressed/decrypted).
+/// [`LogicalFileReader`]; reads are reconstructed (decompressed/decrypted) on
+/// demand, with a one-chunk cache so small local reads don't re-decompress.
 pub struct VbkDisk {
     reader: LogicalFileReader,
     pos: u64,
     len: u64,
+    cache: Vec<u8>, // reconstructed chunk covering [cache_start, cache_start+cache.len())
+    cache_start: u64,
 }
 
 impl VbkDisk {
@@ -95,19 +104,46 @@ impl VbkDisk {
             reader,
             pos: 0,
             len,
+            cache: Vec::new(),
+            cache_start: u64::MAX, // no chunk cached yet
         })
+    }
+
+    /// Reconstruct the `CACHE_CHUNK`-aligned chunk containing `pos` into `cache`.
+    fn fill_cache(&mut self, pos: u64) -> io::Result<()> {
+        let start = (pos / CACHE_CHUNK) * CACHE_CHUNK;
+        let want = CACHE_CHUNK.min(self.len - start) as usize;
+        self.cache.resize(want, 0);
+        let got = self
+            .reader
+            .read_at(&mut self.cache, start)
+            .map_err(|e| io::Error::other(format!("Veeam block read: {e}")))?;
+        self.cache.truncate(got);
+        self.cache_start = start;
+        Ok(())
     }
 }
 
 impl Read for VbkDisk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len {
+        if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
-        let n = self
-            .reader
-            .read_at(buf, self.pos)
-            .map_err(|e| io::Error::other(format!("Veeam block read: {e}")))?;
+        // Large reads bypass the cache — they already amortize reconstruction.
+        if buf.len() as u64 >= CACHE_CHUNK {
+            let n = self
+                .reader
+                .read_at(buf, self.pos)
+                .map_err(|e| io::Error::other(format!("Veeam block read: {e}")))?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        if self.pos < self.cache_start || self.pos >= self.cache_start + self.cache.len() as u64 {
+            self.fill_cache(self.pos)?;
+        }
+        let off = (self.pos - self.cache_start) as usize;
+        let n = buf.len().min(self.cache.len() - off);
+        buf[..n].copy_from_slice(&self.cache[off..off + n]);
         self.pos += n as u64;
         Ok(n)
     }
