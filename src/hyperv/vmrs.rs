@@ -125,11 +125,115 @@ pub struct VmrsLayer {
 
 struct VmrsInner {
     file: fs::File,
-    block_cache: HashMap<u64, Vec<u8>>,
-    /// FIFO of cached block indices, for single-entry eviction (clearing the whole
-    /// cache thrashes the random access done during registry-hive reconstruction).
-    cache_order: std::collections::VecDeque<u64>,
-    cache_limit: usize,
+    cache: BlockCache,
+}
+
+/// One cached decompressed RAM block plus its LRU links (by block index).
+struct CacheNode {
+    data: Vec<u8>,
+    newer: Option<u64>, // toward the head (most-recently used)
+    older: Option<u64>, // toward the tail (least-recently used)
+}
+
+/// Intrusive O(1) LRU cache of decompressed RAM blocks. FIFO evicted the hot
+/// working set — the page tables the LSASS scan re-walks constantly — forcing
+/// repeated decompression; LRU keeps them resident under the same block budget.
+struct BlockCache {
+    map: HashMap<u64, CacheNode>,
+    head: Option<u64>, // most-recently used
+    tail: Option<u64>, // least-recently used
+    limit: usize,
+}
+
+impl BlockCache {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            head: None,
+            tail: None,
+            limit: limit.max(1),
+        }
+    }
+
+    /// Unlink node `k` from the LRU list (leaves it in `map`).
+    fn detach(&mut self, k: u64) {
+        let (newer, older) = {
+            let n = &self.map[&k];
+            (n.newer, n.older)
+        };
+        match newer {
+            Some(x) => self.map.get_mut(&x).unwrap().older = older,
+            None => self.head = older,
+        }
+        match older {
+            Some(x) => self.map.get_mut(&x).unwrap().newer = newer,
+            None => self.tail = newer,
+        }
+    }
+
+    /// Link node `k` (already in `map`) at the head (most-recently used).
+    fn push_front(&mut self, k: u64) {
+        let old_head = self.head;
+        {
+            let n = self.map.get_mut(&k).unwrap();
+            n.newer = None;
+            n.older = old_head;
+        }
+        if let Some(h) = old_head {
+            self.map.get_mut(&h).unwrap().newer = Some(k);
+        }
+        self.head = Some(k);
+        if self.tail.is_none() {
+            self.tail = Some(k);
+        }
+    }
+
+    /// Look up a block and mark it most-recently used.
+    fn get(&mut self, k: u64) -> Option<&[u8]> {
+        if !self.map.contains_key(&k) {
+            return None;
+        }
+        if self.head != Some(k) {
+            self.detach(k);
+            self.push_front(k);
+        }
+        Some(self.map.get(&k).unwrap().data.as_slice())
+    }
+
+    fn evict_to_limit(&mut self) {
+        while self.map.len() > self.limit {
+            let Some(t) = self.tail else { break };
+            self.detach(t);
+            self.map.remove(&t);
+        }
+    }
+
+    /// Insert (or refresh) a block as most-recently used, evicting the LRU tail.
+    fn insert(&mut self, k: u64, data: Vec<u8>) {
+        if let Some(n) = self.map.get_mut(&k) {
+            n.data = data;
+            if self.head != Some(k) {
+                self.detach(k);
+                self.push_front(k);
+            }
+            return;
+        }
+        self.map.insert(
+            k,
+            CacheNode {
+                data,
+                newer: None,
+                older: None,
+            },
+        );
+        self.push_front(k);
+        self.evict_to_limit();
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.max(1);
+        self.evict_to_limit();
+    }
 }
 
 impl VmrsLayer {
@@ -158,11 +262,10 @@ impl VmrsLayer {
         let mut layer = Self {
             inner: RefCell::new(VmrsInner {
                 file,
-                block_cache: HashMap::new(),
-                cache_order: std::collections::VecDeque::new(),
-                // 1 GB of decompressed blocks: enough to keep registry-hive bins and
-                // page tables hot during the random access of reconstruction/walking.
-                cache_limit: 1024,
+                // 1 GB of decompressed blocks (LRU): enough to keep registry-hive
+                // bins and page tables hot during the random access of
+                // reconstruction/walking without unbounded growth.
+                cache: BlockCache::with_limit(1024),
             }),
             header,
             object_entries: Vec::new(),
@@ -1024,13 +1127,8 @@ impl VmrsLayer {
     }
 
     /// Read and decompress a RAM block by index.
-    fn read_ram_block(&self, block_index: u64) -> Result<Vec<u8>> {
-        // Check cache first
-        if let Some(cached) = self.inner.borrow().block_cache.get(&block_index) {
-            return Ok(cached.clone());
-        }
-
-        // Try both key formats
+    /// Decompress one RAM block from the file (no cache access).
+    fn decompress_block(&self, block_index: u64) -> Result<Vec<u8>> {
         let key_paths = [
             format!("savedstate/RamBlock{block_index}"),
             format!("/savedstate/RamBlock{block_index}"),
@@ -1050,8 +1148,6 @@ impl VmrsLayer {
         // If no key found, try sequential object table entries
         // (RAM blocks may be stored sequentially starting from some index)
         if value_info.is_none() {
-            // Fallback: try to find the block by index in object entries
-            // that have data type and appropriate size
             let ram_entries: Vec<&ObjectTableEntry> = self
                 .object_entries
                 .iter()
@@ -1078,35 +1174,20 @@ impl VmrsLayer {
             ))
         })?;
 
-        // Read raw (potentially compressed) data
         let raw_data = self.read_file_bytes(file_offset, compressed_size as usize)?;
-
-        // Decompress if needed
-        let block = if compressed_size as usize == RAM_BLOCK_SIZE {
-            // Uncompressed — direct copy
+        Ok(if compressed_size as usize == RAM_BLOCK_SIZE {
             raw_data
         } else {
-            // Compressed — use VmCompressUnpack
             vm_compress_unpack(&raw_data)
-        };
+        })
+    }
 
-        // Cache the result with single-entry FIFO eviction.
-        let mut inner = self.inner.borrow_mut();
-        while inner.block_cache.len() >= inner.cache_limit {
-            if let Some(old) = inner.cache_order.pop_front() {
-                inner.block_cache.remove(&old);
-            } else {
-                break;
-            }
+    fn read_ram_block(&self, block_index: u64) -> Result<Vec<u8>> {
+        if let Some(cached) = self.inner.borrow_mut().cache.get(block_index) {
+            return Ok(cached.to_vec());
         }
-        if inner
-            .block_cache
-            .insert(block_index, block.clone())
-            .is_none()
-        {
-            inner.cache_order.push_back(block_index);
-        }
-
+        let block = self.decompress_block(block_index)?;
+        self.inner.borrow_mut().cache.insert(block_index, block.clone());
         Ok(block)
     }
 }
@@ -1137,12 +1218,12 @@ impl PhysicalMemory for VmrsLayer {
             let available = RAM_BLOCK_SIZE - block_offset;
             let to_copy = remaining.len().min(available);
 
-            // Fast path: on a cache hit copy the needed slice directly, avoiding a
-            // full 1 MB block clone. Reassembly issues thousands of tiny reads, so
-            // cloning the whole block per read would dominate the run time.
+            // Fast path: on a cache hit copy the needed slice directly (marking the
+            // block most-recently used), avoiding a full 1 MB block clone. The scans
+            // issue thousands of tiny reads, so cloning per read would dominate.
             {
-                let inner = self.inner.borrow();
-                if let Some(block) = inner.block_cache.get(&block_index) {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(block) = inner.cache.get(block_index) {
                     let end = (block_offset + to_copy).min(block.len());
                     if block_offset < block.len() {
                         let copy_len = end - block_offset;
@@ -1158,7 +1239,8 @@ impl PhysicalMemory for VmrsLayer {
                 }
             }
 
-            if let Ok(block) = self.read_ram_block(block_index) {
+            // Miss: decompress (no cache borrow), copy the slice, then cache it.
+            if let Ok(block) = self.decompress_block(block_index) {
                 let end = (block_offset + to_copy).min(block.len());
                 if block_offset < block.len() {
                     let copy_len = end - block_offset;
@@ -1169,6 +1251,7 @@ impl PhysicalMemory for VmrsLayer {
                 } else {
                     remaining[..to_copy].fill(0);
                 }
+                self.inner.borrow_mut().cache.insert(block_index, block);
             } else {
                 // Block failed to read/decompress — zero-fill, best-effort,
                 // but warn once so missing memory isn't taken as valid zeros.
@@ -1290,17 +1373,15 @@ impl PhysicalMemory for VmrsLayer {
             }
         });
 
-        // Warm the LRU with the retained hive blocks. They fit the existing
-        // Keep the warmed working set resident during reassembly by raising the
-        // cache_limit to hold it — but only up to the retention budget, so the
-        // cache stays bounded (a large guest re-decompresses the excess on demand).
+        // Warm the LRU with the retained hive blocks and raise the limit to hold
+        // them (bounded by the retention budget) so they survive reassembly; the
+        // LRU then evicts least-recently-used blocks first as it re-reads the rest.
         let kept = keep.into_inner().unwrap();
         let mut inner = self.inner.borrow_mut();
-        inner.cache_limit = inner.cache_limit.max(kept.len() + 64);
+        let new_limit = inner.cache.limit.max(kept.len() + 64);
+        inner.cache.set_limit(new_limit);
         for (bi, block) in kept {
-            if inner.block_cache.insert(bi, block).is_none() {
-                inner.cache_order.push_back(bi);
-            }
+            inner.cache.insert(bi, block);
         }
         true
     }
