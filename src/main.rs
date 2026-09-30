@@ -835,10 +835,12 @@ fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow:
                 }
                 #[cfg(feature = "chrome")]
                 if args.chrome {
+                    let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
                     match vmkatz::chrome::runner::run_reader(
                         &mut disk,
                         &secrets,
                         &args.chrome_password,
+                        &nt_hashes,
                     ) {
                         Ok(summary) => {
                             let out =
@@ -1164,7 +1166,7 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     for entry in &disks {
         let size_note = entry
             .size
-            .map(|s| format!(" ({:.1} MiB)", s as f64 / (1024.0 * 1024.0)))
+            .map(|s| format!(" ({})", veeam_human_size(s)))
             .unwrap_or_default();
         eprintln!(
             "\n{}=== disk image: {}{}{}",
@@ -1179,6 +1181,18 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
             }
         };
         log::info!("[veeam] {} = {} bytes", entry.name, disk.disk_size());
+
+        // --ntds targets a DC's disk: extract AD hashes from NTDS.dit instead of
+        // the local SAM/DPAPI pipeline.
+        #[cfg(feature = "ntds.dit")]
+        if args.ntds {
+            match extract_ntds_from_reader(&mut disk, args, c) {
+                Ok(found) => found_anything |= found,
+                Err(e) => eprintln!("[!] NTDS extraction failed on {}: {e}", entry.name),
+            }
+            continue;
+        }
+
         match extract_and_print_reader(&mut disk, args, c) {
             Ok(found) => found_anything |= found,
             Err(e) => eprintln!("[!] extraction failed on {}: {e}", entry.name),
@@ -1346,7 +1360,13 @@ fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     #[cfg(feature = "chrome")]
     if args.chrome {
         reader.seek(SeekFrom::Start(0))?;
-        match vmkatz::chrome::runner::run_reader(reader, &secrets, &args.chrome_password) {
+        let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
+        match vmkatz::chrome::runner::run_reader(
+            reader,
+            &secrets,
+            &args.chrome_password,
+            &nt_hashes,
+        ) {
             Ok(summary) => {
                 if !summary.profiles.is_empty() || !summary.findings.is_empty() {
                     found_anything = true;
@@ -1374,6 +1394,58 @@ fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     }
 
     Ok(found_anything)
+}
+
+/// Extract AD hashes from a DC disk's NTDS.dit via a reader — the reader-based
+/// twin of `run_ntds`. Returns whether any hashes were found.
+#[cfg(all(feature = "veeam", feature = "ntds.dit"))]
+fn extract_ntds_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    args: &Args,
+    c: &Colors,
+) -> anyhow::Result<bool> {
+    use std::io::SeekFrom;
+
+    reader.seek(SeekFrom::Start(0))?;
+    let artifacts = vmkatz::sam::extract_ntds_artifacts_from_reader(reader)
+        .context("NTDS artifact extraction failed")?;
+    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
+        .context("NTDS context validation failed")?;
+    let hashes = vmkatz::ntds::extract_ad_hashes(
+        &artifacts.ntds_data,
+        &artifacts.system_data,
+        args.ntds_history,
+    )
+    .context("NTDS hash extraction failed")?;
+
+    eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
+    eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
+    eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
+    eprintln!("  Hashes extracted : {}", hashes.len());
+
+    match args.format.as_str() {
+        "csv" => print_ntds_csv(&hashes),
+        "hashcat" => print_ntds_hashcat(&hashes),
+        "ntlm" => print_ntds_ntlm(&hashes),
+        "brief" => print_ntds_brief(&hashes),
+        _ => print_ntds_text(&hashes, c),
+    }
+
+    // DPAPI master key hashes from the same disk, as run_ntds does.
+    reader.seek(SeekFrom::Start(0))?;
+    let dpapi_hashes = dedup_dpapi_hashes(
+        vmkatz::sam::dpapi_masterkey::extract_from_disk(reader),
+        args.all,
+    );
+    if !dpapi_hashes.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
+            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
+            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    Ok(!hashes.is_empty() || !dpapi_hashes.is_empty())
 }
 
 // ---------------------------------------------------------------------------

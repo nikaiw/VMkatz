@@ -400,7 +400,7 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
 }
 
 /// Extract NTDS artifacts from any Read+Seek source.
-fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
+pub fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
     let partitions = find_ntfs_partitions(reader).unwrap_or_default();
     let mut bitlocker_found = false;
 

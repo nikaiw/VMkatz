@@ -35,15 +35,18 @@ pub struct DiscoverySummary {
 /// the VMFS-backed flat-VMDK flow on ESXi). Skips the `disk::open_disk` call and
 /// uses caller-supplied SAM/LSA secrets instead of re-extracting them.
 ///
-/// `extra_passwords` are tried in addition to every LSA-recovered plaintext when
-/// decrypting user DPAPI masterkey files.
+/// `extra_passwords` are tried in addition to every LSA-recovered plaintext, and
+/// `extra_nt_hashes` (`SID` → NT hash) in addition to local-SAM hashes, when
+/// decrypting user DPAPI masterkey files — the latter carry DOMAIN users' hashes.
 pub fn run_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     secrets: &crate::sam::DiskSecrets,
     extra_passwords: &[String],
+    extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<DiscoverySummary> {
     let (profiles, key_map) = discover_profiles_in_reader(reader)?;
-    let (user_kr, system_kr) = build_keyrings_with_secrets(reader, secrets, extra_passwords, &[]);
+    let (user_kr, system_kr) =
+        build_keyrings_with_secrets(reader, secrets, extra_passwords, extra_nt_hashes);
     log::info!(
         "[chrome] disk MK decrypt: {} user MKs, {} system MKs",
         user_kr.len(),
