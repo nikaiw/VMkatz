@@ -1187,7 +1187,10 @@ impl VmrsLayer {
             return Ok(cached.to_vec());
         }
         let block = self.decompress_block(block_index)?;
-        self.inner.borrow_mut().cache.insert(block_index, block.clone());
+        self.inner
+            .borrow_mut()
+            .cache
+            .insert(block_index, block.clone());
         Ok(block)
     }
 }
