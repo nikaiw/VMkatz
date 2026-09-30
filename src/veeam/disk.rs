@@ -110,15 +110,19 @@ impl VbkDisk {
     }
 
     /// Reconstruct the `CACHE_CHUNK`-aligned chunk containing `pos` into `cache`.
+    ///
+    /// The buffer is kept at its full length: `read_at` may write fewer bytes than
+    /// requested when the chunk runs past the last mapped block (a sparse tail on an
+    /// incomplete backup), and those bytes stay zero — the correct sparse-disk value,
+    /// and it keeps `cache.len()` fixed so callers never index past the end.
     fn fill_cache(&mut self, pos: u64) -> io::Result<()> {
         let start = (pos / CACHE_CHUNK) * CACHE_CHUNK;
         let want = CACHE_CHUNK.min(self.len - start) as usize;
+        self.cache.clear();
         self.cache.resize(want, 0);
-        let got = self
-            .reader
+        self.reader
             .read_at(&mut self.cache, start)
             .map_err(|e| io::Error::other(format!("Veeam block read: {e}")))?;
-        self.cache.truncate(got);
         self.cache_start = start;
         Ok(())
     }
@@ -128,15 +132,6 @@ impl Read for VbkDisk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
-        }
-        // Large reads bypass the cache — they already amortize reconstruction.
-        if buf.len() as u64 >= CACHE_CHUNK {
-            let n = self
-                .reader
-                .read_at(buf, self.pos)
-                .map_err(|e| io::Error::other(format!("Veeam block read: {e}")))?;
-            self.pos += n as u64;
-            return Ok(n);
         }
         if self.pos < self.cache_start || self.pos >= self.cache_start + self.cache.len() as u64 {
             self.fill_cache(self.pos)?;
