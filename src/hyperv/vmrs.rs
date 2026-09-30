@@ -39,6 +39,11 @@ const HEADER_SIZE: usize = 46;
 const BACKUP_HEADER_OFFSET: u64 = 4096;
 const RAM_BLOCK_SIZE: usize = 0x100000; // 1 MB
 
+/// Cap on RAM blocks the scan may keep decompressed to warm the reassembly cache
+/// (≈ this many MiB). Bounds peak memory on large guests; the measured hive
+/// reassembly working set is a few thousand blocks, so this covers it.
+const WARM_CACHE_BLOCKS: usize = 3072; // ~3 GiB
+
 /// Hyper-V Gen1 low MMIO gap: RAM that would sit at [0xF800_0000, 0x1_0000_0000)
 /// is remapped above 4 GB. Applied only when total RAM exceeds the gap base.
 const MMIO_GAP_BASE: u64 = 0xF800_0000;
@@ -1243,8 +1248,13 @@ impl PhysicalMemory for VmrsLayer {
         let path = &self.path;
         let counter = AtomicUsize::new(0);
         // Blocks the callback flagged (they hold hive bins) are kept so the later
-        // reassembly reads hit the cache instead of re-decompressing — that random
-        // re-decompression, not the scan, is what a cold cache makes pathological.
+        // reassembly reads hit the cache instead of re-decompressing. Retention is
+        // capped at `keep_budget` (~WARM_CACHE_BLOCKS MiB): keeping every flagged
+        // block would pin close to all of guest RAM on a large VM. The reassembly's
+        // measured working set is a few thousand blocks, so this budget covers the
+        // common case thrash-free while bounding peak memory; anything beyond it is
+        // re-decompressed on demand.
+        let keep_budget = WARM_CACHE_BLOCKS;
         let keep: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
         let nthreads = std::thread::available_parallelism()
             .map_or(4, std::num::NonZeroUsize::get)
@@ -1270,18 +1280,23 @@ impl PhysicalMemory for VmrsLayer {
                             vm_compress_unpack(&raw)
                         };
                         if f(gpa, &block) {
-                            keep.lock().unwrap().push((bi, block));
+                            let mut k = keep.lock().unwrap();
+                            if k.len() < keep_budget {
+                                k.push((bi, block));
+                            }
                         }
                     }
                 });
             }
         });
 
-        // Warm the cache with the retained hive blocks and raise the limit so they
-        // are not evicted during reassembly.
+        // Warm the LRU with the retained hive blocks. They fit the existing
+        // Keep the warmed working set resident during reassembly by raising the
+        // cache_limit to hold it — but only up to the retention budget, so the
+        // cache stays bounded (a large guest re-decompresses the excess on demand).
         let kept = keep.into_inner().unwrap();
         let mut inner = self.inner.borrow_mut();
-        inner.cache_limit = inner.cache_limit.max(kept.len() + 16);
+        inner.cache_limit = inner.cache_limit.max(kept.len() + 64);
         for (bi, block) in kept {
             if inner.block_cache.insert(bi, block).is_none() {
                 inner.cache_order.push_back(bi);
