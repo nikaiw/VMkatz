@@ -113,6 +113,9 @@ pub struct VmrsLayer {
     mmio_gap_size: u64,
     /// Path to the .vmrs file, so parallel workers can open their own handles.
     path: std::path::PathBuf,
+    /// Set once a RAM block read failed and was zero-filled, to warn a single
+    /// time instead of silently presenting missing memory as valid zeros.
+    read_masked: std::cell::Cell<bool>,
 }
 
 struct VmrsInner {
@@ -165,6 +168,7 @@ impl VmrsLayer {
             mmio_gap_base: 0,
             mmio_gap_size: 0,
             path: path.to_path_buf(),
+            read_masked: std::cell::Cell::new(false),
         };
 
         // Parse the data region
@@ -1149,22 +1153,25 @@ impl PhysicalMemory for VmrsLayer {
                 }
             }
 
-            match self.read_ram_block(block_index) {
-                Ok(block) => {
-                    let end = (block_offset + to_copy).min(block.len());
-                    if block_offset < block.len() {
-                        let copy_len = end - block_offset;
-                        remaining[..copy_len].copy_from_slice(&block[block_offset..end]);
-                        if copy_len < to_copy {
-                            remaining[copy_len..to_copy].fill(0);
-                        }
-                    } else {
-                        remaining[..to_copy].fill(0);
+            if let Ok(block) = self.read_ram_block(block_index) {
+                let end = (block_offset + to_copy).min(block.len());
+                if block_offset < block.len() {
+                    let copy_len = end - block_offset;
+                    remaining[..copy_len].copy_from_slice(&block[block_offset..end]);
+                    if copy_len < to_copy {
+                        remaining[copy_len..to_copy].fill(0);
                     }
-                }
-                Err(_) => {
-                    // Block not available — fill with zeros
+                } else {
                     remaining[..to_copy].fill(0);
+                }
+            } else {
+                // Block failed to read/decompress — zero-fill, best-effort,
+                // but warn once so missing memory isn't taken as valid zeros.
+                remaining[..to_copy].fill(0);
+                if !self.read_masked.replace(true) {
+                    log::warn!(
+                        "VMRS: RAM block {block_index} unreadable, zero-filled — memory image may be incomplete"
+                    );
                 }
             }
 
@@ -1400,6 +1407,7 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
     let mut output = vec![0u8; RAM_BLOCK_SIZE];
     let mut out_offset = 0usize;
     let mut in_offset = 0usize;
+    let mut short_decode = false; // an XPRESS page produced fewer bytes than its page size
 
     while in_offset + 4 <= data.len() && out_offset < RAM_BLOCK_SIZE {
         let tag = u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap());
@@ -1473,10 +1481,11 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                     let n = end - out_offset;
                     output[out_offset..end].copy_from_slice(&data[in_offset..in_offset + n]);
                 } else {
-                    xpress_decompress(
+                    let n = xpress_decompress(
                         &data[in_offset..in_offset + comp],
                         &mut output[out_offset..end],
                     );
+                    short_decode |= n < end - out_offset;
                 }
                 out_offset += uncomp;
                 in_offset += comp;
@@ -1499,10 +1508,11 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                         break;
                     }
                     let end = (out_offset + 4096).min(RAM_BLOCK_SIZE);
-                    xpress_decompress(
+                    let n = xpress_decompress(
                         &data[in_offset..in_offset + compressed_size],
                         &mut output[out_offset..end],
                     );
+                    short_decode |= n < end - out_offset;
                     out_offset += 4096;
                     in_offset += compressed_size;
                 } else {
@@ -1518,6 +1528,11 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
         }
     }
 
+    // An XPRESS page that decoded short leaves buffer zeros in its tail; signal it
+    // so a corrupt/truncated block isn't cached as if it decoded cleanly.
+    if short_decode {
+        log::warn!("VMRS: XPRESS page under-decompressed in a RAM block — data may be incomplete");
+    }
     output
 }
 
