@@ -205,11 +205,9 @@ struct Args {
     #[arg(long, value_name = "PASSWORD")]
     chrome_password: Vec<String>,
 
-    /// Extra NT-hash candidate for the DPAPI masterkey NTLM path, as
-    /// `SID:HEX` (repeatable). Needed for DOMAIN users, whose NT hash isn't in
-    /// the local SAM — source it from NTDS.dit, LSASS, or a pivot. Example:
-    /// `--chrome-nthash S-1-5-21-...-1103:aad3b435b51404eeaad3b435b51404ee`.
-    #[arg(long, value_name = "SID:HEX")]
+    /// NT hash for DPAPI masterkey decrypt (repeatable). Bare hex tries all
+    /// users; `SID:HEX` targets one. For domain users not in the local SAM.
+    #[arg(long, value_name = "[SID:]HEX")]
     chrome_nthash: Vec<String>,
 
     /// Also scan running chrome.exe / msedge.exe / brave.exe process memory
@@ -670,15 +668,15 @@ fn merge_findings(
     dst.autofill.append(&mut extra.autofill);
 }
 
-/// Parse `--chrome-nthash SID:HEX` specs into `(SID, 16-byte NT hash)` pairs.
-/// Malformed entries are logged and skipped rather than aborting the run.
+/// Parse `--chrome-nthash` specs into `(SID, 16-byte NT hash)` pairs.
+/// Accepts `SID:HEX` (targeted) or bare `HEX` (tried against all users).
 #[cfg(feature = "chrome")]
 fn parse_chrome_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
     let mut out: Vec<(String, [u8; 16])> = Vec::new();
     for spec in specs {
-        let Some((sid, hex_str)) = spec.split_once(':') else {
-            log::warn!("--chrome-nthash: expected SID:HEX, got {spec:?}");
-            continue;
+        let (sid, hex_str) = match spec.split_once(':') {
+            Some((s, h)) => (s, h),
+            None => ("", spec.as_str()),
         };
         let Ok(bytes) = hex::decode(hex_str.trim()) else {
             log::warn!("--chrome-nthash: invalid hex in {spec:?}");

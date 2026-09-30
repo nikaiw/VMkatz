@@ -5,17 +5,11 @@
 [![CI](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml/badge.svg)](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml)
 [![Platform](https://img.shields.io/badge/platform-linux%20|%20windows%20|%20macos%20|%20esxi-lightgrey)]()
 
-## Too Big to Steal
+You are three weeks into a red team engagement. You land on a NAS attached to the virtualization cluster — hundreds of gigabytes of `.vmdk`, `.vmsn`, `.sav` sitting right there. But your link does 200 KB/s. Exfiltrating a single 100 GB disk would take **six days**.
 
-You are three weeks into a red team engagement. Your traffic crawls through a VPN, then bounces across four SOCKS proxies chained through compromised jump boxes before it touches the target network. Every packet takes the scenic route.
+VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows credentials directly from VM files — memory snapshots, virtual disks, Veeam backups: NTLM hashes, Kerberos tickets, DPAPI master keys, LSA secrets, NTDS.dit, BitLocker keys, browser secrets.
 
-After days of lateral movement you land on a NAS attached to the virtualization cluster and the directory listing hits different: rows upon rows of `.vmdk`, `.vmsn`, `.sav`. Hundreds of gigabytes of virtual machines - domain controllers, admin workstations, the crown jewels - sitting right there.
-
-But your link wheezes at 200 KB/s. Pulling a single 100 GB disk image would take **six days**, and every hour of sustained exfil is another chance the SOC spots the anomaly, burns your tunnel, and the whole chain collapses.
-
-VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows secrets - NTLM hashes, DPAPI master keys, Kerberos tickets, cached domain credentials, LSA secrets, NTDS.dit, BitLocker keys - directly from VM memory snapshots and virtual disks, **on the NAS, the hypervisor, wherever the VM files are**.
-
-A single static binary, ~3 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a `.vmsn`, `.vmdk`, or an entire VM folder. Walk away with credentials, not disk images.
+Single static binary, ~3 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a VM folder and walk away with credentials, not disk images.
 
 ## What It Extracts
 
@@ -170,87 +164,25 @@ cargo build --release --features chrome                            # Add chrome 
 cargo build --release --features veeam                             # Add Veeam backup support
 ```
 
-## Browser secrets (optional)
+## Browser secrets (experimental)
 
 The optional `chrome` module extracts saved passwords, cookies, and autofill
-entries from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera)
-and Firefox. It is gated by the `chrome` Cargo feature at build time and the
-`--chrome` runtime flag, and depends on the `sam` feature for NTFS + DPAPI
-primitives. Four extraction vectors are supported:
+from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera) via
+offline DPAPI decryption. Build with `--features chrome`, enable with `--chrome`.
 
-- **Disk-only DPAPI chain** — given a disk image, the module walks each
-  user's `Protect` directory, decrypts every masterkey file (Win10+
-  password-derived chain; legacy NT-hash chain for domain users), pulls
-  `DPAPI_SYSTEM` from `SECURITY` for the SYSTEM-context MKs, then decrypts
-  each Chromium SQLite artifact end-to-end. Both Chrome v10
-  (`os_crypt.encrypted_key`) and v20 App-Bound Encryption (Chrome ≥127,
-  `app_bound_encrypted_key`) are handled.
-- **Hybrid (memory + disk)** — when a memory snapshot is also supplied, the
-  cleartext masterkeys extracted from LSASS are merged with the disk-side
-  keyring via `ComposedResolver`. This unlocks profiles whose user password
-  isn't in LSA secrets, and recovers v20 keys that depend on
-  SYSTEM-context-user MKs which only the elevation service can produce.
-- **In-process discovery** (`--chrome-process-scan`, opt-in) — walks every
-  chrome.exe / msedge.exe / brave.exe in the snapshot through the
-  page-table region enumerator and logs each process's PID, image and
-  mapped userland size. Currently a discovery-only signal ("a browser was
-  active when the snapshot was taken; here's how much RAM it had
-  touched"); structured cookie / password extraction is queued behind
-  per-Chrome-version `CookieMonster` locator signatures (the
-  `CanonicalCookie` struct layouts are already in
-  `src/chrome/cookie_monster.rs`, only the locator pattern is missing).
-  An earlier heuristic-based extractor was retired because chrome process
-  memory contains huge amounts of minified-JavaScript string tables and
-  chrome.dll auth-flow constants that look syntactically identical to
-  cookie or credential data once isolated from their structural context —
-  every filter pass either still leaked thousands of false positives
-  (which the user would have to triage) or rejected real cookies too. The
-  upcoming locator-signature path will recover what's in flight in
-  browser memory accurately — including the plaintext passwords Edge ≤
-  147 holds in memory for the whole session ([Rønning, April
-  2026](https://www.threatlocker.com/blog/microsoft-edge-is-keeping-your-passwords-in-plaintext-memory-heres-what-that-actually-means)).
-- **Memory-only** — limited; without disk access the encrypted SQLite files
-  are unreadable, so this path is mostly useful for pivoting MKs to a later
-  disk-mode run.
-
-Use `--chrome-password <pw>` (repeatable) to inject extra password candidates
-when the user's plaintext isn't in LSA (cracked offline, pivoted, known lab
-default). The v20 ABE static keys are auto-extracted from the install's
-`elevation_service.exe` PE; a Chrome 135 fallback ships in-tree so older
-binaries still decrypt.
+Supports Chrome v10 (`os_crypt.encrypted_key`) and v20 App-Bound Encryption
+(Chrome ≥127). Works from disk, memory+disk (hybrid), or both combined.
 
 ```bash
-# Disk-only: full decrypt where the user pwd is in LSA secrets
-./vmkatz --chrome disk.vmdk
-
-# Disk-only with extra password candidates
-./vmkatz --chrome --chrome-password vagrant disk.vmdk
-
-# Hybrid mem+disk: best yield for v20 ABE cookies
-./vmkatz --chrome --disk disk.vmdk snapshot.vmsn
-
-# Hybrid + chromium process discovery (logs each running browser PID+size)
-./vmkatz -v --chrome --chrome-process-scan --disk disk.vmdk snapshot.vmsn
-
-# Structured output for tooling
-./vmkatz --chrome --chrome-json disk.vmdk
+./vmkatz --chrome disk.vmdk                              # Disk-only
+./vmkatz --chrome --chrome-password vagrant disk.vmdk    # With extra password
+./vmkatz --chrome --disk disk.vmdk snapshot.vmsn         # Hybrid mem+disk
+./vmkatz --chrome --chrome-json disk.vmdk                # JSON output
 ```
 
 For domain users (whose credentials aren't in the local SAM), use
 `--chrome-password` with a known plaintext or `--chrome-nthash` with an NT
 hash to unlock their browser secrets.
-
-Status: Chromium decrypt (v10 + v20) validated on Win10 through Win Server 2025,
-including Chrome 154 v20 App-Bound v3 and domain-user DPAPI masterkeys.
-Firefox NSS plaintext decrypt is a scaffold — profile discovery works, but
-plaintext requires an NSS link that is not yet wired through.
-
-What we deliberately do *not* implement: the live `IElevator` COM-interface
-abuse and the debugger-based App-Bound Encryption bypasses (VoidStealer,
-xaitax/Chrome-App-Bound-Encryption-Decryption). Both require a live
-execution context inside a running Windows host; vmkatz is an offline
-forensic tool, so we work the other side of the same problem — disk DPAPI
-chain + memory snapshot reads.
 
 ## Documentation
 
@@ -268,6 +200,5 @@ chain + memory snapshot reads.
 - [**dissect.vmfs**](https://github.com/fox-it/dissect.vmfs) by Fox-IT (NCC Group) -- Python VMFS parser from the Dissect DFIR framework, used as reference for VMFS on-disk structures.
 - [**vmfs-tools**](https://github.com/glandium/vmfs-tools) by Mike Hommey -- open-source VMFS3/5 implementation that documents core on-disk structures and address types.
 - [**volatility-kerberos**](https://github.com/airbus-cert/volatility-kerberos) by Sylvain Peyrefitte ([@citronneur](https://twitter.com/citronneur), Airbus CERT) -- Volatility 3 Kerberos plugin, inspired the ticket carving approach for recovering orphaned tickets from freed LSASS memory.
-- [**ChromeKatz**](https://github.com/Meckazin/ChromeKatz) by Meckazin -- the inspiration for the chrome module's in-process scan. The `CanonicalCookie` struct layouts in `src/chrome/cookie_monster.rs` (Chrome 124 / Chrome 130 / Edge / Edge 130, with the ProcessBoundString cookie value variant) are ported from `CookieKatz/Memory.h`; the upcoming per-version locator signature will replace our current heuristic scan.
-- [**Chrome-App-Bound-Encryption-Decryption**](https://github.com/xaitax/Chrome-App-Bound-Encryption-Decryption) by xaitax -- reference for the Chrome ≥ 127 v20 App-Bound Encryption format. Our offline implementation works disk-side via `elevation_service.exe` PE pattern-scanning rather than the live syscall-based reflective hollowing the project uses, but the format/version notes were invaluable cross-references.
-- [**DonPAPI**](https://github.com/login-securite/DonPAPI) and [**dploot**](https://github.com/zblurx/dploot) -- DPAPI remote dumping tools; surveyed for the masterkey decryption chain order and the LSA-context-vs-machine-context `DPAPI_SYSTEM` halves used per `Protect\S-1-5-18\` subdirectory.
+- [**ChromeKatz**](https://github.com/Meckazin/ChromeKatz) by Meckazin -- reference for in-process cookie struct layouts.
+- [**Chrome-App-Bound-Encryption-Decryption**](https://github.com/xaitax/Chrome-App-Bound-Encryption-Decryption) by xaitax -- reference for the Chrome v20 App-Bound Encryption format.

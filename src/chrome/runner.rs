@@ -579,7 +579,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
             // or `--chrome-nthash`. A domain user's NT hash is not in the local SAM,
             // so this is the only source that covers them.
             for (h_sid, nt_hash) in extra_nt_hashes {
-                if h_sid == sid {
+                if h_sid.is_empty() || h_sid == sid {
                     if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
                         file_bytes, nt_hash, sid,
                     ) {
