@@ -190,35 +190,52 @@ fn materialize<L: PhysicalMemory>(
 
 /// Find the `Storage[Stable]` map layout structurally: try every kernel-VA pointer
 /// in the `_HHIVE` as the `Map`, with each candidate stride and entry scheme, and
-/// accept the one whose `dir -> table -> entry -> bin` chain resolves one of the
-/// first blocks to "hbin". Probes several offsets since the first may be paged out.
+/// keep the one whose `dir -> table -> entry -> bin` chain resolves the MOST probe
+/// blocks to "hbin".
+///
+/// Scoring (not first-match) is essential: a wrong stride can still resolve a few
+/// early blocks by coincidence — e.g. on Win7 the real `_HMAP_ENTRY` stride is 0x20,
+/// but 0x18 aligns on every other entry, so first-match picked 0x18 and mapped only
+/// ~half the hive (incomplete → parse fails). Genuinely paged-out blocks miss under
+/// every candidate, so they don't change which stride scores highest.
 fn calibrate(
     rv: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     hh: &[u8],
     length: usize,
 ) -> Option<MapLayout> {
     let probes = (length / 0x1000).min(64);
+    let mut best: Option<(usize, MapLayout)> = None;
     for o in (0x40..hh.len().saturating_sub(8)).step_by(8) {
         let map_va = u64at(hh, o);
         if !is_kernel_va(map_va) {
             continue;
         }
-        for stride in [0x18u64, 0x10, 0x20] {
+        for stride in [0x18u64, 0x10, 0x20, 0x28, 0x30] {
             for scheme in [EntryScheme::PermBin, EntryScheme::BlockAddr] {
                 let layout = MapLayout {
                     map_va,
                     stride,
                     scheme,
                 };
-                if (0..=probes).any(|i| {
-                    read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
-                }) {
+                let score = (0..=probes)
+                    .filter(|&i| {
+                        read_block(rv, &layout, i * 0x1000).is_some_and(|b| &b[0..4] == b"hbin")
+                    })
+                    .count();
+                if score == 0 {
+                    continue;
+                }
+                // Perfect resolution of every probe — no better layout exists.
+                if score == probes + 1 {
                     return Some(layout);
+                }
+                if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                    best = Some((score, layout));
                 }
             }
         }
     }
-    None
+    best.map(|(_, l)| l)
 }
 
 /// Read the 4 KB hive block for cell offset `off` (which is 4 KB-aligned here):
