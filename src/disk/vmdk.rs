@@ -13,6 +13,9 @@ pub struct VmdkDisk {
     disk_size: u64,
     cursor: u64,
     parent: Option<Box<Self>>,
+    /// Set once a read past an extent's data was zero-filled (truncated image or
+    /// I/O error); used to warn a single time instead of silently masking it.
+    read_masked: bool,
 }
 
 struct VmdkExtent {
@@ -81,6 +84,7 @@ impl VmdkDisk {
             disk_size,
             cursor: 0,
             parent,
+            read_masked: false,
         })
     }
 
@@ -142,6 +146,7 @@ impl VmdkDisk {
             disk_size,
             cursor: 0,
             parent: None,
+            read_masked: false,
         })
     }
 
@@ -160,6 +165,7 @@ impl VmdkDisk {
         }
 
         let mut filled = 0usize;
+        let mut masked_at: Option<u64> = None; // first offset zero-filled after a read failure
         while filled < to_read {
             let pos = offset + filled as u64;
             let virtual_sector = pos / SECTOR_SIZE;
@@ -217,7 +223,10 @@ impl VmdkDisk {
                         .read_exact(&mut buf[filled..filled + chunk])
                         .is_ok();
                 if !read_ok {
-                    // Truncated or sparse flat file: treat as zeros
+                    // Truncated flat file or I/O error: zero-fill, best-effort.
+                    if masked_at.is_none() {
+                        masked_at = Some(data_off);
+                    }
                     buf[filled..filled + chunk].fill(0);
                 }
                 filled += chunk;
@@ -264,6 +273,9 @@ impl VmdkDisk {
                         .read_exact(&mut buf[filled..filled + chunk])
                         .is_ok();
                 if !read_ok {
+                    if masked_at.is_none() {
+                        masked_at = Some(data_off);
+                    }
                     buf[filled..filled + chunk].fill(0);
                 }
             } else if let Some(ref mut parent) = self.parent {
@@ -280,6 +292,18 @@ impl VmdkDisk {
             }
 
             filled += chunk;
+        }
+
+        // Signal masked read failures once — silent zero-fill hides truncated
+        // extents and I/O errors, which would otherwise pass as valid data.
+        if let Some(off) = masked_at {
+            if !self.read_masked {
+                self.read_masked = true;
+                log::warn!(
+                    "VMDK: read failed at extent offset 0x{off:x}; zero-filling \
+                     (truncated image or I/O error). Results may be incomplete."
+                );
+            }
         }
 
         Ok(filled)
