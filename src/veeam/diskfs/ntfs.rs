@@ -167,6 +167,14 @@ impl<'a, R: ByteReader + ?Sized> NtfsFileSystem<'a, R> {
                 Some(offset) => data.extend_from_slice(&read_exact_at(self.reader, offset, want)?),
             }
         }
+        // The data runs must cover the requested size; if they fall short the file
+        // is truncated (missing extents) — refuse rather than return short bytes.
+        if (data.len() as u64) < capped {
+            return Err(corrupt(
+                "non-resident data",
+                "data runs shorter than the file size (truncated)",
+            ));
+        }
         data.truncate(usize::try_from(capped).unwrap_or(0));
         Ok(data)
     }
