@@ -121,16 +121,12 @@ pub fn extract_ad_hashes(
 
         let zero = [0u8; 16];
 
-        // Win2016+ may store the NT hash in dBCSPwd while unicodePwd is empty.
-        // When only one column has data, treat it as the NT hash.
-        let (nt_hash, lm_hash) = if nt_raw != zero {
-            (nt_raw, lm_raw)
-        } else if lm_raw != zero {
-            // unicodePwd is empty but dBCSPwd has data -> use it as NT hash
-            (lm_raw, zero)
-        } else {
-            (zero, zero)
-        };
+        // Columns map directly per the AD schema: unicodePwd (ATTk589879) is the
+        // NT hash, dBCSPwd (ATTk589914) is the LM hash. Never relabel dBCSPwd as
+        // NT when unicodePwd is empty — that emits a bogus, unusable NT hash
+        // (impacket keeps them in their own columns too).
+        let nt_hash = nt_raw;
+        let lm_hash = lm_raw;
 
         // Skip entries with no hashes at all
         if nt_hash == zero && lm_hash == zero {
