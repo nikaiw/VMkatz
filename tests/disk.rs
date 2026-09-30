@@ -165,3 +165,78 @@ fn test_qcow2_zero_flag_overrides_backing() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// Self-contained VDI tests (512-byte blocks): a normal physical block, a
+// VDI_IMAGE_BLOCK_ZERO (0xFFFFFFFE) block, and an unallocated block. Before the
+// zero-block fix, 0xFFFFFFFE was treated as a physical index and seeked past EOF.
+fn build_vdi(block_size: u32) -> Vec<u8> {
+    fn p32(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn p64(b: &mut [u8], off: usize, v: u64) {
+        b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut img = vec![0u8; 0x600];
+    p32(&mut img, 0x40, 0xBEDA_107F); // magic
+    p32(&mut img, 0x4C, 1); // image_type = normal (no parent)
+    p32(&mut img, 0x154, 0x200); // offset_blocks (BAT)
+    p32(&mut img, 0x158, 0x400); // offset_data
+    p64(&mut img, 0x170, 1536); // disk_size = 3 blocks
+    p32(&mut img, 0x178, block_size);
+    p32(&mut img, 0x180, 3); // blocks_total
+    // BAT @0x200: block0 -> physical 0, block1 -> ZERO, block2 -> unallocated
+    p32(&mut img, 0x200, 0);
+    p32(&mut img, 0x204, 0xFFFF_FFFE);
+    p32(&mut img, 0x208, 0xFFFF_FFFF);
+    img[0x400..0x600].fill(0xAB); // data block 0
+    img
+}
+
+#[test]
+fn test_vdi_zero_and_unallocated_blocks() {
+    let dir = std::env::temp_dir().join(format!("vmkatz_vdi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.vdi");
+    std::fs::write(&path, build_vdi(512)).unwrap();
+
+    let mut disk = VdiDisk::open(&path).expect("open vdi");
+    assert_eq!(disk.disk_size(), 1536);
+
+    let mut b0 = [0u8; 512];
+    disk.read_exact(&mut b0).unwrap();
+    assert!(
+        b0.iter().all(|&x| x == 0xAB),
+        "physical block must read its data"
+    );
+
+    disk.seek(SeekFrom::Start(512)).unwrap();
+    let mut b1 = [0xFFu8; 512];
+    disk.read_exact(&mut b1).unwrap();
+    assert!(
+        b1.iter().all(|&x| x == 0),
+        "BLOCK_ZERO must read zeros, not a far seek"
+    );
+
+    disk.seek(SeekFrom::Start(1024)).unwrap();
+    let mut b2 = [0xFFu8; 512];
+    disk.read_exact(&mut b2).unwrap();
+    assert!(
+        b2.iter().all(|&x| x == 0),
+        "unallocated block must read zeros"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_vdi_zero_block_size_rejected() {
+    let dir = std::env::temp_dir().join(format!("vmkatz_vdi0_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("z.vdi");
+    std::fs::write(&path, build_vdi(0)).unwrap(); // corrupt: block_size = 0
+    assert!(
+        VdiDisk::open(&path).is_err(),
+        "zero block_size must be rejected, not divide-by-zero"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

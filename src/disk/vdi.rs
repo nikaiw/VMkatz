@@ -7,6 +7,8 @@ use crate::error::{Result, VmkatzError};
 
 const VDI_MAGIC: u32 = 0xBEDA_107F;
 const BAT_UNALLOCATED: u32 = 0xFFFF_FFFF;
+/// VDI_IMAGE_BLOCK_ZERO: block allocated as all-zeros (not a physical offset).
+const BAT_ZERO: u32 = 0xFFFF_FFFE;
 const VDI_IMAGE_DIFF: u32 = 4;
 
 /// VDI disk image reader supporting dynamic and differencing images.
@@ -250,6 +252,13 @@ impl VdiDisk {
         let mut file = File::open(path)?;
         let header = parse_header(&mut file)?;
 
+        // block_size divides read positions; a zero (corrupt header) would panic.
+        if header.block_size == 0 {
+            return Err(VmkatzError::DiskFormatError(
+                "VDI block_size is zero (corrupt header)".to_string(),
+            ));
+        }
+
         log::debug!(
             "VDI: type={} disk_size={} block_size={} blocks_total={} uuid={}",
             header.image_type,
@@ -306,6 +315,13 @@ impl VdiDisk {
                 return parent.read(buf);
             }
             // Dynamic image: unallocated = zeros
+            buf.fill(0);
+            return Ok(buf.len());
+        }
+
+        // Explicitly-zeroed block: reads as zeros. Not a physical offset — without
+        // this it would be treated as block index 0xFFFFFFFE and seek far past EOF.
+        if bat_entry == BAT_ZERO {
             buf.fill(0);
             return Ok(buf.len());
         }
