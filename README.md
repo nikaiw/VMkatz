@@ -53,7 +53,8 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 | VirtualBox saved states | `.sav` | VirtualBox | Tested |
 | QEMU/KVM savevm states | auto-detected | Proxmox, QEMU | Tested |
 | QEMU/KVM ELF core dumps | `.elf` | `virsh dump` | Tested |
-| Hyper-V saved states | `.vmrs` | Hyper-V 2016+ | Untested |
+| Hyper-V saved states | `.vmrs` | Hyper-V 2016+ | Tested |
+| Veeam backups | `.vbk`, `.vib`, `.vrb` | Veeam B&R | Tested |
 | VMware virtual disks | `.vmdk` (sparse + flat) | Workstation, ESXi | Tested |
 | VirtualBox virtual disks | `.vdi` | VirtualBox | Tested |
 | QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox | Tested |
@@ -103,6 +104,14 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 
 # Parse LSASS minidump
 ./vmkatz lsass.dmp
+
+# Extract from Hyper-V saved state
+./vmkatz guest.vmrs
+
+# Extract from Veeam backup (requires --features veeam)
+./vmkatz --features veeam backup.vbk
+./vmkatz --veeam-list backup.vbk               # List disk images in backup
+./vmkatz --veeam-extract backup.vbk             # Extract raw disk image
 ```
 
 ## Output Formats
@@ -151,12 +160,14 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `dump` | Process memory dump as minidump | Yes |
 | `vmfs` | VMFS-5/6 raw parser for ESXi SCSI devices. Requires `sam` | Yes |
 | `chrome` | Browser secrets extraction (Chromium + Firefox). Requires `sam` | No |
+| `veeam` | Veeam VBK/VIB/VRB backup support. Requires `sam` | No |
 
 ```bash
 cargo build --release                                              # Full build
 cargo build --release --no-default-features --features vmware      # VMware only
 cargo build --release --no-default-features --features "sam ntds.dit"  # Disk only
 cargo build --release --features chrome                            # Add chrome module
+cargo build --release --features veeam                             # Add Veeam backup support
 ```
 
 ## Browser secrets (optional)
@@ -225,10 +236,14 @@ binaries still decrypt.
 ./vmkatz --chrome --chrome-json disk.vmdk
 ```
 
+Use `--chrome-nthash <user:hash>` (repeatable) to inject cracked NT hashes
+for domain-account masterkey derivation (PBKDF2 key3 + legacy 3DES/SHA1).
+
 Status: Chromium decrypt (v10 + v20) is complete and validated on Win10,
-Win11 22H2/24H2/25H2, Win Server 2019/2022/2025. Firefox NSS plaintext
-decrypt is a scaffold — profile discovery works, but plaintext requires an
-NSS link that is not yet wired through.
+Win11 22H2/24H2/25H2, Win Server 2019/2022/2025, including Chrome 154 v20
+App-Bound v3 (CNG-KSP machine key) and domain-user DPAPI masterkeys.
+Firefox NSS plaintext decrypt is a scaffold — profile discovery works, but
+plaintext requires an NSS link that is not yet wired through.
 
 What we deliberately do *not* implement: the live `IElevator` COM-interface
 abuse and the debugger-based App-Bound Encryption bypasses (VoidStealer,
