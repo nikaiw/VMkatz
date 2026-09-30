@@ -42,6 +42,10 @@ const RAM_SAVE_FLAG_CONTINUE: u64 = 0x020;
 const RAM_FLAG_MASK: u64 = 0xFFF;
 const RAM_SAVE_FLAG_COMPRESS_PAGE: u64 = 0x100;
 
+/// Sentinel `file_offset` marking a ZERO page during dedup: it removes any
+/// earlier data mapping for that GPA (a real offset is always < file length).
+const ZERO_PAGE_TOMBSTONE: u64 = u64::MAX;
+
 /// A mapped RAM page: GPA → file offset of its 4096 bytes.
 #[derive(Clone, Copy)]
 struct MappedPage {
@@ -246,12 +250,17 @@ impl QemuSavevmLayer {
             ));
         }
 
-        // Deduplicate: later entries (from dirty page iterations) overwrite earlier ones.
-        // Use a HashMap so the last write wins, then collect and sort for binary search.
+        // Resolve the in-order stream to a final GPA→offset map: iterative
+        // migration re-sends dirty pages, so the last entry per GPA wins, and a
+        // ZERO tombstone drops the GPA so it reads back as zeros.
         let mut page_map: std::collections::HashMap<u64, u64> =
             std::collections::HashMap::with_capacity(pages.len());
         for p in &pages {
-            page_map.insert(p.gpa, p.file_offset);
+            if p.file_offset == ZERO_PAGE_TOMBSTONE {
+                page_map.remove(&p.gpa);
+            } else {
+                page_map.insert(p.gpa, p.file_offset);
+            }
         }
         let mut pages: Vec<MappedPage> = page_map
             .into_iter()
@@ -418,7 +427,14 @@ impl QemuSavevmLayer {
                 }
                 // data[offset]: octet de remplissage (toujours 0x00, ignoré)
                 offset += 1;
-                // Don't store zero pages — read_phys returns zeros for unmapped GPAs
+                // Record a tombstone so this zeroing overrides any earlier data
+                // page at the same GPA (iterative migration re-sends dirty pages).
+                if is_main_ram {
+                    pages.push(MappedPage {
+                        gpa,
+                        file_offset: ZERO_PAGE_TOMBSTONE,
+                    });
+                }
             } else if flags & RAM_SAVE_FLAG_COMPRESS_PAGE != 0 {
                 // Compressed page (legacy, removed in QEMU 9.1) — skip
                 // We can't easily determine the compressed size without zlib parsing
