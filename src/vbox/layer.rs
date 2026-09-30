@@ -331,41 +331,6 @@ fn lzf_decompress(data: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::lzf_decompress;
-
-    #[test]
-    fn lzf_literal_run() {
-        // ctrl=1 => 2 literal bytes "AB"
-        let out = lzf_decompress(&[0x01, b'A', b'B'], 2).unwrap();
-        assert_eq!(out, b"AB");
-    }
-
-    #[test]
-    fn lzf_rle_overlap_offset1() {
-        // "A" then back-ref offset=1 length=4 => replicate last byte (RLE).
-        // ctrl=0x40 (len (2>>0)+2=4), off byte 0x00 => offset=1.
-        let out = lzf_decompress(&[0x00, b'A', 0x40, 0x00], 5).unwrap();
-        assert_eq!(out, b"AAAAA");
-    }
-
-    #[test]
-    fn lzf_pattern_overlap_offset2() {
-        // "AB" then back-ref offset=2 length=4 => period-2 repeat "ABABAB".
-        // A naive slice copy would read stale bytes; sequential copy must not.
-        let out = lzf_decompress(&[0x01, b'A', b'B', 0x40, 0x01], 6).unwrap();
-        assert_eq!(out, b"ABABAB");
-    }
-
-    #[test]
-    fn lzf_nonoverlap_backref() {
-        // "ABCD" then back-ref offset=4 length=4 => copy first 4 bytes.
-        let out = lzf_decompress(&[0x03, b'A', b'B', b'C', b'D', 0x40, 0x03], 8).unwrap();
-        assert_eq!(out, b"ABCDABCD");
-    }
-}
-
 impl VBoxLayer {
     /// Open a VirtualBox .sav file and extract all RAM pages.
     pub fn open(path: &Path) -> Result<Self> {
@@ -711,5 +676,40 @@ impl PhysicalMemory for VBoxLayer {
 
     fn phys_size(&self) -> u64 {
         self.phys_end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lzf_decompress;
+
+    #[test]
+    fn lzf_literal_run() {
+        // ctrl=1 => 2 literal bytes "AB"
+        let out = lzf_decompress(&[0x01, b'A', b'B'], 2).unwrap();
+        assert_eq!(out, b"AB");
+    }
+
+    #[test]
+    fn lzf_rle_overlap_offset1() {
+        // "A" then back-ref offset=1 length=4 => replicate last byte (RLE).
+        // ctrl=0x40 (len (2>>0)+2=4), off byte 0x00 => offset=1.
+        let out = lzf_decompress(&[0x00, b'A', 0x40, 0x00], 5).unwrap();
+        assert_eq!(out, b"AAAAA");
+    }
+
+    #[test]
+    fn lzf_pattern_overlap_offset2() {
+        // "AB" then back-ref offset=2 length=4 => period-2 repeat "ABABAB".
+        // A naive slice copy would read stale bytes; sequential copy must not.
+        let out = lzf_decompress(&[0x01, b'A', b'B', 0x40, 0x01], 6).unwrap();
+        assert_eq!(out, b"ABABAB");
+    }
+
+    #[test]
+    fn lzf_nonoverlap_backref() {
+        // "ABCD" then back-ref offset=4 length=4 => copy first 4 bytes.
+        let out = lzf_decompress(&[0x03, b'A', b'B', b'C', b'D', 0x40, 0x03], 8).unwrap();
+        assert_eq!(out, b"ABCDABCD");
     }
 }

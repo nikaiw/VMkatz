@@ -845,7 +845,9 @@ mod tests {
             })
             .collect();
         // Succeeds only for even payloads, returning the byte as the "key".
-        let f = |_sid: &str, _sub: &str, bytes: &[u8]| (bytes[0] % 2 == 0).then(|| vec![bytes[0]]);
+        let f = |_sid: &str, _sub: &str, bytes: &[u8]| {
+            bytes[0].is_multiple_of(2).then(|| vec![bytes[0]])
+        };
         let mut kr = HybridKeyring::new();
         decrypt_collected(&items, &f, &mut kr, "test");
         assert_eq!(kr.len(), 100);

@@ -845,12 +845,12 @@ mod tests {
     }
 
     /// 3DES-CBC encrypt without padding, for test fixtures.
-    fn tdes_cbc_encrypt(key: &[u8], iv: &[u8; 8], pt: &[u8]) -> Vec<u8> {
+    fn tdes_cbc_encrypt(key: &[u8], iv: [u8; 8], pt: &[u8]) -> Vec<u8> {
         use cbc::cipher::{BlockEncryptMut, KeyIvInit};
         type Enc = cbc::Encryptor<TdesEde3>;
         let mut buf = pt.to_vec();
         let n = buf.len();
-        Enc::new(key.into(), iv.into())
+        Enc::new(key.into(), (&iv).into())
             .encrypt_padded_mut::<NoPadding>(&mut buf, n)
             .unwrap();
         buf
@@ -883,7 +883,7 @@ mod tests {
         cleartext.extend_from_slice(&[0u8; 4]);
         cleartext.extend_from_slice(&mk_bytes);
 
-        let cipher = tdes_cbc_encrypt(des3_key, &iv, &cleartext);
+        let cipher = tdes_cbc_encrypt(des3_key, iv, &cleartext);
         let mut file = build_mk_file(
             2,
             "aaaabbbb-cccc-dddd-eeee-ffff00001177",
