@@ -278,43 +278,47 @@ impl VhdDisk {
             bat.push(read_u32_be_file(&mut file)?);
         }
 
-        // Open parent for differencing disks
+        // Open parent for differencing disks. Without the parent a differencing
+        // disk is incomplete (unchanged blocks would silently read as zeros), so
+        // a missing/unopenable parent is a hard error rather than a warning.
         let parent = if footer.disk_type == DISK_TYPE_DIFFERENCING {
             let parent_id = dyn_header.parent_unique_id;
             if parent_id == [0u8; 16] {
-                log::warn!("VHD differencing disk has zero parent UUID");
-                None
-            } else {
-                // Try each parent locator
-                let mut found_parent = None;
-                for loc in &dyn_header.parent_locators {
-                    if let Ok(parent_ref) = read_parent_path(&mut file, loc) {
-                        if parent_ref.is_empty() {
-                            continue;
-                        }
-                        let parent_path = resolve_parent_path(path, &parent_ref);
-                        log::info!("VHD: differencing disk, parent: {}", parent_path.display());
-                        if parent_path.exists() {
-                            match Self::open(&parent_path) {
-                                Ok(p) => {
-                                    found_parent = Some(Box::new(p));
-                                    break;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "VHD: failed to open parent {}: {e}",
-                                        parent_path.display()
-                                    );
-                                }
+                return Err(VmkatzError::DiskFormatError(
+                    "VHD differencing disk has a zero parent UUID".to_string(),
+                ));
+            }
+            // Try each parent locator
+            let mut found_parent = None;
+            for loc in &dyn_header.parent_locators {
+                if let Ok(parent_ref) = read_parent_path(&mut file, loc) {
+                    if parent_ref.is_empty() {
+                        continue;
+                    }
+                    let parent_path = resolve_parent_path(path, &parent_ref);
+                    log::info!("VHD: differencing disk, parent: {}", parent_path.display());
+                    if parent_path.exists() {
+                        match Self::open(&parent_path) {
+                            Ok(p) => {
+                                found_parent = Some(Box::new(p));
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "VHD: failed to open parent {}: {e}",
+                                    parent_path.display()
+                                );
                             }
                         }
                     }
                 }
-                if found_parent.is_none() {
-                    log::warn!("VHD: no accessible parent found for differencing disk");
-                }
-                found_parent
             }
+            if found_parent.is_none() {
+                return Err(VmkatzError::DiskFormatError(
+                    "VHD differencing disk requires its parent, none accessible".to_string(),
+                ));
+            }
+            found_parent
         } else {
             None
         };
