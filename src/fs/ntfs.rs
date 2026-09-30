@@ -119,25 +119,35 @@ pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> 
     match data_value.read_exact(reader, &mut buf) {
         Ok(()) => Ok(buf),
         Err(e) => {
-            log::warn!("Exact read failed ({e}), retrying with resilient I/O");
+            log::debug!("Exact read failed ({e}), retrying with resilient chunked I/O");
             // Reset and try chunked reads with zero-fill on errors
             let mut data_value = data_attr.value(reader).map_err(|e2| {
                 crate::error::VmkatzError::DecryptionError(format!("Attribute value error: {e2}"))
             })?;
             let mut offset = 0usize;
+            let mut zeroed = 0usize; // bytes we could not read
             while offset < buf.len() {
                 let end = (offset + CHUNK).min(buf.len());
                 // Seek to the correct position before each chunk to avoid cursor desync
                 // after a failed read_exact (which leaves the cursor in an undefined state)
                 let _ = data_value.seek(reader, std::io::SeekFrom::Start(offset as u64));
-                match data_value.read_exact(reader, &mut buf[offset..end]) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        // Zero-fill this chunk and skip
-                        buf[offset..end].fill(0);
-                    }
+                if data_value
+                    .read_exact(reader, &mut buf[offset..end])
+                    .is_err()
+                {
+                    // Zero-fill this chunk and skip
+                    buf[offset..end].fill(0);
+                    zeroed += end - offset;
                 }
                 offset = end;
+            }
+            // Signal how much is missing: a silently-zeroed hive (SAM/NTDS/Chrome)
+            // would otherwise look complete and yield wrong or absent secrets.
+            if zeroed > 0 {
+                log::warn!(
+                    "NTFS resilient read: {zeroed}/{} bytes unreadable and zero-filled — file is incomplete",
+                    buf.len()
+                );
             }
             Ok(buf)
         }
