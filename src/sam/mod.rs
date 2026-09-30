@@ -56,7 +56,7 @@ impl SamEntry {
 }
 
 /// Combined extraction result: SAM hashes + LSA secrets + cached credentials.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DiskSecrets {
     pub sam_entries: Vec<SamEntry>,
     pub lsa_secrets: Vec<lsa::LsaSecret>,

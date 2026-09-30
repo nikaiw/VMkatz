@@ -1145,8 +1145,10 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     let disks = vmkatz::veeam::list_disk_images(input_path, password)
         .context("failed to enumerate Veeam disk images")?;
     if disks.is_empty() {
+        // Encryption is handled above, so an empty list means the backup holds
+        // no Windows disk images (e.g. a Linux/agent backup or a wrong password).
         anyhow::bail!(
-            "No bootable disk images in Veeam backup {} (encrypted? try --veeam-password)",
+            "No Windows disk images in Veeam backup {}",
             input_path.display()
         );
     }
@@ -1305,7 +1307,7 @@ fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     let mut found_anything = false;
 
     reader.seek(SeekFrom::Start(0))?;
-    match vmkatz::sam::extract_secrets_from_reader(reader) {
+    let secrets = match vmkatz::sam::extract_secrets_from_reader(reader) {
         Ok(secrets) => {
             found_anything = true;
             match args.format.as_str() {
@@ -1330,33 +1332,32 @@ fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
                     _ => print_cached_credentials(&secrets.cached_credentials, c),
                 }
             }
+            secrets
+        }
+        Err(e) => {
+            eprintln!("[!] SAM extraction failed: {e}");
+            vmkatz::sam::DiskSecrets::default()
+        }
+    };
 
-            // Chrome reuses the secrets just extracted for keyring building.
-            #[cfg(feature = "chrome")]
-            {
-                if args.chrome {
-                    reader.seek(SeekFrom::Start(0))?;
-                    match vmkatz::chrome::runner::run_reader(
-                        reader,
-                        &secrets,
-                        &args.chrome_password,
-                    ) {
-                        Ok(summary) => {
-                            if !summary.profiles.is_empty() || !summary.findings.is_empty() {
-                                found_anything = true;
-                            }
-                            let out =
-                                vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                            if !out.trim().is_empty() {
-                                println!("{out}");
-                            }
-                        }
-                        Err(e) => log::warn!("chrome extraction failed: {e}"),
-                    }
+    // Chrome — independent of SAM success, like run_sam. Recovered secrets seed
+    // keyring building; without them we still discover profiles and try
+    // --chrome-password candidates.
+    #[cfg(feature = "chrome")]
+    if args.chrome {
+        reader.seek(SeekFrom::Start(0))?;
+        match vmkatz::chrome::runner::run_reader(reader, &secrets, &args.chrome_password) {
+            Ok(summary) => {
+                if !summary.profiles.is_empty() || !summary.findings.is_empty() {
+                    found_anything = true;
+                }
+                let out = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
+                if !out.trim().is_empty() {
+                    println!("{out}");
                 }
             }
+            Err(e) => log::warn!("chrome extraction failed: {e}"),
         }
-        Err(e) => eprintln!("[!] SAM extraction failed: {e}"),
     }
 
     // DPAPI master key hashes (independent of SAM).
