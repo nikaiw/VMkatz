@@ -2826,34 +2826,12 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 
     let layer = make_layer()?;
 
-    // Registry-hive carving from physical memory runs first by default (needs no
-    // page tables or process list, works under Credential Guard). When it recovers
-    // credentials that is the whole result; otherwise fall through to the LSASS
-    // pipeline. `--no-mem-registry` skips it.
-    // `true` when the signature carve already recovered creds — the later CM
-    // hive-map pass (in run_with_system) is then redundant and gets skipped.
-    #[cfg(feature = "sam")]
-    let mem_registry_carved = if args.no_mem_registry {
-        false
-    } else {
-        let found = run_mem_registry(&layer, args);
-        // With --chrome, the browser decrypt runs later in the LSASS pipeline, so a
-        // successful carve must not short-circuit it (else the hybrid flow needs
-        // --no-mem-registry). Treat the carve as the whole result only without --chrome.
-        #[cfg(feature = "chrome")]
-        let keep_going_for_chrome = args.chrome;
-        #[cfg(not(feature = "chrome"))]
-        let keep_going_for_chrome = false;
-        if found && !keep_going_for_chrome {
-            return Ok(());
-        }
-        if !found {
-            eprintln!("[*] Registry carve found nothing usable — trying the LSASS cache");
-        }
-        found
-    };
-    #[cfg(not(feature = "sam"))]
-    let mem_registry_carved = false;
+    // Registry (SAM/LSA) recovery now runs inside run_with_system: the exact CM
+    // hive-map walk first, the signature carve only as a fallback. The carve no
+    // longer runs eagerly up front — it scanned all of physical RAM and reassembled
+    // scattered bins (high memory, slow), which the hive-map walk avoids when page
+    // tables are available. When no System process can be found at all (VBS with no
+    // recoverable page tables), the carve is still reached as the last resort below.
 
     // -- Phase 1: Direct L1 scan for System process --
     let t_system = std::time::Instant::now();
@@ -2868,7 +2846,6 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                 verbose,
                 pagefile,
                 disk_path,
-                mem_registry_carved,
             )
         }
         #[cfg(feature = "carve")]
@@ -2877,6 +2854,13 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
             run_carve(&layer, args, pagefile, disk_path)
         }
         Err(_) if !args.ept => {
+            // No page tables here (System not in L1, EPT disabled), so the CM
+            // hive-map walk can't run — the signature carve is the only registry
+            // recovery. Works under Credential Guard.
+            #[cfg(feature = "sam")]
+            if !args.no_mem_registry && run_mem_registry(&layer, args) {
+                return Ok(());
+            }
             anyhow::bail!(
                 "System process not found in physical memory (EPT scan disabled, use --ept to enable)"
             );
@@ -2969,7 +2953,6 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                             verbose,
                             pagefile,
                             disk_path,
-                            mem_registry_carved,
                         );
                     }
                     Err(e) => {
@@ -3017,6 +3000,12 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                 return run_carve(&layer, args, pagefile, disk_path);
             }
 
+            // System never found (L1 + EPT): no page tables for the hive-map walk,
+            // so fall back to the signature carve for registry (SAM/LSA) recovery.
+            #[cfg(feature = "sam")]
+            if !args.no_mem_registry && run_mem_registry(&layer, args) {
+                return Ok(());
+            }
             Err(last_err
                 .unwrap_or_else(|| vmkatz::error::VmkatzError::SystemProcessNotFound.into()))
         }
@@ -3038,7 +3027,6 @@ fn run_with_system<L: PhysicalMemory>(
     verbose: bool,
     pagefile: PagefileRef<'_>,
     disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
-    mem_registry_carved: bool,
 ) -> anyhow::Result<()> {
     // Enumerate all processes
     let t_enum = std::time::Instant::now();
@@ -3056,19 +3044,24 @@ fn run_with_system<L: PhysicalMemory>(
         }
     }
 
-    // Registry recovery via the CM hive-map — resolves hives the signature carve
-    // can't (fragmented to scattered pages). Bins are mapped in the Registry process
-    // (Win10 1803+), so translate with its DTB. Skipped when the carve already
-    // succeeded, since it is an extra (partly sequential) full-memory pass.
+    // Registry recovery: the CM hive-map walk is primary — it reconstructs each
+    // hive exactly from the _HHIVE/_HMAP (O(hive size), low memory) using the
+    // Registry process DTB (Win10 1803+; else System's). The signature carve —
+    // which scans all of physical RAM and reassembles scattered bins from stale
+    // copies — is only a fallback for hives the map walk can't resolve (fragmented,
+    // pre-1803). LSASS extraction still runs afterwards either way.
     #[cfg(feature = "sam")]
-    if !args.no_mem_registry && !args.list_processes && !mem_registry_carved {
+    if !args.no_mem_registry && !args.list_processes {
         let reg_dtb = processes
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case("Registry"))
             .map_or(system.dtb, |p| p.dtb);
         eprintln!("[*] Recovering registry hives via CM hive-map...");
         let creds = vmkatz::sam::cm_hive::extract_from_cm_map(layer, reg_dtb);
-        print_registry_creds(&creds, args);
+        if !print_registry_creds(&creds, args) {
+            eprintln!("[*] CM hive-map recovered nothing — falling back to signature carve...");
+            run_mem_registry(layer, args);
+        }
     }
 
     if args.list_processes {
