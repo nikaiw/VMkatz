@@ -472,7 +472,9 @@ impl VhdxDisk {
             bat.len(),
         );
 
-        // 7. Open parent for differencing disks
+        // 7. Open parent for differencing disks. A differencing disk only stores
+        // changed blocks, so without its parent the image is incomplete and any
+        // read of an unchanged block would silently return zeros — fail instead.
         let parent = if metadata.has_parent {
             match parse_parent_locator(&mut file, regions.metadata_offset) {
                 Ok(Some(parent_ref)) => {
@@ -481,17 +483,21 @@ impl VhdxDisk {
                     if parent_path.exists() {
                         Some(Box::new(Self::open(&parent_path)?))
                     } else {
-                        log::warn!("VHDX parent not found: {}", parent_path.display());
-                        None
+                        return Err(VmkatzError::DiskFormatError(format!(
+                            "VHDX differencing disk requires its parent, not found: {}",
+                            parent_path.display()
+                        )));
                     }
                 }
                 Ok(None) => {
-                    log::warn!("VHDX has_parent=true but no parent locator found");
-                    None
+                    return Err(VmkatzError::DiskFormatError(
+                        "VHDX differencing disk has no parent locator".to_string(),
+                    ));
                 }
                 Err(e) => {
-                    log::warn!("VHDX parent locator parse error: {e}");
-                    None
+                    return Err(VmkatzError::DiskFormatError(format!(
+                        "VHDX parent locator parse error: {e}"
+                    )));
                 }
             }
         } else {
@@ -596,11 +602,16 @@ impl VhdxDisk {
         // Read sector-by-sector using the bitmap
         let sector_size = u64::from(self.logical_sector_size);
         let block_size = u64::from(self.block_size);
+        // The sector bitmap covers the whole chunk (all `chunk_ratio` payload
+        // blocks), so index it by this block's position within its chunk plus
+        // the sector within the block — not by the in-block sector alone.
+        let sectors_per_block = block_size / sector_size;
+        let block_in_chunk = block_index % self.chunk_ratio;
         let mut filled = 0usize;
         let mut pos_in_block = offset_in_block;
 
         while filled < buf.len() && pos_in_block < block_size {
-            let sector_index = pos_in_block / sector_size;
+            let sector_index = block_in_chunk * sectors_per_block + pos_in_block / sector_size;
             let bitmap_byte_off = sb_file_offset + sector_index / 8;
             let bitmap_bit = (sector_index % 8) as u8;
 
