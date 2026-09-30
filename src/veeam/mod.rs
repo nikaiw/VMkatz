@@ -44,4 +44,6 @@ pub use metadata::{
     MetadataLayout, MetadataMirrorReport, MetadataRegion, MetadataSegment, verify_metadata_mirror,
 };
 pub use properties::{Property, PropertyValue, read_properties_dictionary};
-pub use reconstruct::{LogicalFileReader, LogicalImageReader};
+pub use reconstruct::{
+    ExtractionReport, LogicalFileReader, LogicalImageReader, extract_item_to_path_with_password,
+};

@@ -250,6 +250,23 @@ struct Args {
     #[cfg(feature = "veeam")]
     #[arg(long, value_name = "PASSWORD")]
     veeam_password: Option<String>,
+
+    /// List the catalogue (stored VMs/files) of a Veeam backup, then exit.
+    #[cfg(feature = "veeam")]
+    #[arg(long)]
+    veeam_list: bool,
+
+    /// Reconstruct one stored file from a Veeam backup by exact catalogue name
+    /// or stable path (e.g. a NTDS.dit or a registry hive), then exit.
+    #[cfg(feature = "veeam")]
+    #[arg(long, value_name = "NAME")]
+    veeam_extract: Option<String>,
+
+    /// Destination path for --veeam-extract (default: the item's basename in the
+    /// current directory). Never overwrites an existing file.
+    #[cfg(feature = "veeam")]
+    #[arg(long, value_name = "PATH")]
+    veeam_output: Option<String>,
 }
 
 impl Args {
@@ -1104,6 +1121,20 @@ fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     let password = args.veeam_password.as_deref();
 
+    // Inspection/extraction sub-modes (mirror vbktool's `list` / `extract`).
+    if args.veeam_list {
+        return run_veeam_list(input_path, password, args);
+    }
+    if let Some(name) = &args.veeam_extract {
+        return run_veeam_extract(
+            input_path,
+            name,
+            args.veeam_output.as_deref(),
+            password,
+            args,
+        );
+    }
+
     // Encrypted backup with no password: we can't reconstruct anything, but we
     // can emit the password-wrapped keyset as a Hashcat target (mode 31200) for
     // offline cracking. With --veeam-password we fall through to extraction.
@@ -1182,6 +1213,85 @@ fn emit_veeam_hashcat(input_path: &Path) -> anyhow::Result<()> {
     eprintln!(
         "[*] Crack with: hashcat -m {} <hash> <wordlist>, then re-run with --veeam-password",
         vmkatz::veeam::HASHCAT_VEEAM_VBK_MODE
+    );
+    Ok(())
+}
+
+/// Human-readable byte size (binary units), matching vbktool's list output.
+#[cfg(feature = "veeam")]
+fn veeam_human_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// `--veeam-list`: print the backup catalogue (directories and stored files).
+#[cfg(feature = "veeam")]
+fn run_veeam_list(input_path: &Path, password: Option<&str>, args: &Args) -> anyhow::Result<()> {
+    use vmkatz::veeam::StoredItemKind;
+    let catalog = vmkatz::veeam::list_items_with_password(input_path, password)
+        .context("failed to read Veeam catalogue")?;
+    let c = get_colors(args);
+    let (mut files, mut dirs, mut total) = (0u64, 0u64, 0u64);
+    for item in &catalog.items {
+        match item.kind {
+            StoredItemKind::Directory => {
+                dirs += 1;
+                eprintln!("\n{}{}/{}", c.cyan, item.name, c.reset);
+            }
+            StoredItemKind::File => {
+                files += 1;
+                let sz = item.size.unwrap_or(0);
+                total += sz;
+                println!("  {:>11}  {}", veeam_human_size(sz), item.name);
+            }
+        }
+    }
+    eprintln!(
+        "\n{files} file(s) · {dirs} director(ies) · {} total",
+        veeam_human_size(total)
+    );
+    Ok(())
+}
+
+/// `--veeam-extract`: reconstruct one stored file to disk (never overwrites).
+#[cfg(feature = "veeam")]
+fn run_veeam_extract(
+    input_path: &Path,
+    name: &str,
+    output: Option<&str>,
+    password: Option<&str>,
+    args: &Args,
+) -> anyhow::Result<()> {
+    // Default destination: the item's basename (after any catalogue path) in cwd.
+    let default_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let dest = Path::new(output.unwrap_or(default_name));
+    let report =
+        vmkatz::veeam::extract_item_to_path_with_password(input_path, name, dest, password)
+            .with_context(|| format!("failed to extract {name:?}"))?;
+    let c = get_colors(args);
+    eprintln!(
+        "{}[+] Extracted {} → {}{}",
+        c.green,
+        report.name,
+        dest.display(),
+        c.reset
+    );
+    eprintln!(
+        "    {} · {} blocks ({} sparse, {} compressed)",
+        veeam_human_size(report.bytes_written),
+        report.block_count,
+        report.sparse_blocks,
+        report.compressed_blocks
     );
     Ok(())
 }
