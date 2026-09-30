@@ -20,6 +20,15 @@ const OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
 /// Bit 62: compressed cluster flag.
 const COMPRESSED_FLAG: u64 = 1 << 62;
 
+/// Bit 0: "all zeroes" flag (QCOW_OFLAG_ZERO, qcow2 v3). The cluster reads as
+/// zeros regardless of any backing file — it marks a sector explicitly cleared
+/// over the parent. Reserved (always 0) in v2, so the check is safe there too.
+const ZERO_FLAG: u64 = 1;
+
+/// Max backing-file chain depth. Real chains are a handful deep; the cap turns a
+/// circular chain (which would recurse forever and crash) into a clean error.
+const MAX_BACKING_DEPTH: u32 = 64;
+
 /// QCOW2 (QEMU Copy-On-Write v2/v3) disk image reader with backing file chain.
 pub struct QcowDisk {
     file: File,
@@ -99,6 +108,17 @@ fn parse_header(file: &mut File) -> Result<QcowHeader> {
 impl QcowDisk {
     /// Open a QCOW2 disk image, recursively opening backing files.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_depth(path, 0)
+    }
+
+    /// Backing-file chain depth is bounded so a circular chain errors instead of
+    /// recursing until the stack overflows.
+    fn open_with_depth(path: &Path, depth: u32) -> Result<Self> {
+        if depth > MAX_BACKING_DEPTH {
+            return Err(VmkatzError::Parse(format!(
+                "QCOW2 backing chain exceeds {MAX_BACKING_DEPTH} levels (circular chain?)"
+            )));
+        }
         let mut file = File::open(path)?;
         let header = parse_header(&mut file)?;
 
@@ -132,7 +152,7 @@ impl QcowDisk {
 
             let backing_path = resolve_backing_path(path, &backing_name);
             log::debug!("QCOW2: backing file: {}", backing_path.display());
-            Some(Box::new(Self::open(&backing_path)?))
+            Some(Box::new(Self::open_with_depth(&backing_path, depth + 1)?))
         } else {
             None
         };
@@ -181,6 +201,13 @@ impl QcowDisk {
                 std::io::ErrorKind::Unsupported,
                 "QCOW2 compressed clusters not supported",
             ));
+        }
+
+        // Explicitly-zeroed cluster: reads as zeros, overriding the backing file.
+        // Must be checked before falling back to the parent.
+        if l2_entry & ZERO_FLAG != 0 {
+            buf.fill(0);
+            return Ok(buf.len());
         }
 
         let data_cluster_offset = l2_entry & OFFSET_MASK;

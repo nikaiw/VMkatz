@@ -80,3 +80,88 @@ fn test_open_diff_vdi() {
     assert_eq!(mbr[510], 0x55);
     assert_eq!(mbr[511], 0xAA);
 }
+
+// Self-contained QCOW2 test: crafts a minimal parent + child image (512-byte
+// clusters) to exercise the backing chain and the QCOW_OFLAG_ZERO flag. The
+// child marks virtual cluster 0 explicitly-zeroed over a parent cluster full of
+// 0xAB; before the zero-flag fix this read back 0xAB from the parent.
+#[test]
+fn test_qcow2_zero_flag_overrides_backing() {
+    // BE writers into a fixed-size cluster buffer.
+    fn put_u32(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    fn put_u64(b: &mut [u8], off: usize, v: u64) {
+        b[off..off + 8].copy_from_slice(&v.to_be_bytes());
+    }
+    // header at cluster 0; l1_table_offset points at `l1_off`.
+    fn header(disk_size: u64, l1_off: u64, backing: Option<(u64, u32)>) -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        put_u32(&mut h, 0, 0x5146_49FB); // magic
+        put_u32(&mut h, 4, 3); // version 3
+        if let Some((off, len)) = backing {
+            put_u64(&mut h, 8, off);
+            put_u32(&mut h, 16, len);
+        }
+        put_u32(&mut h, 20, 9); // cluster_bits = 9 (512-byte clusters)
+        put_u64(&mut h, 24, disk_size);
+        put_u32(&mut h, 32, 0); // no encryption
+        put_u32(&mut h, 36, 1); // l1_size = 1 entry
+        put_u64(&mut h, 40, l1_off);
+        h
+    }
+
+    let dir = std::env::temp_dir().join(format!("vmkatz_qcow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent_path = dir.join("parent.qcow2");
+    let child_path = dir.join("child.qcow2");
+
+    // Parent: L2[0] -> data 0xAB, L2[1] -> data 0xCD.
+    let mut parent = header(1024, 512, None); // cluster 0
+    let mut l1 = vec![0u8; 512]; // cluster 1 @512
+    put_u64(&mut l1, 0, 1024); // L1[0] -> L2 table @1024
+    let mut l2 = vec![0u8; 512]; // cluster 2 @1024
+    put_u64(&mut l2, 0, 1536); // L2[0] -> data @1536
+    put_u64(&mut l2, 8, 2048); // L2[1] -> data @2048
+    parent.extend_from_slice(&l1);
+    parent.extend_from_slice(&l2);
+    parent.extend_from_slice(&[0xAB; 512]); // cluster 3 @1536
+    parent.extend_from_slice(&[0xCD; 512]); // cluster 4 @2048
+    std::fs::write(&parent_path, &parent).unwrap();
+
+    // Child: backing = parent; L2[0] = ZERO_FLAG (explicitly zeroed),
+    // L2[1] = 0 (unallocated -> falls through to parent's 0xCD).
+    let backing_name = b"parent.qcow2";
+    let mut child = header(1024, 512, Some((48, backing_name.len() as u32)));
+    child[48..48 + backing_name.len()].copy_from_slice(backing_name);
+    let mut cl1 = vec![0u8; 512];
+    put_u64(&mut cl1, 0, 1024); // L1[0] -> L2 @1024
+    let mut cl2 = vec![0u8; 512];
+    put_u64(&mut cl2, 0, 1); // L2[0] = QCOW_OFLAG_ZERO
+    // L2[1] left 0 (unallocated)
+    child.extend_from_slice(&cl1);
+    child.extend_from_slice(&cl2);
+    std::fs::write(&child_path, &child).unwrap();
+
+    let mut disk = QcowDisk::open(&child_path).expect("open child qcow2");
+    assert_eq!(disk.disk_size(), 1024);
+
+    // Cluster 0: zero-flagged -> must read zeros, NOT the parent's 0xAB.
+    let mut c0 = [0xFFu8; 512];
+    disk.read_exact(&mut c0).unwrap();
+    assert!(
+        c0.iter().all(|&b| b == 0),
+        "zero-flagged cluster must read zeros, not backing data"
+    );
+
+    // Cluster 1: unallocated in child -> backing chain returns parent's 0xCD.
+    disk.seek(SeekFrom::Start(512)).unwrap();
+    let mut c1 = [0u8; 512];
+    disk.read_exact(&mut c1).unwrap();
+    assert!(
+        c1.iter().all(|&b| b == 0xCD),
+        "unallocated cluster must read from backing file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
