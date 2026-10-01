@@ -19,12 +19,22 @@ jobs:
         with:
           toolchain: 1.98.1
           components: clippy, rustfmt
+          # Windows std: cfg(windows) breakage used to surface only at release time.
+          # The -gnu target stands in for -msvc here (same cfg(windows) code paths)
+          # because mingw can build the C deps on an ubuntu runner, msvc can't.
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw (Windows cross-check)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings
+
+      - name: Clippy (Windows target)
+        run: cargo clippy --all-features --target x86_64-pc-windows-gnu -- -D warnings
 
       - name: Tests
         run: cargo test --all-features
