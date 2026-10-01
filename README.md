@@ -5,6 +5,8 @@
 [![CI](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml/badge.svg)](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml)
 [![Platform](https://img.shields.io/badge/platform-linux%20|%20windows%20|%20macos%20|%20esxi-lightgrey)]()
 
+## Too Big to Steal
+
 You are three weeks into a red team engagement. You land on a NAS attached to the virtualization cluster — hundreds of gigabytes of `.vmdk`, `.vmsn`, `.sav` sitting right there. But your link does 200 KB/s. Exfiltrating a single 100 GB disk would take **six days**.
 
 VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows credentials directly from VM files — memory snapshots, virtual disks, Veeam backups: NTLM hashes, Kerberos tickets, DPAPI master keys, LSA secrets, NTDS.dit, BitLocker keys, browser secrets.
