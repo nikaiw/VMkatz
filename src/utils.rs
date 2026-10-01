@@ -168,19 +168,8 @@ impl MappedFile {
                 {
                     return Err(eof());
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::FileExt;
-                    let f = file.lock().unwrap();
-                    f.read_exact_at(buf, offset)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut f = file.lock().unwrap();
-                    f.seek(SeekFrom::Start(offset))?;
-                    f.read_exact(buf)?;
-                }
+                let f = file.lock().unwrap();
+                read_exact_at(&f, buf, offset)?;
                 Ok(())
             }
         }
@@ -210,33 +199,42 @@ impl MappedFile {
     ///
     /// No-op on the pread fallback (nothing is resident there) and best-effort on
     /// mmap (an advisory syscall; harmless if the platform ignores it).
+    // Windows: body is cfg'd out, so clippy sees a trivially-const empty fn.
+    #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))]
     pub fn advise_dontneed(&self, offset: u64, len: u64) {
-        // Round the range inward to page boundaries: only whole pages fully
-        // inside the scanned span are dropped, never a partial page that may
-        // share bytes with data still in use.
-        const PAGE: u64 = 4096;
-        let Self::Mmap(m) = self else { return };
-        let map_len = m.len() as u64;
-        if len == 0 || offset >= map_len {
-            return;
-        }
-        let end = offset.saturating_add(len).min(map_len);
-        let start = offset.div_ceil(PAGE) * PAGE;
-        let aligned_end = (end / PAGE) * PAGE;
-        if aligned_end <= start {
-            return;
-        }
-        // SAFETY: `m` is a read-only, file-backed mapping. MADV_DONTNEED on such a
-        // mapping discards only clean resident pages; a later access transparently
-        // re-faults them from the file with no data loss. (memmap2 gates this as
-        // `unchecked` because on a *dirty private* mapping it would lose writes —
-        // not our case.)
-        unsafe {
-            let _ = m.unchecked_advise_range(
-                memmap2::UncheckedAdvice::DontNeed,
-                start as usize,
-                (aligned_end - start) as usize,
-            );
+        // madvise(DONTNEED) is unix-only; elsewhere the OS reclaims mapped pages on
+        // its own, so the whole body is gated and this is a no-op.
+        #[cfg(not(unix))]
+        let _ = (self, offset, len);
+        #[cfg(unix)]
+        {
+            // Round the range inward to page boundaries: only whole pages fully
+            // inside the scanned span are dropped, never a partial page that may
+            // share bytes with data still in use.
+            const PAGE: u64 = 4096;
+            let Self::Mmap(m) = self else { return };
+            let map_len = m.len() as u64;
+            if len == 0 || offset >= map_len {
+                return;
+            }
+            let end = offset.saturating_add(len).min(map_len);
+            let start = offset.div_ceil(PAGE) * PAGE;
+            let aligned_end = (end / PAGE) * PAGE;
+            if aligned_end <= start {
+                return;
+            }
+            // SAFETY: `m` is a read-only, file-backed mapping. MADV_DONTNEED on such
+            // a mapping discards only clean resident pages; a later access
+            // transparently re-faults them from the file with no data loss. (memmap2
+            // gates this as `unchecked` because on a *dirty private* mapping it would
+            // lose writes — not our case.)
+            unsafe {
+                let _ = m.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    start as usize,
+                    (aligned_end - start) as usize,
+                );
+            }
         }
     }
 }
@@ -301,6 +299,7 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
             // the kernel reads ahead (faster) and may drop pages behind the cursor.
             // Combined with the explicit `advise_dontneed` calls the scan loops
             // make, this keeps resident memory near one scan window. Best-effort.
+            #[cfg(unix)]
             let _ = m.advise(memmap2::Advice::Sequential);
 
             // Guardrail: on a memory-constrained host (notably an ESXi userworld)
@@ -363,4 +362,34 @@ pub fn format_guid(bytes: &[u8]) -> String {
         "{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     )
+}
+
+/// Positioned read, portable. `pread` on unix, `seek_read` on Windows (which can
+/// return short, hence the loop). Both take `&File`, so callers can share one
+/// handle across threads without a lock.
+pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match file.seek_read(&mut buf[done..], offset + done as u64) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short positioned read",
+                    ));
+                }
+                Ok(n) => done += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }

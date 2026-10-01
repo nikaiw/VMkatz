@@ -1284,7 +1284,6 @@ impl PhysicalMemory for VmrsLayer {
     /// GPA. XPRESS decompression is the scan's bottleneck, so this spreads it over
     /// all cores; block scans are independent, so no ordering is needed.
     fn par_scan(&self, f: &(dyn Fn(u64, &[u8]) -> bool + Sync)) -> bool {
-        use std::os::unix::fs::FileExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         if self.ram_block_count == 0 {
@@ -1357,7 +1356,7 @@ impl PhysicalMemory for VmrsLayer {
                             break;
                         };
                         let mut raw = vec![0u8; csize as usize];
-                        if fh.read_exact_at(&mut raw, foff).is_err() {
+                        if crate::utils::read_exact_at(&fh, &mut raw, foff).is_err() {
                             continue;
                         }
                         let block = if csize as usize == RAM_BLOCK_SIZE {

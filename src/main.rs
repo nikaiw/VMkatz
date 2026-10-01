@@ -2585,6 +2585,8 @@ fn run_lsass(
 
 /// Check if a path is a block device (Linux /dev/...).
 #[cfg(feature = "sam")]
+// Windows: the unix branch is cfg'd out, leaving a trivially-const `false`.
+#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))]
 fn is_block_dev(path: &Path) -> bool {
     #[cfg(unix)]
     {

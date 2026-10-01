@@ -1,4 +1,6 @@
-use std::{fs::File, os::unix::fs::FileExt, path::Path};
+use std::{fs::File, path::Path};
+
+use crate::utils::read_exact_at;
 
 use crate::veeam::{Result, VbkError};
 
@@ -30,7 +32,7 @@ impl FileReader {
         self.validate_range(offset, length)?;
 
         let mut bytes = [0_u8; SIZE];
-        self.file.read_exact_at(&mut bytes, offset)?;
+        read_exact_at(&self.file, &mut bytes, offset)?;
         Ok(bytes)
     }
 
@@ -54,7 +56,7 @@ impl FileReader {
             reason: error.to_string(),
         })?;
         let mut bytes = vec![0_u8; allocation];
-        self.file.read_exact_at(&mut bytes, offset)?;
+        read_exact_at(&self.file, &mut bytes, offset)?;
         Ok(bytes)
     }
 
