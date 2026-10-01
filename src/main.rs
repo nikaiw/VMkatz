@@ -1453,7 +1453,10 @@ fn extract_ntds_from_reader<R: std::io::Read + std::io::Seek>(
 /// Extract AD hashes from raw NTDS.dit + SYSTEM hive files.
 #[cfg(feature = "ntds.dit")]
 fn run_raw_ntds(ntds_path: &Path, system_path: &Path, args: &Args) -> anyhow::Result<()> {
-    let ntds_data = std::fs::read(ntds_path)
+    // Mapped, not read: a production NTDS.dit runs to tens of GB and the ESE
+    // parser only ever borrows `&[u8]`, so there is nothing to gain from a heap
+    // copy and an allocation abort to lose.
+    let ntds_data = vmkatz::utils::FileBytes::open(ntds_path)
         .with_context(|| format!("Failed to read {}", ntds_path.display()))?;
     let system_data = std::fs::read(system_path)
         .with_context(|| format!("Failed to read {}", system_path.display()))?;

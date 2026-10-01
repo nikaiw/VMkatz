@@ -11,10 +11,10 @@ license = "MIT"
 
 [features]
 default = ["vmware", "vbox", "qemu", "hyperv", "sam", "ntds.dit", "carve", "dump", "vmfs"]
-vmware = ["dep:memmap2"]
+vmware = []
 vbox = []
-qemu = ["dep:memmap2"]
-hyperv = ["dep:memmap2"]
+qemu = []
+hyperv = []
 sam = ["dep:ntfs", "dep:md-5", "dep:md4", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
 "ntds.dit" = ["sam"]
 carve = []
@@ -33,7 +33,7 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
-memmap2 = { version = "0.9", optional = true }
+memmap2 = "0.9"
 ntfs = { version = "0.4", optional = true }
 md-5 = { version = "0.10", optional = true }
 md4 = { version = "0.10", optional = true }

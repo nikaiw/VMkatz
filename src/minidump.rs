@@ -24,8 +24,8 @@ const STREAM_TYPE_MEMORY64_LIST: u32 = 9;
 
 /// Parsed minidump file ready for virtual memory reads.
 pub struct Minidump {
-    /// Raw file data (memory-mapped or loaded).
-    data: Vec<u8>,
+    /// Raw file data, memory-mapped when opened from a path.
+    data: crate::utils::FileBytes,
     /// Sorted list of (start_va, size, file_offset) for memory regions.
     regions: Vec<MemRegion>,
     /// B-tree mapping start_va → region index for fast lookup.
@@ -56,8 +56,10 @@ struct MemRegion {
 impl Minidump {
     /// Open and parse a minidump file.
     pub fn open(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path).map_err(VmkatzError::Io)?;
-        Self::parse(data)
+        // Mapped, not read: a complete memory dump is RAM-sized, and slurping one
+        // into a Vec is an allocation abort on any host with a sane pagefile.
+        let data = crate::utils::FileBytes::open(path).map_err(VmkatzError::Io)?;
+        Self::parse_bytes(data)
     }
 
     /// Number of memory regions in the dump.
@@ -71,8 +73,12 @@ impl Minidump {
         self.regions.iter().map(|r| (r.start_va, r.size)).collect()
     }
 
-    /// Parse minidump from raw bytes.
+    /// Parse minidump from an owned buffer.
     pub fn parse(data: Vec<u8>) -> Result<Self> {
+        Self::parse_bytes(crate::utils::FileBytes::Owned(data))
+    }
+
+    fn parse_bytes(data: crate::utils::FileBytes) -> Result<Self> {
         if data.len() < 32 {
             return Err(VmkatzError::InvalidMagic(0));
         }
