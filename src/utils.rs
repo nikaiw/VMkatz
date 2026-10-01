@@ -1,3 +1,34 @@
+//! Byte-level read helpers, file mapping, and the host-memory guardrails that
+//! keep a full-image sweep from ballooning resident memory.
+
+// The two kernel32 calls we need for memory behaviour on a Windows analysis
+// host. Declared by hand rather than pulling in `windows-sys` — two prototypes
+// is less than a dependency.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Unlocking a never-locked range still evicts it from the working set.
+    fn VirtualUnlock(addr: *const core::ffi::c_void, size: usize) -> i32;
+    fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+}
+
+/// `MEMORYSTATUSEX`. Only `avail_page_file` is read: on Windows an allocation
+/// fails when the *commit* limit (RAM + pagefile) is exhausted, not when free
+/// RAM runs out, so that is the figure that predicts an allocation abort.
+#[cfg(windows)]
+#[repr(C)]
+struct MemoryStatusEx {
+    length: u32,
+    memory_load: u32,
+    total_phys: u64,
+    avail_phys: u64,
+    total_page_file: u64,
+    avail_page_file: u64,
+    total_virtual: u64,
+    avail_virtual: u64,
+    avail_extended_virtual: u64,
+}
+
 /// Safe little-endian read helpers.
 /// Bounds-checked alternatives to `data[off..off+N].try_into().unwrap()`.
 #[inline]
@@ -109,7 +140,6 @@ pub fn file_size(file: &mut std::fs::File) -> std::io::Result<u64> {
 /// on old ESXi where mmap is unavailable.
 ///
 /// [`advise_dontneed`]: MappedFile::advise_dontneed
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
 pub enum MappedFile {
     Mmap(memmap2::Mmap),
     /// Fallback: pread-based access via a shared file handle. No image bytes are
@@ -120,7 +150,6 @@ pub enum MappedFile {
     },
 }
 
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
 impl MappedFile {
     pub fn len(&self) -> usize {
         match self {
@@ -198,51 +227,64 @@ impl MappedFile {
     /// memory-constrained host (e.g. an ESXi userworld).
     ///
     /// No-op on the pread fallback (nothing is resident there) and best-effort on
-    /// mmap (an advisory syscall; harmless if the platform ignores it).
-    // Windows: body is cfg'd out, so clippy sees a trivially-const empty fn.
-    #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))]
+    /// mmap (an advisory call; harmless if the platform ignores it).
     pub fn advise_dontneed(&self, offset: u64, len: u64) {
-        // madvise(DONTNEED) is unix-only; elsewhere the OS reclaims mapped pages on
-        // its own, so the whole body is gated and this is a no-op.
-        #[cfg(not(unix))]
-        let _ = (self, offset, len);
+        // Round the range inward to page boundaries: only whole pages fully
+        // inside the scanned span are dropped, never a partial page that may
+        // share bytes with data still in use.
+        const PAGE: u64 = 4096;
+        let Self::Mmap(m) = self else { return };
+        let map_len = m.len() as u64;
+        if len == 0 || offset >= map_len {
+            return;
+        }
+        let end = offset.saturating_add(len).min(map_len);
+        let start = offset.div_ceil(PAGE) * PAGE;
+        let aligned_end = (end / PAGE) * PAGE;
+        if aligned_end <= start {
+            return;
+        }
+        let (off, n) = (start as usize, (aligned_end - start) as usize);
+
         #[cfg(unix)]
         {
-            // Round the range inward to page boundaries: only whole pages fully
-            // inside the scanned span are dropped, never a partial page that may
-            // share bytes with data still in use.
-            const PAGE: u64 = 4096;
-            let Self::Mmap(m) = self else { return };
-            let map_len = m.len() as u64;
-            if len == 0 || offset >= map_len {
-                return;
-            }
-            let end = offset.saturating_add(len).min(map_len);
-            let start = offset.div_ceil(PAGE) * PAGE;
-            let aligned_end = (end / PAGE) * PAGE;
-            if aligned_end <= start {
-                return;
-            }
             // SAFETY: `m` is a read-only, file-backed mapping. MADV_DONTNEED on such
             // a mapping discards only clean resident pages; a later access
             // transparently re-faults them from the file with no data loss. (memmap2
             // gates this as `unchecked` because on a *dirty private* mapping it would
             // lose writes — not our case.)
             unsafe {
-                let _ = m.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    start as usize,
-                    (aligned_end - start) as usize,
-                );
+                let _ = m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, off, n);
             }
         }
+        #[cfg(windows)]
+        {
+            // Windows has no madvise. VirtualUnlock on a range that was never
+            // locked still removes those pages from the process working set (it
+            // reports ERROR_NOT_LOCKED, which we ignore) — the documented
+            // equivalent, and safe here because the view is read-only and
+            // file-backed, so the pages re-fault from the file on next access.
+            // Without this the whole image stays in the working set and the RSS
+            // bound promised above simply does not hold.
+            // SAFETY: `[off, off + n)` lies inside the mapping (clamped above).
+            unsafe {
+                let _ = VirtualUnlock(m.as_ptr().add(off).cast(), n);
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = (off, n);
     }
 }
 
-/// Best-effort available-RAM figure from `/proc/meminfo` (present on Linux and the
-/// ESXi userworld). Returns `None` when it can't be read/parsed.
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
-fn available_memory_bytes() -> Option<u64> {
+/// Best-effort "how much more can this host give us" figure.
+///
+/// Used both to warn the operator and to size the scan caches. `None` when it
+/// can't be determined; callers then fall back to their static budget.
+///
+/// Linux/ESXi: `MemAvailable` from `/proc/meminfo`. Windows: the available
+/// *commit* charge, which is what an allocation actually draws on there.
+#[cfg(not(windows))]
+pub fn available_memory_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
@@ -253,7 +295,37 @@ fn available_memory_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
+#[cfg(windows)]
+pub fn available_memory_bytes() -> Option<u64> {
+    let mut st = MemoryStatusEx {
+        length: u32::try_from(size_of::<MemoryStatusEx>()).ok()?,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `st` is a correctly sized, initialised MEMORYSTATUSEX.
+    if unsafe { GlobalMemoryStatusEx(&raw mut st) } == 0 {
+        return None;
+    }
+    // Available commit, but never more than free RAM + what the pagefile can
+    // still take; paging a multi-GB cache to disk is not "available" in any
+    // useful sense for a scan, so clamp to the smaller of the two.
+    Some(st.avail_page_file.min(st.avail_phys.saturating_mul(2)))
+}
+
+/// Memory a scan cache may claim: a quarter of what the host reports available.
+///
+/// The quarter leaves room for the rest of the pipeline and for the host itself.
+/// `None` when the host figure is unknown — callers then keep their static budget.
+pub fn cache_budget_bytes() -> Option<u64> {
+    available_memory_bytes().map(|avail| avail / 4)
+}
+
 impl std::ops::Deref for MappedFile {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -261,9 +333,46 @@ impl std::ops::Deref for MappedFile {
     }
 }
 
+/// Whole-file bytes with no heap copy of the file.
+///
+/// mmap, falling back to a plain read when the platform or filesystem refuses.
+/// An NTDS.dit from a real DC, or a complete memory dump, is routinely tens of
+/// GB — `fs::read` of one is an allocation abort, while a read-only mapping
+/// costs no commit charge and pages in only what gets touched.
+pub enum FileBytes {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl FileBytes {
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only mapping of a file we hold open. Another process
+        // truncating it under us would fault — the same exposure every other
+        // mmap path in this tool already accepts.
+        match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => {
+                #[cfg(unix)]
+                let _ = m.advise(memmap2::Advice::Sequential);
+                Ok(Self::Mapped(m))
+            }
+            Err(_) => Ok(Self::Owned(std::fs::read(path)?)),
+        }
+    }
+}
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(m) => m,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
 /// Read the first `max_bytes` of a file into a Vec.
 /// Used to parse headers/tags from files where mmap is unavailable.
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
 pub fn read_file_header(file: &std::fs::File, max_bytes: usize) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = file.try_clone()?;
@@ -277,7 +386,6 @@ pub fn read_file_header(file: &std::fs::File, max_bytes: usize) -> std::io::Resu
 
 /// Open a file as MappedFile: tries mmap first, falls back to pread on failure.
 /// Handles block devices where fstat returns size 0.
-#[cfg(any(feature = "vmware", feature = "qemu", feature = "hyperv"))]
 pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<MappedFile> {
     use std::io::{Seek, SeekFrom};
     let mut f = file.try_clone()?;
@@ -290,8 +398,16 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
         ));
     }
 
-    // Try mmap first
-    let mmap_result = unsafe { memmap2::MmapOptions::new().len(size as usize).map(file) };
+    // Try mmap first. A file larger than the address space can't be mapped at all
+    // on a 32-bit host (armv7/i686 builds) — `size as usize` would silently
+    // truncate and scan the wrong bytes, so fall through to pread instead.
+    let mmap_result = match usize::try_from(size) {
+        Ok(len) => unsafe { memmap2::MmapOptions::new().len(len).map(file) },
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file larger than this host's address space",
+        )),
+    };
 
     match mmap_result {
         Ok(m) => {
