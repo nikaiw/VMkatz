@@ -24,8 +24,8 @@ jobs:
           # because mingw can build the C deps on an ubuntu runner, msvc can't.
           targets: x86_64-pc-windows-gnu
 
-      - name: Install mingw (Windows cross-check)
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Install mingw + wine (Windows cross-check)
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 wine64
 
       - name: Format
         run: cargo fmt --all --check
@@ -38,3 +38,13 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features
+
+      # The platform-divergent code (positioned reads, drop-behind, host-memory
+      # query) is where cfg(windows) can compile and still be wrong. Clippy only
+      # proves it builds; these two run it.
+      - name: Tests (Windows target, under wine)
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: wine
+        run: >
+          cargo test --all-features --target x86_64-pc-windows-gnu
+          --test memory_limits --test positioned_read
