@@ -129,6 +129,9 @@ fn scan_hives<L: PhysicalMemory>(
                 i += 8; // _HHIVE is 8-aligned
             }
         }
+        // Release the window just swept: on an mmap-backed layer this is the only
+        // thing keeping a full-RAM scan from leaving the whole image resident.
+        layer.advise_scanned(base, n as u64);
         base += buf.len() as u64;
     }
     hives

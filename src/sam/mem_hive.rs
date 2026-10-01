@@ -117,6 +117,10 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
             if phys.read_phys(base, &mut buf[..n]).is_ok() {
                 collect(base, &buf[..n]);
             }
+            // Release the window just swept: on an mmap-backed layer this is the
+            // only thing keeping a full-RAM carve from leaving the whole image
+            // resident. (The par_scan path manages its own block cache.)
+            phys.advise_scanned(base, n as u64);
             base += buf.len() as u64;
         }
     }

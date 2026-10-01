@@ -202,6 +202,9 @@ fn combined_scan_pass<P: PhysicalMemory>(phys: &P) -> (Vec<Process>, ScanResults
             &mut results.session_candidates,
         );
 
+        // Release the window just swept so an mmap-backed layer drops it
+        // instead of leaving the whole image resident.
+        phys.advise_scanned(chunk_addr, read_len as u64);
         chunk_addr += read_len as u64;
     }
 
@@ -1364,6 +1367,9 @@ fn search_blob_multi_keys<P: PhysicalMemory>(
             page_off += 4096;
         }
 
+        // Release the window just swept so an mmap-backed layer drops it
+        // instead of leaving the whole image resident.
+        phys.advise_scanned(chunk_addr, read_len as u64);
         chunk_addr += read_len as u64;
     }
 
