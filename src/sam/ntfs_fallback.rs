@@ -97,8 +97,11 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
         let shift = i32::from(raw).unsigned_abs();
         if shift < 64 { 1u64 << shift } else { 0 }
     };
-    // MFT records are 1024 bytes in practice; bound to a sane range.
-    if record_size_u64 == 0 || record_size_u64 > (1 << 20) {
+    // MFT records are 1024 bytes in practice and can't exceed one cluster, so
+    // 64 KiB is the real ceiling. The bound matters: the MFT readers allocate
+    // 256 records at a time, so the old 1 MiB limit let a bogus boot sector ask
+    // for a 256 MiB buffer.
+    if record_size_u64 == 0 || record_size_u64 > (1 << 16) {
         return Err(VmkatzError::DecryptionError(format!(
             "Invalid NTFS boot sector: record_size={record_size_u64}"
         )));

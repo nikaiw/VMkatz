@@ -1316,7 +1316,13 @@ impl PhysicalMemory for VmrsLayer {
             .iter()
             .find_map(|k| self.key_values.get(k.as_str()).copied())
             .or_else(|| ram_entries.get(bi as usize).copied());
-            if let Some((foff, csize)) = loc {
+            // A compressed block never exceeds the uncompressed block size; a
+            // key-table `size` larger than that is garbage, and allocating it
+            // (×nthreads below) is how a corrupt VMRS turns into an OOM. The
+            // `ram_entries` path already filters on this — apply it to both.
+            if let Some((foff, csize)) =
+                loc.filter(|&(_, cs)| cs > 0 && cs as usize <= RAM_BLOCK_SIZE)
+            {
                 let ram_offset = bi * RAM_BLOCK_SIZE as u64;
                 let gpa = if self.mmio_gap_size == 0 || ram_offset < self.mmio_gap_base {
                     ram_offset
@@ -1339,7 +1345,11 @@ impl PhysicalMemory for VmrsLayer {
         // measured working set is a few thousand blocks, so this budget covers the
         // common case thrash-free while bounding peak memory; anything beyond it is
         // re-decompressed on demand.
-        let keep_budget = WARM_CACHE_BLOCKS;
+        // ...and shrunk further when the host has less to spare than that, since
+        // nothing here ever gives the retained blocks back for the rest of the run.
+        let keep_budget = crate::utils::cache_budget_bytes().map_or(WARM_CACHE_BLOCKS, |b| {
+            WARM_CACHE_BLOCKS.min((b as usize / RAM_BLOCK_SIZE).max(256))
+        });
         let keep: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
         let nthreads = std::thread::available_parallelism()
             .map_or(4, std::num::NonZeroUsize::get)

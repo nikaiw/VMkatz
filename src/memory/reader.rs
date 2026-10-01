@@ -1,4 +1,26 @@
-use crate::error::Result;
+use crate::error::{Result, VmkatzError};
+
+/// Ceiling on a single `read_*_bytes` buffer.
+///
+/// These lengths come from the image: a PE `virtual_size`, a struct length field.
+/// A forged or garbage u32 would ask for up to 4 GiB in one `vec![0u8; len]`,
+/// which aborts the process (`panic = "abort"`, and on Windows the commit limit
+/// bites well before free RAM does). The largest legitimate caller is the Chrome
+/// process scan at 64 MiB per region, so 128 MiB leaves ample headroom while
+/// turning a bogus length into an error instead of a crash.
+pub const MAX_READ_BYTES: usize = 128 * 1024 * 1024;
+
+/// Allocate a read buffer, refusing an implausible length.
+fn alloc_buf(what: &'static str, len: usize) -> Result<Vec<u8>> {
+    if len > MAX_READ_BYTES {
+        return Err(VmkatzError::AllocTooLarge {
+            what,
+            requested: len,
+            limit: MAX_READ_BYTES,
+        });
+    }
+    Ok(vec![0u8; len])
+}
 
 /// Read from guest physical address space.
 pub trait PhysicalMemory {
@@ -29,7 +51,7 @@ pub trait PhysicalMemory {
     }
 
     fn read_phys_bytes(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
+        let mut buf = alloc_buf("physical read", len)?;
         self.read_phys(addr, &mut buf)?;
         Ok(buf)
     }
@@ -98,7 +120,7 @@ pub trait VirtualMemory {
     }
 
     fn read_virt_bytes(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
+        let mut buf = alloc_buf("virtual read", len)?;
         self.read_virt(addr, &mut buf)?;
         Ok(buf)
     }

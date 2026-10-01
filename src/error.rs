@@ -43,6 +43,13 @@ pub enum VmkatzError {
 
     #[error("Parse error: {0}")]
     Parse(String),
+
+    #[error("{what} of {requested} bytes exceeds the {limit}-byte limit")]
+    AllocTooLarge {
+        what: &'static str,
+        requested: usize,
+        limit: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, VmkatzError>;
