@@ -18,6 +18,17 @@ fn is_valid_kernel_flink(flink: u64, bitness: WindowsBitness) -> bool {
     }
 }
 
+/// Is this `EPROCESS.DirectoryTableBase` a usable page-table root?
+///
+/// Only the masked base matters: the low 12 bits of DirectoryTableBase are not
+/// always zero (a Win10 guest in a VirtualBox .sav carries 0x002 on every
+/// process), and every page-table walker masks with `PAGE_PHYS_MASK` anyway.
+/// Checking alignment of the raw value rejects those guests outright.
+const fn is_plausible_dtb(dtb: u64, phys_size: u64) -> bool {
+    let base = dtb & PAGE_PHYS_MASK;
+    base != 0 && base < phys_size
+}
+
 /// Validate that a Flink VA can be translated to a physical address and the
 /// linked EPROCESS contains a plausible PID. This rejects stale System process
 /// remnants where the DTB points to freed/corrupted page tables.
@@ -152,8 +163,7 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
                     let Ok(dtb) = reader.read_dtb(phys, eprocess_phys) else {
                         continue;
                     };
-                    let dtb_base = dtb & PAGE_PHYS_MASK;
-                    if dtb_base == 0 || dtb_base >= phys_size {
+                    if !is_plausible_dtb(dtb, phys_size) {
                         continue;
                     }
 
@@ -296,8 +306,7 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
                         let Ok(dtb) = reader.read_dtb(ept, eprocess_l2) else {
                             continue;
                         };
-                        let dtb_base = dtb & PAGE_PHYS_MASK;
-                        if dtb_base == 0 || dtb_base >= ept.phys_size() {
+                        if !is_plausible_dtb(dtb, ept.phys_size()) {
                             continue;
                         }
 
@@ -444,15 +453,14 @@ pub fn enumerate_processes(
         // contains one node that is NOT an EPROCESS: the PsActiveProcessHead sentinel,
         // a _LIST_ENTRY in ntoskrnl's .data. Interpreting it as an EPROCESS (head -
         // active_process_links) reads arbitrary kernel data — an out-of-range PID, an
-        // unaligned/out-of-range DirectoryTableBase, or an empty name. The same checks
+        // out-of-range DirectoryTableBase, or an empty name. The same checks
         // also reject a genuinely torn link. Such a node is skipped (not recorded) and
         // the walk continues; it then reaches an already-seen EPROCESS (the ring loops
         // back to System) and the visited_eproc guard terminates cleanly, so the full
-        // ring is traversed. Windows PIDs are 32-bit and every live process has a
-        // page-aligned in-range DTB and a non-empty name.
+        // ring is traversed. Windows PIDs are 32-bit and every live process has an
+        // in-range DTB and a non-empty name.
         let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
-        let dtb_base = dtb & PAGE_PHYS_MASK;
-        let dtb_ok = dtb_base != 0 && dtb_base < phys.phys_size() && dtb.trailing_zeros() >= 12;
+        let dtb_ok = is_plausible_dtb(dtb, phys.phys_size());
         // Skip PID 0 (System Idle Process) too.
         if pid != 0 && u32::try_from(pid).is_ok() && dtb_ok {
             let short_name = reader
