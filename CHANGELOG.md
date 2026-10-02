@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.5.1
+
+### Fixes
+- **Process enumeration regression** — `EPROCESS.DirectoryTableBase` is no longer required to be page-aligned in its raw form. Win10 guests carry `0x002` in the low bits on every process, so the alignment check introduced in v1.5.0 rejected the whole list and left only System: LSASS extraction failed with "lsass.exe not found in process list". All three DTB validation sites now share one predicate that masks before checking
+- **Allocation bounds** — a PE `virtual_size` reached `vec![0u8; len]` unvalidated at ~20 call sites; one guard in the shared `read_*_bytes` covers them all. Same for the VMRS key-table block size and the NTFS record size
+- **Full-RAM sweeps** — swept windows are dropped as they are consumed, keeping RSS at one window instead of the whole image
+- **Windows portability** — drop-behind used `madvise(DONTNEED)` with no Windows equivalent, so the documented RSS bound was a no-op there; `VirtualUnlock` evicts the same pages. The host-memory query read `/proc/meminfo` only, which disabled the oversize warning
+
+### Performance
+- NTDS.dit and LSASS minidumps are mapped instead of read into memory
+
 ## v1.5.0
 
 ### New Features
