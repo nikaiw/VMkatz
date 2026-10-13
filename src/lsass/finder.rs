@@ -122,7 +122,7 @@ impl<'a> LsassDlls<'a> {
 
 /// Insert MSV session metadata into the credential map.
 fn insert_sessions(
-    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     sessions: Vec<crate::lsass::msv::MsvSessionInfo>,
 ) {
     for sess in sessions {
@@ -146,7 +146,7 @@ fn extract_simple_providers(
     dlls: &LsassDlls<'_>,
     keys: &CryptoKeys,
     arch: Arch,
-    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     status: &mut ProviderStatuses,
 ) {
     // WDigest
@@ -314,7 +314,7 @@ fn extract_dpapi_from_dlls(
 
 /// Insert DPAPI credentials into the credential map.
 fn insert_dpapi_creds(
-    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     dpapi_creds: Vec<(u64, crate::lsass::types::DpapiCredential)>,
 ) {
     for (luid, dpapi_cred) in dpapi_creds {
@@ -327,7 +327,7 @@ fn insert_dpapi_creds(
 
 /// Assign Kerberos key groups to credentials by matching RC4 keys to NT hashes.
 fn assign_kerberos_key_groups(
-    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     key_groups: Vec<Vec<KerberosKey>>,
 ) {
     let nt_to_luid: Vec<([u8; 16], u64)> = all_creds
@@ -387,7 +387,7 @@ fn assign_kerberos_key_groups(
 /// Attach carved Kerberos tickets to a credential: prefer one in the same domain,
 /// else the first credential that already holds Kerberos data. Deduplicates by blob.
 fn attach_carved_tickets(
-    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     carved: Vec<crate::lsass::types::KerberosTicket>,
 ) {
     for ticket in carved {
@@ -421,7 +421,7 @@ fn attach_carved_tickets(
 
 /// Fill well-known LUID names, sort by LUID.
 fn finalize_credentials(
-    mut all_creds: std::collections::HashMap<u64, Credential>,
+    mut all_creds: std::collections::BTreeMap<u64, Credential>,
 ) -> Vec<Credential> {
     for cred in all_creds.values_mut() {
         crate::lsass::types::fill_wellknown_luid(cred);
@@ -594,8 +594,8 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
     // Extract Vista+ crypto keys (AES/3DES) — same algorithm, x86 patterns
     let keys = crypto::extract_crypto_keys_x86(&vmem, lsasrv.base, lsasrv.size)?;
 
-    let mut all_creds: std::collections::HashMap<u64, Credential> =
-        std::collections::HashMap::new();
+    let mut all_creds: std::collections::BTreeMap<u64, Credential> =
+        std::collections::BTreeMap::new();
     let mut status = ProviderStatuses::new(&dlls);
 
     // MSV sessions + credentials
@@ -777,8 +777,8 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
     };
 
-    let mut all_creds: std::collections::HashMap<u64, Credential> =
-        std::collections::HashMap::new();
+    let mut all_creds: std::collections::BTreeMap<u64, Credential> =
+        std::collections::BTreeMap::new();
     let mut status = ProviderStatuses::new(&dlls);
 
     // MSV sessions + enrichment
@@ -1725,8 +1725,8 @@ pub fn extract_credentials_from_minidump(
         Arch::X86 => crypto::extract_crypto_keys_x86(vmem, lsasrv.base, lsasrv.size)?,
     };
 
-    let mut all_creds: std::collections::HashMap<u64, Credential> =
-        std::collections::HashMap::new();
+    let mut all_creds: std::collections::BTreeMap<u64, Credential> =
+        std::collections::BTreeMap::new();
     let mut status = ProviderStatuses::new(&dlls);
 
     // MSV sessions + credentials (with vmem region scan fallback)
