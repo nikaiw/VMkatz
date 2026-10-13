@@ -107,17 +107,27 @@ const KEY_OFFSET_SETS: &[KeyPatternOffsets] = &[
         iv_disp: 62,
         des_disp: -74,
         aes_disp: 23,
-    }, // LSA_x64_3: Win8.1 / Server 2012 R2
+    }, // empirical Win8.1 / Server 2012 R2 variant (des_disp -74)
     KeyPatternOffsets {
         iv_disp: 59,
         des_disp: -61,
-        aes_disp: 23,
-    }, // LSA_x64_1: Win7 / Server 2008 R2
+        aes_disp: 25,
+    }, // LSA_x64_2: Win7 / Server 2008 R2
     KeyPatternOffsets {
         iv_disp: 62,
         des_disp: -70,
         aes_disp: 23,
-    }, // LSA_x64_2: Win8 / Server 2012
+    }, // LSA_x64_3/4: Win8 / Server 2012 / 8.1
+    KeyPatternOffsets {
+        iv_disp: 58,
+        des_disp: -62,
+        aes_disp: 23,
+    }, // LSA_x64_7: Win8 with patched msv1_0 (timestamp >= 0x60000000)
+    KeyPatternOffsets {
+        iv_disp: 63,
+        des_disp: -69,
+        aes_disp: 25,
+    }, // LSA_x64_1: Vista / Server 2008
 ];
 
 /// Extract IV, 3DES key, and AES key from lsasrv.dll.

@@ -265,6 +265,8 @@ pub static LSASRV_KEY_PATTERNS_X86: &[&[u8]] = &[
     &[0x83, 0x65, 0xFC, 0x00, 0x8D, 0x45, 0xF0],
     // Win10 x86 v2: AND dword [esp+20h],0
     &[0x83, 0x64, 0x24, 0x20, 0x00],
+    // Vista..Win10 x86 (mimikatz PTRN_WALL): PUSH 2; PUSH 10h; PUSH imm32
+    &[0x6A, 0x02, 0x6A, 0x10, 0x68],
 ];
 
 /// Patterns to find LogonSessionList in msv1_0.dll on Win10 x86.
