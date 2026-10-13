@@ -128,9 +128,12 @@ const CREDMAN_ENTRY_VARIANTS: &[CredmanEntryOffsets] = &[
     // Flink+0x20, i.e. base+0x70 and base+0x58 for this flink_offset. Verified
     // on 17763, 19041, 22621 and 26100. The old 0xA8 read an empty name, so
     // try_extract_credman_entry bailed and every entry was dropped.
-    // server2 (domain) is NOT verified against the DLL — the two corrected
-    // fields moved by different deltas, so it cannot be extrapolated. It only
-    // feeds a display field and cannot drop an entry, so it is left as found.
+    // server2 (domain) is NOT verified: base+0xC0 is canonical+0xE0, and no
+    // field was found there in CredpCloneCredential/CredpFindCredential (the
+    // identified ones stop at canonical+0xB0). TargetAlias and UserName on the
+    // canonical struct are PWSTRs, not UNICODE_STRINGs, so no read_ustring can
+    // match here — expect an empty domain. Left as found: it only feeds a
+    // display field and cannot drop an entry.
     CredmanEntryOffsets {
         flink_offset: 0x38,
         cb_enc_password: 0x00,
