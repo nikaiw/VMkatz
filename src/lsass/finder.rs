@@ -338,38 +338,39 @@ fn assign_kerberos_key_groups(
     let mut unassigned: Vec<Vec<KerberosKey>> = Vec::new();
 
     for key_group in key_groups {
-        let rc4_match = key_group.iter().find(|k| k.etype == 23).and_then(|k| {
-            if k.key.len() == 16 {
-                let mut hash = [0u8; 16];
-                hash.copy_from_slice(&k.key);
-                nt_to_luid
-                    .iter()
-                    .find(|(h, _)| *h == hash)
-                    .map(|(_, luid)| *luid)
-            } else {
-                None
-            }
-        });
-
-        if let Some(luid) = rc4_match {
-            if let Some(cred) = all_creds.get_mut(&luid) {
-                if cred.kerberos.is_none() {
+        // RC4_HMAC key == NT hash: every session logged on with that hash owns
+        // the group (the physical scan cannot tell which one allocated it).
+        let rc4 = key_group
+            .iter()
+            .find(|k| k.etype == 23 && k.key.len() == 16)
+            .map(|k| k.key.as_slice());
+        let luids: Vec<u64> = nt_to_luid
+            .iter()
+            .filter(|(h, _)| Some(h.as_slice()) == rc4)
+            .map(|(_, luid)| *luid)
+            .collect();
+        if luids.is_empty() {
+            unassigned.push(key_group);
+            continue;
+        }
+        for luid in luids {
+            let Some(cred) = all_creds.get_mut(&luid) else {
+                continue;
+            };
+            match &mut cred.kerberos {
+                None => {
                     cred.kerberos = Some(KerberosCredential {
                         username: cred.username.clone(),
                         domain: cred.domain.clone(),
                         password: String::new(),
-                        keys: key_group,
+                        keys: key_group.clone(),
                         tickets: Vec::new(),
                     });
-                } else if let Some(krb) = &mut cred.kerberos {
-                    if krb.keys.is_empty() {
-                        krb.keys = key_group;
-                    }
                 }
-                continue;
+                Some(krb) if krb.keys.is_empty() => krb.keys.clone_from(&key_group),
+                Some(_) => {}
             }
         }
-        unassigned.push(key_group);
     }
 
     for key_group in unassigned {
