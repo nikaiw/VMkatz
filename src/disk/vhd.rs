@@ -40,10 +40,7 @@ struct VhdFooter {
     data_offset: u64,
     current_size: u64,
     disk_type: u32,
-    #[expect(
-        dead_code,
-        reason = "GUID unique du disque, conservé pour documenter le format"
-    )]
+    #[expect(dead_code, reason = "unique disk GUID, kept to document the format")]
     unique_id: [u8; 16],
 }
 

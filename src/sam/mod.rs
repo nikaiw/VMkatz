@@ -131,8 +131,8 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
         }
 
         // BitLocker-encrypted partition — try each FVEK candidate
-        eprintln!(
-            "[*] BitLocker partition at 0x{:x} — trying {} FVEK candidate(s)",
+        log::info!(
+            "BitLocker partition at 0x{:x} — trying {} FVEK candidate(s)",
             partition_offset,
             fvek_keys.len()
         );
@@ -181,8 +181,8 @@ fn extract_ntds_with_bitlocker<R: Read + Seek>(
             continue;
         }
 
-        eprintln!(
-            "[*] BitLocker partition at 0x{:x} — trying {} FVEK candidate(s) for NTDS",
+        log::info!(
+            "BitLocker partition at 0x{:x} — trying {} FVEK candidate(s) for NTDS",
             partition_offset,
             fvek_keys.len()
         );
@@ -252,9 +252,11 @@ where
             continue;
         }
 
-        eprintln!(
-            "[+] BitLocker: FVEK #{} ({}) unlocked partition at 0x{:x}",
-            i, key.cipher, partition_offset
+        log::info!(
+            "BitLocker: FVEK #{} ({}) unlocked partition at 0x{:x}",
+            i,
+            key.cipher,
+            partition_offset
         );
 
         // Re-create reader (validate consumed a seek) and extract
@@ -321,7 +323,7 @@ pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskS
     let mut bitlocker_found = false;
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
+            log::warn!("Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }
@@ -352,7 +354,7 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
 
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
+            log::warn!("Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }
@@ -406,7 +408,7 @@ pub fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Res
 
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
-            eprintln!("[!] Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
+            log::warn!("Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
             bitlocker_found = true;
             continue;
         }

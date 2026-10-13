@@ -131,8 +131,8 @@ impl VmwareLayer {
         let expected_size = expected_pages * PAGE_SIZE as u64 + base_offset;
         let actual_size = data.len() as u64;
         if actual_size < expected_size {
-            eprintln!(
-                "[!] WARNING: VMEM file is truncated ({:.1} GB / {:.1} GB expected) — results may be incomplete",
+            log::warn!(
+                "VMEM file is truncated ({:.1} GB / {:.1} GB expected) — results may be incomplete",
                 actual_size as f64 / (1024.0 * 1024.0 * 1024.0),
                 expected_size as f64 / (1024.0 * 1024.0 * 1024.0),
             );

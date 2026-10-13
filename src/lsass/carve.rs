@@ -42,11 +42,11 @@ pub fn carve_credentials<P: PhysicalMemory>(
 ) -> Vec<Credential> {
     // Single-pass scan: find LSASS EPROCESS + crypto structures simultaneously.
     // This avoids reading the entire physical memory twice.
-    println!("[*] Carve: single-pass scan for LSASS + crypto structures...");
+    log::info!("Carve: single-pass scan for LSASS + crypto structures...");
     let (lsass_candidates, scan) = combined_scan_pass(phys);
 
-    println!(
-        "[*] Carve scan: {} LSASS candidates, {} MSSK keys, {} Primary hits, {} DPAPI hits",
+    log::info!(
+        "Carve scan: {} LSASS candidates, {} MSSK keys, {} Primary hits, {} DPAPI hits",
         lsass_candidates.len(),
         scan.mssk_keys.len(),
         scan.primary_hits.len(),
@@ -56,28 +56,30 @@ pub fn carve_credentials<P: PhysicalMemory>(
     // Level 1: try each LSASS candidate for full extraction
     let mut lsass_dtb = None;
     for process in &lsass_candidates {
-        println!(
-            "[+] Carve L1: trying LSASS at phys=0x{:x}, PID={}, DTB=0x{:x}",
-            process.eprocess_phys, process.pid, process.dtb
+        log::info!(
+            "Carve L1: trying LSASS at phys=0x{:x}, PID={}, DTB=0x{:x}",
+            process.eprocess_phys,
+            process.pid,
+            process.dtb
         );
         match crate::lsass::finder::extract_all_credentials(phys, process, 0, pagefile, disk_path) {
             Ok(creds) => {
-                println!("[+] Carve L1: extracted {} logon sessions", creds.len());
+                log::info!("Carve L1: extracted {} logon sessions", creds.len());
                 return creds;
             }
             Err(e) => {
-                println!("[!] Carve L1: full extraction failed ({e}), keeping DTB for L2");
+                log::warn!("Carve L1: full extraction failed ({e}), keeping DTB for L2");
                 lsass_dtb = Some(process.dtb);
             }
         }
     }
 
     if lsass_candidates.is_empty() {
-        println!("[!] Carve L1: lsass.exe EPROCESS not found");
+        log::warn!("Carve L1: lsass.exe EPROCESS not found");
     }
 
     // Level 2: raw page carving using scan results
-    println!("[*] Carve Level 2: extracting credentials from scan results...");
+    log::info!("Carve Level 2: extracting credentials from scan results...");
     carve_level2(phys, lsass_dtb, &scan)
 }
 
@@ -325,12 +327,12 @@ fn carve_level2<P: PhysicalMemory>(
 ) -> Vec<Credential> {
     // Resolve crypto keys: prefer LSASS-focused extraction, fall back to physical scan keys.
     let Some((des_key, aes_key)) = resolve_crypto_keys(phys, lsass_dtb, &scan.mssk_keys) else {
-        println!("[!] Carve L2: no valid 3DES/AES keys found — cannot decrypt credentials");
+        log::warn!("Carve L2: no valid 3DES/AES keys found — cannot decrypt credentials");
         return Vec::new();
     };
 
-    println!(
-        "[+] Carve L2: 3DES key ({} bytes), AES key ({} bytes)",
+    log::info!(
+        "Carve L2: 3DES key ({} bytes), AES key ({} bytes)",
         des_key.len(),
         aes_key.len()
     );
@@ -391,8 +393,8 @@ fn carve_level2<P: PhysicalMemory>(
                 })
                 .collect();
 
-            println!(
-                "[*] Carve L2: trying {} key combos × {} targets in single pass{}...",
+            log::info!(
+                "Carve L2: trying {} key combos × {} targets in single pass{}...",
                 alt_key_list.len(),
                 targets.len(),
                 if has_3des_targets { " (3DES)" } else { "" }
@@ -404,7 +406,7 @@ fn carve_level2<P: PhysicalMemory>(
         }
     }
 
-    println!("[+] Carve L2: {} MSV credentials carved", msv_creds.len());
+    log::info!("Carve L2: {} MSV credentials carved", msv_creds.len());
     for msv in msv_creds {
         credentials.push(Credential {
             msv: Some(msv),
@@ -415,20 +417,20 @@ fn carve_level2<P: PhysicalMemory>(
     // For DPAPI: try to resolve IV (first block matters for master key correctness).
     // If IV can't be resolved, use zero IV (first 16B of master key will be wrong).
     let dpapi_keys = if let Some(iv) = resolve_iv(phys, scan, &des_key, &aes_key, lsass_dtb) {
-        println!("[+] Carve L2: IV resolved: {}", hex::encode(iv));
+        log::info!("Carve L2: IV resolved: {}", hex::encode(iv));
         CryptoKeys {
             iv,
             des_key,
             aes_key,
         }
     } else {
-        println!("[!] Carve L2: no valid IV found — DPAPI master keys may be partially incorrect");
+        log::warn!("Carve L2: no valid IV found — DPAPI master keys may be partially incorrect");
         msv_keys
     };
 
     // Carve DPAPI entries
     let dpapi_creds = carve_dpapi_entries(&scan.dpapi_hits, &dpapi_keys);
-    println!("[+] Carve L2: {} DPAPI entries carved", dpapi_creds.len());
+    log::info!("Carve L2: {} DPAPI entries carved", dpapi_creds.len());
     for (luid, dk) in dpapi_creds {
         // Try to attach to an existing credential with same LUID, or create new
         let existing = credentials.iter_mut().find(|c| c.luid == luid && luid != 0);
@@ -536,8 +538,8 @@ fn enrich_session_metadata(candidates: &HashMap<u64, SessionMeta>, credentials: 
         .filter(|l| candidates.contains_key(l))
         .count();
     if found_count > 0 {
-        println!(
-            "[+] Carve: found session metadata for {}/{} LUIDs",
+        log::info!(
+            "Carve: found session metadata for {}/{} LUIDs",
             found_count,
             target_luids.len()
         );
@@ -892,16 +894,16 @@ fn resolve_crypto_keys<P: PhysicalMemory>(
     if let Some(dtb) = lsass_dtb {
         let lsass_keys = find_lsass_mssk_keys(phys, dtb);
         if lsass_keys.is_empty() {
-            println!("[*] Carve L2: no MSSK keys in LSASS pages, using physical scan keys");
+            log::info!("Carve L2: no MSSK keys in LSASS pages, using physical scan keys");
         } else {
-            println!(
-                "[+] Carve L2: found {} MSSK keys in LSASS pages",
+            log::info!(
+                "Carve L2: found {} MSSK keys in LSASS pages",
                 lsass_keys.len()
             );
             if let Some(keys) = extract_crypto_keys(&lsass_keys) {
                 return Some(keys);
             }
-            println!("[!] Carve L2: LSASS keys insufficient, trying all keys");
+            log::warn!("Carve L2: LSASS keys insufficient, trying all keys");
         }
     }
     extract_crypto_keys(scan_keys)

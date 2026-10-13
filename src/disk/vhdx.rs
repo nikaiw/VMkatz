@@ -86,7 +86,7 @@ struct VhdxRegions {
     bat_offset: u64,
     bat_length: u32,
     metadata_offset: u64,
-    #[expect(dead_code, reason = "longueur de la région métadonnées, non exploitée")]
+    #[expect(dead_code, reason = "metadata region length, unused")]
     metadata_length: u32,
 }
 

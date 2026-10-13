@@ -78,8 +78,8 @@ impl ProviderStatuses {
     }
 
     fn print_summary(&self) {
-        println!(
-            "[*] Providers: MSV({}) WDigest({}) Kerberos({}) TsPkg({}) DPAPI({}) SSP({}) LiveSSP({}) Credman({}) CloudAP({})",
+        log::info!(
+            "Providers: MSV({}) WDigest({}) Kerberos({}) TsPkg({}) DPAPI({}) SSP({}) LiveSSP({}) Credman({}) CloudAP({})",
             self.msv,
             self.wdigest,
             self.kerberos,
@@ -510,7 +510,7 @@ fn extract_prevista_credentials<P: PhysicalMemory>(
 
     // Extract pre-Vista crypto keys from lsasrv.dll
     let keys = crypto::extract_prevista_crypto_keys(&vmem, lsasrv.base, u64::from(lsasrv.size))?;
-    println!("[+] Pre-Vista crypto keys extracted (DES-X + RC4)");
+    log::info!("Pre-Vista crypto keys extracted (DES-X + RC4)");
 
     let mut credentials = Vec::new();
 
@@ -523,10 +523,7 @@ fn extract_prevista_credentials<P: PhysicalMemory>(
             &keys,
         ) {
             Ok(msv_creds) => {
-                println!(
-                    "[+] Pre-Vista MSV: {} credential(s) extracted",
-                    msv_creds.len()
-                );
+                log::info!("Pre-Vista MSV: {} credential(s) extracted", msv_creds.len());
                 for (luid, msv_cred) in msv_creds {
                     let mut cred = Credential::new_empty(
                         luid,
@@ -539,17 +536,17 @@ fn extract_prevista_credentials<P: PhysicalMemory>(
             }
             Err(e) => {
                 log::warn!("Pre-Vista MSV extraction failed: {e}");
-                println!("[-] Pre-Vista MSV: {e}");
+                log::warn!("Pre-Vista MSV: {e}");
             }
         }
     } else {
-        println!("[-] msv1_0.dll not found in pre-Vista LSASS");
+        log::warn!("msv1_0.dll not found in pre-Vista LSASS");
     }
 
     // Pre-Vista has no DPAPI/TsPkg/CloudAP/SSP/LiveSSP/Credman in LSASS
     // WDigest + Kerberos: deferred to follow-up (different pre-Vista structures)
     if credentials.is_empty() {
-        println!("[*] Pre-Vista: no credentials extracted (WDigest/Kerberos not yet supported)");
+        log::info!("Pre-Vista: no credentials extracted (WDigest/Kerberos not yet supported)");
     }
 
     Ok(credentials)
@@ -1007,7 +1004,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     if let Some(fb) = &filebacked {
         let resolved = fb.pages_resolved();
         if resolved > 0 {
-            println!("[+] File-backed: {resolved} DLL pages resolved from disk");
+            log::info!("File-backed: {resolved} DLL pages resolved from disk");
         }
     }
 

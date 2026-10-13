@@ -61,7 +61,7 @@ struct RamBlock {
     name: String,
     #[expect(
         dead_code,
-        reason = "taille du bloc RAM, non exploitée (indexation par nom)"
+        reason = "on-disk RAM block size, unused (blocks are indexed by name)"
     )]
     size: u64,
 }

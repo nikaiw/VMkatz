@@ -424,8 +424,8 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
             if let Some(avail) = available_memory_bytes() {
                 if size > avail {
                     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-                    eprintln!(
-                        "[!] image is {:.1} GB but only {:.1} GB RAM is available — \
+                    log::warn!(
+                        "image is {:.1} GB but only {:.1} GB RAM is available — \
                          scanned pages are released as they're consumed to bound memory; \
                          on a constrained host prefer copying the image off-host to scan",
                         size as f64 / GB,
@@ -436,8 +436,8 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
             Ok(MappedFile::Mmap(m))
         }
         Err(mmap_err) => {
-            eprintln!(
-                "[!] mmap failed for '{}' ({:.1} MB): {} — falling back to file I/O (slower)",
+            log::warn!(
+                "mmap failed for '{}' ({:.1} MB): {} — falling back to file I/O (slower)",
                 path.display(),
                 size as f64 / (1024.0 * 1024.0),
                 mmap_err,

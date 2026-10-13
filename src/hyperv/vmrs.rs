@@ -69,14 +69,11 @@ struct HvsHeader {
 #[derive(Debug, Clone)]
 struct ObjectTableEntry {
     entry_type: u8,
-    #[expect(
-        dead_code,
-        reason = "CRC on-disk de l'entrée, non vérifié pour l'instant"
-    )]
+    #[expect(dead_code, reason = "on-disk entry CRC, not verified yet")]
     crc32: u32,
     file_offset: u64,
     size: u32,
-    #[expect(dead_code, reason = "flags on-disk de l'entrée, non exploités")]
+    #[expect(dead_code, reason = "on-disk entry flags, unused")]
     flags: u8,
 }
 
@@ -716,7 +713,7 @@ impl VmrsLayer {
         while offset + 21 < total {
             // Entry header
             let entry_type = data[offset];
-            // data[offset + 1]: entry flags (non exploité)
+            // data[offset + 1]: entry flags (unused)
             let entry_total_size =
                 u32::from_le_bytes(data[offset + 2..offset + 6].try_into().unwrap()) as usize;
 

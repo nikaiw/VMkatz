@@ -48,12 +48,12 @@ const MIN_FILE_SIZE: usize = 128 + 32;
 struct MasterKeyFileHeader {
     version: u32,
     guid: String,
-    #[expect(dead_code, reason = "flags on-disk du header DPAPI, non exploités")]
+    #[expect(dead_code, reason = "on-disk DPAPI header flags, unused")]
     flags: u32,
     masterkey_len: u64,
-    #[expect(dead_code, reason = "longueur on-disk de la backup key, non exploitée")]
+    #[expect(dead_code, reason = "on-disk backup key length, unused")]
     backupkey_len: u64,
-    #[expect(dead_code, reason = "longueur on-disk du credhist, non exploitée")]
+    #[expect(dead_code, reason = "on-disk credhist length, unused")]
     credhist_len: u64,
     domainkey_len: u64,
 }
@@ -61,10 +61,7 @@ struct MasterKeyFileHeader {
 /// Parsed master key section (salt, rounds, algorithms, ciphertext).
 #[derive(Debug)]
 struct MasterKeySection {
-    #[expect(
-        dead_code,
-        reason = "version on-disk de la section master key, non exploitée"
-    )]
+    #[expect(dead_code, reason = "on-disk master key section version, unused")]
     version: u32,
     salt: [u8; 16],
     rounds: u32,
