@@ -385,12 +385,29 @@ fn assign_kerberos_key_groups(
     }
 }
 
+/// First unused LUID in the physical-scan range, so a synthetic session never
+/// collides with one an earlier fallback already created.
+fn next_free_synthetic_luid(all_creds: &std::collections::BTreeMap<u64, Credential>) -> u64 {
+    const SYNTHETIC_LUID_BASE: u64 = 0x8000_0000_0000_0000;
+    all_creds
+        .keys()
+        .rev()
+        .find(|&&l| l >= SYNTHETIC_LUID_BASE)
+        .map_or(SYNTHETIC_LUID_BASE, |&l| l + 1)
+}
+
 /// Attach carved Kerberos tickets to a credential: prefer one in the same domain,
 /// else the first credential that already holds Kerberos data. Deduplicates by blob.
+///
+/// When nothing holds Kerberos data at all, the tickets go to a synthetic
+/// physical-scan session instead of being discarded — that case is precisely why
+/// carving exists (the session walk found nothing), and dropping them there threw
+/// away the only result the fallback had produced.
 fn attach_carved_tickets(
     all_creds: &mut std::collections::BTreeMap<u64, Credential>,
     carved: Vec<crate::lsass::types::KerberosTicket>,
 ) {
+    let mut orphan_luid: Option<u64> = None;
     for ticket in carved {
         let domain_lower = ticket.domain_name.to_lowercase();
         let key = all_creds
@@ -405,10 +422,28 @@ fn attach_carved_tickets(
             })
             .or_else(|| all_creds.iter().find(|(_, c)| c.kerberos.is_some()))
             .map(|(&k, _)| k);
-        if let Some(krb) = key
-            .and_then(|k| all_creds.get_mut(&k))
-            .and_then(|c| c.kerberos.as_mut())
-        {
+        let key = match key {
+            Some(k) => k,
+            None => *orphan_luid.get_or_insert_with(|| {
+                let luid = next_free_synthetic_luid(all_creds);
+                let username = ticket.client_name.join("/");
+                let mut cred = Credential::new_empty(
+                    luid,
+                    username.clone(),
+                    ticket.domain_name.clone(),
+                );
+                cred.kerberos = Some(crate::lsass::types::KerberosCredential {
+                    username,
+                    domain: ticket.domain_name.clone(),
+                    password: String::new(),
+                    keys: Vec::new(),
+                    tickets: Vec::new(),
+                });
+                all_creds.insert(luid, cred);
+                luid
+            }),
+        };
+        if let Some(krb) = all_creds.get_mut(&key).and_then(|c| c.kerberos.as_mut()) {
             if !krb
                 .tickets
                 .iter()
