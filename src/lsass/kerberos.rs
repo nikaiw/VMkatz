@@ -142,12 +142,14 @@ const TICKET_OFFSETS_1607: TicketOffsets = TicketOffsets {
     ticket_value: 0x138,
 };
 
-/// Ticket offsets for Server 2025 / Win11 24H2+ (build 26100).
-/// Header (service/domain/target/client/flags/key) is identical to 1607, but the
-/// tail from the timestamps onward is shifted +0x10 (an extra 16 bytes appear
-/// between the session key and StartTime). Reverse-engineered from a live cifs
-/// ticket in a DC25 (Server 2025 26100) memory dump.
-const TICKET_OFFSETS_26100: TicketOffsets = TicketOffsets {
+/// Ticket offsets for build 19041 and later (19041/20348/22000/22621/26100).
+/// Identical to 1607 except inside KERB_ENCRYPTION_KEY, which gained a leading
+/// ULONG flag: the key Type moved 0xB0 -> 0xB4 while Length/Value stayed put.
+/// Everything after the key is unchanged — the earlier +0x10 tail shift here was
+/// wrong, which is why 26100 never yielded a ticket by this path.
+/// Derived from KerbPackExternalTicket's stores into the documented
+/// KERB_EXTERNAL_TICKET, cross-checked against KerbCreateTicketCacheEntry.
+const TICKET_OFFSETS_19041: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x20,
     domain_name: 0x30,
     target_domain_name: 0x40,
@@ -156,14 +158,21 @@ const TICKET_OFFSETS_26100: TicketOffsets = TicketOffsets {
     key_type: 0xB4,
     key_length: 0xB8,
     key_value: 0xC0,
-    start_time: 0xF8,
-    end_time: 0x100,
-    renew_until: 0x108,
-    ticket_enc_type: 0x134,
-    ticket_kvno: 0x138,
-    ticket_length: 0x140,
-    ticket_value: 0x148,
+    start_time: 0xE8,
+    end_time: 0xF0,
+    renew_until: 0xF8,
+    ticket_enc_type: 0x124,
+    ticket_kvno: 0x128,
+    ticket_length: 0x130,
+    ticket_value: 0x138,
 };
+
+/// `KERB_ENCRYPTION_KEY.Type` sentinel: on 19041+ the ULONG at the old Type slot
+/// (0xB0) is the added flag field and is always 1, while the real Type sits at
+/// 0xB4. On 14393-18362 that same slot holds the Type itself. Reading 1 there is
+/// therefore a layout marker, not an etype — des-cbc-crc has been off by default
+/// since Win7 and is absent from every build that has these layouts.
+const KERB_KEY_FLAG_SENTINEL: u32 = 1;
 
 /// Ticket offsets for Win10 1507-1511 / Win11 (KIWI_KERBEROS_INTERNAL_TICKET_10).
 /// Same as _6 but with KDCServer+unk10586_d LSA_UNICODE_STRINGs before ClientName.
@@ -830,10 +839,17 @@ fn extract_single_ticket(
         .read_virt_u32(ticket_addr + offsets.ticket_flags)
         .unwrap_or(0);
 
-    // Session key
+    // Session key. The 1607 and 19041+ layouts differ only in where the key Type
+    // lives (0xB0 vs 0xB4), and both parse "successfully" on the other's images —
+    // on 19041+ the 1607 table reads the flag sentinel and reports etype 1, so
+    // every kirbi came out as des-cbc-crc. Reject that read here so the probe
+    // moves on to the 19041+ candidate.
     let key_type = vmem
         .read_virt_u32(ticket_addr + offsets.key_type)
         .unwrap_or(0);
+    if offsets.key_type == TICKET_OFFSETS_1607.key_type && key_type == KERB_KEY_FLAG_SENTINEL {
+        return None;
+    }
     let key_length = vmem
         .read_virt_u32(ticket_addr + offsets.key_length)
         .unwrap_or(0) as usize;
@@ -1140,17 +1156,18 @@ fn is_ticket_list_head(vmem: &dyn VirtualMemory, head: u64, arch: Arch) -> bool 
 }
 
 /// Candidate ticket-entry layouts for a session variant index, most likely first.
-/// Session variant 0 covers 1607 through 23H2; mimikatz keeps the 1607 ticket
-/// layout for all of them while pypykatz switches to the 26100-style tail from
-/// build 20348. Neither is verified on Win11 21H2-23H2 / Server 2022, so both
-/// are offered and `detect_kerb_offsets` keeps whichever parses a real ticket.
+/// Session variant 0 spans 1607 through 23H2, which is two different ticket
+/// layouts: 14393-18362 keep the key Type at 0xB0, 19041+ moved it to 0xB4.
+/// Both are offered; `extract_single_ticket` tells them apart by the flag
+/// sentinel rather than by build number, so detection still works when the
+/// build is unknown or the image is odd.
 const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static [&'static TicketOffsets] {
     match arch {
         Arch::X64 => match variant_idx {
-            0 => &[&TICKET_OFFSETS_1607, &TICKET_OFFSETS_26100],
-            // Variant 1 is Win11 24H2 / Server 2025 (build 26100): the session
-            // layout matches variant 1 but the ticket-entry tail is shifted +0x10.
-            1 => &[&TICKET_OFFSETS_26100],
+            0 => &[&TICKET_OFFSETS_1607, &TICKET_OFFSETS_19041],
+            // Variant 1 is Win11 24H2 / Server 2025 (26100), which uses the
+            // same ticket entry as 19041+.
+            1 => &[&TICKET_OFFSETS_19041],
             2 => &[&TICKET_OFFSETS_10],
             _ => &[&TICKET_OFFSETS_6],
         },
@@ -1596,7 +1613,7 @@ pub fn carve_kerberos_tickets(
     let ticket_offset_sets: &[&TicketOffsets] = match arch {
         Arch::X64 => &[
             &TICKET_OFFSETS_1607,
-            &TICKET_OFFSETS_26100,
+            &TICKET_OFFSETS_19041,
             &TICKET_OFFSETS_10,
             &TICKET_OFFSETS_6,
         ],
