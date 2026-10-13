@@ -1634,6 +1634,7 @@ pub fn carve_kerberos_tickets(
     // lives at enc_type - 0x84 (for Win10 1607+). 512 bytes covers every
     // known TicketOffsets variant with margin.
     const CHUNK_OVERLAP: u64 = 0x200;
+    const PAGE_SIZE: u64 = 0x1000;
 
     let mut carved = Vec::new();
     let existing_blobs: HashSet<Vec<u8>> = existing_tickets
@@ -1677,7 +1678,10 @@ pub fn carve_kerberos_tickets(
             let chunk_addr = region_start + offset;
             let Ok(chunk) = vmem.read_virt_bytes(chunk_addr, read_size) else {
                 read_errors += 1;
-                offset += (CHUNK_SIZE as u64).saturating_sub(CHUNK_OVERLAP).max(1);
+                // One paged-out page used to cost the whole 256 KB chunk. Step a
+                // single page instead so the scan resynchronises on the next
+                // resident page rather than skipping the tickets behind it.
+                offset += PAGE_SIZE;
                 continue;
             };
 
@@ -1702,8 +1706,10 @@ pub fn carve_kerberos_tickets(
                     }
                     let local_base = i - enc_type_off;
 
-                    // kvno: reject 0 and obvious garbage. Upper bound is loose
-                    // because krbtgt rotation can push real kvnos well past 20.
+                    // kvno: EncryptedData.kvno is OPTIONAL in RFC 4120, so 0 is a
+                    // legitimate value and rejecting it lost real tickets. Only the
+                    // upper bound is a filter, and it is loose because krbtgt
+                    // rotation can push real kvnos well past 20.
                     let kvno_pos = local_base + offsets.ticket_kvno as usize;
                     if kvno_pos + 4 > chunk.len() {
                         continue;
@@ -1714,7 +1720,7 @@ pub fn carve_kerberos_tickets(
                         chunk[kvno_pos + 2],
                         chunk[kvno_pos + 3],
                     ]);
-                    if kvno == 0 || kvno > 1000 {
+                    if kvno > 1000 {
                         continue;
                     }
 
