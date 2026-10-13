@@ -5,7 +5,7 @@
 //! unambiguous per-hive offset -> page translation, so it works even when a hive is
 //! fragmented into scattered pages. Bins are mapped in the Registry process (Win10
 //! 1803+), so translation uses its DTB; the map structures are kernel VAs and resolve
-//! in any DTB. Field offsets are self-calibrated per hive (see [`calibrate`]), so it
+//! in any DTB. Field offsets are self-calibrated per hive (see `calibrate`), so it
 //! is version-agnostic. Needs page tables, so it runs after System/Registry are found.
 
 use std::collections::HashMap;

@@ -16,12 +16,12 @@
 //!    leaves, tables inline in the data region, and a set near the file start. The
 //!    low-memory leaf (RamBlock0..15) and ~200 scattered indices appear only in the
 //!    inline/early tables, so all of them must be swept (see
-//!    [`VmrsLayer::parse_ramblock_references`]); otherwise kernel page tables (e.g.
+//!    `VmrsLayer::parse_ramblock_references`); otherwise kernel page tables (e.g.
 //!    behind KUSER_SHARED_DATA) are missing and translation fails.
 //!
 //! 2. RamBlock indices are contiguous RAM offsets, but the guest's GPA space has a
 //!    low MMIO gap: RAM under it is remapped above 4 GB. read_phys therefore maps
-//!    GPA -> RAM offset across the gap (see [`VmrsLayer::gpa_to_ram_offset`]).
+//!    GPA -> RAM offset across the gap (see `VmrsLayer::gpa_to_ram_offset`).
 //!    Without this, high-memory page-table entries translate out of range and the
 //!    EPROCESS list can't be walked.
 

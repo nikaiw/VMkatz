@@ -8,7 +8,8 @@
     clippy::pedantic,
     clippy::nursery,
     dead_code,
-    unexpected_cfgs
+    unexpected_cfgs,
+    rustdoc::private_intra_doc_links
 )]
 
 pub mod block;

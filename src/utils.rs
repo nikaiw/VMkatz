@@ -451,7 +451,7 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
     }
 }
 
-/// Decode UTF-16LE bytes to a String without intermediate Vec<u16> allocation.
+/// Decode UTF-16LE bytes to a String without intermediate `Vec<u16>` allocation.
 /// NUL-terminated: stops at first U+0000. Replaces invalid surrogates with U+FFFD.
 pub fn utf16le_decode(data: &[u8]) -> String {
     char::decode_utf16(

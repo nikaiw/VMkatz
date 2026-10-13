@@ -1732,7 +1732,6 @@ pub fn carve_kerberos_tickets(
 // ---- ASN.1 DER encoding for .kirbi (KRB-CRED) ----
 
 /// Build a .kirbi blob (KRB-CRED ASN.1 DER) from ticket data.
-#[allow(clippy::too_many_arguments)]
 fn build_kirbi(
     service_name: &[String],
     service_name_type: i16,
@@ -1829,7 +1828,6 @@ pub fn build_ticket_der(ticket: &KerberosTicket) -> Vec<u8> {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_enc_krb_cred_part(
     client_name: &[String],
     client_name_type: i16,
@@ -1866,7 +1864,6 @@ fn build_enc_krb_cred_part(
     asn1_application(29, &body)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_krb_cred_info(
     client_name: &[String],
     client_name_type: i16,

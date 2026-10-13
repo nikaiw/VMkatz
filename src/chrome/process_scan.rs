@@ -25,15 +25,15 @@
 //!    page tables top-down and emits every mapped 4 KiB region in the
 //!    canonical low half.
 //! 2. For each region we re-patch the 152-byte
-//!    [`cookie_monster::COOKIE_MONSTER_SIG`] with the high 4 bytes of that
+//!    [`super::cookie_monster::COOKIE_MONSTER_SIG`] with the high 4 bytes of that
 //!    region's base address (`patch_module_high_half`), then scan the
 //!    region buffer for matches. Every match is a candidate CookieMonster
 //!    instance.
-//! 3. From each instance address we read the [`cookie_monster::RbRoot`] at
+//! 3. From each instance address we read the [`super::cookie_monster::RbRoot`] at
 //!    `instance + COOKIE_MAP_OFFSET` (0x30) and call
-//!    [`cookie_monster::walk_cookie_tree`]; each leaf's `value_address`
+//!    [`super::cookie_monster::walk_cookie_tree`]; each leaf's `value_address`
 //!    points at a `CanonicalCookie`.
-//! 4. We try each [`cookie_monster::CookieVariant`] in turn (Chrome 130 ↔
+//! 4. We try each [`super::cookie_monster::CookieVariant`] in turn (Chrome 130 ↔
 //!    Edge 130, with and without `ProcessBoundString` value encryption,
 //!    plus the legacy Chrome 124 layout) and keep the first decode whose
 //!    fields all pass plausibility checks. The variant is per-process,

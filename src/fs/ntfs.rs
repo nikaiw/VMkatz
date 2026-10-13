@@ -17,6 +17,7 @@ impl<'a, R: Read + Seek> PartitionReader<'a, R> {
     }
 
     /// Access the underlying reader (for fallback paths that manage offsets themselves).
+    #[cfg(feature = "sam")]
     pub(crate) const fn inner_mut(&mut self) -> &mut R {
         self.inner
     }
@@ -87,7 +88,7 @@ pub fn find_entry<'n, R: Read + Seek>(
     )))
 }
 
-/// Read file data ($DATA attribute) into a Vec<u8>.
+/// Read file data ($DATA attribute) into a `Vec<u8>`.
 /// Uses resilient reads — on I/O errors, zero-fills the failing chunk and continues.
 /// This allows extraction from live/in-use block devices.
 pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> Result<Vec<u8>> {

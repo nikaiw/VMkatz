@@ -15,7 +15,7 @@ vmware = []
 vbox = []
 qemu = []
 hyperv = []
-sam = ["dep:ntfs", "dep:md-5", "dep:md4", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
+sam = ["dep:md-5", "dep:md4", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
 "ntds.dit" = ["sam"]
 carve = []
 dump = []
@@ -34,7 +34,7 @@ panic = "abort"
 
 [dependencies]
 memmap2 = "0.9"
-ntfs = { version = "0.4", optional = true }
+ntfs = "0.4"
 md-5 = { version = "0.10", optional = true }
 md4 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }

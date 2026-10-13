@@ -691,7 +691,6 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
 /// Find LSASS and extract all credentials.
 /// When a pagefile reader is provided, paged-out memory is resolved from disk.
 /// When a disk path is provided, demand-paged DLL sections are resolved from DLL files.
-#[allow(clippy::let_unit_value, clippy::unit_arg)]
 pub fn extract_all_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass: &Process,
@@ -704,8 +703,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     let lsass_vmem_init = ProcessMemory::with_resolvers(phys, lsass.dtb, pagefile, None);
     #[cfg(not(feature = "sam"))]
     let lsass_vmem_init = {
-        let _ = pagefile;
-        let _ = disk_path;
+        let _ = (pagefile, disk_path);
         ProcessMemory::new(phys, lsass.dtb)
     };
 

@@ -269,6 +269,13 @@ struct Args {
 
 impl Args {
     /// Whether carve mode is enabled (always false when feature is disabled).
+    #[cfg(any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    ))]
+    #[cfg_attr(not(feature = "carve"), expect(clippy::unused_self))]
     const fn carve(&self) -> bool {
         #[cfg(feature = "carve")]
         {
@@ -658,7 +665,15 @@ fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool
 /// results into the disk-side `DiscoverySummary` so the renderer emits one
 /// document. Profiles aren't merged here — in-process findings get
 /// per-record `ChromeSource::Memory { pid, … }` tagging instead.
-#[cfg(feature = "chrome")]
+#[cfg(all(
+    feature = "chrome",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
 fn merge_findings(
     dst: &mut vmkatz::chrome::types::ChromeFindings,
     mut extra: vmkatz::chrome::types::ChromeFindings,
@@ -699,7 +714,15 @@ fn parse_chrome_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
 /// the discovery step) can race against external filesystem locks (e.g. ESXi
 /// system datastores) and fail the whole hybrid flow with EBUSY, even when the
 /// first open succeeded.
-#[cfg(feature = "chrome")]
+#[cfg(all(
+    feature = "chrome",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
 fn run_chrome_hybrid(
     disk_path: &Path,
     mem_keyring: &vmkatz::chrome::hybrid::HybridKeyring,
@@ -938,7 +961,15 @@ fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow:
 }
 
 /// Print `DiskSecrets` (SAM + LSA + cached creds) using the current output format.
-#[cfg(feature = "sam")]
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
 fn print_disk_secrets(secrets: &vmkatz::sam::DiskSecrets, args: &Args) {
     let c = get_colors(args);
 
@@ -1319,6 +1350,8 @@ fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     let mut found_anything = false;
 
     reader.seek(SeekFrom::Start(0))?;
+    // Only the chrome block below reads `secrets` after printing.
+    #[cfg_attr(not(feature = "chrome"), expect(unused_variables))]
     let secrets = match vmkatz::sam::extract_secrets_from_reader(reader) {
         Ok(secrets) => {
             found_anything = true;
@@ -2322,7 +2355,6 @@ fn run_recursive(root: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::let_unit_value, clippy::unit_arg)]
 fn run_lsass(
     input_path: &Path,
     args: &Args,
@@ -2429,39 +2461,27 @@ fn run_lsass(
                     anyhow::bail!("QEMU ELF support not enabled (compile with --features qemu)")
                 }
             }
-            LsassFormat::QemuSavevm => {
-                #[cfg(feature = "qemu")]
-                {
-                    run_with_layer(
-                        || {
-                            if verbose {
-                                eprintln!(
-                                    "[*] Opening QEMU savevm state: {}",
-                                    input_path.display()
-                                );
-                            }
-                            let layer = vmkatz::qemu::QemuSavevmLayer::open(input_path)
-                                .context("Failed to open QEMU savevm state")?;
-                            if verbose {
-                                eprintln!(
-                                    "[+] QEMU savevm: {} MB physical memory",
-                                    layer.phys_size() / (1024 * 1024),
-                                );
-                            }
-                            Ok(layer)
-                        },
-                        args,
-                        verbose,
-                        pagefile,
-                        disk_path,
-                    )
-                }
-                #[cfg(not(feature = "qemu"))]
-                {
-                    let _ = (pagefile, disk_path);
-                    anyhow::bail!("QEMU savevm support not enabled (compile with --features qemu)")
-                }
-            }
+            #[cfg(feature = "qemu")]
+            LsassFormat::QemuSavevm => run_with_layer(
+                || {
+                    if verbose {
+                        eprintln!("[*] Opening QEMU savevm state: {}", input_path.display());
+                    }
+                    let layer = vmkatz::qemu::QemuSavevmLayer::open(input_path)
+                        .context("Failed to open QEMU savevm state")?;
+                    if verbose {
+                        eprintln!(
+                            "[+] QEMU savevm: {} MB physical memory",
+                            layer.phys_size() / (1024 * 1024),
+                        );
+                    }
+                    Ok(layer)
+                },
+                args,
+                verbose,
+                pagefile,
+                disk_path,
+            ),
             LsassFormat::HypervBin => {
                 #[cfg(feature = "hyperv")]
                 {
@@ -2616,6 +2636,7 @@ fn is_block_dev(path: &Path) -> bool {
 enum LsassFormat {
     VBox,
     QemuElf,
+    #[cfg(feature = "qemu")]
     QemuSavevm,
     HypervBin,
     HypervVmrs,
@@ -2776,6 +2797,15 @@ fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> bool {
 
 /// Print bootkey + SAM hashes + LSA secrets recovered from a memory image (by the
 /// signature carve or the CM hive-map walk). Returns true if anything was printed.
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
 fn print_registry_creds(creds: &vmkatz::sam::mem_hive::MemoryHiveCreds, args: &Args) -> bool {
     let c = get_colors(args);
     let Some(bootkey) = creds.bootkey else {
@@ -3446,11 +3476,14 @@ fn extract_and_output_bitlocker<L: PhysicalMemory>(
 ///
 /// Opens the snapshot in the appropriate format, scans physical memory for
 /// pool tags, and returns any FVEK candidates found.
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
 ))]
 fn extract_bitlocker_keys_from_snapshot(
     path: &Path,
@@ -3495,6 +3528,12 @@ fn extract_bitlocker_keys_from_snapshot(
 }
 
 /// Write dislocker-compatible FVEK files to disk.
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
 fn export_bitlocker_fvek(keys: &[vmkatz::lsass::bitlocker::BitLockerKey], dir: &str) {
     let dir_path = std::path::Path::new(dir);
     if !dir_path.exists() {

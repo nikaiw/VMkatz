@@ -11,7 +11,7 @@ pub struct Tag {
 /// Parse tags from a VMware memory group.
 ///
 /// Tag format:
-///   byte 0: flags - bits[7:6] = index_count (0-3), bits[5:0] = inline_data_len
+///   byte 0: flags - `bits[7:6]` = index_count (0-3), `bits[5:0]` = inline_data_len
 ///   byte 1: name_len
 ///   bytes 2..2+name_len: name (ASCII)
 ///   next index_count*4 bytes: indices (u32 LE each)

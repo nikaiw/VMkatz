@@ -408,7 +408,6 @@ pub(super) fn read_data_section(
 ///
 /// When `accept_empty` is true, self-referencing entries (flink == blink == list_addr)
 /// in the first 0x1000 bytes are returned immediately (some providers store empty lists).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_data_for_list_head(
     vmem: &dyn VirtualMemory,
     pe: &PeHeaders,

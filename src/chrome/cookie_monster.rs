@@ -37,7 +37,7 @@ use crate::memory::VirtualMemory;
 /// first members.
 ///
 /// Wildcards: `0xAA`, `0xCC`. The `0xBB` bytes at the six
-/// fixed offsets [`PATCH_OFFSETS`] get replaced via [`patch_module_high_half`]
+/// fixed offsets `PATCH_OFFSETS` get replaced via [`patch_module_high_half`]
 /// before each per-region scan — they represent the high 4 bytes of
 /// pointer fields that must point back into the same chrome.dll / heap
 /// region we're scanning.
@@ -69,7 +69,7 @@ const PATCH_OFFSETS: [usize; 6] = [16, 24, 56, 64, 88, 152];
 /// / Edge versions.
 pub const COOKIE_MAP_OFFSET: u64 = 0x30;
 
-/// Replace the four bytes ending at each [`PATCH_OFFSETS`] position with
+/// Replace the four bytes ending at each `PATCH_OFFSETS` position with
 /// the high half (bytes 4..8) of `region_base` in little-endian form.
 ///
 /// On

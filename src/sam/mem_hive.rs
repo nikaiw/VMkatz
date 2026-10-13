@@ -12,7 +12,7 @@
 //! bins across paged pool — they are NOT contiguous, in physical OR in a single
 //! virtual view we can find without the CM cell map. Every `hbin` header records
 //! its own hive-file offset and size, so a scan of physical memory locates all
-//! bins and indexes them by the offsets they cover ([`RunIndex`]).
+//! bins and indexes them by the offsets they cover (`RunIndex`).
 //!
 //! The parser navigates a hive purely by cell offset from the root, so we don't
 //! need a contiguous image — only the cells actually reached from the root, placed
