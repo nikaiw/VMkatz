@@ -122,7 +122,7 @@ impl Minidump {
                         processor_arch = u16_le_or0(&data, stream_rva);
                         major_version = u32_le_or0(&data, stream_rva + 8);
                         minor_version = u32_le_or0(&data, stream_rva + 12);
-                        build_number = u32_le_or0(&data, stream_rva + 16);
+                        build_number = u32_le_or0(&data, stream_rva + 16) & 0xFFFF;
                     }
                 }
                 STREAM_TYPE_MODULE_LIST => {
