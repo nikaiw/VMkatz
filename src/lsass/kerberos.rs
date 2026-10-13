@@ -9,7 +9,7 @@ use crate::lsass::types::{
 };
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
-use crate::utils::{u32_le, u64_le};
+use crate::utils::{u16_le, u32_le, u64_le};
 
 /// Kerberos session offsets per Windows version.
 /// AVL OrderedPointer at node+0x20 (x64) / +0x10 (x86) points to session data.
@@ -659,6 +659,14 @@ pub fn extract_kerberos_credentials(
     Ok(results)
 }
 
+/// `KIWI_KERBEROS_KEYS_LIST_6` entry count. The field at +0x04 is NOT a DWORD:
+/// `KerbGetKeyFromList` reads it as two USHORTs — `CredentialCount` at +0x04 and
+/// `OldCredentialCount` at +0x06. Reading the full DWORD folded the old-credential
+/// count into the high half, so any account that had ever changed its password
+/// blew past the sanity bound and the whole key list was dropped.
+/// Only the current credentials are walked; the old ones sit past them.
+const KERB_KEY_LIST_COUNT_OFF: u64 = 0x04;
+
 /// Extract Kerberos encryption keys (AES128, AES256, RC4, DES) from pKeyList.
 fn extract_kerb_keys(
     vmem: &dyn VirtualMemory,
@@ -673,8 +681,8 @@ fn extract_kerb_keys(
         _ => return Vec::new(),
     };
 
-    // Read key list header: cbItem at +0x04
-    let cb_item = match vmem.read_virt_u32(key_list_ptr + 0x04) {
+    // Read key list header: CredentialCount (USHORT) at +0x04
+    let cb_item = match vmem.read_virt_u16(key_list_ptr + KERB_KEY_LIST_COUNT_OFF) {
         Ok(n) if n > 0 && n <= 32 => n as usize,
         _ => return Vec::new(),
     };
@@ -1438,7 +1446,8 @@ pub fn scan_vmem_for_kerberos_keys(
         };
 
         for off in (0..page_data.len().saturating_sub(0x80)).step_by(8) {
-            let cb_item = u32_le(&page_data, off + 4);
+            // CredentialCount is a USHORT; +0x06 is OldCredentialCount.
+            let cb_item = u32::from(u16_le(&page_data, off + 4));
             if cb_item == 0 || cb_item > 10 {
                 continue;
             }
@@ -1486,7 +1495,7 @@ pub fn scan_vmem_for_kerberos_keys(
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
     for vaddr in &key_list_candidates {
-        let cb_item = match vmem.read_virt_u32(*vaddr + 0x04) {
+        let cb_item = match vmem.read_virt_u16(*vaddr + KERB_KEY_LIST_COUNT_OFF) {
             Ok(n) if n > 0 && n <= 10 => n as usize,
             _ => continue,
         };

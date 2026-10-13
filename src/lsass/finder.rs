@@ -1507,11 +1507,12 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
 
         // Search for KIWI_KERBEROS_KEYS_LIST_6 header:
         //   +0x00: unk0 (DWORD)
-        //   +0x04: cbItem (DWORD) - number of entries (1-10)
+        //   +0x04: CredentialCount (USHORT) - number of entries (1-10)
+        //   +0x06: OldCredentialCount (USHORT) - NOT part of the count
         //   +0x28: first KERB_HASHPASSWORD entry
         // Try both 1607+ and pre-1607 layouts for the first entry.
         for off in (0..0x1000usize - 0x80).step_by(8) {
-            let Some(cb_item) = read_u32_le(&page_data, off + 4) else {
+            let Some(cb_item) = read_u16_le(&page_data, off + 4).map(u32::from) else {
                 continue;
             };
             if cb_item == 0 || cb_item > 10 {
@@ -1581,7 +1582,8 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
     let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
     for vaddr in &key_list_candidates {
-        let cb_item = match vmem.read_virt_u32(*vaddr + 0x04) {
+        // CredentialCount is a USHORT; +0x06 holds OldCredentialCount.
+        let cb_item = match vmem.read_virt_u16(*vaddr + 0x04) {
             Ok(n) if n > 0 && n <= 10 => n as usize,
             _ => continue,
         };
