@@ -175,14 +175,17 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) vmfs_list: bool,
 
-    /// Skip carving SAM/SYSTEM/SECURITY registry hives from physical memory. By
-    /// default that carve runs first on a memory snapshot (local NT hashes + LSA
-    /// secrets, no page tables — works under Credential Guard) and, when it finds
-    /// credentials, is the whole result; this flag disables it and goes straight to
-    /// the LSASS-cache pipeline.
+    /// Skip registry hive (SAM/SYSTEM/SECURITY) recovery from memory entirely:
+    /// neither the CM hive-map walk nor the --registry-carve fallback runs.
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
     pub(crate) no_mem_registry: bool,
+
+    /// Fall back to a full physical-memory signature scan for SAM/SYSTEM/SECURITY
+    /// when the CM hive-map walk finds nothing or cannot run (slow, up to ~3 GB RSS).
+    #[cfg(feature = "sam")]
+    #[arg(long, default_value_t = false)]
+    pub(crate) registry_carve: bool,
 
     /// Password for an encrypted Veeam backup (VBK/VIB/VRB). Not needed for
     /// unencrypted backups.

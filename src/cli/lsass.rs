@@ -596,6 +596,31 @@ fn run_mem_registry<L: PhysicalMemory>(layer: &L, args: &Args) -> bool {
     print_registry_creds(&creds, args)
 }
 
+/// Signature-carve SAM/LSA only when `--registry-carve` asks for it; otherwise
+/// say why the hive-map walk gave nothing and how to go further. Returns true
+/// when the carve printed credentials.
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
+fn registry_carve_or_hint<L: PhysicalMemory>(layer: &L, args: &Args, why: &str) -> bool {
+    if args.no_mem_registry {
+        return false;
+    }
+    if args.registry_carve {
+        return run_mem_registry(layer, args);
+    }
+    eprintln!(
+        "[*] {why} — rerun with --registry-carve to signature-scan SAM/LSA from physical memory"
+    );
+    false
+}
+
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
@@ -648,7 +673,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
             // hive-map walk can't run — the signature carve is the only registry
             // recovery. Works under Credential Guard.
             #[cfg(feature = "sam")]
-            if !args.no_mem_registry && run_mem_registry(&layer, args) {
+            if registry_carve_or_hint(&layer, args, "No page tables for the registry hive-map") {
                 return Ok(());
             }
             anyhow::bail!(
@@ -793,7 +818,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
             // System never found (L1 + EPT): no page tables for the hive-map walk,
             // so fall back to the signature carve for registry (SAM/LSA) recovery.
             #[cfg(feature = "sam")]
-            if !args.no_mem_registry && run_mem_registry(&layer, args) {
+            if registry_carve_or_hint(&layer, args, "No page tables for the registry hive-map") {
                 return Ok(());
             }
             Err(last_err
@@ -849,8 +874,7 @@ fn run_with_system<L: PhysicalMemory>(
         eprintln!("[*] Recovering registry hives via CM hive-map...");
         let creds = vmkatz::sam::cm_hive::extract_from_cm_map(layer, reg_dtb);
         if !print_registry_creds(&creds, args) {
-            eprintln!("[*] CM hive-map recovered nothing — falling back to signature carve...");
-            run_mem_registry(layer, args);
+            registry_carve_or_hint(layer, args, "CM hive-map recovered nothing");
         }
     }
 
