@@ -24,6 +24,20 @@ const CREDMAN_MSV_OFFSET_VARIANTS: &[CredmanMsvOffsets] = &[
         username: 0x90,
         credman_ptr: 0x158,
     },
+    // Win11 24H2 early (KIWI_MSV1_0_LIST_64): LIST_63 + 8 bytes before UserName
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0x98,
+        credman_ptr: 0x160,
+    },
+    // Win11 24H2 newer (KIWI_MSV1_0_LIST_65): LIST_63 + 16 bytes before UserName
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0xA0,
+        credman_ptr: 0x168,
+    },
     // Win8/8.1 (KIWI_MSV1_0_LIST_62, no waza[12])
     CredmanMsvOffsets {
         flink: 0x00,
