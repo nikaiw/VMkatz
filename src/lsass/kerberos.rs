@@ -108,27 +108,17 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         tickets_3: 0x148,
         smartcard_infos: 0, // not available on pre-1607
     },
-    // Win8/8.1: KIWI_KERBEROS_LOGON_SESSION (session_10 variant)
+    // Vista / Win7 / Win8 / 8.1: KIWI_KERBEROS_LOGON_SESSION (mimikatz uses the
+    // same struct for all of 6.x; credentials is KIWI_GENERIC_PRIMARY_CREDENTIAL)
     KerbOffsets {
         luid: 0x40,
-        credentials: 0x80,
-        cred_password: 0x28,
+        credentials: 0x78,
+        cred_password: 0x20,
         key_list_ptr: 0xD8,
         tickets_1: 0xE8,
         tickets_2: 0x100,
         tickets_3: 0x118,
-        smartcard_infos: 0, // not available
-    },
-    // Win7: KIWI_KERBEROS_LOGON_SESSION
-    KerbOffsets {
-        luid: 0x18,
-        credentials: 0x50,
-        cred_password: 0x28,
-        key_list_ptr: 0x90,
-        tickets_1: 0xA0,
-        tickets_2: 0xB8,
-        tickets_3: 0xD0,
-        smartcard_infos: 0, // not available
+        smartcard_infos: 0x130,
     },
 ];
 
@@ -208,55 +198,69 @@ const TICKET_OFFSETS_6: TicketOffsets = TicketOffsets {
     key_type: 0x98,
     key_length: 0xA0,
     key_value: 0xA8,
-    start_time: 0xC0,
-    end_time: 0xC8,
-    renew_until: 0xD0,
-    ticket_enc_type: 0xF8,
-    ticket_kvno: 0xFC,
-    ticket_length: 0x100,
-    ticket_value: 0x108,
+    start_time: 0xC8,
+    end_time: 0xD0,
+    renew_until: 0xD8,
+    ticket_enc_type: 0x104,
+    ticket_kvno: 0x108,
+    ticket_length: 0x110,
+    ticket_value: 0x118,
 };
 
 // -- x86 offset variants --
 
-/// x86 Kerberos session offsets (estimated from x64 struct layout with 4-byte pointers).
-/// Auto-detection validates LUID + username at runtime.
+/// x86 Kerberos session offsets, computed from the mimikatz struct definitions
+/// with 4-byte pointers, 8-byte LSA_UNICODE_STRING and the x86-only `unkAlign`
+/// padding (not verified on a live x86 dump). Auto-detection validates
+/// LUID + username at runtime.
 const KERB_OFFSET_VARIANTS_X86: &[KerbOffsets] = &[
-    // Win10 1607+ x86
+    // Win10 1607+ x86: KIWI_KERBEROS_LOGON_SESSION_10_1607
     KerbOffsets {
-        luid: 0x24,
-        credentials: 0x50,
+        luid: 0x28,
+        credentials: 0x58,
         cred_password: 0x18,
-        key_list_ptr: 0x8C,
-        tickets_1: 0x94,
-        tickets_2: 0xA0,
-        tickets_3: 0xAC,
-        smartcard_infos: 0, // not handled on x86
+        key_list_ptr: 0xA8,
+        tickets_1: 0xB0,
+        tickets_2: 0xC0,
+        tickets_3: 0xD0,
+        smartcard_infos: 0xE0,
     },
-    // Win10 1507-1511 x86
+    // Win10 1507-1511 x86: KIWI_KERBEROS_LOGON_SESSION_10
+    KerbOffsets {
+        luid: 0x28,
+        credentials: 0x58,
+        cred_password: 0x14,
+        key_list_ptr: 0xA0,
+        tickets_1: 0xA8,
+        tickets_2: 0xB8,
+        tickets_3: 0xC8,
+        smartcard_infos: 0xD8,
+    },
+    // Vista / Win7 / Win8 / 8.1 x86: KIWI_KERBEROS_LOGON_SESSION
     KerbOffsets {
         luid: 0x24,
         credentials: 0x50,
-        cred_password: 0x14,
-        key_list_ptr: 0x84,
-        tickets_1: 0x8C,
-        tickets_2: 0x98,
-        tickets_3: 0xA4,
-        smartcard_infos: 0, // not handled on x86
+        cred_password: 0x10,
+        key_list_ptr: 0x88,
+        tickets_1: 0x90,
+        tickets_2: 0xA0,
+        tickets_3: 0xB0,
+        smartcard_infos: 0xC0,
     },
 ];
 
 /// x86 key entry offsets (SIZE_T=4, PVOID=4).
 const KEY_ENTRY_1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
-    entry_size: 0x20, // salt(USTRING 8) + stringToKey(PVOID 4) + void2(PVOID 4) + generic(0x10)
+    entry_size: 0x1C, // salt(USTRING 8) + stringToKey(PVOID 4) + unk0(PVOID 4) + generic(0x0C)
     generic_offset: 0x10,
 };
 const KEY_ENTRY_PRE1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
-    entry_size: 0x1C, // salt(USTRING 8) + stringToKey(PVOID 4) + generic(0x10)
+    entry_size: 0x18, // salt(USTRING 8) + stringToKey(PVOID 4) + generic(0x0C)
     generic_offset: 0x0C,
 };
 
-/// x86 ticket structure offsets (Win10 1607+).
+/// x86 ticket structure offsets (Win10 1607+), computed from
+/// KIWI_KERBEROS_INTERNAL_TICKET_10_1607 with 4-byte pointers.
 const TICKET_OFFSETS_1607_X86: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x10,
     domain_name: 0x18,
@@ -269,29 +273,48 @@ const TICKET_OFFSETS_1607_X86: TicketOffsets = TicketOffsets {
     start_time: 0x78,
     end_time: 0x80,
     renew_until: 0x88,
-    ticket_enc_type: 0x9C,
-    ticket_kvno: 0xA0,
-    ticket_length: 0xA4,
-    ticket_value: 0xA8,
+    ticket_enc_type: 0xA8,
+    ticket_kvno: 0xAC,
+    ticket_length: 0xB0,
+    ticket_value: 0xB4,
 };
 
-/// x86 ticket structure offsets (Win10 1507-1511, no KDCServer/unk10586_d).
+/// x86 ticket structure offsets (Win10 1507-1511, KIWI_KERBEROS_INTERNAL_TICKET_10).
 const TICKET_OFFSETS_10_X86: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x10,
     domain_name: 0x18,
     target_domain_name: 0x20,
-    client_name_ptr: 0x38,
-    ticket_flags: 0x40,
-    key_type: 0x4C,
-    key_length: 0x50,
-    key_value: 0x54,
+    client_name_ptr: 0x48,
+    ticket_flags: 0x50,
+    key_type: 0x58,
+    key_length: 0x5C,
+    key_value: 0x60,
+    start_time: 0x70,
+    end_time: 0x78,
+    renew_until: 0x80,
+    ticket_enc_type: 0xA0,
+    ticket_kvno: 0xA4,
+    ticket_length: 0xA8,
+    ticket_value: 0xAC,
+};
+
+/// x86 ticket structure offsets (Win7/8, KIWI_KERBEROS_INTERNAL_TICKET_6).
+const TICKET_OFFSETS_6_X86: TicketOffsets = TicketOffsets {
+    service_name_ptr: 0x10,
+    domain_name: 0x18,
+    target_domain_name: 0x20,
+    client_name_ptr: 0x40,
+    ticket_flags: 0x48,
+    key_type: 0x50,
+    key_length: 0x54,
+    key_value: 0x58,
     start_time: 0x68,
     end_time: 0x70,
     renew_until: 0x78,
-    ticket_enc_type: 0x8C,
-    ticket_kvno: 0x90,
-    ticket_length: 0x94,
-    ticket_value: 0x98,
+    ticket_enc_type: 0x98,
+    ticket_kvno: 0x9C,
+    ticket_length: 0xA0,
+    ticket_value: 0xA4,
 };
 
 /// Validate that `addr` looks like a live Kerberos session `RTL_AVL_TABLE`: a
@@ -777,6 +800,10 @@ fn extract_tickets_from_list(
     }
 }
 
+/// FILETIME bounds (100 ns since 1601) for a plausible ticket EndTime.
+const FILETIME_2000: u64 = 125_911_584_000_000_000;
+const FILETIME_2100: u64 = 157_469_184_000_000_000;
+
 /// Extract a single Kerberos ticket from a KIWI_KERBEROS_INTERNAL_TICKET struct.
 fn extract_single_ticket(
     vmem: &dyn VirtualMemory,
@@ -876,6 +903,14 @@ fn extract_single_ticket(
     if start_time == 0 && end_time == 0 && renew_until == 0 {
         log::debug!(
             "Kerberos ticket at 0x{ticket_addr:x}: all timestamps are zero (paged out), skipping"
+        );
+        return None;
+    }
+    // EndTime is always set on a real ticket; a FILETIME outside 2000..2100
+    // means the candidate layout landed mid-struct (carve false positive).
+    if !(FILETIME_2000..FILETIME_2100).contains(&end_time) {
+        log::debug!(
+            "Kerberos ticket at 0x{ticket_addr:x}: implausible EndTime {end_time:#x}, skipping"
         );
         return None;
     }
@@ -1118,13 +1153,11 @@ const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static [&'stati
             2 => &[&TICKET_OFFSETS_10],
             _ => &[&TICKET_OFFSETS_6],
         },
-        Arch::X86 => {
-            if variant_idx == 0 {
-                &[&TICKET_OFFSETS_1607_X86]
-            } else {
-                &[&TICKET_OFFSETS_10_X86]
-            }
-        }
+        Arch::X86 => match variant_idx {
+            0 => &[&TICKET_OFFSETS_1607_X86],
+            1 => &[&TICKET_OFFSETS_10_X86],
+            _ => &[&TICKET_OFFSETS_6_X86],
+        },
     }
 }
 
@@ -1566,7 +1599,11 @@ pub fn carve_kerberos_tickets(
             &TICKET_OFFSETS_10,
             &TICKET_OFFSETS_6,
         ],
-        Arch::X86 => &[&TICKET_OFFSETS_1607_X86, &TICKET_OFFSETS_10_X86],
+        Arch::X86 => &[
+            &TICKET_OFFSETS_1607_X86,
+            &TICKET_OFFSETS_10_X86,
+            &TICKET_OFFSETS_6_X86,
+        ],
     };
 
     log::info!(

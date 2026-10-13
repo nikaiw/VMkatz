@@ -63,35 +63,50 @@ const CREDMAN_MSV_OFFSET_VARIANTS: &[CredmanMsvOffsets] = &[
 
 // -- x86 offset variants --
 
-/// x86 MSV entry offsets for CredentialManager pointer.
+/// x86 MSV entry offsets for CredentialManager pointer, computed from the
+/// mimikatz KIWI_MSV1_0_LIST_* structs with 4-byte pointers (unverified live).
 const CREDMAN_MSV_OFFSET_VARIANTS_X86: &[CredmanMsvOffsets] = &[
-    // Win10 1607+ (LIST_63) x86
+    // Win10 (LIST_63) x86
     CredmanMsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x48,
-        credman_ptr: 0xB0,
+        luid: 0x40,
+        username: 0x5C,
+        credman_ptr: 0xD0,
+    },
+    // Win11 24H2 (LIST_64) x86
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x40,
+        username: 0x64,
+        credman_ptr: 0xD8,
     },
     // Win8/8.1 (LIST_62) x86
     CredmanMsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x44,
-        credman_ptr: 0xA4,
+        luid: 0x40,
+        username: 0x50,
+        credman_ptr: 0xC0,
     },
     // Win7 SP1 (LIST_61) x86
     CredmanMsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x44,
-        credman_ptr: 0x80,
+        luid: 0x40,
+        username: 0x50,
+        credman_ptr: 0x9C,
+    },
+    // Win7 anti-mimikatz msv1_0 (LIST_61_ANTI_MIMIKATZ) x86
+    CredmanMsvOffsets {
+        flink: 0x00,
+        luid: 0x40,
+        username: 0x5C,
+        credman_ptr: 0xA4,
     },
     // Vista (LIST_60) x86
     CredmanMsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x44,
-        credman_ptr: 0x84,
+        luid: 0x40,
+        username: 0x50,
+        credman_ptr: 0xA0,
     },
 ];
 
@@ -116,10 +131,10 @@ const CREDMAN_ENTRY_VARIANTS: &[CredmanEntryOffsets] = &[
         server1: 0x70,
         server2: 0xC0,
     },
-    // Win Vista / 2008 (KIWI_CREDMAN_LIST_ENTRY_60, no unk4 LIST_ENTRY)
-    // Flink shifts back by 0x10 (no 16-byte unk4 LIST_ENTRY)
+    // Win Vista / 2008 (KIWI_CREDMAN_LIST_ENTRY_60, no unk4 LIST_ENTRY after
+    // Flink/Blink: Flink stays at 0x38, the later fields shift back by 0x10)
     CredmanEntryOffsets {
-        flink_offset: 0x28,
+        flink_offset: 0x38,
         cb_enc_password: 0x00,
         enc_password: 0x08,
         user: 0x98,
@@ -139,9 +154,9 @@ const CREDMAN_ENTRY_VARIANTS_X86: &[CredmanEntryOffsets] = &[
         server1: 0x3C,
         server2: 0x64,
     },
-    // Vista x86 (no unk4 LIST_ENTRY)
+    // Vista x86 (no unk4 LIST_ENTRY; Flink unchanged, later fields shift by 8)
     CredmanEntryOffsets {
-        flink_offset: 0x18,
+        flink_offset: 0x20,
         cb_enc_password: 0x00,
         enc_password: 0x04,
         user: 0x50,

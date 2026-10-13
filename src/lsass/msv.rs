@@ -217,16 +217,19 @@ fn variant_order_for_build(build: u32) -> Vec<usize> {
 }
 
 /// Variant ordering with arch awareness.
-/// x86 has only 3 variants (indices 0-2), x64 delegates to the build-specific ordering.
+/// x86 has its own variant table, x64 delegates to the build-specific ordering.
 fn variant_order_for_build_arch(build: u32, arch: Arch) -> Vec<usize> {
     if arch == Arch::X64 {
         return variant_order_for_build(build);
     }
-    // MSV_OFFSET_VARIANTS_X86 has 3 entries: 0=LIST_63 (Win10+), 1=LIST_62 (Win8), 2=LIST_61 (Win7)
+    // MSV_OFFSET_VARIANTS_X86: 0=NlpActiveLogon (19041+), 1=LIST_63 (Win10),
+    // 2=LIST_62 (Win8), 3=LIST_61/60 (Win7/Vista), 4=LIST_61_AM, 5=LIST_64 (24H2)
     match build {
-        10240.. => vec![0, 1, 2],
-        9200.. => vec![1, 0, 2],
-        _ => vec![2, 1, 0],
+        26100.. => vec![5, 1, 0, 2, 3, 4],
+        19041.. => vec![0, 1, 2, 3, 4, 5],
+        10240.. => vec![1, 0, 2, 3, 4, 5],
+        9200.. => vec![2, 1, 3, 4, 0, 5],
+        _ => vec![3, 4, 2, 1, 0, 5],
     }
 }
 
@@ -2874,33 +2877,77 @@ const MSV_OFFSET_VARIANTS_X86: &[MsvOffsets] = &[
         sid: 0x48,
         sid_embedded: true,
     },
-    // Variant 1: KIWI_MSV1_0_LIST_63 x86 (Win10 10240-22H2)
-    // LIST_ENTRY(8)+unk0-5(6*4=24)+pad+LUID = LUID at ~0x3C
+    // Variants 1-5 are computed from the mimikatz KIWI_MSV1_0_LIST_* structs with
+    // 4-byte pointers, 8-byte LSA_UNICODE_STRING and 8-aligned LogonTime
+    // (not verified on a live x86 dump).
+    // Variant 1: KIWI_MSV1_0_LIST_63 x86 (Win10 10240-22H2, Win8.1 AM)
     MsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x4C,
-        domain: 0x54,
-        credentials_ptr: 0x84,
-        logon_type: 0x70,
-        session_id: 0x78,
-        logon_time: 0x7C,
-        logon_server: 0x5C,
+        luid: 0x40,
+        username: 0x5C,
+        domain: 0x64,
+        credentials_ptr: 0xA0,
+        logon_type: 0x80,
+        session_id: 0x88,
+        logon_time: 0x90,
+        logon_server: 0x98,
+        sid: 0x7C,
+        sid_embedded: false,
+    },
+    // Variant 2: LIST_62 x86 (Win8/8.1)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x40,
+        username: 0x50,
+        domain: 0x58,
+        credentials_ptr: 0x90,
+        logon_type: 0x74,
+        session_id: 0x7C,
+        logon_time: 0x80,
+        logon_server: 0x88,
+        sid: 0x70,
+        sid_embedded: false,
+    },
+    // Variant 3: LIST_61 / LIST_60 x86 (Win7 / Vista; identical up to Credentials)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x40,
+        username: 0x50,
+        domain: 0x58,
+        credentials_ptr: 0x88,
+        logon_type: 0x6C,
+        session_id: 0x70,
+        logon_time: 0x78,
+        logon_server: 0x80,
         sid: 0x68,
         sid_embedded: false,
     },
-    // Variant 2: LIST_62 x86 (Win8)
+    // Variant 4: LIST_61_ANTI_MIMIKATZ x86 (Win7 with newer msv1_0.dll)
     MsvOffsets {
         flink: 0x00,
-        luid: 0x3C,
-        username: 0x44,
-        domain: 0x4C,
-        credentials_ptr: 0x7C,
-        logon_type: 0x68,
-        session_id: 0x70,
-        logon_time: 0x74,
-        logon_server: 0x54,
-        sid: 0x60,
+        luid: 0x40,
+        username: 0x5C,
+        domain: 0x64,
+        credentials_ptr: 0x90,
+        logon_type: 0x78,
+        session_id: 0x7C,
+        logon_time: 0x80,
+        logon_server: 0x88,
+        sid: 0x74,
+        sid_embedded: false,
+    },
+    // Variant 5: LIST_64 x86 (Win11 24H2+)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x40,
+        username: 0x64,
+        domain: 0x6C,
+        credentials_ptr: 0xA8,
+        logon_type: 0x88,
+        session_id: 0x90,
+        logon_time: 0x98,
+        logon_server: 0xA0,
+        sid: 0x84,
         sid_embedded: false,
     },
 ];
