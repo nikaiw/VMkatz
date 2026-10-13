@@ -483,10 +483,9 @@ pub fn extract_kerberos_credentials(
     walk_avl_tree(vmem, root_node, table_addr, &mut nodes, 0, arch);
     log::info!("Kerberos AVL tree: found {} nodes", nodes.len());
 
-    let (offsets, variant_idx) = detect_kerb_offsets(vmem, &nodes, arch);
+    let (offsets, variant_idx, ticket_offsets) = detect_kerb_offsets(vmem, &nodes, arch);
 
-    // Select ticket and key entry offsets based on variant and arch
-    let ticket_offsets = ticket_offsets_for(variant_idx, arch);
+    // Select key entry offsets based on variant and arch
     let key_entry_offsets = match arch {
         Arch::X64 => match variant_idx {
             0 | 1 => &KEY_ENTRY_1607,
@@ -998,12 +997,13 @@ fn is_plausible_username(name: &str) -> bool {
 }
 
 /// Auto-detect Kerberos offset variant by probing AVL tree nodes.
-/// Returns the offsets and variant index.
+/// Returns the session offsets, variant index and the ticket-entry layout
+/// that actually parsed a ticket (first candidate when none did).
 fn detect_kerb_offsets(
     vmem: &dyn VirtualMemory,
     nodes: &[u64],
     arch: Arch,
-) -> (&'static KerbOffsets, usize) {
+) -> (&'static KerbOffsets, usize, &'static TicketOffsets) {
     let variants: &[KerbOffsets] = if arch == Arch::X64 {
         KERB_OFFSET_VARIANTS
     } else {
@@ -1019,7 +1019,7 @@ fn detect_kerb_offsets(
     // bonus when a populated list's first node actually parses into a real ticket
     // using that variant's entry offsets (this is what separates 26100 from 1607).
     // Keep the best; lowest index breaks ties so 17763 still resolves to variant 0.
-    let mut best: Option<(usize, i32)> = None;
+    let mut best: Option<(usize, i32, &'static TicketOffsets)> = None;
     for node_ptr in nodes {
         let entry = match read_ptr(vmem, node_ptr + ordered_ptr_off, arch) {
             Ok(p) if is_valid_user_ptr(p, arch) => p,
@@ -1042,39 +1042,49 @@ fn detect_kerb_offsets(
                 .iter()
                 .map(|&off| i32::from(is_ticket_list_head(vmem, entry + off, arch)))
                 .sum();
-            let toff = ticket_offsets_for(idx, arch);
-            for &off in &lists {
+            let candidates = ticket_offsets_for(idx, arch);
+            let mut toff = candidates[0];
+            'probe: for &off in &lists {
                 let flink = read_ptr(vmem, entry + off, arch).unwrap_or(0);
-                if is_valid_user_ptr(flink, arch)
-                    && flink != entry + off
-                    && extract_single_ticket(vmem, flink, KerberosTicketType::Tgs, toff, arch)
+                if !is_valid_user_ptr(flink, arch) || flink == entry + off {
+                    continue;
+                }
+                for (ci, &cand) in candidates.iter().enumerate() {
+                    if extract_single_ticket(vmem, flink, KerberosTicketType::Tgs, cand, arch)
                         .is_some()
-                {
-                    score += 10;
-                    break;
+                    {
+                        if ci > 0 {
+                            log::info!(
+                                "Kerberos: session variant {idx} parses tickets with fallback layout {ci}"
+                            );
+                        }
+                        score += 10;
+                        toff = cand;
+                        break 'probe;
+                    }
                 }
             }
-            if best.is_none_or(|(_, bs)| score > bs) {
-                best = Some((idx, score));
+            if best.is_none_or(|(_, bs, _)| score > bs) {
+                best = Some((idx, score, toff));
             }
         }
-        if matches!(best, Some((_, s)) if s >= 10) {
+        if matches!(best, Some((_, s, _)) if s >= 10) {
             break;
         }
     }
-    if let Some((idx, score)) = best {
+    if let Some((idx, score, toff)) = best {
         log::debug!(
             "Kerberos: auto-detected variant {idx} (luid=0x{:x} cred=0x{:x} score={score})",
             variants[idx].luid,
             variants[idx].credentials,
         );
-        return (&variants[idx], idx);
+        return (&variants[idx], idx, toff);
     }
     log::warn!(
         "Kerberos: could not auto-detect offset variant from {} AVL nodes, defaulting to variant 0",
         nodes.len()
     );
-    (&variants[0], 0)
+    (&variants[0], 0, ticket_offsets_for(0, arch)[0])
 }
 
 /// A `KERB_TICKET_CACHE` LIST_ENTRY head is valid when it is either empty (Flink
@@ -1093,22 +1103,26 @@ fn is_ticket_list_head(vmem: &dyn VirtualMemory, head: u64, arch: Arch) -> bool 
     read_ptr(vmem, flink + arch.ptr_size(), arch).is_ok_and(|blink| blink == head)
 }
 
-/// Ticket-entry offset set for a detected session variant index.
-const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static TicketOffsets {
+/// Candidate ticket-entry layouts for a session variant index, most likely first.
+/// Session variant 0 covers 1607 through 23H2; mimikatz keeps the 1607 ticket
+/// layout for all of them while pypykatz switches to the 26100-style tail from
+/// build 20348. Neither is verified on Win11 21H2-23H2 / Server 2022, so both
+/// are offered and `detect_kerb_offsets` keeps whichever parses a real ticket.
+const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static [&'static TicketOffsets] {
     match arch {
         Arch::X64 => match variant_idx {
-            0 => &TICKET_OFFSETS_1607,
+            0 => &[&TICKET_OFFSETS_1607, &TICKET_OFFSETS_26100],
             // Variant 1 is Win11 24H2 / Server 2025 (build 26100): the session
             // layout matches variant 1 but the ticket-entry tail is shifted +0x10.
-            1 => &TICKET_OFFSETS_26100,
-            2 => &TICKET_OFFSETS_10,
-            _ => &TICKET_OFFSETS_6,
+            1 => &[&TICKET_OFFSETS_26100],
+            2 => &[&TICKET_OFFSETS_10],
+            _ => &[&TICKET_OFFSETS_6],
         },
         Arch::X86 => {
             if variant_idx == 0 {
-                &TICKET_OFFSETS_1607_X86
+                &[&TICKET_OFFSETS_1607_X86]
             } else {
-                &TICKET_OFFSETS_10_X86
+                &[&TICKET_OFFSETS_10_X86]
             }
         }
     }
@@ -1546,7 +1560,12 @@ pub fn carve_kerberos_tickets(
 
     // Select ticket offset variants based on architecture
     let ticket_offset_sets: &[&TicketOffsets] = match arch {
-        Arch::X64 => &[&TICKET_OFFSETS_1607, &TICKET_OFFSETS_10, &TICKET_OFFSETS_6],
+        Arch::X64 => &[
+            &TICKET_OFFSETS_1607,
+            &TICKET_OFFSETS_26100,
+            &TICKET_OFFSETS_10,
+            &TICKET_OFFSETS_6,
+        ],
         Arch::X86 => &[&TICKET_OFFSETS_1607_X86, &TICKET_OFFSETS_10_X86],
     };
 
