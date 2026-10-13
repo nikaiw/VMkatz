@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VmkatzError};
+use crate::utils::{u32_le, u64_le};
 
 const VMDK_MAGIC: u32 = 0x564D444B; // "KDMV" LE
 const SECTOR_SIZE: u64 = 512;
@@ -385,9 +386,7 @@ impl VmdkDisk {
                 }
 
                 for gte_idx in 0..num_gtes as usize {
-                    let grain_sector = u32::from_le_bytes(
-                        gt_buf[gte_idx * 4..(gte_idx + 1) * 4].try_into().unwrap(),
-                    );
+                    let grain_sector = u32_le(&gt_buf, gte_idx * 4);
                     if grain_sector == 0 {
                         continue;
                     }
@@ -545,16 +544,16 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
     let mut hdr = [0u8; 0x48];
     file.read_exact(&mut hdr)?;
 
-    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let magic = u32_le(&hdr, 0);
     if magic != VMDK_MAGIC {
         return Err(VmkatzError::InvalidMagic(magic));
     }
 
     // SparseExtentHeader fields (VMDK format spec):
-    let capacity = u64::from_le_bytes(hdr[0x0C..0x14].try_into().unwrap()); // capacity (sectors)
-    let grain_size = u64::from_le_bytes(hdr[0x14..0x1C].try_into().unwrap()); // grainSize (sectors)
-    let num_gtes_per_gt = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap()); // numGTEsPerGT
-    let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap()); // gdOffset (sectors)
+    let capacity = u64_le(&hdr, 0x0C); // capacity (sectors)
+    let grain_size = u64_le(&hdr, 0x14); // grainSize (sectors)
+    let num_gtes_per_gt = u32_le(&hdr, 0x2C); // numGTEsPerGT
+    let gd_offset_sectors = u64_le(&hdr, 0x38); // gdOffset (sectors)
 
     // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt).
     // Cap num_gtes_per_gt (standard is 512, so 1<<16 is generous) so the per-GT

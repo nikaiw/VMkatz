@@ -1,6 +1,7 @@
 use super::page::Pager;
 use super::record::{Value, decode_record, read_varint};
 use crate::error::{Result, VmkatzError as Error};
+use crate::utils::u32_be;
 
 const PAGE_INTERIOR_INDEX: u8 = 0x02;
 const PAGE_INTERIOR_TABLE: u8 = 0x05;
@@ -83,11 +84,11 @@ fn walk_inner<F: FnMut(i64, Vec<Value>) -> Result<()>>(
                 if cell_off.checked_add(4).is_none_or(|e| e > page.len()) {
                     return Err(Error::Parse("interior cell out of range".into()));
                 }
-                let child = u32::from_be_bytes(page[cell_off..cell_off + 4].try_into().unwrap());
+                let child = u32_be(page, cell_off);
                 // The varint rowid that follows is unused for table walks.
                 walk_inner(pager, child, cb, depth + 1)?;
             }
-            let rightmost = u32::from_be_bytes(h[8..12].try_into().unwrap());
+            let rightmost = u32_be(h, 8);
             if rightmost != 0 {
                 walk_inner(pager, rightmost, cb, depth + 1)?;
             }

@@ -16,6 +16,7 @@ use crate::sam::bootkey::extract_bootkey;
 use crate::sam::hashes::extract_hashes;
 use crate::sam::lsa::extract_lsa_secrets;
 use crate::sam::mem_hive::MemoryHiveCreds;
+use crate::utils::{u32_le, u64_le};
 
 const HHIVE_SIG: u32 = 0xBEE0_BEE0;
 const BASE_BLOCK: usize = 0x1000;
@@ -24,12 +25,6 @@ const WANTED: [&str; 3] = ["SAM", "SYSTEM", "SECURITY"];
 /// Cap a hive image so a corrupt length can't drive a huge allocation.
 const MAX_HIVE: usize = 256 << 20;
 
-fn u32at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
-}
-fn u64at(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
-}
 fn is_kernel_va(v: u64) -> bool {
     (0xFFFF_8000_0000_0000..u64::MAX).contains(&v)
 }
@@ -118,7 +113,7 @@ fn scan_hives<L: PhysicalMemory>(
         if layer.read_phys(base, &mut buf[..n]).is_ok() {
             let mut i = 0;
             while i + 4 <= n {
-                if u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) == HHIVE_SIG {
+                if u32_le(&buf, i) == HHIVE_SIG {
                     if let Some((name, img)) = materialize(layer, rv, base + i as u64) {
                         // Keep the largest (most-complete) image seen per hive name.
                         if hives.get(&name).is_none_or(|e| img.len() > e.len()) {
@@ -149,10 +144,10 @@ fn materialize<L: PhysicalMemory>(
     // BaseBlock: the first kernel-VA pointer whose target begins with "regf".
     let base_block = (8..0x100)
         .step_by(8)
-        .map(|o| u64at(&hh, o))
+        .map(|o| u64_le(&hh, o))
         .filter(|&va| is_kernel_va(va))
         .find_map(|va| rv(va, BASE_BLOCK).filter(|b| &b[0..4] == b"regf"))?;
-    let length = u32at(&base_block, 0x28) as usize;
+    let length = u32_le(&base_block, 0x28) as usize;
     let name = crate::utils::utf16le_decode(&base_block[0x30..0x70]);
     let base = name
         .rsplit(['\\', '/'])
@@ -209,7 +204,7 @@ fn calibrate(
     let probes = (length / 0x1000).min(64);
     let mut best: Option<(usize, MapLayout)> = None;
     for o in (0x40..hh.len().saturating_sub(8)).step_by(8) {
-        let map_va = u64at(hh, o);
+        let map_va = u64_le(hh, o);
         if !is_kernel_va(map_va) {
             continue;
         }
@@ -249,7 +244,7 @@ fn read_block(
     off: usize,
 ) -> Option<Vec<u8>> {
     let dir = rv(layout.map_va + ((off >> 21) as u64) * 8, 8)?;
-    let table_va = u64at(&dir, 0);
+    let table_va = u64_le(&dir, 0);
     if !is_kernel_va(table_va) {
         return None;
     }
@@ -258,9 +253,9 @@ fn read_block(
     let block_va = match layout.scheme {
         // (PermanentBinAddress & ~0xF) + BlockOffset. The block VA is user-range in
         // the Registry process (Win10 1803+); the caller's DTB maps it.
-        EntryScheme::PermBin => (u64at(&ent, 8) & !0xF).checked_add(u64at(&ent, 0))?,
+        EntryScheme::PermBin => (u64_le(&ent, 8) & !0xF).checked_add(u64_le(&ent, 0))?,
         // BlockAddress is the 4 KB block VA directly (Win7/Vista, System space).
-        EntryScheme::BlockAddr => u64at(&ent, 0) & !0xFFF,
+        EntryScheme::BlockAddr => u64_le(&ent, 0) & !0xFFF,
     };
     if block_va == 0 {
         return None;

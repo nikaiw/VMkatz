@@ -8,6 +8,7 @@ use crate::lsass::types::{
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::translate::{PaePageTableWalker, PageTableWalker};
 use crate::pe::parser::PeHeaders;
+use crate::utils::{u16_le, u32_le};
 
 /// Per-arch offsets for KIWI_MASTERKEY_CACHE_ENTRY.
 struct DpapiOffsets {
@@ -681,14 +682,14 @@ fn validate_dpapi_guid(guid: &[u8]) -> bool {
     }
 
     // D1 (first u32) non-zero
-    let d1 = u32::from_le_bytes(guid[0..4].try_into().unwrap());
+    let d1 = u32_le(guid, 0);
     if d1 == 0 {
         return false;
     }
     // D2+D3 (bytes 4..8) should not both be zero -- real GUIDs have random fields here.
     // Pattern like 00000381-0000-0000-... has D2=0, D3=0 which is not a real GUID.
-    let d2 = u16::from_le_bytes(guid[4..6].try_into().unwrap());
-    let d3 = u16::from_le_bytes(guid[6..8].try_into().unwrap());
+    let d2 = u16_le(guid, 4);
+    let d3 = u16_le(guid, 6);
     if d2 == 0 && d3 == 0 {
         return false;
     }

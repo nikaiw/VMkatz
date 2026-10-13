@@ -7,6 +7,7 @@ use crate::paging::entry::{
     LARGE_1GB_MASK, LARGE_2MB_MASK, PAGE_OFFSET_1GB, PAGE_OFFSET_2MB, PAGE_PHYS_MASK,
     PageTableEntry,
 };
+use crate::utils::u64_le;
 
 /// TLB cache size: 256 entries, direct-mapped by VA page number.
 /// Each entry is (va_page, pa_page_base) where va_page = vaddr >> 12.
@@ -226,11 +227,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
         pagefile: Option<&crate::paging::pagefile::PagefileReader>,
     ) -> Result<u64> {
         let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-        let pdpte = PageTableEntry(u64::from_le_bytes(
-            pdpt_page[pdpt_idx * 8..pdpt_idx * 8 + 8]
-                .try_into()
-                .unwrap(),
-        ));
+        let pdpte = PageTableEntry(u64_le(pdpt_page, pdpt_idx * 8));
         if !pdpte.is_present() {
             if let Some(pf) = pagefile {
                 if pdpte.is_pagefile() {
@@ -278,9 +275,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
         pagefile: Option<&crate::paging::pagefile::PagefileReader>,
     ) -> Result<u64> {
         let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-        let pde = PageTableEntry(u64::from_le_bytes(
-            pd_page[pd_idx * 8..pd_idx * 8 + 8].try_into().unwrap(),
-        ));
+        let pde = PageTableEntry(u64_le(pd_page, pd_idx * 8));
         if !pde.is_present() {
             if let Some(pf) = pagefile {
                 if pde.is_pagefile() {
@@ -308,9 +303,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
         _pagefile: Option<&crate::paging::pagefile::PagefileReader>,
     ) -> Result<u64> {
         let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-        let pte = PageTableEntry(u64::from_le_bytes(
-            pt_page[pt_idx * 8..pt_idx * 8 + 8].try_into().unwrap(),
-        ));
+        let pte = PageTableEntry(u64_le(pt_page, pt_idx * 8));
         if !pte.is_present() {
             if pte.is_transition() {
                 return Ok(pte.frame_addr() | (vaddr & 0xFFF));
@@ -354,7 +347,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
 #[inline]
 fn read_pte_from_buf(buf: &[u8], idx: usize) -> u64 {
     let off = idx * 8;
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    u64_le(buf, off)
 }
 
 /// A mapping from virtual address to physical address for a present page.

@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::error::{Result, VmkatzError};
 use crate::lsass::types::Arch;
 use crate::memory::VirtualMemory;
+use crate::utils::{u16_le_or0, u32_le_or0, u64_le_or0};
 use crate::windows::peb::LoadedModule;
 
 // ── Minidump constants ──────────────────────────────────────────────────────
@@ -105,9 +106,9 @@ impl Minidump {
             if entry_off + 12 > data.len() {
                 break;
             }
-            let stream_type = read_u32(&data, entry_off);
-            let stream_size = read_u32(&data, entry_off + 4) as usize;
-            let stream_rva = read_u32(&data, entry_off + 8) as usize;
+            let stream_type = u32_le_or0(&data, entry_off);
+            let stream_size = u32_le_or0(&data, entry_off + 4) as usize;
+            let stream_rva = u32_le_or0(&data, entry_off + 8) as usize;
 
             if stream_rva + stream_size > data.len() {
                 log::warn!("Minidump stream {i} (type {stream_type}) extends past EOF, skipping");
@@ -118,10 +119,10 @@ impl Minidump {
                 STREAM_TYPE_SYSTEM_INFO => {
                     if stream_size >= 24 {
                         // ProcessorArchitecture at offset 0 (u16): 0=i386, 9=AMD64
-                        processor_arch = read_u16(&data, stream_rva);
-                        major_version = read_u32(&data, stream_rva + 8);
-                        minor_version = read_u32(&data, stream_rva + 12);
-                        build_number = read_u32(&data, stream_rva + 16);
+                        processor_arch = u16_le_or0(&data, stream_rva);
+                        major_version = u32_le_or0(&data, stream_rva + 8);
+                        minor_version = u32_le_or0(&data, stream_rva + 12);
+                        build_number = u32_le_or0(&data, stream_rva + 16);
                     }
                 }
                 STREAM_TYPE_MODULE_LIST => {
@@ -237,7 +238,7 @@ fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
         return modules;
     }
 
-    let count = read_u32(data, rva) as usize;
+    let count = u32_le_or0(data, rva) as usize;
     // Cap module count to prevent excessive iteration on malformed dumps
     if count > 4096 {
         log::warn!("Module count {count} too large, capping at 4096");
@@ -253,11 +254,11 @@ fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
             break;
         }
 
-        let base = read_u64(data, off);
-        let size = read_u32(data, off + 8);
+        let base = u64_le_or0(data, off);
+        let size = u32_le_or0(data, off + 8);
         // MINIDUMP_MODULE layout: BaseOfImage(8) + SizeOfImage(4) + CheckSum(4) +
         // TimeDateStamp(4) + ModuleNameRva(4) at offset 20
-        let name_rva = read_u32(data, off + 20) as usize;
+        let name_rva = u32_le_or0(data, off + 20) as usize;
 
         let full_name = read_minidump_string(data, name_rva);
         let base_name = full_name
@@ -289,13 +290,13 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
         return regions;
     }
 
-    let count = read_u64(data, rva) as usize;
+    let count = u64_le_or0(data, rva) as usize;
     // Cap region count to prevent excessive iteration on malformed dumps
     if count > 1_000_000 {
         log::warn!("Memory64 region count {count} too large, capping");
         return regions;
     }
-    let base_rva = read_u64(data, rva + 8);
+    let base_rva = u64_le_or0(data, rva + 8);
 
     let descs_start = rva + 16;
     let mut current_file_offset = base_rva;
@@ -308,8 +309,8 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
             break;
         }
 
-        let start_va = read_u64(data, desc_off);
-        let size = read_u64(data, desc_off + 8);
+        let start_va = u64_le_or0(data, desc_off);
+        let size = u64_le_or0(data, desc_off + 8);
 
         regions.push(MemRegion {
             start_va,
@@ -331,24 +332,10 @@ fn read_minidump_string(data: &[u8], rva: usize) -> String {
     if rva + 4 > data.len() {
         return String::new();
     }
-    let byte_len = read_u32(data, rva) as usize;
+    let byte_len = u32_le_or0(data, rva) as usize;
     let str_start = rva + 4;
     if str_start + byte_len > data.len() || byte_len == 0 {
         return String::new();
     }
     crate::utils::utf16le_decode(&data[str_start..str_start + byte_len])
-}
-
-// ── Helpers (delegate to crate::utils, defaulting to 0 on failure) ──────────
-
-fn read_u16(data: &[u8], off: usize) -> u16 {
-    crate::utils::read_u16_le(data, off).unwrap_or(0)
-}
-
-fn read_u32(data: &[u8], off: usize) -> u32 {
-    crate::utils::read_u32_le(data, off).unwrap_or(0)
-}
-
-fn read_u64(data: &[u8], off: usize) -> u64 {
-    crate::utils::read_u64_le(data, off).unwrap_or(0)
 }

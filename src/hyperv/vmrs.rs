@@ -33,6 +33,7 @@ use std::path::Path;
 
 use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
+use crate::utils::{u16_le, u32_le, u64_le};
 
 const VMRS_MAGIC: u32 = 0x01282014;
 const HEADER_SIZE: usize = 46;
@@ -325,7 +326,7 @@ impl VmrsLayer {
         let mut buf = [0u8; HEADER_SIZE];
         file.read_exact(&mut buf)?;
 
-        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let magic = u32_le(&buf, 0);
         if magic != VMRS_MAGIC {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -333,7 +334,7 @@ impl VmrsLayer {
             )));
         }
 
-        let stored_crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let stored_crc = u32_le(&buf, 4);
 
         // Verify CRC32: zero out the CRC field, compute over all 46 bytes
         let mut crc_buf = buf;
@@ -348,11 +349,11 @@ impl VmrsLayer {
             )));
         }
 
-        let sequence = u16::from_le_bytes(buf[8..10].try_into().unwrap());
-        let version = u32::from_le_bytes(buf[10..14].try_into().unwrap());
-        let data_alignment = u32::from_le_bytes(buf[22..26].try_into().unwrap());
-        let data_offset = u64::from_le_bytes(buf[26..34].try_into().unwrap());
-        let data_size = u64::from_le_bytes(buf[34..42].try_into().unwrap());
+        let sequence = u16_le(&buf, 8);
+        let version = u32_le(&buf, 10);
+        let data_alignment = u32_le(&buf, 22);
+        let data_offset = u64_le(&buf, 26);
+        let data_size = u64_le(&buf, 34);
 
         // Validate alignment (0x1000 to 0x10000)
         if !(0x1000..=0x10000).contains(&data_alignment) {
@@ -495,9 +496,8 @@ impl VmrsLayer {
                 if ref_off + 12 > buf.len() {
                     continue;
                 }
-                let size = u32::from_le_bytes(buf[ref_off..ref_off + 4].try_into().unwrap());
-                let file_offset =
-                    u64::from_le_bytes(buf[ref_off + 4..ref_off + 12].try_into().unwrap());
+                let size = u32_le(&buf, ref_off);
+                let file_offset = u64_le(&buf, ref_off + 4);
                 if size == 0
                     || size as usize > RAM_BLOCK_SIZE
                     || file_offset == 0
@@ -534,7 +534,7 @@ impl VmrsLayer {
             self.read_file_bytes(self.header.data_offset, self.header.data_size as usize)?;
         let n = region.len();
         let entry_crc_ok = |e: &[u8]| -> bool {
-            let stored = u32::from_le_bytes(e[1..5].try_into().unwrap());
+            let stored = u32_le(e, 1);
             if stored == 0 {
                 return false;
             }
@@ -547,7 +547,7 @@ impl VmrsLayer {
         let mut tables = 0usize;
         let mut off = 0usize;
         while off + 8 <= n {
-            let count = u32::from_le_bytes(region[off + 4..off + 8].try_into().unwrap()) as usize;
+            let count = u32_le(&region, off + 4) as usize;
             if count == 0 || count > 100_000 || off + 8 + count * 18 > n {
                 off += 1;
                 continue;
@@ -564,9 +564,9 @@ impl VmrsLayer {
                 let e = &region[base + i * 18..base + (i + 1) * 18];
                 let entry = ObjectTableEntry {
                     entry_type: e[0],
-                    crc32: u32::from_le_bytes(e[1..5].try_into().unwrap()),
-                    file_offset: u64::from_le_bytes(e[5..13].try_into().unwrap()),
-                    size: u32::from_le_bytes(e[13..17].try_into().unwrap()),
+                    crc32: u32_le(e, 1),
+                    file_offset: u64_le(e, 5),
+                    size: u32_le(e, 13),
                     flags: e[17],
                 };
                 // Skip empty slots: KeyTable reference indices count only populated
@@ -594,7 +594,7 @@ impl VmrsLayer {
         let mut hdr = [0u8; 8];
         inner.file.read_exact(&mut hdr)?;
 
-        let entry_count = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let entry_count = u32_le(&hdr, 4) as usize;
         if entry_count > 100_000 {
             return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -614,9 +614,9 @@ impl VmrsLayer {
             let e = &entries_buf[i * 18..(i + 1) * 18];
             let entry = ObjectTableEntry {
                 entry_type: e[0],
-                crc32: u32::from_le_bytes(e[1..5].try_into().unwrap()),
-                file_offset: u64::from_le_bytes(e[5..13].try_into().unwrap()),
-                size: u32::from_le_bytes(e[13..17].try_into().unwrap()),
+                crc32: u32_le(e, 1),
+                file_offset: u64_le(e, 5),
+                size: u32_le(e, 13),
                 flags: e[17],
             };
             // Only store non-empty entries
@@ -681,7 +681,7 @@ impl VmrsLayer {
         }
 
         // KeyTable header: [0:2] type=2, [2:4] kt_index, [4:10] reserved
-        let kt_type = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let kt_type = u16_le(&data, 0);
         if kt_type != 2 {
             log::debug!(
                 "VMRS: KeyTable at {:#x} has unexpected type {}",
@@ -689,7 +689,7 @@ impl VmrsLayer {
                 kt_type
             );
         }
-        let _kt_index = u16::from_le_bytes(data[2..4].try_into().unwrap());
+        let _kt_index = u16_le(&data, 2);
 
         // Walk entries starting at offset 10
         self.walk_key_entries(&data, 10, entry.file_offset, "");
@@ -714,8 +714,7 @@ impl VmrsLayer {
             // Entry header
             let entry_type = data[offset];
             // data[offset + 1]: entry flags (unused)
-            let entry_total_size =
-                u32::from_le_bytes(data[offset + 2..offset + 6].try_into().unwrap()) as usize;
+            let entry_total_size = u32_le(data, offset + 2) as usize;
 
             if entry_total_size == 0 {
                 break;
@@ -764,9 +763,8 @@ impl VmrsLayer {
                 let is_reference = entry_flags & 1 != 0;
                 let ref_off = offset + 21 + name_length; // 0x15 + name_length
                 let resolved_reference = if is_reference && ref_off + 12 <= total {
-                    let size = u32::from_le_bytes(data[ref_off..ref_off + 4].try_into().unwrap());
-                    let file_offset =
-                        u64::from_le_bytes(data[ref_off + 4..ref_off + 12].try_into().unwrap());
+                    let size = u32_le(data, ref_off);
+                    let file_offset = u64_le(data, ref_off + 4);
                     if file_offset != 0 && size != 0 {
                         Some((file_offset, size))
                     } else {
@@ -793,11 +791,7 @@ impl VmrsLayer {
                             // Variable-size value
                             let value_size_offset = offset + 21 + name_length;
                             if value_size_offset + 4 <= total {
-                                let value_size = u32::from_le_bytes(
-                                    data[value_size_offset..value_size_offset + 4]
-                                        .try_into()
-                                        .unwrap(),
-                                );
+                                let value_size = u32_le(data, value_size_offset);
                                 let value_data_offset = value_size_offset + 4;
                                 if value_size > 0 {
                                     self.key_values.insert(
@@ -820,8 +814,7 @@ impl VmrsLayer {
 
                 // Check for child key table reference
                 // Bytes [6:8] = child count, [8:12] = child object table entry offset
-                let child_obj_ref =
-                    u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap());
+                let child_obj_ref = u32_le(data, offset + 8);
                 if child_obj_ref > 0 {
                     // Try to find and parse the child key table
                     if let Some(child_entry) = self.find_object_entry(child_obj_ref) {
@@ -1043,7 +1036,7 @@ impl VmrsLayer {
                 let mut kernel = 0u32;
                 candidates.clear();
                 for i in 0..512 {
-                    let e = u64::from_le_bytes(pg[i * 8..i * 8 + 8].try_into().unwrap());
+                    let e = u64_le(pg, i * 8);
                     if e & 1 == 0 {
                         continue;
                     }
@@ -1428,7 +1421,7 @@ fn xpress_decompress(input: &[u8], out: &mut [u8]) -> usize {
             if in_pos + 4 > input.len() {
                 break;
             }
-            flags = u32::from_le_bytes(input[in_pos..in_pos + 4].try_into().unwrap());
+            flags = u32_le(input, in_pos);
             in_pos += 4;
             flag_count = 32;
         }
@@ -1515,7 +1508,7 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
     let mut short_decode = false; // an XPRESS page produced fewer bytes than its page size
 
     while in_offset + 4 <= data.len() && out_offset < RAM_BLOCK_SIZE {
-        let tag = u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap());
+        let tag = u32_le(data, in_offset);
         in_offset += 4;
 
         match tag {
@@ -1548,9 +1541,7 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                     break;
                 }
                 let pattern = data[in_offset..in_offset + 8].to_vec();
-                let count =
-                    u32::from_le_bytes(data[in_offset + 8..in_offset + 12].try_into().unwrap())
-                        as usize;
+                let count = u32_le(data, in_offset + 8) as usize;
                 in_offset += 12;
                 for _ in 0..count {
                     let page_end = (out_offset + 4096).min(RAM_BLOCK_SIZE);
@@ -1572,11 +1563,8 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                 if in_offset + 8 > data.len() {
                     break;
                 }
-                let uncomp =
-                    u32::from_le_bytes(data[in_offset..in_offset + 4].try_into().unwrap()) as usize;
-                let comp =
-                    u32::from_le_bytes(data[in_offset + 4..in_offset + 8].try_into().unwrap())
-                        as usize;
+                let uncomp = u32_le(data, in_offset) as usize;
+                let comp = u32_le(data, in_offset + 4) as usize;
                 in_offset += 8;
                 if uncomp == 0 || comp > uncomp || in_offset + comp > data.len() {
                     break;

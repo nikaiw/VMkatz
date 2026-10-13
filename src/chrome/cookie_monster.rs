@@ -28,6 +28,7 @@
 
 use crate::error::Result;
 use crate::memory::VirtualMemory;
+use crate::utils::u64_le;
 
 // ============================================================================
 // Locator signature
@@ -200,7 +201,7 @@ pub fn read_optimized_string(vmem: &dyn VirtualMemory, addr: u64) -> Result<Stri
         // Heap-allocated: bytes 0..8 are a pointer to the char buffer, and
         // the real length lives at offset 0x10 of the std::string struct.
         // Cap at 8 KiB to bound a corrupt-pointer scenario.
-        let str_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let str_ptr = u64_le(&buf, 0);
         let str_len_raw = vmem.read_virt_u64(addr + 16).unwrap_or(len as u64);
         let str_len = (str_len_raw as usize).min(8192);
         if str_ptr == 0 || str_len == 0 {
@@ -333,8 +334,8 @@ fn read_process_bound_value(vmem: &dyn VirtualMemory, pb_addr: u64) -> String {
     if encrypted {
         return String::from("<encrypted in-process>");
     }
-    let data_ptr = u64::from_le_bytes(pb_buf[0..8].try_into().unwrap());
-    let data_size = u64::from_le_bytes(pb_buf[8..16].try_into().unwrap()).min(8192);
+    let data_ptr = u64_le(&pb_buf, 0);
+    let data_size = u64_le(&pb_buf, 8).min(8192);
     if data_ptr == 0 || data_size == 0 {
         return String::new();
     }
@@ -374,11 +375,11 @@ pub fn walk_cookie_tree(
         if node_buf.len() < std::mem::size_of::<RbNode>() {
             continue;
         }
-        let left = u64::from_le_bytes(node_buf[0..8].try_into().unwrap());
-        let right = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
+        let left = u64_le(&node_buf, 0);
+        let right = u64_le(&node_buf, 8);
         // value_address is at offset 56: left(8) + right(8) + parent(8) +
         // is_black(1) + pad(7) + key OptimizedString(24) = 56.
-        let value_addr = u64::from_le_bytes(node_buf[56..64].try_into().unwrap());
+        let value_addr = u64_le(&node_buf, 56);
         if value_addr != 0 && visit(value_addr) {
             count += 1;
         }

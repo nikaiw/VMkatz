@@ -1,4 +1,5 @@
 use crate::error::{Result, VmkatzError as Error};
+use crate::utils::u32_be;
 
 pub const HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\x00";
 
@@ -32,10 +33,10 @@ pub fn parse_header(bytes: &[u8]) -> Result<DbHeader> {
     } else {
         page_size_raw
     };
-    let page_count = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
-    let first_freelist_page = u32::from_be_bytes(bytes[32..36].try_into().unwrap());
-    let freelist_pages = u32::from_be_bytes(bytes[36..40].try_into().unwrap());
-    let enc = u32::from_be_bytes(bytes[56..60].try_into().unwrap());
+    let page_count = u32_be(bytes, 28);
+    let first_freelist_page = u32_be(bytes, 32);
+    let freelist_pages = u32_be(bytes, 36);
+    let enc = u32_be(bytes, 56);
     let text_encoding = match enc {
         2 => TextEncoding::Utf16Le,
         3 => TextEncoding::Utf16Be,

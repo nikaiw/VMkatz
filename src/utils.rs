@@ -51,6 +51,73 @@ pub fn read_i32_le(data: &[u8], off: usize) -> Option<i32> {
     Some(i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
 }
 
+/// Little-endian u16 at `off`. Panics if the slice is short, like indexing.
+#[inline]
+#[must_use]
+pub fn u16_le(d: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(d[off..off + 2].try_into().expect("2 bytes"))
+}
+
+/// Little-endian u32 at `off`. Panics if the slice is short, like indexing.
+#[inline]
+#[must_use]
+pub fn u32_le(d: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(d[off..off + 4].try_into().expect("4 bytes"))
+}
+
+/// Little-endian u64 at `off`. Panics if the slice is short, like indexing.
+#[inline]
+#[must_use]
+pub fn u64_le(d: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(d[off..off + 8].try_into().expect("8 bytes"))
+}
+
+/// Big-endian u32 at `off`. Panics if the slice is short, like indexing.
+#[inline]
+#[must_use]
+pub fn u32_be(d: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes(d[off..off + 4].try_into().expect("4 bytes"))
+}
+
+/// Little-endian u16 at `off`, 0 when the slice is short.
+#[inline]
+#[must_use]
+pub fn u16_le_or0(d: &[u8], off: usize) -> u16 {
+    read_u16_le(d, off).unwrap_or(0)
+}
+
+/// Little-endian u32 at `off`, 0 when the slice is short.
+#[inline]
+#[must_use]
+pub fn u32_le_or0(d: &[u8], off: usize) -> u32 {
+    read_u32_le(d, off).unwrap_or(0)
+}
+
+/// Little-endian u64 at `off`, 0 when the slice is short.
+#[inline]
+#[must_use]
+pub fn u64_le_or0(d: &[u8], off: usize) -> u64 {
+    read_u64_le(d, off).unwrap_or(0)
+}
+
+/// Big-endian u32 at `off`, 0 when the slice is short.
+#[inline]
+#[must_use]
+pub fn u32_be_or0(d: &[u8], off: usize) -> u32 {
+    d.get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u32::from_be_bytes)
+}
+
+/// Big-endian u64 at `off`, 0 when the slice is short.
+#[inline]
+#[must_use]
+pub fn u64_be_or0(d: &[u8], off: usize) -> u64 {
+    d.get(off..off + 8)
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u64::from_be_bytes)
+}
+
 /// SHA-1 digest (FIPS 180-4). Returns 20-byte hash.
 ///
 /// Used for MSV credential cross-validation (SHA1(NT_hash) == ShaOwPassword)
