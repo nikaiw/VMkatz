@@ -427,11 +427,8 @@ fn attach_carved_tickets(
             None => *orphan_luid.get_or_insert_with(|| {
                 let luid = next_free_synthetic_luid(all_creds);
                 let username = ticket.client_name.join("/");
-                let mut cred = Credential::new_empty(
-                    luid,
-                    username.clone(),
-                    ticket.domain_name.clone(),
-                );
+                let mut cred =
+                    Credential::new_empty(luid, username.clone(), ticket.domain_name.clone());
                 cred.kerberos = Some(crate::lsass::types::KerberosCredential {
                     username,
                     domain: ticket.domain_name.clone(),
