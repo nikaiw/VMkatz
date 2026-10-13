@@ -667,6 +667,34 @@ pub fn extract_kerberos_credentials(
 /// Only the current credentials are walked; the old ones sit past them.
 const KERB_KEY_LIST_COUNT_OFF: u64 = 0x04;
 
+/// Encryption types Windows actually emits in a Kerberos key list.
+const fn is_kerb_etype(v: u32) -> bool {
+    matches!(v, 1 | 3 | 17 | 18 | 23 | 24)
+}
+
+/// Read `Type` from a KERB_HASHPASSWORD_GENERIC, whichever layout applies.
+///
+/// Up to 18362 the struct starts with `Type`; 19041+ inserted a ULONG version
+/// marker (always 2) ahead of it — the same shift KERB_ENCRYPTION_KEY took when
+/// the session-key `Type` moved 0xB0 -> 0xB4. The two slots are told apart by
+/// which one holds a real etype, so this needs no build number. Previously
+/// kerberos.rs hardcoded +0x04 and finder.rs hardcoded +0x00, so each dropped
+/// every key on the half of the builds it did not match.
+pub fn read_kerb_etype(vmem: &dyn VirtualMemory, generic_base: u64) -> Option<u32> {
+    [0x00u64, 0x04].into_iter().find_map(|off| {
+        vmem.read_virt_u32(generic_base + off)
+            .ok()
+            .filter(|&v| is_kerb_etype(v))
+    })
+}
+
+/// Slice-backed twin of [`read_kerb_etype`] for the page/physical scans.
+fn kerb_etype_from_slice(data: &[u8], generic_off: usize) -> Option<u32> {
+    [0usize, 4]
+        .into_iter()
+        .find_map(|off| Some(u32_le(data, generic_off + off)).filter(|&v| is_kerb_etype(v)))
+}
+
 /// Extract Kerberos encryption keys (AES128, AES256, RC4, DES) from pKeyList.
 fn extract_kerb_keys(
     vmem: &dyn VirtualMemory,
@@ -696,11 +724,10 @@ fn extract_kerb_keys(
         let generic_base = entry_base + key_entry_offsets.generic_offset;
 
         // KERB_HASHPASSWORD_GENERIC layout:
-        //   +0x00: unk (u32, always 2)
-        //   +0x04: Type (u32, encryption type / etype)
+        //   +0x00: Type, or a version marker with Type at +0x04 on 19041+
         //   +0x08: Size (SIZE_T: u64 on x64, u32 on x86)
         //   +0x08+sizeof(SIZE_T): Checksump (pointer to encrypted key data)
-        let Ok(etype) = vmem.read_virt_u32(generic_base + 0x04) else {
+        let Some(etype) = read_kerb_etype(vmem, generic_base) else {
             continue;
         };
         let key_size = if arch == Arch::X64 {
@@ -1459,14 +1486,11 @@ pub fn scan_vmem_for_kerberos_keys(
                     continue;
                 }
 
-                // Etype is at generic+0x04 (generic+0x00 is always 2, a version marker)
-                let etype = u32_le(&page_data, generic_off + 4);
+                let Some(etype) = kerb_etype_from_slice(&page_data, generic_off) else {
+                    continue;
+                };
                 let key_size = u64_le(&page_data, generic_off + 8);
                 let key_ptr = u64_le(&page_data, generic_off + 16);
-
-                if !matches!(etype, 1 | 3 | 17 | 18 | 23 | 24) {
-                    continue;
-                }
                 let expected = match etype {
                     17 | 23 | 24 => 16,
                     18 => 32,
@@ -1511,8 +1535,7 @@ pub fn scan_vmem_for_kerberos_keys(
                 let entry_base = entries_base + (i as u64) * key_entry.entry_size;
                 let generic_base = entry_base + key_entry.generic_offset;
 
-                // Etype at generic+0x04 (generic+0x00 is always 2)
-                let Ok(etype) = vmem.read_virt_u32(generic_base + 0x04) else {
+                let Some(etype) = read_kerb_etype(vmem, generic_base) else {
                     break;
                 };
                 let key_size = match vmem.read_virt_u64(generic_base + 0x08) {

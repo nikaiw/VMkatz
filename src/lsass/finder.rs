@@ -1603,7 +1603,8 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
                 let entry_base = entries_base + (i as u64) * key_entry.entry_size;
                 let generic_base = entry_base + key_entry.generic_offset;
 
-                let Ok(etype) = vmem.read_virt_u32(generic_base) else {
+                let Some(etype) = crate::lsass::kerberos::read_kerb_etype(vmem, generic_base)
+                else {
                     break;
                 };
                 let key_size = match vmem.read_virt_u64(generic_base + 0x08) {
