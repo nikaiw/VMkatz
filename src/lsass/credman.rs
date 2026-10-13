@@ -122,17 +122,26 @@ struct CredmanEntryOffsets {
 }
 
 const CREDMAN_ENTRY_VARIANTS: &[CredmanEntryOffsets] = &[
-    // Win7+ (KIWI_CREDMAN_LIST_ENTRY with unk4 LIST_ENTRY)
+    // Win7+ (KIWI_CREDMAN_LIST_ENTRY with unk4 LIST_ENTRY).
+    // user/server1 come from _CANONICAL_CREDENTIAL in lsasrv: the chain runs
+    // through struct+0x58, with UserName at Flink+0x38 and TargetName at
+    // Flink+0x20, i.e. base+0x70 and base+0x58 for this flink_offset. Verified
+    // on 17763, 19041, 22621 and 26100. The old 0xA8 read an empty name, so
+    // try_extract_credman_entry bailed and every entry was dropped.
+    // server2 (domain) is NOT verified against the DLL — the two corrected
+    // fields moved by different deltas, so it cannot be extrapolated. It only
+    // feeds a display field and cannot drop an entry, so it is left as found.
     CredmanEntryOffsets {
         flink_offset: 0x38,
         cb_enc_password: 0x00,
         enc_password: 0x08,
-        user: 0xA8,
-        server1: 0x70,
+        user: 0x70,
+        server1: 0x58,
         server2: 0xC0,
     },
     // Win Vista / 2008 (KIWI_CREDMAN_LIST_ENTRY_60, no unk4 LIST_ENTRY after
-    // Flink/Blink: Flink stays at 0x38, the later fields shift back by 0x10)
+    // Flink/Blink: Flink stays at 0x38, the later fields shift back by 0x10).
+    // Unverified: no pre-Win10 x64 lsasrv.dll is obtainable to check against.
     CredmanEntryOffsets {
         flink_offset: 0x38,
         cb_enc_password: 0x00,
