@@ -823,11 +823,12 @@ fn extract_single_ticket(
     let target_domain_name =
         read_ustring(vmem, ticket_addr + offsets.target_domain_name, arch).unwrap_or_default();
 
-    // Ticket flags (stored big-endian in memory)
+    // TicketFlags are already in KERB_TICKET_FLAGS_* order: KerbConvertFlagsToUlong
+    // writes bitstring byte 0 into the dword's MSB and walks down, so forwardable
+    // is 0x40000000 as read. Byte-swapping here mangled every exported kirbi.
     let ticket_flags = vmem
         .read_virt_u32(ticket_addr + offsets.ticket_flags)
-        .unwrap_or(0)
-        .swap_bytes();
+        .unwrap_or(0);
 
     // Session key
     let key_type = vmem
@@ -1695,13 +1696,16 @@ pub fn carve_kerberos_tickets(
                         chunk[flags_pos + 2],
                         chunk[flags_pos + 3],
                     ]);
-                    let flags = raw_flags.swap_bytes();
+                    // No byte swap: the dword is already in KERB_TICKET_FLAGS_* order
+                    // (see extract_single_ticket). Swapping inverted this gate — it then
+                    // demanded the high half be zero, which no real ticket satisfies, so
+                    // every correctly-anchored candidate was rejected.
                     // At least one standard flag must be set, and no undefined low bits
                     // Standard flags: bits 30..22 (forwardable, forwarded, proxiable, proxy,
                     // may-postdate, postdated, invalid, renewable, initial, pre-authent,
                     // hw-authent, transited-policy-checked, ok-as-delegate, enc-pa-rep,
                     // anonymous). Reject if bits 0..15 are set (undefined).
-                    if flags == 0 || (flags & 0x0000_FFFF) != 0 {
+                    if raw_flags == 0 || (raw_flags & 0x0000_FFFF) != 0 {
                         continue;
                     }
 
