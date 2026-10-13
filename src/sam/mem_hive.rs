@@ -34,6 +34,7 @@ use crate::memory::PhysicalMemory;
 use crate::sam::SamEntry;
 use crate::sam::hashes::extract_hashes;
 use crate::sam::lsa::{LsaSecret, LsaSecretType, extract_lsa_secrets};
+use crate::utils::{u16_le_or0, u32_le, u32_le_or0};
 
 const PAGE: u64 = 0x1000;
 const BASE_BLOCK: u64 = 0x1000;
@@ -159,8 +160,8 @@ fn scan_chunk(
         {
             continue;
         }
-        let subs = u32::from_le_bytes(buf[j + 0x14..j + 0x18].try_into().unwrap());
-        let list = u32::from_le_bytes(buf[j + 0x1C..j + 0x20].try_into().unwrap());
+        let subs = u32_le(buf, j + 0x14);
+        let list = u32_le(buf, j + 0x1C);
         if (4..=64).contains(&subs) && list != 0xFFFF_FFFF {
             lsa.push((buf[j..j + 0x80].to_vec(), base_gpa + j as u64));
         }
@@ -172,11 +173,9 @@ fn scan_chunk(
         let gpa = base_gpa + off as u64;
         match &buf[off..off + 4] {
             b"regf" => {
-                let seq1 = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
-                let seq2 = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
-                let length = u64::from(u32::from_le_bytes(
-                    buf[off + 0x28..off + 0x2c].try_into().unwrap(),
-                ));
+                let seq1 = u32_le(buf, off + 4);
+                let seq2 = u32_le(buf, off + 8);
+                let length = u64::from(u32_le(buf, off + 0x28));
                 if off + 0x30 + 64 <= n && (BASE_BLOCK..=MAX_HIVE).contains(&(length + BASE_BLOCK))
                 {
                     let name: String = buf[off + 0x30..off + 0x30 + 64]
@@ -197,12 +196,8 @@ fn scan_chunk(
                 }
             }
             b"hbin" => {
-                let file_offset = u64::from(u32::from_le_bytes(
-                    buf[off + 4..off + 8].try_into().unwrap(),
-                ));
-                let size = u64::from(u32::from_le_bytes(
-                    buf[off + 8..off + 12].try_into().unwrap(),
-                ));
+                let file_offset = u64::from(u32_le(buf, off + 4));
+                let size = u64::from(u32_le(buf, off + 8));
                 if (PAGE..=MAX_BIN).contains(&size)
                     && size.is_multiple_of(PAGE)
                     && file_offset.is_multiple_of(PAGE)
@@ -408,8 +403,8 @@ fn walk_children(
     // offset choose the one physically NEAREST the parent (same hive copy) that is
     // large enough and whose entries resolve to "vk" cells, then place it and each
     // VK's data. Proximity keeps the whole subtree within one consistent copy.
-    let vcount = u32_at(nk, 0x24) as usize;
-    let vlist_off = u32_at(nk, 0x28);
+    let vcount = u32_le_or0(nk, 0x24) as usize;
+    let vlist_off = u32_le_or0(nk, 0x28);
     if vcount > 0 && vcount < 0x10000 && vlist_off != 0xFFFF_FFFF {
         let want = vcount * 4;
         let best = cells_with_gpa(phys, runs, u64::from(vlist_off))
@@ -417,7 +412,7 @@ fn walk_children(
             .filter(|(c, _)| c.len() >= want)
             .filter(|(c, _)| {
                 (0..vcount).any(|i| {
-                    let vk = u32_at(c, i * 4);
+                    let vk = u32_le_or0(c, i * 4);
                     vk != 0xFFFF_FFFF
                         && cells_with_gpa(phys, runs, u64::from(vk))
                             .iter()
@@ -434,15 +429,15 @@ fn walk_children(
                 buf[dst + 4..dst + 4 + vlist.len()].copy_from_slice(&vlist);
             }
             for i in 0..vcount {
-                let vk_off = u32_at(&vlist, i * 4);
+                let vk_off = u32_le_or0(&vlist, i * 4);
                 if vk_off == 0xFFFF_FFFF {
                     continue;
                 }
                 if let Some((vk, vk_gpa)) =
                     place_cell(phys, runs, buf, u64::from(vk_off), &[b"vk"], run_gpa)
                 {
-                    let dsize = u32_at(&vk, 0x04);
-                    let doff = u32_at(&vk, 0x08);
+                    let dsize = u32_le_or0(&vk, 0x04);
+                    let doff = u32_le_or0(&vk, 0x08);
                     if dsize & 0x8000_0000 == 0 && dsize > 0 && doff != 0xFFFF_FFFF {
                         place_cell(phys, runs, buf, u64::from(doff), &[], vk_gpa);
                     }
@@ -451,15 +446,15 @@ fn walk_children(
         }
     }
     // Class name cell (holds bootkey nibbles for Lsa subkeys).
-    let class_off = u32_at(nk, 0x30);
+    let class_off = u32_le_or0(nk, 0x30);
     if class_off != 0xFFFF_FFFF {
         place_cell(phys, runs, buf, u64::from(class_off), &[], run_gpa);
     }
     // Subkeys. The subkey-list cell has no name to disambiguate copies, so among the
     // candidate list cells (that resolve to at least one name-matched child NK)
     // choose the one physically NEAREST the parent, then place it and recurse.
-    let scount = u32_at(nk, 0x14);
-    let slist_off = u32_at(nk, 0x1C);
+    let scount = u32_le_or0(nk, 0x14);
+    let slist_off = u32_le_or0(nk, 0x1C);
     if scount > 0 && slist_off != 0xFFFF_FFFF {
         let mut best: Option<(u64, Vec<u8>, SubkeyEntries)> = None; // (dist, list, entries)
         for (list, lgpa) in cells_with_gpa(phys, runs, u64::from(slist_off)) {
@@ -587,9 +582,9 @@ pub fn extract_from_memory(phys: &impl PhysicalMemory) -> MemoryHiveCreds {
 /// Returns `None` when no DPAPI_SYSTEM secret is present (can't judge).
 fn dpapi_system_valid(secrets: &[LsaSecret]) -> Option<bool> {
     secrets.iter().find_map(|s| match &s.parsed {
-        LsaSecretType::DpapiSystem { .. } => Some(
-            s.raw_data.len() == 44 && u32::from_le_bytes(s.raw_data[0..4].try_into().unwrap()) == 1,
-        ),
+        LsaSecretType::DpapiSystem { .. } => {
+            Some(s.raw_data.len() == 44 && u32_le(&s.raw_data, 0) == 1)
+        }
         _ => None,
     })
 }
@@ -637,7 +632,7 @@ fn root_candidates(
     };
     for loc in locs.iter().filter(|l| hive_key(&l.name) == hive) {
         if let Ok(head) = phys.read_phys_bytes(loc.gpa, BASE_BLOCK as usize) {
-            let root_off = u64::from(u32_at(&head, 0x24));
+            let root_off = u64::from(u32_le_or0(&head, 0x24));
             for (cell, gpa) in cells_with_gpa(phys, runs, root_off) {
                 add(root_off, cell, gpa);
             }
@@ -653,7 +648,7 @@ fn root_has_child(phys: &impl PhysicalMemory, runs: &RunIndex, root: &[u8], name
     if root.len() < 0x50 || &root[0..2] != b"nk" {
         return false;
     }
-    let list_off = u32_at(root, 0x1C);
+    let list_off = u32_le_or0(root, 0x1C);
     if list_off == 0xFFFF_FFFF {
         return false;
     }
@@ -733,15 +728,6 @@ fn best_reassembly<S: Fn(&[u8]) -> usize>(
 
 const PBOX: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
 
-fn u32_at(d: &[u8], o: usize) -> u32 {
-    d.get(o..o + 4)
-        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
-}
-fn u16_at(d: &[u8], o: usize) -> u16 {
-    d.get(o..o + 2)
-        .map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()))
-}
-
 /// All cell payloads (bytes after the 4-byte size prefix) at a hive-relative
 /// offset, one per run that covers it.
 fn cell_candidates(phys: &impl PhysicalMemory, ix: &RunIndex, hive_off: u64) -> Vec<Vec<u8>> {
@@ -810,14 +796,14 @@ fn subkey_list_entries(
     if list.len() < 4 || depth > 4 {
         return Vec::new();
     }
-    let count = u16_at(list, 2) as usize;
+    let count = u16_le_or0(list, 2) as usize;
     let mut out = Vec::new();
     match &list[0..2] {
         b"lf" => {
             for i in 0..count.min(4096) {
                 let o = 4 + i * 8;
                 if o + 8 <= list.len() {
-                    out.push((u32_at(list, o), SkHash::Lf(u32_at(list, o + 4))));
+                    out.push((u32_le_or0(list, o), SkHash::Lf(u32_le_or0(list, o + 4))));
                 }
             }
         }
@@ -825,7 +811,7 @@ fn subkey_list_entries(
             for i in 0..count.min(4096) {
                 let o = 4 + i * 8;
                 if o + 8 <= list.len() {
-                    out.push((u32_at(list, o), SkHash::Lh(u32_at(list, o + 4))));
+                    out.push((u32_le_or0(list, o), SkHash::Lh(u32_le_or0(list, o + 4))));
                 }
             }
         }
@@ -833,7 +819,7 @@ fn subkey_list_entries(
             for i in 0..count.min(4096) {
                 let o = 4 + i * 4;
                 if o + 4 <= list.len() {
-                    out.push((u32_at(list, o), SkHash::None));
+                    out.push((u32_le_or0(list, o), SkHash::None));
                 }
             }
         }
@@ -843,7 +829,7 @@ fn subkey_list_entries(
                 if o + 4 > list.len() {
                     break;
                 }
-                for sub in cell_candidates(phys, runs, u64::from(u32_at(list, o))) {
+                for sub in cell_candidates(phys, runs, u64::from(u32_le_or0(list, o))) {
                     out.extend(subkey_list_entries(phys, runs, &sub, depth + 1));
                 }
             }
@@ -854,7 +840,7 @@ fn subkey_list_entries(
 }
 
 fn nk_name(nk: &[u8]) -> String {
-    let nl = u16_at(nk, 0x48) as usize;
+    let nl = u16_le_or0(nk, 0x48) as usize;
     nk.get(0x4C..0x4C + nl)
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default()
@@ -900,7 +886,7 @@ fn child_by_name(
     if nk.len() < 0x50 || &nk[0..2] != b"nk" {
         return None;
     }
-    let list_off = u32_at(nk, 0x1C);
+    let list_off = u32_le_or0(nk, 0x1C);
     if list_off == 0xFFFF_FFFF {
         return None;
     }
@@ -930,8 +916,8 @@ fn child_by_name(
 /// nearest `anchor` that decodes as hex (the Lsa `JD`/`Skew1`/`GBG`/`Data` keys
 /// carry bootkey nibbles as their class name).
 fn class_hex(phys: &impl PhysicalMemory, ix: &RunIndex, nk: &[u8], anchor: u64) -> Option<Vec<u8>> {
-    let class_off = u32_at(nk, 0x30);
-    let class_len = u16_at(nk, 0x4A) as usize;
+    let class_off = u32_le_or0(nk, 0x30);
+    let class_len = u16_le_or0(nk, 0x4A) as usize;
     if class_off == 0xFFFF_FFFF || class_len == 0 {
         return None;
     }

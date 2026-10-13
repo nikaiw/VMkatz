@@ -11,6 +11,7 @@
 //! - Long value (separated record) resolution
 
 use crate::error::{Result, VmkatzError};
+use crate::utils::{u16_le_or0, u32_le_or0};
 use std::collections::HashMap;
 
 /// ESE database backed by a byte slice.
@@ -92,7 +93,7 @@ impl<'a> EseDb<'a> {
         }
 
         // Page size: offset 0xEC in the header (u32)
-        let page_size = u32_le(data, 0xEC) as usize;
+        let page_size = u32_le_or0(data, 0xEC) as usize;
         if page_size == 0 || !page_size.is_power_of_two() || !(4096..=32768).contains(&page_size) {
             // Fallback: try common page sizes
             let ps = if data.len() >= 2 * 8192 { 8192 } else { 4096 };
@@ -146,8 +147,8 @@ impl<'a> EseDb<'a> {
     ///   +0x1C: cbFree(2)   +0x1E: cbUncommittedFree(2)
     ///   +0x20: ibMicFree(2) +0x22: itagMicFree(2) +0x24: fPageFlags(4)
     fn page_header(page: &[u8]) -> (u32, u32) {
-        let flags = u32_le(page, 0x24);
-        let next = u32_le(page, 0x14);
+        let flags = u32_le_or0(page, 0x24);
+        let next = u32_le_or0(page, 0x14);
         (flags, next)
     }
 
@@ -157,7 +158,7 @@ impl<'a> EseDb<'a> {
     /// and encode the tag count in the low 12 bits of itagMicFree (upper 4 bits are reserved).
     /// Small pages (<=8KB) use a 40-byte header and the full itagMicFree as tag count.
     fn page_tags(&self, page: &[u8]) -> (usize, usize) {
-        let raw = u16_le(page, 0x22) as usize;
+        let raw = u16_le_or0(page, 0x22) as usize;
         if self.page_size > 8192 {
             (80, raw & 0xFFF)
         } else {
@@ -186,7 +187,7 @@ impl<'a> EseDb<'a> {
             return (0, 0, 0);
         }
 
-        let raw = u32_le(page, tag_pos);
+        let raw = u32_le_or0(page, tag_pos);
 
         if self.page_size <= 8192 {
             // Small pages: cb_ & 0x1FFF = size, ib_ & 0x1FFF = offset, flags = ib_ >> 13
@@ -265,7 +266,7 @@ impl<'a> EseDb<'a> {
         if off + 2 > tag_data.len() {
             return &[];
         }
-        let suffix_size = (u16_le(tag_data, off) & 0x1FFF) as usize;
+        let suffix_size = (u16_le_or0(tag_data, off) & 0x1FFF) as usize;
         off += 2 + suffix_size;
 
         if off > tag_data.len() {
@@ -282,7 +283,7 @@ impl<'a> EseDb<'a> {
         let compressed = tag_flags & 0x04 != 0;
 
         let prefix_size = if compressed && tag_data.len() >= 2 {
-            let ps = (u16_le(tag_data, 0) & 0x1FFF) as usize;
+            let ps = (u16_le_or0(tag_data, 0) & 0x1FFF) as usize;
             off += 2;
             ps
         } else {
@@ -292,7 +293,7 @@ impl<'a> EseDb<'a> {
         if off + 2 > tag_data.len() {
             return (0, &[]);
         }
-        let suffix_size = (u16_le(tag_data, off) & 0x1FFF) as usize;
+        let suffix_size = (u16_le_or0(tag_data, off) & 0x1FFF) as usize;
         off += 2;
 
         let suffix_end = (off + suffix_size).min(tag_data.len());
@@ -345,7 +346,7 @@ impl<'a> EseDb<'a> {
                     if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
                         let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
-                            let child = u32_le(record, 0);
+                            let child = u32_le_or0(record, 0);
                             stack.push(child);
                         }
                     }
@@ -414,7 +415,7 @@ impl<'a> EseDb<'a> {
                     if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
                         let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
-                            let child = u32_le(record, 0);
+                            let child = u32_le_or0(record, 0);
                             stack.push(child);
                         }
                     }
@@ -466,7 +467,7 @@ impl<'a> EseDb<'a> {
             // Preamble
             let last_fixed_id = u16::from(rec[0]);
             let last_var_id = u16::from(rec[1]);
-            let var_data_off = u16_le(rec, 2) as usize;
+            let var_data_off = u16_le_or0(rec, 2) as usize;
 
             log::debug!(
                 "ESE catalog rec[{rec_idx}]: last_fixed_id={last_fixed_id} last_var_id={last_var_id} var_data_off={var_data_off}"
@@ -479,13 +480,13 @@ impl<'a> EseDb<'a> {
                 continue;
             }
 
-            let obj_id_table = u32_le(rec, 4);
-            let rec_type = u16_le(rec, 8);
-            let id = u32_le(rec, 10);
-            let coltyp_or_pgno = u32_le(rec, 14);
-            let space_usage = u32_le(rec, 18);
-            let _flags = u32_le(rec, 22);
-            let _pages_or_locale = u32_le(rec, 26);
+            let obj_id_table = u32_le_or0(rec, 4);
+            let rec_type = u16_le_or0(rec, 8);
+            let id = u32_le_or0(rec, 10);
+            let coltyp_or_pgno = u32_le_or0(rec, 14);
+            let space_usage = u32_le_or0(rec, 18);
+            let _flags = u32_le_or0(rec, 22);
+            let _pages_or_locale = u32_le_or0(rec, 26);
 
             // Extract name from variable column 128 (first variable column)
             let name = Self::extract_catalog_name(rec, var_data_off, last_var_id);
@@ -576,7 +577,7 @@ impl<'a> EseDb<'a> {
         }
 
         // First variable column (128 = Name) data offset
-        let first_off = u16_le(rec, offsets_start);
+        let first_off = u16_le_or0(rec, offsets_start);
         // The actual data starts after the offset array
         let data_start = offsets_end;
         // First column data is from data_start to data_start + first_off
@@ -685,7 +686,7 @@ impl<'a> EseDb<'a> {
 
         let last_fixed_id = u32::from(rec[0]);
         let last_var_id = u32::from(rec[1]);
-        let var_data_off = u16_le(rec, 2) as usize;
+        let var_data_off = u16_le_or0(rec, 2) as usize;
 
         if col.is_fixed {
             Self::read_fixed_column(rec, col, last_fixed_id, var_data_off)
@@ -749,7 +750,7 @@ impl<'a> EseDb<'a> {
         let offsets_start = var_data_off;
         let data_start = offsets_start + num_var * 2;
 
-        let end_raw = u16_le(rec, offsets_start + var_idx * 2);
+        let end_raw = u16_le_or0(rec, offsets_start + var_idx * 2);
         if end_raw & 0x8000 != 0 {
             return None; // NULL column
         }
@@ -758,7 +759,7 @@ impl<'a> EseDb<'a> {
         let start = if var_idx == 0 {
             0
         } else {
-            let prev_raw = u16_le(rec, offsets_start + (var_idx - 1) * 2);
+            let prev_raw = u16_le_or0(rec, offsets_start + (var_idx - 1) * 2);
             (prev_raw & 0x7FFF) as usize
         };
 
@@ -811,7 +812,7 @@ impl<'a> EseDb<'a> {
 
         // Find the end of variable data
         let var_data_end = if num_var > 0 && var_offsets_end <= rec.len() {
-            let last_off_raw = u16_le(rec, var_data_off + (num_var - 1) * 2);
+            let last_off_raw = u16_le_or0(rec, var_data_off + (num_var - 1) * 2);
             let last_off = (last_off_raw & 0x7FFF) as usize;
             var_offsets_end + last_off
         } else {
@@ -831,7 +832,7 @@ impl<'a> EseDb<'a> {
         let small_pages = self.page_size <= 8192;
 
         // First TAGFLD: its offset field tells us the directory size in bytes
-        let first_raw = u32_le(tagged_data, 0);
+        let first_raw = u32_le_or0(tagged_data, 0);
         let first_offset_bits = ((first_raw >> 16) & 0xFFFF) as u16;
         let dir_bytes = if small_pages {
             (first_offset_bits & 0x1FFF) as usize
@@ -852,7 +853,7 @@ impl<'a> EseDb<'a> {
                 break;
             }
 
-            let entry_raw = u32_le(tagged_data, entry_off);
+            let entry_raw = u32_le_or0(tagged_data, entry_off);
             let tag_col_id = (entry_raw & 0xFFFF) as u16;
             let offset_bits = ((entry_raw >> 16) & 0xFFFF) as u16;
 
@@ -881,7 +882,7 @@ impl<'a> EseDb<'a> {
 
             // End of this column's data: next entry's offset or end of tagged_data
             let data_end = if i + 1 < num_entries {
-                let next_raw = u32_le(tagged_data, (i + 1) * 4);
+                let next_raw = u32_le_or0(tagged_data, (i + 1) * 4);
                 let next_bits = ((next_raw >> 16) & 0xFFFF) as u16;
                 if small_pages {
                     (next_bits & 0x1FFF) as usize
@@ -976,16 +977,4 @@ impl<'a> EseDb<'a> {
 
 fn ese_err(msg: &str) -> VmkatzError {
     VmkatzError::DecryptionError(format!("ESE: {msg}"))
-}
-
-fn u16_le(data: &[u8], off: usize) -> u16 {
-    data.get(off..off + 2)
-        .and_then(|s| <[u8; 2]>::try_from(s).ok())
-        .map_or(0, u16::from_le_bytes)
-}
-
-fn u32_le(data: &[u8], off: usize) -> u32 {
-    data.get(off..off + 4)
-        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map_or(0, u32::from_le_bytes)
 }

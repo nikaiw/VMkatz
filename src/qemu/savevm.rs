@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
+use crate::utils::{u32_be_or0, u64_be_or0};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -152,14 +153,14 @@ impl QemuSavevmLayer {
                     if offset + 4 > len {
                         break;
                     }
-                    let clen = read_be_u32(data, offset) as usize;
+                    let clen = u32_be_or0(data, offset) as usize;
                     offset += 4 + clen;
                 }
                 QEMU_VM_SECTION_START | QEMU_VM_SECTION_FULL => {
                     if offset + 4 > len {
                         break;
                     }
-                    let sid = read_be_u32(data, offset);
+                    let sid = u32_be_or0(data, offset);
                     offset += 4;
                     let (name, new_off) = read_string(data, offset)?;
                     offset = new_off;
@@ -196,7 +197,7 @@ impl QemuSavevmLayer {
                     if offset + 4 > len {
                         break;
                     }
-                    let sid = read_be_u32(data, offset);
+                    let sid = u32_be_or0(data, offset);
                     offset += 4;
 
                     if ram_section_id == Some(sid) {
@@ -285,7 +286,7 @@ impl QemuSavevmLayer {
             return Err(io_err("Truncated RAM MEM_SIZE".to_string()));
         }
 
-        let val = read_be_u64(data, offset);
+        let val = u64_be_or0(data, offset);
         offset += 8;
         let flags = val & RAM_FLAG_MASK;
 
@@ -307,7 +308,7 @@ impl QemuSavevmLayer {
             if offset + 8 > len {
                 break;
             }
-            let block_size = read_be_u64(data, offset);
+            let block_size = u64_be_or0(data, offset);
             offset += 8;
 
             log::info!("  RAM block '{}': {} MB", name, block_size / (1024 * 1024));
@@ -346,7 +347,7 @@ impl QemuSavevmLayer {
 
         // Read EOS
         if offset + 8 <= len {
-            let eos_val = read_be_u64(data, offset);
+            let eos_val = u64_be_or0(data, offset);
             if eos_val & RAM_FLAG_MASK == RAM_SAVE_FLAG_EOS {
                 offset += 8;
             }
@@ -367,7 +368,7 @@ impl QemuSavevmLayer {
         let len = data.len();
 
         while offset + 8 <= len {
-            let val = read_be_u64(data, offset);
+            let val = u64_be_or0(data, offset);
             let flags = val & RAM_FLAG_MASK;
             let addr = val & !RAM_FLAG_MASK;
             offset += 8;
@@ -558,20 +559,6 @@ pub fn is_qemu_savevm(path: &Path) -> bool {
 /// Create a VmkatzError::Io from a string message.
 fn io_err(msg: String) -> VmkatzError {
     VmkatzError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-}
-
-// Helpers for big-endian reads from a byte slice.
-
-fn read_be_u32(data: &[u8], offset: usize) -> u32 {
-    data.get(offset..offset + 4)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u32::from_be_bytes)
-}
-
-fn read_be_u64(data: &[u8], offset: usize) -> u64 {
-    data.get(offset..offset + 8)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u64::from_be_bytes)
 }
 
 /// Read a length-prefixed string (u8 len + bytes).

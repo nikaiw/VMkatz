@@ -17,6 +17,8 @@
 //! key slots. On failure or missing binary, fall back to the hardcoded
 //! Chrome 135.0.7049.115 keys.
 
+use crate::utils::u32_le;
+
 /// Hardcoded Chrome 135.0.7049.115 static keys. Kept as the fallback when the
 /// PE scan can't find a fresh table on the disk.
 pub const CHROME_135_V1: [u8; 32] = [
@@ -228,8 +230,8 @@ fn try_table_at(buf: &[u8]) -> Option<Vec<AbeKey>> {
             return None;
         }
         // flag (+8) and algo (+0xC): both are small enums (flag 0/1, algo 2/4).
-        let flag = u32::from_le_bytes(e[8..12].try_into().unwrap());
-        let algo = u32::from_le_bytes(e[12..16].try_into().unwrap());
+        let flag = u32_le(e, 8);
+        let algo = u32_le(e, 12);
         if flag > 32 || algo > 32 {
             return None;
         }

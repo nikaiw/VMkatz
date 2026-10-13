@@ -11,6 +11,7 @@ use des::cipher::{BlockDecrypt, KeyInit};
 use super::SamEntry;
 use super::hive::Hive;
 use crate::error::{Result, VmkatzError};
+use crate::utils::u32_le_or0;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
@@ -144,8 +145,8 @@ fn extract_user_hashes(
     }
 
     // Parse username from descriptor 1 (V+0x0C)
-    let name_offset = (u32_le(v, 0x0C) as usize).saturating_add(0xCC);
-    let name_length = u32_le(v, 0x10) as usize;
+    let name_offset = (u32_le_or0(v, 0x0C) as usize).saturating_add(0xCC);
+    let name_length = u32_le_or0(v, 0x10) as usize;
     let username = if name_offset
         .checked_add(name_length)
         .is_some_and(|end| end <= v.len())
@@ -157,8 +158,8 @@ fn extract_user_hashes(
     };
 
     // Parse LM hash (desc[13] at V+0x9C)
-    let lm_offset = (u32_le(v, 0x9C) as usize).saturating_add(0xCC);
-    let lm_length = u32_le(v, 0xA0) as usize;
+    let lm_offset = (u32_le_or0(v, 0x9C) as usize).saturating_add(0xCC);
+    let lm_length = u32_le_or0(v, 0xA0) as usize;
     let lm_hash = if lm_length >= 4
         && lm_offset
             .checked_add(lm_length)
@@ -175,8 +176,8 @@ fn extract_user_hashes(
     };
 
     // Parse NT hash (desc[14] at V+0xA8)
-    let nt_offset = (u32_le(v, 0xA8) as usize).saturating_add(0xCC);
-    let nt_length = u32_le(v, 0xAC) as usize;
+    let nt_offset = (u32_le_or0(v, 0xA8) as usize).saturating_add(0xCC);
+    let nt_length = u32_le_or0(v, 0xAC) as usize;
     let nt_hash = if nt_length >= 4
         && nt_offset
             .checked_add(nt_length)
@@ -386,12 +387,6 @@ pub(crate) fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 pub(crate) fn decode_utf16le(data: &[u8]) -> String {
     crate::utils::utf16le_decode(data)
-}
-
-fn u32_le(data: &[u8], offset: usize) -> u32 {
-    data.get(offset..offset + 4)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u32::from_le_bytes)
 }
 
 fn sam_err(msg: &str) -> VmkatzError {

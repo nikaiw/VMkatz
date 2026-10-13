@@ -11,6 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, VmkatzError};
+use crate::utils::{u16_le, u32_le, u64_le};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -79,20 +80,20 @@ impl LvmLayer {
         let mut hdr = [0u8; 0xD6];
         file.read_exact(&mut hdr).map_err(VmkatzError::Io)?;
 
-        let magic = u32::from_le_bytes(hdr[0x00..0x04].try_into().unwrap());
+        let magic = u32_le(&hdr, 0x00);
         if magic != LVM_MAGIC {
             return Err(VmkatzError::DiskFormatError(format!(
                 "Invalid LVM magic 0x{magic:08x} at 0x{LVM_HEADER_OFFSET:x}"
             )));
         }
 
-        let major_version = u32::from_le_bytes(hdr[0x04..0x08].try_into().unwrap());
-        let num_pes = u32::from_le_bytes(hdr[0x6A..0x6E].try_into().unwrap());
-        let data_offset = u64::from_le_bytes(hdr[0x7A..0x82].try_into().unwrap());
-        let num_pe_maps = u32::from_le_bytes(hdr[0xBE..0xC2].try_into().unwrap());
-        let md_alignment = u32::from_le_bytes(hdr[0xCA..0xCE].try_into().unwrap());
-        let num_pes6 = u32::from_le_bytes(hdr[0xCE..0xD2].try_into().unwrap());
-        let _num_volumes = u32::from_le_bytes(hdr[0x66..0x6A].try_into().unwrap());
+        let major_version = u32_le(&hdr, 0x04);
+        let num_pes = u32_le(&hdr, 0x6A);
+        let data_offset = u64_le(&hdr, 0x7A);
+        let num_pe_maps = u32_le(&hdr, 0xBE);
+        let md_alignment = u32_le(&hdr, 0xCA);
+        let num_pes6 = u32_le(&hdr, 0xCE);
+        let _num_volumes = u32_le(&hdr, 0x66);
 
         let is_lvm6 = major_version >= 6;
         let actual_num_pes = if is_lvm6 { num_pes6 } else { num_pes };
@@ -127,8 +128,8 @@ impl LvmLayer {
             .map_err(VmkatzError::Io)?;
         let mut vol_desc = [0u8; 0x200];
         file.read_exact(&mut vol_desc).map_err(VmkatzError::Io)?;
-        let volume_size = u64::from_le_bytes(vol_desc[0x00..0x08].try_into().unwrap());
-        let volume_id = u32::from_le_bytes(vol_desc[0x70..0x74].try_into().unwrap());
+        let volume_size = u64_le(&vol_desc, 0x00);
+        let volume_id = u32_le(&vol_desc, 0x70);
 
         log::debug!(
             "LVM volume: size=0x{:x} ({}GB), id={}",
@@ -175,10 +176,10 @@ impl LvmLayer {
                 }
 
                 // PE descriptor starts at offset 1
-                let pe_volume_id = u32::from_le_bytes(entry[0x05..0x09].try_into().unwrap());
-                let p_offset = u64::from_le_bytes(entry[0x09..0x11].try_into().unwrap());
-                let l_offset = u64::from_le_bytes(entry[0x11..0x19].try_into().unwrap());
-                let length = u64::from_le_bytes(entry[0x19..0x21].try_into().unwrap());
+                let pe_volume_id = u32_le(&entry, 0x05);
+                let p_offset = u64_le(&entry, 0x09);
+                let l_offset = u64_le(&entry, 0x11);
+                let length = u64_le(&entry, 0x19);
 
                 if pe_volume_id != volume_id {
                     continue;
@@ -279,14 +280,14 @@ impl VmfsSuperblock {
         let mut buf = [0u8; 0x170];
         file.read_exact(&mut buf).map_err(VmkatzError::Io)?;
 
-        let magic = u32::from_le_bytes(buf[0x00..0x04].try_into().unwrap());
+        let magic = u32_le(&buf, 0x00);
         if magic != VMFS_MAGIC && magic != VMFSL_MAGIC {
             return Err(VmkatzError::DiskFormatError(format!(
                 "Invalid VMFS magic 0x{magic:08x} at vol offset 0x{vol_offset:x}"
             )));
         }
 
-        let major_version = u32::from_le_bytes(buf[0x04..0x08].try_into().unwrap());
+        let major_version = u32_le(&buf, 0x04);
         let is_vmfs6 = major_version >= 24;
 
         let label_bytes = &buf[0x1D..0x9D];
@@ -298,14 +299,14 @@ impl VmfsSuperblock {
         )
         .to_string();
 
-        let file_block_size = u64::from_le_bytes(buf[0xA1..0xA9].try_into().unwrap());
-        let fdc_cluster_group_offset = u32::from_le_bytes(buf[0xD1..0xD5].try_into().unwrap());
-        let fdc_clusters_per_group = u32::from_le_bytes(buf[0xD5..0xD9].try_into().unwrap());
-        let sub_block_size = u32::from_le_bytes(buf[0xD9..0xDD].try_into().unwrap());
-        let md_alignment = u32::from_le_bytes(buf[0x134..0x138].try_into().unwrap());
-        let sfb_to_lfb_shift = u16::from_le_bytes(buf[0x138..0x13A].try_into().unwrap());
-        let ptr_block_shift = u16::from_le_bytes(buf[0x13E..0x140].try_into().unwrap());
-        let sfb_addr_bits = u16::from_le_bytes(buf[0x140..0x142].try_into().unwrap());
+        let file_block_size = u64_le(&buf, 0xA1);
+        let fdc_cluster_group_offset = u32_le(&buf, 0xD1);
+        let fdc_clusters_per_group = u32_le(&buf, 0xD5);
+        let sub_block_size = u32_le(&buf, 0xD9);
+        let md_alignment = u32_le(&buf, 0x134);
+        let sfb_to_lfb_shift = u16_le(&buf, 0x138);
+        let ptr_block_shift = u16_le(&buf, 0x13E);
+        let sfb_addr_bits = u16_le(&buf, 0x140);
 
         // These sizing fields drive metadata allocations (fd_size, sub-block
         // reads). Reject absurd values (real ones are a few KB) so a crafted
@@ -442,18 +443,18 @@ impl ResFileMeta {
             if data.len() < 0x58 {
                 return None;
             }
-            let signature = u32::from_le_bytes(data[0x20..0x24].try_into().unwrap());
+            let signature = u32_le(data, 0x20);
             if signature != RFMD_SIGNATURE {
                 log::warn!("Invalid rfmd signature: 0x{signature:08x}");
                 return None;
             }
         }
 
-        let resources_per_cluster = u32::from_le_bytes(data[0x00..0x04].try_into().unwrap());
-        let clusters_per_group = u32::from_le_bytes(data[0x04..0x08].try_into().unwrap());
-        let cluster_group_offset = u32::from_le_bytes(data[0x08..0x0C].try_into().unwrap());
-        let resource_size = u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap());
-        let cluster_group_size = u32::from_le_bytes(data[0x10..0x14].try_into().unwrap());
+        let resources_per_cluster = u32_le(data, 0x00);
+        let clusters_per_group = u32_le(data, 0x04);
+        let cluster_group_offset = u32_le(data, 0x08);
+        let resource_size = u32_le(data, 0x0C);
+        let cluster_group_size = u32_le(data, 0x10);
 
         // Extended fields only in VMFS-6
         let (
@@ -464,11 +465,11 @@ impl ResFileMeta {
             parent_cluster_group_size,
         ) = if is_vmfs6 && data.len() >= 0x44 {
             (
-                u32::from_le_bytes(data[0x28..0x2C].try_into().unwrap()),
-                u32::from_le_bytes(data[0x34..0x38].try_into().unwrap()),
-                u32::from_le_bytes(data[0x38..0x3C].try_into().unwrap()),
-                u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()),
-                u32::from_le_bytes(data[0x40..0x44].try_into().unwrap()),
+                u32_le(data, 0x28),
+                u32_le(data, 0x34),
+                u32_le(data, 0x38),
+                u32_le(data, 0x3C),
+                u32_le(data, 0x40),
             )
         } else {
             (0, 0, 0, 0, 0)
@@ -793,15 +794,11 @@ impl Vmfs6Volume {
         }
 
         // FS3_FileMetadata starts at meta_off within the FD
-        let desc_type =
-            u32::from_le_bytes(buf[meta_off + 0x0C..meta_off + 0x10].try_into().unwrap());
-        let file_length =
-            u64::from_le_bytes(buf[meta_off + 0x14..meta_off + 0x1C].try_into().unwrap());
-        let _block_size =
-            u64::from_le_bytes(buf[meta_off + 0x1C..meta_off + 0x24].try_into().unwrap());
-        let num_blocks =
-            u64::from_le_bytes(buf[meta_off + 0x24..meta_off + 0x2C].try_into().unwrap());
-        let zla = u32::from_le_bytes(buf[meta_off + 0x44..meta_off + 0x48].try_into().unwrap());
+        let desc_type = u32_le(buf, meta_off + 0x0C);
+        let file_length = u64_le(buf, meta_off + 0x14);
+        let _block_size = u64_le(buf, meta_off + 0x1C);
+        let num_blocks = u64_le(buf, meta_off + 0x24);
+        let zla = u32_le(buf, meta_off + 0x44);
         let block_offset_shift = buf[meta_off + 0x89];
 
         // Block pointer array
@@ -814,7 +811,7 @@ impl Vmfs6Volume {
                 if off + 8 > buf.len() {
                     break;
                 }
-                blocks.push(u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()));
+                blocks.push(u64_le(buf, off));
             }
         } else {
             // VMFS-5: 32-bit block pointers
@@ -823,9 +820,7 @@ impl Vmfs6Volume {
                 if off + 4 > buf.len() {
                     break;
                 }
-                blocks.push(u64::from(u32::from_le_bytes(
-                    buf[off..off + 4].try_into().unwrap(),
-                )));
+                blocks.push(u64::from(u32_le(buf, off)));
             }
         }
 
@@ -1210,15 +1205,15 @@ impl Vmfs6Volume {
             ));
         }
 
-        let version = u32::from_le_bytes(dir_data[0x00..0x04].try_into().unwrap());
+        let version = u32_le(&dir_data, 0x00);
         if version != FS6_DIR_HEADER_VERSION && version != FS6_DIR_HEADER_DEBUG_VERSION {
             return Err(VmkatzError::DiskFormatError(format!(
                 "Invalid directory version 0x{version:08x}"
             )));
         }
 
-        let num_entries = u32::from_le_bytes(dir_data[0x04..0x08].try_into().unwrap());
-        let num_alloc_map_blocks = u32::from_le_bytes(dir_data[0x0C..0x10].try_into().unwrap());
+        let num_entries = u32_le(&dir_data, 0x04);
+        let num_alloc_map_blocks = u32_le(&dir_data, 0x0C);
 
         log::debug!(
             "Directory header: version=0x{version:08x}, numEntries={num_entries}, numAllocMapBlocks={num_alloc_map_blocks}"
@@ -1252,9 +1247,7 @@ impl Vmfs6Volume {
         for i in 0..std::cmp::min(num_alloc_map_blocks, 128) {
             let off = 0x10 + i as usize * 4;
             if off + 4 <= dir_data.len() {
-                alloc_map_blocks.push(u32::from_le_bytes(
-                    dir_data[off..off + 4].try_into().unwrap(),
-                ));
+                alloc_map_blocks.push(u32_le(&dir_data, off));
             }
         }
 
@@ -1339,11 +1332,11 @@ impl Vmfs6Volume {
             if block_data.len() < FS6_DIR_BLOCK_HEADER_SIZE {
                 continue;
             }
-            let block_type = u16::from_le_bytes(block_data[0x02..0x04].try_into().unwrap());
+            let block_type = u16_le(block_data, 0x02);
             if block_type != 1 {
                 continue; // Not a DIRENT block
             }
-            let total_slots = u16::from_le_bytes(block_data[0x04..0x06].try_into().unwrap());
+            let total_slots = u16_le(block_data, 0x04);
             let bitmap = &block_data[0x08..0x40]; // 56 bytes of bitmap
 
             let entries_data = &block_data[FS6_DIR_BLOCK_HEADER_SIZE..];
@@ -1401,8 +1394,8 @@ impl Vmfs6Volume {
         if data.len() < FS6_DIR_ENTRY_SIZE {
             return None;
         }
-        let entry_type = u32::from_le_bytes(data[0x00..0x04].try_into().unwrap());
-        let fd_addr = u32::from_le_bytes(data[0x04..0x08].try_into().unwrap());
+        let entry_type = u32_le(data, 0x00);
+        let fd_addr = u32_le(data, 0x04);
 
         if fd_addr == 0 || entry_type == 0 {
             return None;
@@ -1436,8 +1429,8 @@ impl Vmfs6Volume {
         let mut offset = 0;
         while offset + V5_DIR_ENTRY_SIZE <= dir_data.len() {
             let data = &dir_data[offset..offset + V5_DIR_ENTRY_SIZE];
-            let entry_type = u32::from_le_bytes(data[0x00..0x04].try_into().unwrap());
-            let fd_addr = u32::from_le_bytes(data[0x04..0x08].try_into().unwrap());
+            let entry_type = u32_le(data, 0x00);
+            let fd_addr = u32_le(data, 0x04);
 
             if entry_type != 0 && fd_addr != 0 {
                 let name_bytes = &data[0x0C..0x8C]; // 128 bytes
@@ -1712,15 +1705,13 @@ impl Vmfs6Volume {
             if off + 8 > pb_data.len() {
                 return 0;
             }
-            u64::from_le_bytes(pb_data[off..off + 8].try_into().unwrap())
+            u64_le(pb_data, off)
         } else {
             let off = index * 4;
             if off + 4 > pb_data.len() {
                 return 0;
             }
-            u64::from(u32::from_le_bytes(
-                pb_data[off..off + 4].try_into().unwrap(),
-            ))
+            u64::from(u32_le(pb_data, off))
         }
     }
 

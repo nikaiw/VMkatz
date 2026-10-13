@@ -10,6 +10,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Result, VmkatzError};
+use crate::utils::{u16_le_or0, u32_le_or0, u64_le_or0};
 
 /// Read into `buf` in block-sized chunks. On I/O error, zero-fill the failing
 /// block and continue. `block_size` is the logical record size (e.g., MFT record size).
@@ -25,27 +26,6 @@ fn resilient_read_blocks<R: Read>(reader: &mut R, buf: &mut [u8], block_size: us
         }
         offset = end;
     }
-}
-
-/// Read a u32 from a byte slice at the given offset, returning 0 on out-of-bounds.
-fn read_u32(data: &[u8], off: usize) -> u32 {
-    data.get(off..off + 4)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u32::from_le_bytes)
-}
-
-/// Read a u64 from a byte slice at the given offset, returning 0 on out-of-bounds.
-fn read_u64(data: &[u8], off: usize) -> u64 {
-    data.get(off..off + 8)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u64::from_le_bytes)
-}
-
-/// Read a u16 from a byte slice at the given offset, returning 0 on out-of-bounds.
-fn read_u16(data: &[u8], off: usize) -> u16 {
-    data.get(off..off + 2)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u16::from_le_bytes)
 }
 
 /// NTFS boot sector parameters.
@@ -83,8 +63,8 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
         ));
     }
 
-    let mft_cluster = read_u64(data, 0x30);
-    let mftmirr_cluster = read_u64(data, 0x38);
+    let mft_cluster = u64_le_or0(data, 0x30);
+    let mftmirr_cluster = u64_le_or0(data, 0x38);
 
     // Record size: signed byte at 0x40. Positive → clusters, negative → 2^|value|.
     // Guard both arithmetic paths: a hostile boot sector could overflow the
@@ -217,11 +197,11 @@ fn find_attribute(record: &[u8], attr_type: u32) -> Option<(usize, usize)> {
     let mut pos = first_attr;
 
     while pos + 16 <= record.len() {
-        let atype = read_u32(record, pos);
+        let atype = u32_le_or0(record, pos);
         if atype == 0xFFFF_FFFF {
             break;
         }
-        let alen = read_u32(record, pos + 4) as usize;
+        let alen = u32_le_or0(record, pos + 4) as usize;
         if alen < 16 || pos + alen > record.len() {
             break;
         }
@@ -243,11 +223,11 @@ fn find_all_attributes(record: &[u8], attr_type: u32) -> Vec<(usize, usize)> {
     let mut pos = first_attr;
 
     while pos + 16 <= record.len() {
-        let atype = read_u32(record, pos);
+        let atype = u32_le_or0(record, pos);
         if atype == 0xFFFF_FFFF {
             break;
         }
-        let alen = read_u32(record, pos + 4) as usize;
+        let alen = u32_le_or0(record, pos + 4) as usize;
         if alen < 16 || pos + alen > record.len() {
             break;
         }
@@ -265,8 +245,8 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     if non_resident != 0 {
         return None; // $FILE_NAME is always resident
     }
-    let value_length = read_u32(record, attr_pos + 0x10) as usize;
-    let value_offset = read_u16(record, attr_pos + 0x14) as usize;
+    let value_length = u32_le_or0(record, attr_pos + 0x10) as usize;
+    let value_offset = u16_le_or0(record, attr_pos + 0x14) as usize;
     let data_start = attr_pos + value_offset;
 
     if data_start + value_length > record.len() || value_length < 0x44 {
@@ -275,7 +255,7 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     let fname = &record[data_start..data_start + value_length];
 
     // Parent directory MFT reference (6 bytes record number + 2 bytes seq)
-    let parent_ref = read_u64(fname, 0) & 0x0000_FFFF_FFFF_FFFF;
+    let parent_ref = u64_le_or0(fname, 0) & 0x0000_FFFF_FFFF_FFFF;
 
     let name_len = fname[0x40] as usize;
     let namespace = fname[0x41];
@@ -314,7 +294,7 @@ fn extract_data_attribute(record: &[u8]) -> Option<(Vec<DataRun>, u64)> {
 
     if non_resident == 0 {
         // Resident
-        let value_length = u64::from(read_u32(record, pos + 0x10));
+        let value_length = u64::from(u32_le_or0(record, pos + 0x10));
         return Some((Vec::new(), value_length));
     }
 
@@ -322,7 +302,7 @@ fn extract_data_attribute(record: &[u8]) -> Option<(Vec<DataRun>, u64)> {
     if pos + 0x38 > record.len() {
         return None;
     }
-    let real_size = read_u64(record, pos + 0x30);
+    let real_size = u64_le_or0(record, pos + 0x30);
     let runs_offset = u16::from_le_bytes([record[pos + 0x20], record[pos + 0x21]]) as usize;
 
     if pos + runs_offset >= pos + len {
@@ -338,8 +318,8 @@ fn read_resident_data(record: &[u8]) -> Option<Vec<u8>> {
     if record[pos + 8] != 0 {
         return None;
     }
-    let value_length = read_u32(record, pos + 0x10) as usize;
-    let value_offset = read_u16(record, pos + 0x14) as usize;
+    let value_length = u32_le_or0(record, pos + 0x10) as usize;
+    let value_offset = u16_le_or0(record, pos + 0x14) as usize;
     let start = pos + value_offset;
     if start + value_length > record.len() {
         return None;
@@ -464,8 +444,8 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
 
     let attr_list_data = if non_resident == 0 {
         // Resident $ATTRIBUTE_LIST
-        let value_length = read_u32(record, pos + 0x10) as usize;
-        let value_offset = read_u16(record, pos + 0x14) as usize;
+        let value_length = u32_le_or0(record, pos + 0x10) as usize;
+        let value_offset = u16_le_or0(record, pos + 0x14) as usize;
         let start = pos + value_offset;
         if start + value_length > record.len() {
             return Vec::new();
@@ -476,8 +456,8 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
         if pos + 0x38 > record.len() {
             return Vec::new();
         }
-        let real_size = read_u64(record, pos + 0x30);
-        let runs_offset = read_u16(record, pos + 0x20) as usize;
+        let real_size = u64_le_or0(record, pos + 0x30);
+        let runs_offset = u16_le_or0(record, pos + 0x20) as usize;
         if pos + runs_offset >= pos + len || real_size > 256 * 1024 {
             return Vec::new();
         }
@@ -497,14 +477,14 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
     let mut extension_records = Vec::new();
     let mut off = 0;
     while off + 0x1A <= attr_list_data.len() {
-        let attr_type = read_u32(&attr_list_data, off);
-        let entry_length = read_u16(&attr_list_data, off + 4) as usize;
+        let attr_type = u32_le_or0(&attr_list_data, off);
+        let entry_length = u16_le_or0(&attr_list_data, off + 4) as usize;
         if entry_length < 0x1A || off + entry_length > attr_list_data.len() {
             break;
         }
         // $DATA attribute type = 0x80
         if attr_type == 0x80 {
-            let mft_ref = read_u64(&attr_list_data, off + 0x10) & 0x0000_FFFF_FFFF_FFFF;
+            let mft_ref = u64_le_or0(&attr_list_data, off + 0x10) & 0x0000_FFFF_FFFF_FFFF;
             if !extension_records.contains(&mft_ref) {
                 extension_records.push(mft_ref);
             }

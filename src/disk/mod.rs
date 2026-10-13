@@ -1,3 +1,4 @@
+use crate::utils::{u32_be, u32_le, u64_le};
 pub mod qcow2;
 pub mod raw;
 pub mod vdi;
@@ -117,22 +118,22 @@ fn detect_format_by_magic(path: &Path) -> Option<DiskFormat> {
     f.read_exact(&mut header).ok()?;
 
     // QCOW2: magic "QFI\xFB" at offset 0 (big-endian u32)
-    if u32::from_be_bytes(header[0..4].try_into().unwrap()) == 0x514649FB {
+    if u32_be(&header, 0) == 0x514649FB {
         return Some(DiskFormat::Qcow2);
     }
 
     // VMDK sparse extent: "KDMV" at offset 0 (little-endian u32)
-    if u32::from_le_bytes(header[0..4].try_into().unwrap()) == 0x564D444B {
+    if u32_le(&header, 0) == 0x564D444B {
         return Some(DiskFormat::Vmdk);
     }
 
     // VHDX: "vhdxfile" at offset 0 (little-endian u64)
-    if u64::from_le_bytes(header[0..8].try_into().unwrap()) == 0x656C_6966_7864_6876 {
+    if u64_le(&header, 0) == 0x656C_6966_7864_6876 {
         return Some(DiskFormat::Vhdx);
     }
 
     // VDI: magic 0xBEDA107F at offset 0x40
-    if u32::from_le_bytes(header[0x40..0x44].try_into().unwrap()) == 0xBEDA_107F {
+    if u32_le(&header, 0x40) == 0xBEDA_107F {
         return Some(DiskFormat::Vdi);
     }
 

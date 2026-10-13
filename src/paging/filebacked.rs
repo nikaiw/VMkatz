@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::disk;
 use crate::error::{Result, VmkatzError};
+use crate::utils::{u16_le, u32_le};
 use crate::windows::peb::LoadedModule;
 
 /// IMAGE_SCN_MEM_WRITE — skip writable sections (in-memory content differs from disk).
@@ -134,23 +135,21 @@ impl FileBackedResolver {
         if u16::from_le_bytes([pe_data[0], pe_data[1]]) != 0x5A4D {
             return Err(VmkatzError::DecryptionError("Not a PE (no MZ)".to_string()));
         }
-        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
+        let e_lfanew = u32_le(pe_data, 0x3C) as usize;
         if e_lfanew + 24 > pe_data.len() {
             return Err(VmkatzError::DecryptionError("Invalid e_lfanew".to_string()));
         }
 
         // PE signature
-        if u32::from_le_bytes(pe_data[e_lfanew..e_lfanew + 4].try_into().unwrap()) != 0x0000_4550 {
+        if u32_le(pe_data, e_lfanew) != 0x0000_4550 {
             return Err(VmkatzError::DecryptionError(
                 "Invalid PE signature".to_string(),
             ));
         }
 
         // COFF header
-        let num_sections =
-            u16::from_le_bytes(pe_data[e_lfanew + 6..e_lfanew + 8].try_into().unwrap()) as usize;
-        let opt_hdr_size =
-            u16::from_le_bytes(pe_data[e_lfanew + 20..e_lfanew + 22].try_into().unwrap()) as usize;
+        let num_sections = u16_le(pe_data, e_lfanew + 6) as usize;
+        let opt_hdr_size = u16_le(pe_data, e_lfanew + 20) as usize;
 
         let section_table = e_lfanew + 24 + opt_hdr_size;
         let mut sections = Vec::new();
@@ -161,17 +160,11 @@ impl FileBackedResolver {
                 break;
             }
 
-            let virt_size =
-                u32::from_le_bytes(pe_data[off + 8..off + 12].try_into().unwrap()) as usize;
-            let virt_addr = u64::from(u32::from_le_bytes(
-                pe_data[off + 12..off + 16].try_into().unwrap(),
-            ));
-            let raw_size =
-                u32::from_le_bytes(pe_data[off + 16..off + 20].try_into().unwrap()) as usize;
-            let raw_offset =
-                u32::from_le_bytes(pe_data[off + 20..off + 24].try_into().unwrap()) as usize;
-            let characteristics =
-                u32::from_le_bytes(pe_data[off + 36..off + 40].try_into().unwrap());
+            let virt_size = u32_le(pe_data, off + 8) as usize;
+            let virt_addr = u64::from(u32_le(pe_data, off + 12));
+            let raw_size = u32_le(pe_data, off + 16) as usize;
+            let raw_offset = u32_le(pe_data, off + 20) as usize;
+            let characteristics = u32_le(pe_data, off + 36);
 
             // Skip writable sections (in-memory content modified by process)
             if characteristics & SCN_MEM_WRITE != 0 {

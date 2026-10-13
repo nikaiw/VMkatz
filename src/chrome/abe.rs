@@ -26,6 +26,7 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use crate::chrome::abe_keys::{AbeKey, BrowserKeyMap};
 use crate::chrome::dpapi_decrypt::{decrypt_blob, parse_blob};
 use crate::error::{Result, VmkatzError as Error};
+use crate::utils::u32_le;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -226,8 +227,7 @@ fn parse_aes_encrypted_key_struct(blob: &[u8]) -> Result<(&[u8], &[u8], u8)> {
     let flag = buf[4];
     let header = &buf[..4 + header_len];
     let cipher_len_off = 4 + header_len;
-    let cipher_len =
-        u32::from_le_bytes(buf[cipher_len_off..cipher_len_off + 4].try_into().unwrap()) as usize;
+    let cipher_len = u32_le(buf, cipher_len_off) as usize;
     let cipher_off = cipher_len_off + 4;
     if cipher_off + cipher_len > buf.len() {
         return Err(Error::Parse(format!(

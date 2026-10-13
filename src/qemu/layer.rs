@@ -12,6 +12,7 @@ use std::path::Path;
 
 use crate::error::{Result, VmkatzError};
 use crate::memory::PhysicalMemory;
+use crate::utils::{u32_le, u64_le};
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -81,7 +82,7 @@ impl QemuElfLayer {
             )));
         }
 
-        let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap());
+        let e_phoff = u64_le(data, 32);
         let e_phentsize = u16::from_le_bytes([data[54], data[55]]) as usize;
         let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
 
@@ -104,14 +105,14 @@ impl QemuElfLayer {
             }
             let ph = &data[off..off + ELF64_PHDR_SIZE];
 
-            let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
+            let p_type = u32_le(ph, 0);
             if p_type != PT_LOAD {
                 continue;
             }
 
-            let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
-            let p_paddr = u64::from_le_bytes(ph[24..32].try_into().unwrap());
-            let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
+            let p_offset = u64_le(ph, 8);
+            let p_paddr = u64_le(ph, 24);
+            let p_filesz = u64_le(ph, 32);
 
             if p_filesz == 0 {
                 continue;

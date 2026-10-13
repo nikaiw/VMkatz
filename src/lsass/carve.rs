@@ -17,6 +17,7 @@ use crate::windows::process::Process;
 use std::collections::{HashMap, HashSet};
 
 use crate::lsass::msv::PRIMARY_CRED_OFFSET_VARIANTS as PRIMARY_CRED_OFFSETS;
+use crate::utils::u64_le;
 
 /// Collected scan results from a single physical memory pass.
 struct ScanResults {
@@ -770,7 +771,7 @@ fn scan_chunk_for_sessions(data: &[u8], base: u64, candidates: &mut HashMap<u64,
 
     // Scan for 8-byte aligned positions where a non-trivial LUID could be at +0x70
     for off in (0..data.len().saturating_sub(8)).step_by(8) {
-        let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let val = u64_le(data, off);
 
         // Quick filter: LUIDs are non-zero, typically < 0x10000000, and > 0x100
         // (skip very common values like 0, 1, 2 that cause too many false hits)

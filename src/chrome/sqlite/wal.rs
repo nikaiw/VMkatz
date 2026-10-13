@@ -1,4 +1,5 @@
 use crate::error::{Result, VmkatzError as Error};
+use crate::utils::u32_be;
 use std::collections::HashMap;
 
 /// Frame header descriptor (kept for documentation / potential future use).
@@ -58,7 +59,7 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
     {
         let h = &bytes[cursor..cursor + 24];
         let page_no = u32::from_be_bytes(h[..4].try_into().unwrap());
-        let db_size = u32::from_be_bytes(h[4..8].try_into().unwrap());
+        let db_size = u32_be(h, 4);
         // page_no == 0 is reserved (used by some SQLite versions as a sentinel
         // for frames that have been overwritten). Discard rather than panic.
         if page_no != 0 {

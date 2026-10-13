@@ -9,6 +9,7 @@ use crate::lsass::types::{
 };
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
+use crate::utils::{u32_le, u64_le};
 
 /// Kerberos session offsets per Windows version.
 /// AVL OrderedPointer at node+0x20 (x64) / +0x10 (x86) points to session data.
@@ -1183,8 +1184,8 @@ pub fn scan_vmem_for_kerberos_credentials(
         for off in (0..page_data.len().saturating_sub(0x40)).step_by(8) {
             let user_len = u16::from_le_bytes([page_data[off], page_data[off + 1]]) as usize;
             let user_max = u16::from_le_bytes([page_data[off + 2], page_data[off + 3]]) as usize;
-            let user_pad = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
-            let user_buf = u64::from_le_bytes(page_data[off + 8..off + 16].try_into().unwrap());
+            let user_pad = u32_le(&page_data, off + 4);
+            let user_buf = u64_le(&page_data, off + 8);
 
             if user_len == 0 || user_len > 100 || !user_len.is_multiple_of(2) {
                 continue;
@@ -1203,10 +1204,8 @@ pub fn scan_vmem_for_kerberos_credentials(
             let dom_len = u16::from_le_bytes([page_data[dom_off], page_data[dom_off + 1]]) as usize;
             let dom_max =
                 u16::from_le_bytes([page_data[dom_off + 2], page_data[dom_off + 3]]) as usize;
-            let dom_pad =
-                u32::from_le_bytes(page_data[dom_off + 4..dom_off + 8].try_into().unwrap());
-            let dom_buf =
-                u64::from_le_bytes(page_data[dom_off + 8..dom_off + 16].try_into().unwrap());
+            let dom_pad = u32_le(&page_data, dom_off + 4);
+            let dom_buf = u64_le(&page_data, dom_off + 8);
 
             if dom_len == 0 || dom_len > 100 || !dom_len.is_multiple_of(2) {
                 continue;
@@ -1227,8 +1226,8 @@ pub fn scan_vmem_for_kerberos_credentials(
                 }
                 let pwd_len = u16::from_le_bytes([page_data[po], page_data[po + 1]]) as usize;
                 let pwd_max = u16::from_le_bytes([page_data[po + 2], page_data[po + 3]]) as usize;
-                let pwd_pad = u32::from_le_bytes(page_data[po + 4..po + 8].try_into().unwrap());
-                let pwd_buf = u64::from_le_bytes(page_data[po + 8..po + 16].try_into().unwrap());
+                let pwd_pad = u32_le(&page_data, po + 4);
+                let pwd_buf = u64_le(&page_data, po + 8);
 
                 if pwd_len == 0 || pwd_len > 0x200 || pwd_max < pwd_len || pwd_pad != 0 {
                     continue;
@@ -1374,7 +1373,7 @@ pub fn scan_vmem_for_kerberos_keys(
         };
 
         for off in (0..page_data.len().saturating_sub(0x80)).step_by(8) {
-            let cb_item = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
+            let cb_item = u32_le(&page_data, off + 4);
             if cb_item == 0 || cb_item > 10 {
                 continue;
             }
@@ -1387,21 +1386,9 @@ pub fn scan_vmem_for_kerberos_keys(
                 }
 
                 // Etype is at generic+0x04 (generic+0x00 is always 2, a version marker)
-                let etype = u32::from_le_bytes(
-                    page_data[generic_off + 4..generic_off + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-                let key_size = u64::from_le_bytes(
-                    page_data[generic_off + 8..generic_off + 16]
-                        .try_into()
-                        .unwrap(),
-                );
-                let key_ptr = u64::from_le_bytes(
-                    page_data[generic_off + 16..generic_off + 24]
-                        .try_into()
-                        .unwrap(),
-                );
+                let etype = u32_le(&page_data, generic_off + 4);
+                let key_size = u64_le(&page_data, generic_off + 8);
+                let key_ptr = u64_le(&page_data, generic_off + 16);
 
                 if !matches!(etype, 1 | 3 | 17 | 18 | 23 | 24) {
                     continue;
