@@ -227,28 +227,61 @@ pub fn resolve_rip_relative(
     Ok(target)
 }
 
+/// Is `head` a self-consistent LIST_ENTRY head? Either empty (Flink == Blink ==
+/// head) or Flink->Blink points back at it.
+///
+/// The locks sitting next to these globals are the reason this exists: an
+/// `RTL_RESOURCE`/critical section's first qword is `DebugInfo`, a live heap
+/// pointer, so a "Flink looks like a heap pointer" test accepts the lock. On
+/// several builds the lock is LEA'd before the list it guards and won.
+fn is_list_head(vmem: &dyn VirtualMemory, head: u64) -> bool {
+    let (Ok(flink), Ok(blink)) = (vmem.read_virt_u64(head), vmem.read_virt_u64(head + 8)) else {
+        return false;
+    };
+    if flink == head && blink == head {
+        return true;
+    }
+    is_heap_ptr(flink)
+        && is_heap_ptr(blink)
+        && matches!(vmem.read_virt_u64(flink + 8), Ok(back) if back == head)
+}
+
 /// Find a LIST_ENTRY global by scanning for LEA instructions near a code pattern.
 ///
 /// Scans 0x100 bytes starting from `pattern_addr - 0x30` for `48/4C 8D modrm`
-/// LEA instructions, resolves RIP-relative targets, and validates as LIST_ENTRY.
+/// LEA instructions and resolves RIP-relative targets. Candidates are ranked:
+/// a real list head wins over anything that merely looks like one, so the
+/// neighbouring lock no longer shadows the list. The lax pass is kept as a
+/// second chance for images where Flink's target is paged out.
 pub fn find_list_via_lea(vmem: &dyn VirtualMemory, pattern_addr: u64, label: &str) -> Result<u64> {
     let search_start = pattern_addr.saturating_sub(0x30);
     let data = vmem.read_virt_bytes(search_start, 0x100)?;
 
+    let mut lax_hit = None;
     for i in 0..data.len().saturating_sub(7) {
         let is_lea = (data[i] == 0x48 || data[i] == 0x4C)
             && data[i + 1] == 0x8D
             && matches!(data[i + 2], 0x05 | 0x0D | 0x15 | 0x35 | 0x3D);
-        if is_lea {
-            let target = resolve_rip_relative(vmem, search_start + i as u64, 3)?;
-            if let Ok(flink) = vmem.read_virt_u64(target) {
-                if flink == target || (flink > 0x10000 && (flink >> 48) == 0) {
-                    return Ok(target);
-                }
-            }
+        if !is_lea {
+            continue;
+        }
+        let Ok(target) = resolve_rip_relative(vmem, search_start + i as u64, 3) else {
+            continue;
+        };
+        if is_list_head(vmem, target) {
+            return Ok(target);
+        }
+        if lax_hit.is_none()
+            && matches!(vmem.read_virt_u64(target), Ok(f) if f == target || is_heap_ptr(f))
+        {
+            lax_hit = Some(target);
         }
     }
 
+    if let Some(target) = lax_hit {
+        log::debug!("{label}: no self-consistent list head, falling back to 0x{target:x}");
+        return Ok(target);
+    }
     Err(VmkatzError::PatternNotFound(format!("LEA for {label}")))
 }
 

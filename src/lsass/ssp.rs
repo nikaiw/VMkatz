@@ -74,8 +74,23 @@ pub fn extract_ssp_credentials_arch(
                 Ok((pattern_addr, _)) => {
                     // Resolve the list address from the pattern match
                     match arch {
+                        // Same trap as CloudAP: SSP_CREDENTIAL_PATTERNS is a
+                        // generic prologue that matches unrelated functions on
+                        // several builds, and `?` then skipped the .data scan.
                         Arch::X64 => {
-                            patterns::find_list_via_lea(vmem, pattern_addr, "SspCredentialList")?
+                            match patterns::find_list_via_lea(
+                                vmem,
+                                pattern_addr,
+                                "SspCredentialList",
+                            ) {
+                                Ok(addr) => addr,
+                                Err(e) => {
+                                    log::debug!(
+                                        "SSP pattern matched but no list resolved ({e}), trying .data fallback"
+                                    );
+                                    find_ssp_list_in_data(vmem, &pe, msv_base, arch)?
+                                }
+                            }
                         }
                         Arch::X86 => {
                             let ds = pe.find_section(".data");

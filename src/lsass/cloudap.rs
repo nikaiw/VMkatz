@@ -116,8 +116,21 @@ pub fn extract_cloudap_credentials_arch(
                     patterns::CLOUDAP_CACHE_PATTERNS,
                     "CloudApCache",
                 ) {
+                    // A pattern that matches but resolves wrong used to be fatal
+                    // here: `?` skipped the .data fallback that would have found
+                    // the list. On 22000/22621 the pattern hits an unrelated
+                    // function, so CloudAP returned nothing at all.
                     Ok((pattern_addr, _)) => {
-                        patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")?
+                        match patterns::find_list_via_lea(vmem, pattern_addr, "CloudAP cache list")
+                        {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                log::debug!(
+                                    "CloudAP pattern matched but no list resolved ({e}), trying .data fallback"
+                                );
+                                find_cloudap_cache_in_data(vmem, &pe, dll_base, arch)?
+                            }
+                        }
                     }
                     Err(e) => {
                         log::debug!(
