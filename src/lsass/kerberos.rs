@@ -174,8 +174,17 @@ const TICKET_OFFSETS_19041: TicketOffsets = TicketOffsets {
 /// since Win7 and is absent from every build that has these layouts.
 const KERB_KEY_FLAG_SENTINEL: u32 = 1;
 
-/// Ticket offsets for Win10 1507-1511 / Win11 (KIWI_KERBEROS_INTERNAL_TICKET_10).
+/// Ticket offsets for Win10 1511 (KIWI_KERBEROS_INTERNAL_TICKET_10).
 /// Same as _6 but with KDCServer+unk10586_d LSA_UNICODE_STRINGs before ClientName.
+///
+/// Derived from `KerbPackExternalTicket` (kerberos.dll 10586.1356 @0x83e78),
+/// whose stores into the documented KERB_EXTERNAL_TICKET name each source field:
+/// `[rsi+0xa8] -> [r14+0x48]` SessionKey.KeyType, `[rsi+0xb0] -> [r14+0x4c]`
+/// Length (also the memcpy length, with `[rsi+0xb8]` as source = Value),
+/// `[rsi+0xd8/0xe0/0xe8] -> [r14+0x68/0x70/0x78]` Start/End/RenewUntil, and
+/// `lea rcx,[rsi+0xf0]` before KerbPackData fixing the internal KERB_TICKET at
+/// 0xF0. The encrypted-data quartet then follows ASN.1 order at +0x24/+0x28/
+/// +0x30/+0x38. The previous values matched no shipped build.
 const TICKET_OFFSETS_10: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x20,
 
@@ -183,16 +192,16 @@ const TICKET_OFFSETS_10: TicketOffsets = TicketOffsets {
     target_domain_name: 0x40,
     client_name_ptr: 0x90,
     ticket_flags: 0xA0,
-    key_type: 0xB0,
-    key_length: 0xB8,
-    key_value: 0xC0,
+    key_type: 0xA8,
+    key_length: 0xB0,
+    key_value: 0xB8,
     start_time: 0xD8,
     end_time: 0xE0,
     renew_until: 0xE8,
-    ticket_enc_type: 0x110,
-    ticket_kvno: 0x114,
-    ticket_length: 0x118,
-    ticket_value: 0x120,
+    ticket_enc_type: 0x114,
+    ticket_kvno: 0x118,
+    ticket_length: 0x120,
+    ticket_value: 0x128,
 };
 
 /// Ticket offsets for Win7/8 (KIWI_KERBEROS_INTERNAL_TICKET_6).
@@ -1203,7 +1212,9 @@ const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static [&'stati
             // Variant 1 is Win11 24H2 / Server 2025 (26100), which uses the
             // same ticket entry as 19041+.
             1 => &[&TICKET_OFFSETS_19041],
-            2 => &[&TICKET_OFFSETS_10],
+            // 1507 and 1511 share the variant-2 session layout but not the
+            // ticket entry: 10240 is really _6, 10586 is _10. Offer both.
+            2 => &[&TICKET_OFFSETS_10, &TICKET_OFFSETS_6],
             _ => &[&TICKET_OFFSETS_6],
         },
         Arch::X86 => match variant_idx {
