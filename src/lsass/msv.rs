@@ -285,23 +285,15 @@ pub fn extract_msv_sessions(
     let (list_base, bucket_count) = if let Some((base, count)) = lsasrv_table {
         (Some(base), count)
     } else if arch == Arch::X64 {
-        let Some(text) = pe.find_section(".text") else {
-            return Vec::new();
-        };
-        let text_base = msv_base + u64::from(text.virtual_address);
-        match patterns::find_pattern(
-            vmem,
-            text_base,
-            text.virtual_size,
-            patterns::MSV_LOGON_SESSION_PATTERNS,
-            "msv_LogonSessionList_sessions",
-        ) {
-            Ok((pattern_addr, _)) => match find_list_addr_and_count(vmem, pattern_addr) {
-                Ok((addr, count)) => (Some(addr), count),
-                Err(_) => (None, 0),
-            },
-            Err(_) => (None, 0),
-        }
+        // These signatures are lsasrv.dll's, not msv1_0's: the LogonSessionList
+        // hash table lives in lsasrv. Scanned against msv1_0 they match 0 times
+        // on every shipped build, so list_base stayed None, the bucket walk below
+        // never ran and only the .data candidate scan survived — which also costs
+        // the scored variant selection, so metadata could come from the wrong
+        // MsvOffsets. Against lsasrv they resolve on 91 of 96 builds.
+        lsasrv
+            .and_then(|(base, _)| find_msv_list_in_lsasrv(vmem, base))
+            .map_or((None, 0), |(addr, count)| (Some(addr), count))
     } else {
         (None, 0)
     };
@@ -1708,6 +1700,23 @@ fn resolve_lsasrv_logon_session_table(
 /// Returns (list_addr, bucket_count). After the pattern, mimikatz resolves
 /// two LEA instructions: one for the list (array of LIST_ENTRY heads) and
 /// one for the count (DWORD). We find all LEAs and identify which is which.
+/// Locate the LogonSessionList hash table inside lsasrv.dll with
+/// `MSV_LOGON_SESSION_PATTERNS`, for the builds the 26100 signature misses.
+fn find_msv_list_in_lsasrv(vmem: &dyn VirtualMemory, lsasrv_base: u64) -> Option<(u64, usize)> {
+    let pe = PeHeaders::parse_from_memory(vmem, lsasrv_base).ok()?;
+    let text = pe.find_section(".text")?;
+    let text_base = lsasrv_base + u64::from(text.virtual_address);
+    let (pattern_addr, _) = patterns::find_pattern(
+        vmem,
+        text_base,
+        text.virtual_size,
+        patterns::MSV_LOGON_SESSION_PATTERNS,
+        "msv_LogonSessionList_sessions",
+    )
+    .ok()?;
+    find_list_addr_and_count(vmem, pattern_addr).ok()
+}
+
 fn find_list_addr_and_count(vmem: &dyn VirtualMemory, pattern_addr: u64) -> Result<(u64, usize)> {
     let data = vmem.read_virt_bytes(pattern_addr, 0x80)?;
     let mut lea_addrs = Vec::new();
