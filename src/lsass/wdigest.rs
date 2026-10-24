@@ -28,15 +28,17 @@ const WDIGEST_OFFSETS_X64: WdigestOffsets = WdigestOffsets {
     password: 0x50,
 };
 
-/// x86 offsets:
-///   +0x00: Flink (4B), +0x04: Blink (4B), +0x08: UsageCount (4B), +0x0C: This (4B)
-///   +0x10: LUID (8B), +0x18: pad (4B)
-///   +0x1C: UserName (8B), +0x24: HostName (8B), +0x2C: Password (8B)
+/// x86 offsets — validated on a live Win10 19045 i386 dump (entry with LUID
+/// 0x2648f, "vagrant"/"WKS10X86"): Flink@+0, Blink@+4, UsageCount@+8,
+/// This@+0xC, LUID@+0x10, then UNICODE_STRINGs at +0x20/+0x28/+0x30
+/// (len@+0, max@+2, buf@+4 each). The old +0x1C/+0x24/+0x2C were off by 4
+/// and read garbage for every entry — the list was found but always reported
+/// empty (username read failed → skipped).
 const WDIGEST_OFFSETS_X86: WdigestOffsets = WdigestOffsets {
     luid: 0x10,
-    username: 0x1C,
-    domain: 0x24,
-    password: 0x2C,
+    username: 0x20,
+    domain: 0x28,
+    password: 0x30,
 };
 
 /// Extract WDigest credentials (plaintext passwords) from wdigest.dll (unified x64/x86).
