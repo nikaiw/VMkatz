@@ -221,7 +221,10 @@ const WIN10_1703_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
 /// Windows 10 2004-22H2 x86 (builds 19041-19045, the last 32-bit Windows)
 const WIN10_2004_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
     bitness: WindowsBitness::X86Pae,
-    directory_table_base: 0x18,
+    // DTB at +0x1D0, validated empirically on a live Win10 19045 x86 Proxmox
+    // snapshot (System dtb=0x1a8000 there): reading 0x18 yields 0/garbage and
+    // no candidate passes the page-table validation. PDB audit missed this.
+    directory_table_base: 0x1D0,
     unique_process_id: 0x29C,
     active_process_links: 0x2A0,
     image_file_name: 0x364,
