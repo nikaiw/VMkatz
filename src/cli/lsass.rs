@@ -280,26 +280,69 @@ pub(crate) fn run_lsass(
                 }
             }
             #[cfg(feature = "qemu")]
-            LsassFormat::QemuSavevm => run_with_layer(
-                || {
-                    if verbose {
-                        eprintln!("[*] Opening QEMU savevm state: {}", input_path.display());
+            LsassFormat::QemuSavevm => {
+                // The savevm stream does not record the MMIO gap that splits
+                // pc.ram into the below-4G and above-4G GPA regions. A wrong
+                // guess misplaces every page at/above the gap — on 32-bit
+                // guests that is all of kernel physical memory, so System is
+                // never found. Probe the machine/firmware gap candidates and
+                // keep the one whose page mapping yields a valid System
+                // EPROCESS (PID + DTB + Flink translation all check out).
+                const GAP_CANDIDATES: &[u64] =
+                    &[0x8000_0000, 0xB000_0000, 0xC000_0000, 0xE000_0000];
+                let mut chosen_gap: Option<u64> = None;
+                for gap in GAP_CANDIDATES {
+                    let Ok(layer) = vmkatz::qemu::QemuSavevmLayer::open_with_gap(input_path, *gap)
+                    else {
+                        continue;
+                    };
+                    // A wrong gap can still find System (its own EPROCESS chain
+                    // may live entirely below the gap), but the process-list
+                    // walk faults one or two hops in when a page table lands in
+                    // the misplaced region. Require a healthy process list, not
+                    // just a System hit, to accept a gap.
+                    let healthy_list = match process::find_system_process_auto(&layer) {
+                        Ok((system, offsets)) => {
+                            process::enumerate_processes(&layer, &system, &offsets)
+                                .is_ok_and(|ps| ps.len() >= 5)
+                        }
+                        Err(_) => false,
+                    };
+                    if healthy_list {
+                        chosen_gap = Some(*gap);
+                        break;
                     }
-                    let layer = vmkatz::qemu::QemuSavevmLayer::open(input_path)
+                }
+
+                run_with_layer(
+                    || {
+                        if verbose {
+                            eprintln!("[*] Opening QEMU savevm state: {}", input_path.display());
+                        }
+                        let layer = match chosen_gap {
+                            // The probe above already scanned with this gap and
+                            // found System; re-open with the same mapping so
+                            // the real scan sees the validated layout.
+                            Some(gap) => {
+                                vmkatz::qemu::QemuSavevmLayer::open_with_gap(input_path, gap)
+                            }
+                            None => vmkatz::qemu::QemuSavevmLayer::open(input_path),
+                        }
                         .context("Failed to open QEMU savevm state")?;
-                    if verbose {
-                        eprintln!(
-                            "[+] QEMU savevm: {} MB physical memory",
-                            layer.phys_size() / (1024 * 1024),
-                        );
-                    }
-                    Ok(layer)
-                },
-                args,
-                verbose,
-                pagefile,
-                disk_path,
-            ),
+                        if verbose {
+                            eprintln!(
+                                "[+] QEMU savevm: {} MB physical memory",
+                                layer.phys_size() / (1024 * 1024),
+                            );
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
             LsassFormat::HypervBin => {
                 #[cfg(feature = "hyperv")]
                 {

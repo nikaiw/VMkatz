@@ -116,7 +116,7 @@ impl QemuSavevmLayer {
         );
 
         // Parse the stream to find RAM section and build page index
-        let (pages, phys_end) = Self::parse_ram_stream(data)?;
+        let (pages, phys_end) = Self::parse_ram_stream(data, None)?;
 
         log::info!(
             "QEMU savevm: {} mapped pages ({} MB), phys_end=0x{:x}",
@@ -132,8 +132,50 @@ impl QemuSavevmLayer {
         })
     }
 
+    /// Open with an explicit MMIO gap (below_4g). The savevm stream stores
+    /// pc.ram as ONE contiguous block and does not record where the MMIO gap
+    /// splits it; the heuristic in `open` guesses 0x8000_0000 (q35+OVMF).
+    /// Wrong guess = every guest-phys address at/above the gap (all kernel
+    /// physical memory on 32-bit guests) decodes to the wrong file offset.
+    /// The CLI probes the known machine/firmware gap values and validates by
+    /// finding the System EPROCESS; this entry point lets it re-open the
+    /// state with the winning gap instead of re-parsing the stream by hand.
+    pub fn open_with_gap(path: &Path, below_4g: u64) -> Result<Self> {
+        let file = fs::File::open(path)?;
+        let mmap = crate::utils::mmap_file(&file, path)?;
+
+        if mmap.len() < 16 {
+            return Err(VmkatzError::InvalidMagic(0));
+        }
+        if mmap.is_pread() {
+            return Err(io_err(
+                "QEMU savevm requires mmap support (file I/O fallback too slow for stream parsing)"
+                    .to_string(),
+            ));
+        }
+        let data = mmap.as_bytes();
+
+        let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if magic != QEVM_MAGIC {
+            return Err(VmkatzError::InvalidMagic(magic));
+        }
+        let version = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        if version < 3 {
+            return Err(io_err(format!(
+                "Unsupported QEMU savevm version {version} (expected >= 3)"
+            )));
+        }
+
+        let (pages, phys_end) = Self::parse_ram_stream(data, Some(below_4g))?;
+        Ok(Self {
+            mmap,
+            pages,
+            phys_end,
+        })
+    }
+
     /// Parse the entire savevm stream and extract RAM page locations.
-    fn parse_ram_stream(data: &[u8]) -> Result<(Vec<MappedPage>, u64)> {
+    fn parse_ram_stream(data: &[u8], gap_override: Option<u64>) -> Result<(Vec<MappedPage>, u64)> {
         let mut offset = 8usize; // skip magic + version
         let len = data.len();
         let mut ram_section_id: Option<u32> = None;
@@ -176,6 +218,7 @@ impl QemuSavevmLayer {
                             &mut block_gpa_bases,
                             &mut phys_end,
                             &mut below_4g,
+                            gap_override,
                         )?;
                     } else {
                         // Non-RAM device (dirty-bitmap, cpu, etc.) — skip by scanning
@@ -280,6 +323,7 @@ impl QemuSavevmLayer {
         block_gpa_bases: &mut Vec<u64>,
         phys_end: &mut u64,
         below_4g: &mut u64,
+        gap_override: Option<u64>,
     ) -> Result<usize> {
         let len = data.len();
         if offset + 8 > len {
@@ -324,6 +368,10 @@ impl QemuSavevmLayer {
                 if block_size <= 0x8000_0000 {
                     // RAM fits below 2GB — no MMIO gap, identity mapping
                     *below_4g = block_size;
+                } else if let Some(gap) = gap_override {
+                    // Explicit caller-provided gap (probe already validated it
+                    // by finding the System EPROCESS with this mapping).
+                    *below_4g = gap;
                 } else {
                     // Default to 0x8000_0000 (UEFI/OVMF, most common on Proxmox).
                     // This is validated later; if page table walks fail, other values
