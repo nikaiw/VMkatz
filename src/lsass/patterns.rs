@@ -303,12 +303,16 @@ pub const fn is_heap_ptr(addr: u64) -> bool {
 /// Patterns to find the key initialization in lsasrv.dll on Win10 x86.
 /// These use x86 instructions (no REX prefix, absolute addressing).
 pub static LSASRV_KEY_PATTERNS_X86: &[&[u8]] = &[
+    // Vista..Win10 x86 (mimikatz PTRN_WALL): PUSH 2; PUSH 10h; PUSH imm32.
+    // First — the 19041 i386 key init hits this once, at LsaInitializeProtectedMemory
+    // itself, where the 0x200-byte abs window covers h3DesKey/hAesKey/IV.
+    // The stack-shape patterns below also match unrelated functions and,
+    // when tried first, resolve nothing (the .data fallback then saves us).
+    &[0x6A, 0x02, 0x6A, 0x10, 0x68],
     // Win10 x86 v1: AND dword [ebp-4],0; LEA eax,[ebp-10h]
     &[0x83, 0x65, 0xFC, 0x00, 0x8D, 0x45, 0xF0],
     // Win10 x86 v2: AND dword [esp+20h],0
     &[0x83, 0x64, 0x24, 0x20, 0x00],
-    // Vista..Win10 x86 (mimikatz PTRN_WALL): PUSH 2; PUSH 10h; PUSH imm32
-    &[0x6A, 0x02, 0x6A, 0x10, 0x68],
 ];
 
 /// Patterns to find LogonSessionList in msv1_0.dll on Win10 x86.
@@ -335,6 +339,10 @@ pub static MSV_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
 
 /// Patterns to find l_LogSessList in wdigest.dll on Win10 x86.
 pub static WDIGEST_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
+    // Win10 x86: MOV [ESI],EAX; MOV [ESI+4],imm32 — the list-insert tail of the
+    // credential insertion function. The only .data abs-ref in its window is
+    // l_LogSessList itself (19041 i386: single .text occurrence).
+    &[0x89, 0x06, 0xC7, 0x46, 0x04],
     // Win10 x86: CMP ECX,EBX; JE
     &[0x3B, 0xCB, 0x74],
     // CMP EBX,ECX; JE
@@ -347,6 +355,11 @@ pub static WDIGEST_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
 
 /// Patterns to find KerbGlobalLogonSessionTable in kerberos.dll on Win10 x86.
 pub static KERBEROS_LOGON_SESSION_PATTERNS_X86: &[&[u8]] = &[
+    // Win10 19041 i386: LOCK INC dword [ESI] — the credential refcount bump on
+    // the entry returned by RtlLookupElementGenericTableAvl. First .text
+    // occurrence sits right after the lookup that takes the table in ESI/push,
+    // and the only .data abs-ref in the ±0x30 window is the table itself.
+    &[0xF0, 0xFF, 0x06],
     // Win10 x86: MOV reg,[reg]; LEA/PUSH abs32
     &[0x8B, 0x38, 0x8D],
     &[0x8B, 0x18, 0x8D],
@@ -447,18 +460,14 @@ pub fn find_list_via_abs(
             continue;
         }
 
-        // Validate as LIST_ENTRY: flink should be valid or self-referencing
-        if let Ok(flink) = vmem.read_virt_u32(target) {
-            let flink = u64::from(flink);
-            if flink == target || (flink > 0x10000 && flink < 0x8000_0000) {
-                log::info!(
-                    "Found x86 {} via abs at 0x{:x} → 0x{:x}",
-                    label,
-                    search_start + i as u64,
-                    target
-                );
-                return Ok(target);
-            }
+        if x86_list_head_plausible(vmem, target) {
+            log::info!(
+                "Found x86 {} via abs at 0x{:x} → 0x{:x}",
+                label,
+                search_start + i as u64,
+                target
+            );
+            return Ok(target);
         }
     }
 
@@ -486,21 +495,44 @@ pub fn find_list_via_abs(
         if target < data_base || target >= data_end || target < dll_base {
             continue;
         }
-        if let Ok(flink) = vmem.read_virt_u32(target) {
-            let flink = u64::from(flink);
-            if flink == target || (flink > 0x10000 && flink < 0x8000_0000) {
-                log::info!(
-                    "Found x86 {} via wider abs scan at 0x{:x} → 0x{:x}",
-                    label,
-                    search_start2 + i as u64,
-                    target
-                );
-                return Ok(target);
-            }
+        if x86_list_head_plausible(vmem, target) {
+            log::info!(
+                "Found x86 {} via wider abs scan at 0x{:x} → 0x{:x}",
+                label,
+                search_start2 + i as u64,
+                target
+            );
+            return Ok(target);
         }
     }
 
     Err(VmkatzError::PatternNotFound(format!("abs for {label}")))
+}
+
+/// A real x86 LIST_ENTRY head is either empty (Flink == itself — tspkg and
+/// kerberos tables self-point when unused, with a zero Blink) or doubly linked
+/// (both Flink and Blink are kernel/heap VAs). Synchronization objects that
+/// shadow these globals (SRWLOCK / critical section right before the list)
+/// read as a lone plausible first dword with a garbage second one (e.g. a
+/// locked SRWLOCK had Flink=heap-ptr, Blink=0xffffffff) — reject those.
+fn x86_list_head_plausible(vmem: &dyn VirtualMemory, target: u64) -> bool {
+    let Ok(flink) = vmem.read_virt_u32(target) else {
+        return false;
+    };
+    let flink = u64::from(flink);
+    if flink == target {
+        return true;
+    }
+    if !(flink > 0x10000 && flink < 0x8000_0000) {
+        return false;
+    }
+    match vmem.read_virt_u32(target + 4) {
+        Ok(blink) => {
+            let blink = u64::from(blink);
+            blink == target || (blink > 0x10000 && blink < 0x8000_0000)
+        }
+        Err(_) => false,
+    }
 }
 
 // -- Pre-Vista (WinXP / Win2003) patterns --
