@@ -309,6 +309,22 @@ pub fn extract_msv_sessions(
     let variant_order = variant_order_for_build_arch(build_number, arch);
     log::info!("MSV session discovery: build={build_number}, variant order={variant_order:?}");
 
+    // Win10 1903+ x86: msv1_0 keeps its logon sessions in _NlpActiveLogonTable,
+    // a binary tree (children at +0x00/+0x04 keyed on LUID) whose root pointer
+    // lives in .data. Bucket/list walks cannot traverse it — walk the tree.
+    if arch == Arch::X86 {
+        let tree_sessions = extract_active_logon_sessions(vmem, msv_base, arch);
+        if !tree_sessions.is_empty() {
+            log::info!(
+                "MSV x86: NlpActiveLogon tree yielded {} sessions",
+                tree_sessions.len()
+            );
+            for info in tree_sessions {
+                session_map.insert(info.luid, info);
+            }
+        }
+    }
+
     // Walk all buckets of the pattern-resolved hash table
     if let Some(base) = list_base {
         log::info!("MSV session discovery: list=0x{base:x} buckets={bucket_count}");
@@ -579,6 +595,201 @@ impl CycleDetector {
         self.addrs[self.len] = addr;
         self.len += 1;
     }
+}
+
+// -- Win10 1903+ x86 NlpActiveLogonTable binary tree --
+//
+// msv1_0 keeps its active logon sessions in `_NlpActiveLogonTable` (pointer
+// global in .data): a binary tree keyed on LUID — NlpFindActiveLogon walks it
+// with children at +0x00/+0x04 and compares LUID at +0x10. Derivation: PDB
+// publics (_NlpActiveLogonTable, _NlpFindActiveLogon) + decompilation +
+// validation on a live Win10 19045 x86 snapshot (the "vagrant" entry carried
+// NTLM tag, LUID 0x9882b, LogonType 2, SID S-1-5-21-…-1000).
+
+/// Package tag stored at entry+0x0c in ActiveLogon entries ("NTLM").
+const ACTIVE_LOGON_NTLM_TAG: u32 = 0x4d4c544e;
+
+/// NlpActiveLogon entry offsets (x86, validated on 19045 i386).
+const ACTIVE_LOGON_OFFSETS_X86: MsvOffsets = MsvOffsets {
+    // flink is meaningless here: children are walked explicitly (+0x00/+0x04).
+    flink: 0x00,
+    luid: 0x10,
+    username: 0x24,
+    domain: 0x2c,
+    credentials_ptr: 0, // auto-detect: find_credentials_ptr_in_entry scans the entry
+    logon_type: 0x1c,
+    session_id: 0x08,
+    logon_time: 0xb8,
+    logon_server: 0x34,
+    sid: 0x48,
+    sid_embedded: true,
+};
+
+/// Sanity-check an ActiveLogon tree node: 'NTLM' tag and plausible LUID.
+fn active_logon_entry_plausible(vmem: &dyn VirtualMemory, entry: u64, arch: Arch) -> bool {
+    match vmem.read_virt_u32(entry + 0x0c) {
+        Ok(tag) if tag == ACTIVE_LOGON_NTLM_TAG => {}
+        _ => return false,
+    }
+    is_plausible_luid(vmem.read_virt_u64(entry + 0x10).unwrap_or(0))
+        && is_valid_user_ptr(entry, arch)
+}
+
+/// Find the NlpActiveLogonTable root: scan msv1_0 .data for a pointer whose
+/// target looks like an ActiveLogon tree node. .data slots referencing a
+/// single session exist, so prefer the candidate whose tree is the largest.
+fn find_active_logon_root(vmem: &dyn VirtualMemory, msv_base: u64, arch: Arch) -> Option<u64> {
+    let pe = PeHeaders::parse_from_memory(vmem, msv_base).ok()?;
+    let ds = pe.find_section(".data")?;
+    let data_base = msv_base + u64::from(ds.virtual_address);
+    let data = vmem
+        .read_virt_bytes(data_base, ds.virtual_size as usize)
+        .ok()?;
+    let mut best: Option<(usize, u64)> = None;
+    for off in (0..data.len().saturating_sub(4)).step_by(4) {
+        let p = u64::from(u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]));
+        if p == 0 || !is_valid_user_ptr(p, arch) {
+            continue;
+        }
+        if !active_logon_entry_plausible(vmem, p, arch) {
+            continue;
+        }
+        let n = walk_active_logon_tree(vmem, p, arch).len();
+        if best.is_none_or(|(bn, _)| n > bn) {
+            best = Some((n, p));
+        }
+        if n >= 4 {
+            // A multi-session tree is certainly the session table.
+            return Some(p);
+        }
+    }
+    best.filter(|(n, _)| *n > 0).map(|(_, p)| p)
+}
+
+/// Walk the ActiveLogon binary tree from `root`, collecting entry addresses.
+fn walk_active_logon_tree(vmem: &dyn VirtualMemory, root: u64, arch: Arch) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(entry) = stack.pop() {
+        if entry == 0
+            || !is_valid_user_ptr(entry, arch)
+            || !visited.insert(entry)
+            || visited.len() > 64
+        {
+            continue;
+        }
+        if !active_logon_entry_plausible(vmem, entry, arch) {
+            continue;
+        }
+        out.push(entry);
+        for child_off in [0x00u64, 0x04] {
+            if let Ok(child) = read_ptr(vmem, entry + child_off, arch) {
+                stack.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// Sessions (with metadata) from the NlpActiveLogonTable tree.
+fn extract_active_logon_sessions(
+    vmem: &dyn VirtualMemory,
+    msv_base: u64,
+    arch: Arch,
+) -> Vec<MsvSessionInfo> {
+    let Some(root) = find_active_logon_root(vmem, msv_base, arch) else {
+        return Vec::new();
+    };
+    let offsets = &ACTIVE_LOGON_OFFSETS_X86;
+    let mut sessions = Vec::new();
+    for entry in walk_active_logon_tree(vmem, root, arch) {
+        let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
+        if !is_plausible_luid(luid) {
+            continue;
+        }
+        let username = read_ustring(vmem, entry + offsets.username, arch).unwrap_or_default();
+        let domain = read_ustring(vmem, entry + offsets.domain, arch).unwrap_or_default();
+        if username.is_empty() || !is_plausible_username(&username) {
+            continue;
+        }
+        let (logon_type, session_id, logon_time, logon_server, sid) =
+            extract_session_metadata(vmem, entry, offsets, arch);
+        log::info!(
+            "MSV ActiveLogon tree entry 0x{entry:x}: LUID=0x{luid:x} user={username} domain={domain}"
+        );
+        sessions.push(MsvSessionInfo {
+            luid,
+            username,
+            domain,
+            logon_type,
+            session_id,
+            logon_time,
+            logon_server,
+            sid,
+        });
+    }
+    sessions
+}
+
+/// Credentials from the NlpActiveLogonTable tree: each entry's LSA credential
+/// list holds the encrypted MSV1_0 primary credential ("Primary" chain),
+/// located with the same generic scan the x64 path uses.
+fn extract_active_logon_credentials(
+    vmem: &dyn VirtualMemory,
+    msv_base: u64,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Vec<(u64, MsvCredential)> {
+    let Some(root) = find_active_logon_root(vmem, msv_base, arch) else {
+        return Vec::new();
+    };
+    let offsets = &ACTIVE_LOGON_OFFSETS_X86;
+    let mut results = Vec::new();
+    for entry in walk_active_logon_tree(vmem, root, arch) {
+        let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
+        if !is_plausible_luid(luid) {
+            continue;
+        }
+        let username = read_ustring(vmem, entry + offsets.username, arch).unwrap_or_default();
+        let domain = read_ustring(vmem, entry + offsets.domain, arch).unwrap_or_default();
+        if username.is_empty() || !is_plausible_username(&username) {
+            continue;
+        }
+        let Some(cred_ptr) = find_credentials_ptr_in_entry(vmem, entry, arch) else {
+            log::info!("MSV ActiveLogon entry 0x{entry:x}: no credential chain found");
+            continue;
+        };
+        let Some(primary_ptr) = find_primary_entry_in_chain(vmem, cred_ptr, arch) else {
+            log::info!("MSV ActiveLogon entry 0x{entry:x}: no Primary in chain");
+            continue;
+        };
+        match extract_primary_credential(vmem, primary_ptr, keys, &mut None, arch, None) {
+            Ok(cred) => {
+                log::info!(
+                    "MSV ActiveLogon credential: LUID=0x{luid:x} user={username} domain={domain} NT={}",
+                    hex::encode(cred.nt_hash)
+                );
+                results.push((
+                    luid,
+                    MsvCredential {
+                        username: username.clone(),
+                        domain: domain.clone(),
+                        lm_hash: cred.lm_hash,
+                        nt_hash: cred.nt_hash,
+                        sha1_hash: cred.sha1_hash,
+                    },
+                ));
+            }
+            Err(e) => log::info!("MSV ActiveLogon Primary at 0x{primary_ptr:x}: {e}"),
+        }
+    }
+    results
 }
 
 /// Walk a hash table (array of LIST_ENTRY buckets) and insert/merge sessions.
@@ -875,6 +1086,17 @@ pub fn extract_msv_credentials(
                 );
                 return Ok(creds);
             }
+        }
+    }
+
+    // Win10 1903+ x86: NlpActiveLogonTable tree credentials (see
+    // extract_active_logon_sessions). Entries carry the LSA credential list
+    // with the encrypted MSV1_0 primary credential; the generic scan
+    // (find_credentials_ptr_in_entry) locates the "Primary" chain in each.
+    if arch == Arch::X86 {
+        let creds = extract_active_logon_credentials(vmem, msv_base, keys, arch);
+        if !creds.is_empty() {
+            return Ok(creds);
         }
     }
 

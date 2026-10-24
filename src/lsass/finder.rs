@@ -663,11 +663,50 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
             arch,
         ) {
             Ok(msv_creds) => {
+                // Win10 1903+ x86: the ActiveLogon tree entries do not carry the
+                // LSA credential chain (it hangs off the lsasrv-side logon
+                // session); when the standard walk yields nothing, scan LSASS
+                // pages for KIWI_MSV1_0_PRIMARY_CREDENTIALS and match by name.
+                let msv_creds = if msv_creds.is_empty() {
+                    log::info!(
+                        "MSV x86: standard extraction found nothing, trying physical scan..."
+                    );
+                    scan_phys_for_msv_credentials(
+                        phys, lsass.dtb, &vmem, msv.base, msv.size, &keys, arch,
+                    )
+                } else {
+                    msv_creds
+                };
                 status.msv = ProviderStatus::from_result_empty(msv_creds.is_empty());
+                let mut next_synth_luid = 0x8000_0000_0000_0000u64;
                 for (luid, msv_cred) in msv_creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                    // Physical-scan credentials carry LUID=0: match an existing
+                    // session by username/domain (same strategy as the x64 path).
+                    let effective_luid = if luid == 0 {
+                        all_creds
+                            .iter()
+                            .find(|(_, c)| {
+                                let name_match =
+                                    c.username.eq_ignore_ascii_case(&msv_cred.username);
+                                let domain_match = msv_cred.domain.is_empty()
+                                    || msv_cred.domain == "."
+                                    || c.domain.eq_ignore_ascii_case(&msv_cred.domain);
+                                name_match && domain_match && c.msv.is_none()
+                            })
+                            .map_or_else(
+                                || {
+                                    let synth = next_synth_luid;
+                                    next_synth_luid += 1;
+                                    synth
+                                },
+                                |(&k, _)| k,
+                            )
+                    } else {
+                        luid
+                    };
+                    let entry = all_creds.entry(effective_luid).or_insert_with(|| {
                         Credential::new_empty(
-                            luid,
+                            effective_luid,
                             msv_cred.username.clone(),
                             msv_cred.domain.clone(),
                         )
@@ -1128,7 +1167,6 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     keys: &CryptoKeys,
     arch: Arch,
 ) -> Vec<(u64, MsvCredential)> {
-    let walker = PageTableWalker::new(phys);
     let mut results = Vec::new();
     let mut pages_scanned = 0u64;
     let mut candidates_found = 0u64;
@@ -1138,13 +1176,17 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     // Collect all candidate (vaddr, paddr) pairs for KIWI_MSV1_0_PRIMARY_CREDENTIALS
     let mut cred_candidates: Vec<(u64, u64)> = Vec::new(); // (vaddr of struct, paddr)
 
-    walker.enumerate_present_pages(lsass_dtb, |mapping| {
+    // The walker must match the guest bitness: the x64 walker against a PAE
+    // DTB enumerates garbage mappings.
+    let mut scan_page = |mapping: crate::paging::translate::PageMapping| {
         if mapping.size != 0x1000 {
             return;
         }
         pages_scanned += 1;
 
-        let Ok(page_data) = phys.read_phys_bytes(mapping.paddr, 0x1000) else { return };
+        let Ok(page_data) = phys.read_phys_bytes(mapping.paddr, 0x1000) else {
+            return;
+        };
 
         // Skip zero pages
         if page_data.iter().all(|&b| b == 0) {
@@ -1152,9 +1194,17 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
         }
 
         // Scan for ANSI_STRING signature: Length=7 (0x0007), MaxLength=8 (0x0008)
-        // This appears at offset +0x08 in KIWI_MSV1_0_PRIMARY_CREDENTIALS
-        // So we search for 07 00 08 00 at 8-byte aligned positions
-        for off in (0..0x1000usize - 0x28).step_by(8) {
+        // This appears at offset +0x08 (x64) / +0x04 (x86) in
+        // KIWI_MSV1_0_PRIMARY_CREDENTIALS.
+        //   x64: +0x00 next(8), +0x08 ANSI, +0x10 ANSI buf, +0x18 UNICODE, +0x20 buf(8)
+        //   x86: +0x00 next(4), +0x04 ANSI, +0x08 ANSI buf, +0x0C UNICODE, +0x10 buf(4)
+        let (hdr_pre, next_off, ansi_buf_off, cred_len_off, cred_buf_off, ptr_read) = match arch {
+            Arch::X64 => (0x08, 0x00, 0x10, 0x18, 0x20, 8usize),
+            Arch::X86 => (0x04, 0x00, 0x08, 0x0C, 0x10, 4),
+        };
+        let step = if arch == Arch::X64 { 8 } else { 4 };
+        let is_ptr = |v: u64| -> bool { v >= 0x10000 && (v >> 48) == 0 };
+        for off in (0..0x1000usize - 0x28).step_by(step) {
             // Check for 07 00 08 00 pattern
             if page_data[off] != 0x07
                 || page_data[off + 1] != 0x00
@@ -1164,40 +1214,64 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
                 continue;
             }
 
-            // The KIWI_MSV1_0_PRIMARY_CREDENTIALS struct starts 0x08 bytes before this
-            if off < 0x08 {
+            // The struct starts `hdr_pre` bytes before the ANSI header
+            if off < hdr_pre {
                 continue;
             }
-            let struct_off = off - 0x08;
+            let struct_off = off - hdr_pre;
 
             // Ensure enough room on page for the full structure header (0x28 bytes)
             if struct_off + 0x28 > 0x1000 {
                 continue;
             }
 
-            // Validate: next pointer at +0x00 should be 0 or a heap ptr
-            let Some(next) = read_u64_le(&page_data, struct_off) else { continue };
-            if next != 0 && (next < 0x10000 || (next >> 48) != 0) {
+            // Validate: next pointer should be 0 or a heap ptr
+            let next = match ptr_read {
+                8 => crate::utils::read_u64_le(&page_data, struct_off + next_off).unwrap_or(0),
+                _ => u64::from(
+                    crate::utils::read_u32_le(&page_data, struct_off + next_off).unwrap_or(0),
+                ),
+            };
+            if next != 0 && !is_ptr(next) {
                 continue;
             }
 
-            // Validate: ANSI_STRING.Buffer at +0x10 should be a heap ptr
-            let Some(buf_ptr) = read_u64_le(&page_data, struct_off + 0x10) else { continue };
-            if buf_ptr < 0x10000 || (buf_ptr >> 48) != 0 {
+            // Validate: ANSI_STRING.Buffer should be a heap ptr
+            let buf_ptr = match ptr_read {
+                8 => crate::utils::read_u64_le(&page_data, struct_off + ansi_buf_off).unwrap_or(0),
+                _ => u64::from(
+                    crate::utils::read_u32_le(&page_data, struct_off + ansi_buf_off).unwrap_or(0),
+                ),
+            };
+            if !is_ptr(buf_ptr) {
                 continue;
             }
 
-            // Validate: Credentials UNICODE_STRING at +0x18
-            let Some(cred_len) = read_u16_le(&page_data, struct_off + 0x18).map(|v| v as usize) else { continue };
-            let Some(cred_max_len) = read_u16_le(&page_data, struct_off + 0x1A).map(|v| v as usize) else { continue };
-            let Some(cred_buf) = read_u64_le(&page_data, struct_off + 0x20) else { continue };
+            // Validate: Credentials UNICODE_STRING
+            let Some(cred_len) = crate::utils::read_u16_le(&page_data, struct_off + cred_len_off)
+                .map(|v| v as usize)
+            else {
+                continue;
+            };
+            let Some(cred_max_len) =
+                crate::utils::read_u16_le(&page_data, struct_off + cred_len_off + 2)
+                    .map(|v| v as usize)
+            else {
+                continue;
+            };
+            let cred_buf = match ptr_read {
+                8 => crate::utils::read_u64_le(&page_data, struct_off + cred_buf_off).unwrap_or(0),
+                _ => u64::from(
+                    crate::utils::read_u32_le(&page_data, struct_off + cred_buf_off).unwrap_or(0),
+                ),
+            };
 
             // Encrypted credentials must be non-zero length, reasonable size, even length
             if cred_len == 0 || cred_len > 0x400 || cred_max_len < cred_len {
                 continue;
             }
             // Buffer must be a valid heap pointer
-            if cred_buf < 0x10000 || (cred_buf >> 48) != 0 {
+            if !is_ptr(cred_buf) {
                 continue;
             }
 
@@ -1212,7 +1286,12 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
 
             cred_candidates.push((struct_vaddr, struct_paddr));
         }
-    });
+    };
+    match arch {
+        Arch::X64 => PageTableWalker::new(phys).enumerate_present_pages(lsass_dtb, &mut scan_page),
+        Arch::X86 => crate::paging::translate::PaePageTableWalker::new(phys)
+            .enumerate_present_pages(lsass_dtb, &mut scan_page),
+    }
 
     log::info!(
         "MSV physical scan: {pages_scanned} pages scanned, {candidates_found} Primary credential candidates found"
@@ -1224,7 +1303,10 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     let mut validated_variant: Option<usize> = None;
     for (vaddr, _paddr) in &cred_candidates {
         // Try to verify "Primary" string
-        let ansi_buf = vmem.read_virt_u64(*vaddr + 0x10).unwrap_or(0);
+        let ansi_buf = match arch {
+            Arch::X64 => vmem.read_virt_u64(*vaddr + 0x10).unwrap_or(0),
+            Arch::X86 => u64::from(vmem.read_virt_u32(*vaddr + 0x08).unwrap_or(0)),
+        };
         if ansi_buf != 0 {
             if let Ok(primary_bytes) = vmem.read_virt_bytes(ansi_buf, 7) {
                 if primary_bytes != b"Primary" {
