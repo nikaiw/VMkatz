@@ -164,11 +164,19 @@ pub const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
         lm_hash: 0x36,
         sha1_hash: 0x46,
     },
-    // Win7/8/8.1
+    // Win7/8/8.1 x64
     PrimaryCredOffsets {
         nt_hash: 0x20,
         lm_hash: 0x30,
         sha1_hash: 0x40,
+    },
+    // Win7/8/8.1 x86 — the two leading UNICODE_STRINGs (LogonDomainName,
+    // UserName) are 8 bytes each instead of 16, so every field sits 0x10 lower
+    // than x64. Verified on a Win7-x86 dump (NT at 0x10, empty LM at 0x20).
+    PrimaryCredOffsets {
+        nt_hash: 0x10,
+        lm_hash: 0x20,
+        sha1_hash: 0x30,
     },
     // Win10 1607+ (Credential Guard variant)
     PrimaryCredOffsets {
@@ -2614,6 +2622,16 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
         // Win7/Win8: no flags before hashes
         0x20 if blob.len() >= 0x20 => {
             score += 3;
+        }
+        // Win7/8/8.1 x86: hashes sit right after the two 8-byte UNICODE_STRINGs,
+        // no Win10 flags. The empty-LM field at lm_off (0x20) is the
+        // discriminator — a wrong variant reading SHA/string data there is
+        // non-zero, so this out-scores the stray 0x30/0x36 matches on this blob.
+        0x10 if blob.len() >= lm_off + 16 => {
+            score += 5;
+            if blob[lm_off..lm_off + 16] == [0u8; 16] {
+                score += 8;
+            }
         }
         // Win10 1607+ without unk0/unk1
         0x30 if blob.len() >= 0x30 => {
