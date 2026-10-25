@@ -605,7 +605,7 @@ fn extract_crypto_keys_x86_from_pattern(
     }
 
     // Among .data references, find IV (16-byte non-pointer), h3DesKey (UUUR handle), hAesKey (UUUR handle)
-    let mut iv: Option<[u8; 16]> = None;
+    let mut best_iv: Option<([u8; 16], u16)> = None;
     let mut des_key: Option<Vec<u8>> = None;
     let mut aes_key: Option<Vec<u8>> = None;
 
@@ -630,25 +630,31 @@ fn extract_crypto_keys_x86_from_pattern(
             }
         }
 
-        // Check if this could be the IV (16 bytes of non-zero, non-pointer data)
-        if iv.is_none() {
-            if let Ok(candidate) = vmem.read_virt_bytes(addr, 16) {
-                if candidate.len() == 16
-                    && !candidate.iter().all(|&b| b == 0)
-                    && count_unique_bytes(&candidate) >= 4
-                {
-                    let val = u64::from(super::types::read_u32_le(&candidate, 0).unwrap_or(0));
-                    if !(val > 0x10000 && val < 0x8000_0000) {
-                        let mut arr = [0u8; 16];
-                        arr.copy_from_slice(&candidate);
-                        iv = Some(arr);
-                    }
+        // IV candidate: pick the referenced global with the HIGHEST byte entropy.
+        // The IV is 16 random bytes; the earlier "first dword isn't a 32-bit
+        // pointer" test wrongly discarded it, because a random IV dword routinely
+        // falls in the user-address range (0x10000..0x80000000) — leaving the
+        // first 3DES-CBC block corrupted (then healed from the NT hash). A pointer
+        // table or mostly-zero struct has far lower entropy, so entropy separates
+        // them cleanly.
+        if let Ok(candidate) = vmem.read_virt_bytes(addr, 16) {
+            if candidate.len() == 16 {
+                let uniq = count_unique_bytes(&candidate);
+                if best_iv.is_none_or(|(_, b)| uniq > b) {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&candidate);
+                    best_iv = Some((arr, uniq));
                 }
             }
         }
     }
 
-    let iv = iv.ok_or_else(|| VmkatzError::PatternNotFound("x86 IV not found".to_string()))?;
+    // A genuine IV is near-maximal entropy; require a high bar so a low-entropy
+    // struct is never mistaken for one.
+    let iv = best_iv
+        .filter(|&(_, uniq)| uniq >= 12)
+        .map(|(arr, _)| arr)
+        .ok_or_else(|| VmkatzError::PatternNotFound("x86 IV not found".to_string()))?;
     let des_key = des_key
         .ok_or_else(|| VmkatzError::PatternNotFound("x86 3DES key not found".to_string()))?;
     let aes_key =
@@ -754,36 +760,35 @@ fn find_iv_near_handles_x86(data: &[u8], handle_offset: u64) -> Result<[u8; 16]>
     let search_start = handle_off.saturating_sub(0x200);
     let search_end = (handle_off + 0x200).min(data.len().saturating_sub(16));
 
+    // The IV is 16 random bytes → near-maximal byte entropy. Pick the
+    // highest-entropy 4-aligned window; pointer tables and mostly-zero structs
+    // in the same neighbourhood have much lower entropy. (The old "first two
+    // dwords aren't pointers" test both let a low-entropy near-zero window
+    // through and could reject a random IV, corrupting the first CBC block.)
+    let mut best: Option<(usize, u16)> = None;
     for off in (search_start..search_end).step_by(4) {
         let candidate = &data[off..off + 16];
         if candidate.iter().all(|&b| b == 0) {
             continue;
         }
-
-        // Check first dword doesn't look like a pointer
-        let val = u64::from(super::types::read_u32_le(candidate, 0).unwrap_or(0));
-        if val > 0x10000 && val < 0x8000_0000 && val & 0x3 == 0 {
-            continue;
+        let uniq = count_unique_bytes(candidate);
+        if best.is_none_or(|(_, b)| uniq > b) {
+            best = Some((off, uniq));
         }
+    }
 
-        // Check second dword too
-        let val2 = u64::from(super::types::read_u32_le(candidate, 4).unwrap_or(0));
-        if val2 > 0x10000 && val2 < 0x8000_0000 && val2 & 0x3 == 0 {
-            continue;
+    if let Some((off, uniq)) = best {
+        if uniq >= 12 {
+            log::debug!(
+                "x86 IV at .data+0x{:x} (uniq={}): {}",
+                off,
+                uniq,
+                hex::encode(&data[off..off + 16])
+            );
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&data[off..off + 16]);
+            return Ok(iv);
         }
-
-        if count_unique_bytes(candidate) < 4 {
-            continue;
-        }
-
-        log::debug!(
-            "x86 IV candidate at .data+0x{:x}: {}",
-            off,
-            hex::encode(candidate)
-        );
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(candidate);
-        return Ok(iv);
     }
 
     Err(VmkatzError::PatternNotFound(
