@@ -458,10 +458,45 @@ fn finalize_credentials(
 ) -> Vec<Credential> {
     for cred in all_creds.values_mut() {
         crate::lsass::types::fill_wellknown_luid(cred);
+        heal_rc4_from_nt(cred);
     }
     let mut result: Vec<Credential> = all_creds.into_values().collect();
     result.sort_by_key(|c| c.luid);
     result
+}
+
+/// Repair a Kerberos RC4 key from the session's MSV NT hash.
+///
+/// The Kerberos RC4 key of an account is by definition the NT hash of its
+/// password. lsasrv encrypts 8-byte-aligned credential blobs with 3DES-CBC
+/// whose IV is the live chaining state of the protected-memory key object, so
+/// the first 8-byte block of older blobs decrypts to garbage when the chain
+/// has advanced between the encryption and the snapshot (see the x86 domain
+/// dumps: the machine RC4 garbles to `<8 random bytes><low half of NT>`).
+/// MSV blobs are unaffected (odd lengths take the AES-CFB path, which is
+/// insensitive to the chain state). When both are present and disagree, the
+/// MSV NT hash is the ground truth — heal the RC4 key so downstream consumers
+/// (and the key-group-to-session assignment, which matches on RC4 == NT)
+/// keep working on stale dumps.
+fn heal_rc4_from_nt(cred: &mut Credential) {
+    let Some(msv) = &cred.msv else { return };
+    let nt = msv.nt_hash;
+    let Some(krb) = &mut cred.kerberos else {
+        return;
+    };
+    for key in &mut krb.keys {
+        // RC4_HMAC (23) and RC4_HMAC_EXP (24) share the same NT-derived key
+        // bytes (identical ciphertext for both etypes in observed lists).
+        if (key.etype == 23 || key.etype == 24) && key.key.len() == 16 && key.key[..] != nt {
+            log::warn!(
+                "Kerberos RC4 key of LUID 0x{:x} disagrees with the MSV NT hash \
+                 (first CBC block corrupted by the lsasrv 3DES chain state); \
+                 replacing with the MSV NT hash",
+                cred.luid
+            );
+            key.key.copy_from_slice(&nt);
+        }
+    }
 }
 
 /// Pagefile reference type: wraps Option<&PagefileReader> when sam feature is enabled,
