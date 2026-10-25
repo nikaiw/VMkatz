@@ -887,7 +887,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     let build_number = read_build_number(&lsass_vmem, lsass.peb_vaddr, Arch::X64);
     log::info!("Windows build number: {build_number}");
 
-    let keys = match crypto::extract_crypto_keys(&lsass_vmem, lsasrv.base, lsasrv.size) {
+    let mut keys = match crypto::extract_crypto_keys(&lsass_vmem, lsasrv.base, lsasrv.size) {
         Ok(k) => k,
         Err(e) => {
             log::info!("Standard crypto extraction failed: {e}");
@@ -901,6 +901,12 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
             )?
         }
     };
+
+    // Derive the true 3DES IV from an MSV primary credential (fixes Win8.0/Vista
+    // where the code-pattern IV resolution fails because lsasrv .text is paged out).
+    if let Some(iv8) = recover_3des_iv_x64(phys, lsass.dtb, &lsass_vmem, &keys) {
+        keys.iv[..8].copy_from_slice(&iv8);
+    }
 
     let mut all_creds: std::collections::BTreeMap<u64, Credential> =
         std::collections::BTreeMap::new();
@@ -1211,6 +1217,132 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 ///   +0x18: Credentials (UNICODE_STRING: encrypted blob)
 ///
 /// The distinctive signature is bytes 07 00 08 00 at offset +0x08.
+/// Recover the 3DES IV by deriving it from an MSV primary credential.
+///
+/// The IV is one global reused for every lsasrv 3DES-CBC decryption. When the
+/// normal resolution yields a wrong IV (Win8.0 9200 / Vista, where lsasrv .text
+/// is paged out of the lsass working set so the code pattern can't be found),
+/// only CBC block 0 (the first 8 bytes) of each credential is corrupted; blocks
+/// 1+ are correct. The MSV primary credential begins with LogonDomainName (an
+/// LSA_UNICODE_STRING whose {Length, MaxLength} live in block 0 and whose pad
+/// bytes 4-7 are zero), and the domain string itself sits in a later, correct
+/// block — so its length, hence the true block-0 plaintext P0, is known. Then
+/// `IV[..8] = D(C[0]) XOR P0`, where `D(C[0]) = block0_current XOR current_iv[..8]`.
+/// This is a no-op when the IV is already correct (it recomputes the same value).
+/// x64 only; the x86 path resolves its IV separately.
+fn recover_3des_iv_x64<P: PhysicalMemory>(
+    phys: &P,
+    lsass_dtb: u64,
+    vmem: &dyn VirtualMemory,
+    keys: &CryptoKeys,
+) -> Option<[u8; 8]> {
+    use crate::paging::translate::PageTableWalker;
+    let is_ptr = |v: u64| v >= 0x10000 && (v >> 48) == 0;
+    let mut found: Option<[u8; 8]> = None;
+    let mut decided = false;
+    let mut scan = |mapping: crate::paging::translate::PageMapping| {
+        if decided || mapping.size != 0x1000 {
+            return;
+        }
+        let Ok(page) = phys.read_phys_bytes(mapping.paddr, 0x1000) else {
+            return;
+        };
+        if page.iter().all(|&b| b == 0) {
+            return;
+        }
+        // KIWI_MSV1_0_PRIMARY_CREDENTIALS (x64): +0x08 ANSI_STRING "Primary"
+        // (Length=7, MaxLength=8), +0x10 ANSI Buffer, +0x18 Credentials
+        // UNICODE_STRING (Length@+0x18), +0x20 encrypted-blob Buffer.
+        for off in (0..0x1000usize - 0x28).step_by(8) {
+            if page[off] != 0x07
+                || page[off + 1] != 0
+                || page[off + 2] != 0x08
+                || page[off + 3] != 0
+            {
+                continue;
+            }
+            if off < 0x08 {
+                continue;
+            }
+            let s = off - 0x08;
+            if s + 0x28 > 0x1000 {
+                continue;
+            }
+            let cred_len = crate::utils::read_u16_le(&page, s + 0x18).unwrap_or(0) as usize;
+            if cred_len == 0 || cred_len > 0x400 || !cred_len.is_multiple_of(8) {
+                continue;
+            }
+            let cred_buf = crate::utils::read_u64_le(&page, s + 0x20).unwrap_or(0);
+            let ansi_buf = crate::utils::read_u64_le(&page, s + 0x10).unwrap_or(0);
+            if !is_ptr(cred_buf) || !is_ptr(ansi_buf) {
+                continue;
+            }
+            if !matches!(vmem.read_virt_bytes(ansi_buf, 7), Ok(b) if b == b"Primary") {
+                continue;
+            }
+            let Ok(enc) = vmem.read_virt_bytes(cred_buf, cred_len) else {
+                continue;
+            };
+            let Ok(dec) = crate::lsass::crypto::decrypt_credential(keys, &enc) else {
+                continue;
+            };
+            if dec.len() < 0x18 {
+                continue;
+            }
+            // D(C[0]) = block0 decrypted-with-current-iv XOR current iv[..8]
+            let mut dc0 = [0u8; 8];
+            for i in 0..8 {
+                dc0[i] = dec[i] ^ keys.iv[i];
+            }
+            // LogonDomainName.Buffer is a self-relative offset into the blob (x64 @+8).
+            let dom_off = crate::utils::read_u64_le(&dec, 8).unwrap_or(0) as usize;
+            if dom_off == 0 || dom_off + 2 > dec.len() {
+                continue;
+            }
+            let mut chars = 0usize;
+            while dom_off + chars * 2 + 1 < dec.len()
+                && !(dec[dom_off + chars * 2] == 0 && dec[dom_off + chars * 2 + 1] == 0)
+            {
+                chars += 1;
+            }
+            if chars == 0 || chars > 0xff {
+                continue;
+            }
+            let length = (chars * 2) as u16;
+            // Pure-fallback guard: if the current IV already decrypts block 0 to a
+            // valid LogonDomainName header (pad bytes 4-7 zero AND Length equal to
+            // the domain's actual byte-length), the IV is correct — leave it. Builds
+            // whose lsasrv .text is resident (all Win10/11/Server, resolved by the
+            // code pattern) thus pass through untouched; only a broken IV (Win8.0/
+            // Vista, paged-out .text) triggers derivation.
+            if dec[4..8] == [0u8; 4] && u16::from_le_bytes([dec[0], dec[1]]) == length {
+                decided = true;
+                return;
+            }
+            let maxlength = length + 2; // LSA_UNICODE_STRING reserves the null terminator
+            let p0 = [
+                length as u8,
+                (length >> 8) as u8,
+                maxlength as u8,
+                (maxlength >> 8) as u8,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let mut iv8 = [0u8; 8];
+            for i in 0..8 {
+                iv8[i] = dc0[i] ^ p0[i];
+            }
+            found = Some(iv8);
+            decided = true;
+            return;
+        }
+    };
+    PageTableWalker::new(phys).enumerate_present_pages(lsass_dtb, &mut scan);
+    found
+}
+
 fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
