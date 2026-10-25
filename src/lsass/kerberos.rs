@@ -452,21 +452,34 @@ pub fn extract_kerberos_credentials(
             };
             let mut i = 0usize;
             while i + 10 <= data.len() {
-                if data[i] == 0x48
-                    && data[i + 1] == 0x8D
-                    && data[i + 2] == 0x0D
-                    && data[i + 7] == 0x48
-                    && data[i + 8] == 0xFF
-                    && data[i + 9] == 0x15
-                {
-                    let code_addr = text_base + i as u64;
-                    if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 3) {
-                        if avl_table_is_valid(vmem, cand, arch, kerberos_base, mod_span) {
-                            log::info!(
-                                "{pattern_label}: validated session table at 0x{cand:x} (LEA+call site 0x{code_addr:x})"
-                            );
-                            table = Some(cand);
+                if data[i] == 0x48 && data[i + 1] == 0x8D && data[i + 2] == 0x0D {
+                    // The session table is passed in RCX to an Rtl*GenericTableAvl
+                    // call. On 1809+ MSVC emits a redundant REX.W on the indirect
+                    // call right after the LEA (`48 FF 15`); on 14393 the call is
+                    // `FF 15` and up to a few instructions (e.g. `8B D8`, mov
+                    // ebx,eax) sit between the LEA and it. Look ahead a bounded
+                    // window for either call form; the strict AVL validation below
+                    // rejects unrelated globals that share the shape.
+                    let mut has_call = false;
+                    let end = (i + 24).min(data.len() - 6);
+                    let mut j = i + 7;
+                    while j < end {
+                        if data[j] == 0xFF && data[j + 1] == 0x15 {
+                            has_call = true;
                             break;
+                        }
+                        j += 1;
+                    }
+                    if has_call {
+                        let code_addr = text_base + i as u64;
+                        if let Ok(cand) = patterns::resolve_rip_relative(vmem, code_addr, 3) {
+                            if avl_table_is_valid(vmem, cand, arch, kerberos_base, mod_span) {
+                                log::info!(
+                                    "{pattern_label}: validated session table at 0x{cand:x} (LEA+call site 0x{code_addr:x})"
+                                );
+                                table = Some(cand);
+                                break;
+                            }
                         }
                     }
                 }
