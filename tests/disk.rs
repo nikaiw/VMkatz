@@ -269,6 +269,7 @@ fn test_list_path_healthy_root() {
     use vmkatz::sam::{ListOutcome, list_path};
     let path = Path::new("/tmp/test.qcow2");
     if !path.exists() {
+        eprintln!("SKIP test_list_path_healthy_root: /tmp/test.qcow2 absent");
         return;
     }
     let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");

@@ -46,6 +46,16 @@ pub fn list_path<R: Read + Seek>(
     )
 }
 
+/// Decide how a navigation result is handled: `DiskFormatError` means the index
+/// works and the entry is absent (`PathNotFound`); any other error falls back.
+fn classify_nav_error<T>(nav: Result<T>) -> std::result::Result<T, Result<ListOutcome>> {
+    match nav {
+        Ok(v) => Ok(v),
+        Err(VmkatzError::DiskFormatError(_)) => Err(Ok(ListOutcome::PathNotFound)),
+        Err(e) => Err(Err(e)),
+    }
+}
+
 /// Healthy attempt; `Err` means "fall back" (never a `DiskFormatError` from navigation).
 fn list_healthy<R: Read + Seek>(
     reader: &mut R,
@@ -58,10 +68,9 @@ fn list_healthy<R: Read + Seek>(
     let root = ntfs
         .root_directory(&mut part)
         .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root error: {e}")))?;
-    let dir = match navigate_to_dir(&ntfs, &root, &mut part, path) {
+    let dir = match classify_nav_error(navigate_to_dir(&ntfs, &root, &mut part, path)) {
         Ok(d) => d,
-        Err(VmkatzError::DiskFormatError(_)) => return Ok(ListOutcome::PathNotFound),
-        Err(e) => return Err(e),
+        Err(outcome) => return outcome,
     };
     let raw = list_index(&ntfs, &dir, &mut part)?;
     Ok(ListOutcome::Listed {
@@ -104,8 +113,24 @@ mod tests {
     fn list_path_empty_dir_is_not_error() {
         let mut r = volume();
         match list_path(&mut r, PART_OFF, "Users").unwrap() {
-            ListOutcome::Listed { entries, .. } => assert!(entries.is_empty()),
+            ListOutcome::Listed { entries, degraded } => {
+                assert!(entries.is_empty());
+                assert!(degraded);
+            }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_disk_format_error_is_path_not_found() {
+        let r = classify_nav_error::<()>(Err(VmkatzError::DiskFormatError("nf".into())));
+        assert!(matches!(r, Err(Ok(ListOutcome::PathNotFound))));
+    }
+
+    #[test]
+    fn classify_other_error_falls_back() {
+        let r = classify_nav_error::<()>(Err(VmkatzError::DecryptionError("io".into())));
+        assert!(matches!(r, Err(Err(_))));
+        assert!(classify_nav_error(Ok(1)).is_ok());
     }
 }
