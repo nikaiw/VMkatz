@@ -2,11 +2,15 @@
 
 ## v1.5.2
 
-A VMFS reliability release. The headline fix is a block-resolution bug that made
-thick-provisioned / GPT Windows VMs read the wrong data over VMFS and silently
-extract **nothing**; VMFS mode now also reaches parity with the local-disk path
-(NTDS + DPAPI), partition detection handles GPT, and a column mix-up that mislabeled
-NTDS NT hashes is corrected. ~10 fixes + 2 new flags, validated on real ESXi 8.0.2.
+A large bug-fix roll-up since v1.5.1 (~70 commits). The VMFS highlights below head
+the release: a block-resolution bug that made thick-provisioned / GPT Windows VMs
+read the wrong data over VMFS and silently extract **nothing** is fixed, VMFS mode
+reaches parity with the local-disk path (NTDS + DPAPI), partition detection handles
+GPT, and an NTDS column mix-up that mislabeled NT hashes is corrected (validated on
+real ESXi 8.0.2). The release also rolls up extensive earlier dev fixes across LSASS
+credential extraction — Kerberos, MSV, WDigest, credman and EPROCESS/x86 layout
+offsets for many Windows builds — plus QEMU/Hyper-V handling; see the full commit
+list in the release notes.
 
 ### New Features
 - **`--ls[=PATH]`** — read-only NTFS directory listing. Without a path, lists the root of every NTFS partition on the target; with a path given in equals form (e.g. `--ls='\Windows\System32'`) lists that directory. Works on local disk images and VMFS (`--vmfs-device [--vmdk]`), and falls back to an MFTMirr scan when the directory index is unreadable
