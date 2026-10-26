@@ -356,6 +356,15 @@ pub(crate) fn run_vmfs(
 
         vmfs_emit_dpapi(&mut disk, args, c);
     } else {
+        // A --partition offset is specific to one disk's partition table and is
+        // meaningless across the many differently-laid-out VMDKs an auto-scan visits.
+        // Require --vmdk so the offset applies to a single, explicit disk.
+        if args.partition.is_some() {
+            anyhow::bail!(
+                "--partition requires --vmdk: a partition offset applies to one disk, not an \
+                 auto-scan of all VMDKs. Select a disk with --vmdk (see --vmfs-list)."
+            );
+        }
         // Auto-scan mode: list all VMs and extract from each
         eprintln!(
             "{}[*] VMFS-6: Scanning all VMs on {}{}",
@@ -397,10 +406,8 @@ pub(crate) fn run_vmfs(
                     #[cfg(feature = "ntds.dit")]
                     if args.ntds {
                         println!("=== {vmdk_path} ===");
-                        match vmfs_emit_ntds(&mut disk, args, c) {
-                            Err(e) if args.partition.is_some() => return Err(e),
-                            Err(e) => eprintln!("[!] {vm_name}: {e:#}"),
-                            Ok(()) => {}
+                        if let Err(e) = vmfs_emit_ntds(&mut disk, args, c) {
+                            eprintln!("[!] {vm_name}: {e:#}");
                         }
                         continue;
                     }
@@ -439,7 +446,6 @@ pub(crate) fn run_vmfs(
                                 }
                             }
                         }
-                        Err(e) if args.partition.is_some() => return Err(e.into()),
                         Err(e) => {
                             eprintln!("[!] {vm_name}: {e}");
                         }
