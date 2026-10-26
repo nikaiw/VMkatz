@@ -18,6 +18,11 @@ pub struct NtdsContext {
     pub boot_key: [u8; 16],
 }
 
+/// datatable column holding unicodePwd (the NT hash). Matches impacket's NTHASH.
+const COL_UNICODE_PWD: &str = "ATTk589914";
+/// datatable column holding dBCSPwd (the LM hash; empty on modern AD).
+const COL_DBCS_PWD: &str = "ATTk589879";
+
 /// A single AD NTLM hash entry extracted from NTDS.
 #[derive(Debug, Clone)]
 pub struct AdHashEntry {
@@ -75,8 +80,8 @@ pub fn extract_ad_hashes(
     // Find relevant column names (AD attribute IDs)
     // The NTDS.dit datatable uses column names like:
     //   ATTm590045 = sAMAccountName
-    //   ATTk589879 = unicodePwd (NT hash, encrypted)
-    //   ATTk589914 = dBCSPwd (LM hash, encrypted)
+    //   ATTk589914 = unicodePwd (NT hash, encrypted)
+    //   ATTk589879 = dBCSPwd (LM hash, encrypted)
     //   ATTr589970 = objectSid
     //   ATTj589832 = userAccountControl
     //   ATTk590689 = pekList (Password Encryption Key)
@@ -111,18 +116,18 @@ pub fn extract_ad_hashes(
             .unwrap_or(0);
 
         // Read encrypted NT hash (unicodePwd) and LM hash (dBCSPwd)
-        let nt_raw = read_col("ATTk589879")
+        let nt_raw = read_col(COL_UNICODE_PWD)
             .and_then(|data| decrypt_ad_hash(&data, &pek, rid).ok())
             .unwrap_or([0u8; 16]);
 
-        let lm_raw = read_col("ATTk589914")
+        let lm_raw = read_col(COL_DBCS_PWD)
             .and_then(|data| decrypt_ad_hash(&data, &pek, rid).ok())
             .unwrap_or([0u8; 16]);
 
         let zero = [0u8; 16];
 
-        // Columns map directly per the AD schema: unicodePwd (ATTk589879) is the
-        // NT hash, dBCSPwd (ATTk589914) is the LM hash. Never relabel dBCSPwd as
+        // Columns map directly per the AD schema: unicodePwd (ATTk589914) is the
+        // NT hash, dBCSPwd (ATTk589879) is the LM hash. Never relabel dBCSPwd as
         // NT when unicodePwd is empty — that emits a bogus, unusable NT hash
         // (impacket keeps them in their own columns too).
         let nt_hash = nt_raw;
@@ -505,4 +510,18 @@ fn extract_rid_from_sid(sid: &[u8]) -> Option<u32> {
     let rid_le = u32::from_le_bytes(rid_bytes);
     let rid_be = u32::from_be_bytes(rid_bytes);
     Some(rid_le.min(rid_be))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nt_and_lm_columns_match_ad_schema() {
+        // Regression: these were swapped, so the real NT hash was printed as LM
+        // and NT came out all-zero (modern AD leaves dBCSPwd empty).
+        // Reference: impacket secretsdump NTDS.NAME_TO_INTERNAL.
+        assert_eq!(COL_UNICODE_PWD, "ATTk589914");
+        assert_eq!(COL_DBCS_PWD, "ATTk589879");
+    }
 }
