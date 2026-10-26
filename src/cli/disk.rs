@@ -58,6 +58,73 @@ use super::output::{
     print_ntds_brief, print_ntds_csv, print_ntds_hashcat, print_ntds_ntlm, print_ntds_text,
 };
 
+/// Format a byte count with binary units (B/KiB/MiB/GiB/TiB).
+#[cfg(feature = "sam")]
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < units.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.1} {}", units[i])
+}
+
+/// One listing line: `<DIR>` marker or right-aligned size, then the name.
+#[cfg(feature = "sam")]
+fn format_entry(e: &vmkatz::fs::DirEntry) -> String {
+    match e.kind {
+        vmkatz::fs::EntryKind::Dir => format!("{:>10}  {}", "<DIR>", e.name),
+        vmkatz::fs::EntryKind::File { size } => format!("{:>10}  {}", human_size(size), e.name),
+    }
+}
+
+/// List `path` on each selected NTFS partition of `reader`.
+#[cfg(feature = "sam")]
+pub(crate) fn run_ls<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    path: &str,
+    partition: Option<u64>,
+) -> anyhow::Result<()> {
+    use vmkatz::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};
+    use vmkatz::sam::{ListOutcome, list_path};
+
+    let offsets = select_partition(find_ntfs_partitions(reader)?, partition)?;
+    for off in offsets {
+        if is_bitlocker_partition(reader, off) {
+            println!("[partition @ {off:#x}, BitLocker] skipped: encrypted volume");
+            continue;
+        }
+        match list_path(reader, off, path)? {
+            ListOutcome::Listed { entries, degraded } => {
+                let note = if degraded { " (degraded: MFTMirr)" } else { "" };
+                println!("[partition @ {off:#x}, NTFS]{note}");
+                if entries.is_empty() {
+                    println!("(empty)");
+                }
+                for e in &entries {
+                    println!("{}", format_entry(e));
+                }
+            }
+            ListOutcome::PathNotFound => {
+                println!("[partition @ {off:#x}, NTFS]");
+                println!("path not found: {path}");
+            }
+            ListOutcome::PathUnresolvableDegraded => {
+                println!("[partition @ {off:#x}, NTFS] (degraded: MFTMirr)");
+                println!(
+                    "path cannot be resolved: NTFS index unusable and fallback scan could not locate it: {path}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Quick check for MBR partition type 0x07 (NTFS/HPFS) in first sector.
 #[cfg(feature = "vmfs")]
 fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool {
@@ -165,8 +232,12 @@ pub(crate) fn run_vmfs(
             c.reset
         );
 
+        if let Some(ref ls_path) = args.ls {
+            return run_ls(&mut disk, ls_path, args.partition);
+        }
+
         // Extract secrets via the standard pipeline
-        match vmkatz::sam::extract_secrets_from_reader(&mut disk) {
+        match vmkatz::sam::extract_secrets_from_reader_scoped(&mut disk, args.partition) {
             Ok(secrets) => {
                 match args.format.as_str() {
                     "ntlm" => print_sam_ntlm(&secrets.sam_entries),
@@ -246,8 +317,15 @@ pub(crate) fn run_vmfs(
                         eprintln!("[-] {vm_name}: no NTFS partitions, skipping");
                         continue;
                     }
+                    if let Some(ref ls_path) = args.ls {
+                        println!("=== {vmdk_path} ===");
+                        if let Err(e) = run_ls(&mut disk, ls_path, args.partition) {
+                            eprintln!("[!] {vm_name}: {e}");
+                        }
+                        continue;
+                    }
                     // Use NTFS-only extraction (no raw fallback scans) for batch mode
-                    match vmkatz::sam::extract_secrets_ntfs_only(&mut disk) {
+                    match vmkatz::sam::extract_secrets_ntfs_only_scoped(&mut disk, args.partition) {
                         Ok(secrets) => {
                             if !secrets.sam_entries.is_empty() {
                                 eprintln!(
@@ -313,7 +391,7 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     let mut found_anything = false;
 
     // SAM/LSA extraction — non-fatal so DPAPI masterkey scan can still proceed
-    match vmkatz::sam::extract_disk_secrets(input_path) {
+    match vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition) {
         Ok(secrets) => {
             found_anything = true;
 
@@ -397,7 +475,7 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
         eprintln!("[*] NTDS extraction from: {}", input_path.display());
     }
 
-    let artifacts = vmkatz::sam::extract_ntds_artifacts(input_path)
+    let artifacts = vmkatz::sam::extract_ntds_artifacts_scoped(input_path, args.partition)
         .context("NTDS artifact extraction failed")?;
     let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
         .context("NTDS context validation failed")?;
@@ -1166,4 +1244,42 @@ pub(crate) fn run_recursive(root: &Path, args: &Args) -> anyhow::Result<()> {
 
     eprintln!("\n[*] Recursive scan complete: {success} processed, {errors} errors");
     Ok(())
+}
+
+#[cfg(all(test, feature = "sam"))]
+mod ls_tests {
+    use super::{format_entry, human_size};
+    use vmkatz::fs::{DirEntry, EntryKind};
+
+    #[test]
+    fn human_size_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(4096), "4.0 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
+
+    #[test]
+    fn format_entry_dir_vs_file() {
+        let d = format_entry(&DirEntry {
+            name: "Windows".into(),
+            kind: EntryKind::Dir,
+        });
+        assert!(d.contains("<DIR>") && d.contains("Windows"));
+        let f = format_entry(&DirEntry {
+            name: "a.txt".into(),
+            kind: EntryKind::File { size: 4096 },
+        });
+        assert!(f.contains("4.0 KiB") && f.contains("a.txt") && !f.contains("<DIR>"));
+    }
+
+    #[test]
+    fn run_ls_lists_root_when_fixture_present() {
+        let p = std::path::Path::new("/tmp/test.qcow2");
+        if !p.exists() {
+            eprintln!("SKIP run_ls_lists_root_when_fixture_present: /tmp/test.qcow2 absent");
+            return;
+        }
+        let mut disk = vmkatz::disk::open_disk(p).unwrap();
+        super::run_ls(&mut disk, "", None).unwrap();
+    }
 }

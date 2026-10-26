@@ -219,6 +219,10 @@ fn vmkatz_main() -> anyhow::Result<()> {
         #[cfg(not(feature = "ntds.dit"))]
         let sam_mode = (args.sam || is_disk_ext || is_block_device) && !is_memory_snapshot;
         if sam_mode {
+            if let Some(ref ls_path) = args.ls {
+                let mut disk = vmkatz::disk::open_disk(input_path)?;
+                return cli::disk::run_ls(&mut disk, ls_path, args.partition);
+            }
             return run_sam(input_path, &args);
         }
     }

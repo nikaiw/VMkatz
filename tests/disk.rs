@@ -305,3 +305,19 @@ fn test_qcow2_scoped_partition_extraction() {
     );
     assert!(vmkatz::sam::extract_disk_secrets_scoped(path, Some(0xDEAD_BEEF)).is_err());
 }
+
+/// `run_ls` lives in the binary crate (not importable here), so this exercises
+/// the library path it wraps: partition discovery + `list_path` on the root.
+#[test]
+fn test_cli_ls_lists_root() {
+    let path = Path::new("/tmp/test.qcow2");
+    if !path.exists() {
+        eprintln!("SKIP test_cli_ls_lists_root: /tmp/test.qcow2 absent");
+        return;
+    }
+    let mut disk = vmkatz::disk::open_disk(path).expect("open");
+    let parts = vmkatz::fs::find_ntfs_partitions(&mut disk).expect("partitions");
+    assert!(!parts.is_empty());
+    let out = vmkatz::sam::list_path(&mut disk, parts[0], "").expect("list");
+    assert!(matches!(out, vmkatz::sam::ListOutcome::Listed { .. }));
+}

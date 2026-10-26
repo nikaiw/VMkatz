@@ -68,6 +68,16 @@ pub(crate) struct Args {
     #[arg(long, value_name = "DISK_IMAGE")]
     pub(crate) disk: Option<String>,
 
+    /// List a directory on the NTFS partition(s) of a disk image (default: root)
+    #[cfg(feature = "sam")]
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub(crate) ls: Option<String>,
+
+    /// Restrict --ls and extraction to the NTFS partition at this byte offset (decimal or 0x hex)
+    #[cfg(feature = "sam")]
+    #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
+    pub(crate) partition: Option<u64>,
+
     /// Dump a process's virtual memory as minidump (.dmp) file
     #[cfg(feature = "dump")]
     #[arg(long, value_name = "PROCESS_NAME")]
@@ -354,4 +364,27 @@ pub(crate) fn parse_chrome_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])>
         out.push((sid.to_string(), nt_hash));
     }
     out
+}
+
+/// Parse a byte offset given as decimal or `0x`-prefixed hex.
+#[cfg(feature = "sam")]
+pub(crate) fn parse_offset(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let r = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => t.parse::<u64>(),
+    };
+    r.map_err(|e| format!("invalid offset '{s}': {e}"))
+}
+
+#[cfg(all(test, feature = "sam"))]
+mod offset_tests {
+    use super::parse_offset;
+
+    #[test]
+    fn parse_offset_hex_and_decimal() {
+        assert_eq!(parse_offset("0x100000"), Ok(1048576));
+        assert_eq!(parse_offset("1048576"), Ok(1048576));
+        assert!(parse_offset("zzz").is_err());
+    }
 }
