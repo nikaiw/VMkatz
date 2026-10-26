@@ -281,6 +281,7 @@ pub(crate) fn run_vmfs(
                     }
                 }
             }
+            Err(e) if args.partition.is_some() => return Err(e.into()),
             Err(e) => {
                 eprintln!("[!] Extraction failed for {vmdk}: {e}");
             }
@@ -359,6 +360,7 @@ pub(crate) fn run_vmfs(
                                 }
                             }
                         }
+                        Err(e) if args.partition.is_some() => return Err(e.into()),
                         Err(e) => {
                             eprintln!("[!] {vm_name}: {e}");
                         }
@@ -422,6 +424,7 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
                 }
             }
         }
+        Err(e) if args.partition.is_some() => return Err(e.into()),
         Err(e) => {
             eprintln!("[!] SAM extraction failed: {e}");
         }
