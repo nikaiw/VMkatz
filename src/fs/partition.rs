@@ -119,7 +119,8 @@ fn is_ntfs_vbr<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
         && &vbr[3..11] == b"NTFS    "
 }
 
-/// Parse GPT partition table and find NTFS partitions (Basic Data GUID or NTFS VBR).
+/// Parse GPT partition table and find NTFS partitions. A valid NTFS VBR is required
+/// for every accepted offset (the partition type GUID is not used for acceptance).
 fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     const MAX_ENTRIES: u32 = 256;
 

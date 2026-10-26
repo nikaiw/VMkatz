@@ -210,7 +210,11 @@ pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
 }
 
 /// Print DPAPI master key hashes found on a VMFS-backed disk (same formats as `run_sam`).
-fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(disk: &mut R, args: &Args, c: &super::args::Colors) {
+fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
+    disk: &mut R,
+    args: &Args,
+    c: &super::args::Colors,
+) {
     let hashes = vmkatz::sam::extract_dpapi_masterkeys_from_reader(disk, args.partition);
     let hashes = dedup_dpapi_hashes(hashes, args.all);
     if !hashes.is_empty() {
