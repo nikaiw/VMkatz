@@ -321,3 +321,29 @@ fn test_cli_ls_lists_root() {
     let out = vmkatz::sam::list_path(&mut disk, parts[0], "").expect("list");
     assert!(matches!(out, vmkatz::sam::ListOutcome::Listed { .. }));
 }
+
+#[test]
+fn dpapi_from_reader_matches_path() {
+    let path = Path::new("/tmp/test.qcow2");
+    if !path.exists() {
+        eprintln!("SKIP dpapi_from_reader_matches_path: /tmp/test.qcow2 absent");
+        return;
+    }
+    let by_path = vmkatz::sam::extract_dpapi_masterkeys(path);
+    let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");
+    let by_reader = vmkatz::sam::extract_dpapi_masterkeys_from_reader(&mut disk, None);
+    assert_eq!(by_path.len(), by_reader.len());
+    let guids = |v: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]| {
+        let mut g: Vec<String> = v.iter().map(|h| h.guid.clone()).collect();
+        g.sort();
+        g
+    };
+    assert_eq!(guids(&by_path), guids(&by_reader));
+
+    // Scoped to a real partition: must be a subset of the unscoped result.
+    let parts = vmkatz::fs::find_ntfs_partitions(&mut disk).unwrap_or_default();
+    if let Some(&off) = parts.first() {
+        let scoped = vmkatz::sam::extract_dpapi_masterkeys_from_reader(&mut disk, Some(off));
+        assert!(scoped.len() <= by_reader.len());
+    }
+}

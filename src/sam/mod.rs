@@ -80,6 +80,15 @@ pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMaster
     }
 }
 
+/// Reader-based DPAPI master key extraction, optionally scoped to one NTFS
+/// partition offset. Usable by VMFS mode, which has a reader but no path.
+pub fn extract_dpapi_masterkeys_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    partition_filter: Option<u64>,
+) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
+    dpapi_masterkey::extract_from_disk_scoped(reader, partition_filter)
+}
+
 /// Extract NTDS artifacts (NTDS.dit + SYSTEM hive) from a disk image.
 ///
 /// This is the input set required by offline AD secrets extraction workflows.

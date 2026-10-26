@@ -812,7 +812,22 @@ fn is_guid_filename(name: &str) -> bool {
 
 /// High-level extraction: scan all NTFS partitions on a disk for DPAPI master key files.
 pub fn extract_from_disk<R: Read + Seek>(reader: &mut R) -> Vec<DpapiMasterKeyHash> {
-    let partitions = super::find_ntfs_partitions(reader).unwrap_or_default();
+    extract_from_disk_scoped(reader, None)
+}
+
+/// Like [`extract_from_disk`], restricted to the NTFS partition at `partition_filter`.
+///
+/// An offset that matches no NTFS partition yields an empty result (callers that
+/// need a hard error validate the offset beforehand).
+pub fn extract_from_disk_scoped<R: Read + Seek>(
+    reader: &mut R,
+    partition_filter: Option<u64>,
+) -> Vec<DpapiMasterKeyHash> {
+    let partitions = crate::fs::select_partition(
+        super::find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )
+    .unwrap_or_default();
     let mut results = Vec::new();
 
     for &offset in &partitions {
