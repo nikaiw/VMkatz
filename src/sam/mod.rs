@@ -143,7 +143,10 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
+    let partitions = select_partition(
+        find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )?;
 
     for &partition_offset in &partitions {
         // Try unencrypted first
@@ -192,7 +195,10 @@ fn extract_ntds_with_bitlocker<R: Read + Seek>(
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
     partition_filter: Option<u64>,
 ) -> Result<NtdsArtifacts> {
-    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
+    let partitions = select_partition(
+        find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )?;
 
     for &partition_offset in &partitions {
         if !is_bitlocker_partition(reader, partition_offset) {
@@ -319,6 +325,7 @@ pub fn extract_disk_secrets_scoped(
     let mut disk = crate::disk::open_disk(path)?;
     match extract_secrets_from_reader_scoped(&mut disk, partition_filter) {
         Ok(secrets) => return Ok(secrets),
+        Err(e) if partition_filter.is_some() => return Err(e),
         Err(e) => {
             log::info!("Standard extraction failed: {e}");
         }
@@ -367,7 +374,10 @@ pub fn extract_secrets_ntfs_only_scoped<R: Read + Seek>(
     reader: &mut R,
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
+    let partitions = select_partition(
+        find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )?;
     let mut bitlocker_found = false;
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
@@ -406,7 +416,10 @@ pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
     reader: &mut R,
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
+    let partitions = select_partition(
+        find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )?;
     let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {
@@ -480,7 +493,10 @@ pub fn extract_ntds_artifacts_from_reader_scoped<R: Read + Seek>(
     reader: &mut R,
     partition_filter: Option<u64>,
 ) -> Result<NtdsArtifacts> {
-    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
+    let partitions = select_partition(
+        find_ntfs_partitions(reader).unwrap_or_default(),
+        partition_filter,
+    )?;
     let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {

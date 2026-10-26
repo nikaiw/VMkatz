@@ -203,4 +203,11 @@ mod tests {
         assert!(msg.contains("100000"), "{msg}");
         assert!(msg.contains("6400000"), "{msg}");
     }
+
+    #[test]
+    fn select_partition_rejects_when_no_partitions() {
+        let err = select_partition(vec![], Some(0x100000)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("0x100000") && msg.contains("none"), "{msg}");
+    }
 }
