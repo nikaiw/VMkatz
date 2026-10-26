@@ -99,7 +99,14 @@ pub(crate) fn run_ls<R: std::io::Read + std::io::Seek>(
             println!("[partition @ {off:#x}, BitLocker] skipped: encrypted volume");
             continue;
         }
-        match list_path(reader, off, path)? {
+        let outcome = match list_path(reader, off, path) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("[partition @ {off:#x}] listing failed: {e}");
+                continue;
+            }
+        };
+        match outcome {
             ListOutcome::Listed { entries, degraded } => {
                 let note = if degraded { " (degraded: MFTMirr)" } else { "" };
                 println!("[partition @ {off:#x}, NTFS]{note}");

@@ -38,7 +38,7 @@ use clap::Parser;
         vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
         vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
         vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
-        vmkatz --ls '\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
+        vmkatz --ls='\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
         vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \
         vmkatz --vmfs-device /dev/sdb --vmdk 'DC01/DC01-flat.vmdk' --ls   List from VMFS\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
@@ -74,7 +74,7 @@ pub(crate) struct Args {
 
     /// List a directory on the NTFS partition(s) of a disk image (default: root)
     #[cfg(feature = "sam")]
-    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub(crate) ls: Option<String>,
 
     /// Restrict --ls and extraction to the NTFS partition at this byte offset (decimal or 0x hex)

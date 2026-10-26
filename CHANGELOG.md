@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### New Features
-- **`--ls [PATH]`** — read-only NTFS directory listing. Without a path, lists the root of every NTFS partition on the target; with a path (e.g. `'\Windows\System32'`) lists that directory. Works on local disk images and VMFS (`--vmfs-device [--vmdk]`), and falls back to an MFTMirr scan when the directory index is unreadable
+- **`--ls[=PATH]`** — read-only NTFS directory listing. Without a path, lists the root of every NTFS partition on the target; with a path given in equals form (e.g. `--ls='\Windows\System32'`) lists that directory. Works on local disk images and VMFS (`--vmfs-device [--vmdk]`), and falls back to an MFTMirr scan when the directory index is unreadable
 - **`--partition <OFFSET>`** — restrict any operation to a single partition by byte offset (hex `0x...` or decimal, as shown in logs and `--ls` headers)
 
 ### Fixes
