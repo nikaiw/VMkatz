@@ -1,6 +1,31 @@
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::error::Result;
+use crate::error::{Result, VmkatzError};
+
+/// Restrict a list of partition offsets to a single requested one.
+///
+/// `None` returns `parts` unchanged. `Some(off)` returns `vec![off]` if present,
+/// otherwise a `DiskFormatError` naming the request and the available offsets.
+pub fn select_partition(parts: Vec<u64>, wanted: Option<u64>) -> Result<Vec<u64>> {
+    let Some(off) = wanted else {
+        return Ok(parts);
+    };
+    if parts.contains(&off) {
+        return Ok(vec![off]);
+    }
+    let avail = if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts
+            .iter()
+            .map(|p| format!("0x{p:x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(VmkatzError::DiskFormatError(format!(
+        "partition at offset 0x{off:x} not found; available NTFS partition offsets: {avail}"
+    )))
+}
 
 /// BitLocker OEM ID found at offset +3 in the volume boot record.
 const BITLOCKER_OEM_ID: &[u8; 8] = b"-FVE-FS-";
@@ -145,4 +170,37 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     }
 
     Ok(partitions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_partition_passthrough_when_none() {
+        let parts = vec![0x100000, 0x6400000];
+        assert_eq!(select_partition(parts.clone(), None).unwrap(), parts);
+    }
+
+    #[test]
+    fn select_partition_keeps_only_match() {
+        let parts = vec![0x100000, 0x6400000];
+        assert_eq!(
+            select_partition(parts.clone(), Some(0x100000)).unwrap(),
+            vec![0x100000]
+        );
+        assert_eq!(
+            select_partition(parts, Some(1048576)).unwrap(),
+            vec![0x100000]
+        );
+    }
+
+    #[test]
+    fn select_partition_rejects_unknown() {
+        let err = select_partition(vec![0x100000, 0x6400000], Some(0xDEAD_BEEF)).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("deadbeef"), "{msg}");
+        assert!(msg.contains("100000"), "{msg}");
+        assert!(msg.contains("6400000"), "{msg}");
+    }
 }

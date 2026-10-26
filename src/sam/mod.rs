@@ -17,7 +17,7 @@ pub mod aes_xts;
 pub mod bitlocker_decrypt;
 pub mod dpapi_masterkey;
 
-use crate::fs::{find_ntfs_partitions, is_bitlocker_partition};
+use crate::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -84,8 +84,16 @@ pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMaster
 ///
 /// This is the input set required by offline AD secrets extraction workflows.
 pub fn extract_ntds_artifacts(path: &Path) -> Result<NtdsArtifacts> {
+    extract_ntds_artifacts_scoped(path, None)
+}
+
+/// Like [`extract_ntds_artifacts`], restricted to the NTFS partition at `partition_filter`.
+pub fn extract_ntds_artifacts_scoped(
+    path: &Path,
+    partition_filter: Option<u64>,
+) -> Result<NtdsArtifacts> {
     let mut disk = crate::disk::open_disk(path)?;
-    extract_ntds_artifacts_from_reader(&mut disk)
+    extract_ntds_artifacts_from_reader_scoped(&mut disk, partition_filter)
 }
 
 /// Extract secrets from a disk, trying FVEK keys for BitLocker partitions.
@@ -98,8 +106,17 @@ pub fn extract_disk_secrets_with_bitlocker(
     path: &Path,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
 ) -> Result<DiskSecrets> {
+    extract_disk_secrets_with_bitlocker_scoped(path, fvek_keys, None)
+}
+
+/// Like [`extract_disk_secrets_with_bitlocker`], restricted to one partition offset.
+pub fn extract_disk_secrets_with_bitlocker_scoped(
+    path: &Path,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
+) -> Result<DiskSecrets> {
     let mut disk = crate::disk::open_disk(path)?;
-    extract_secrets_with_bitlocker(&mut disk, fvek_keys)
+    extract_secrets_with_bitlocker(&mut disk, fvek_keys, partition_filter)
 }
 
 /// Extract NTDS artifacts from a disk, trying FVEK keys for BitLocker partitions.
@@ -107,16 +124,26 @@ pub fn extract_ntds_artifacts_with_bitlocker(
     path: &Path,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
 ) -> Result<NtdsArtifacts> {
+    extract_ntds_artifacts_with_bitlocker_scoped(path, fvek_keys, None)
+}
+
+/// Like [`extract_ntds_artifacts_with_bitlocker`], restricted to one partition offset.
+pub fn extract_ntds_artifacts_with_bitlocker_scoped(
+    path: &Path,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
+) -> Result<NtdsArtifacts> {
     let mut disk = crate::disk::open_disk(path)?;
-    extract_ntds_with_bitlocker(&mut disk, fvek_keys)
+    extract_ntds_with_bitlocker(&mut disk, fvek_keys, partition_filter)
 }
 
 /// Core BitLocker-aware extraction for SAM/LSA secrets.
 fn extract_secrets_with_bitlocker<R: Read + Seek>(
     reader: &mut R,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
 
     for &partition_offset in &partitions {
         // Try unencrypted first
@@ -163,8 +190,9 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
 fn extract_ntds_with_bitlocker<R: Read + Seek>(
     reader: &mut R,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
 ) -> Result<NtdsArtifacts> {
-    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
 
     for &partition_offset in &partitions {
         if !is_bitlocker_partition(reader, partition_offset) {
@@ -279,8 +307,17 @@ where
 
 /// Extract both SAM hashes and LSA secrets from a disk image.
 pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
+    extract_disk_secrets_scoped(path, None)
+}
+
+/// Like [`extract_disk_secrets`], restricted to the NTFS partition at `partition_filter`.
+/// When a filter is set, all whole-disk fallbacks are disabled.
+pub fn extract_disk_secrets_scoped(
+    path: &Path,
+    partition_filter: Option<u64>,
+) -> Result<DiskSecrets> {
     let mut disk = crate::disk::open_disk(path)?;
-    match extract_secrets_from_reader(&mut disk) {
+    match extract_secrets_from_reader_scoped(&mut disk, partition_filter) {
         Ok(secrets) => return Ok(secrets),
         Err(e) => {
             log::info!("Standard extraction failed: {e}");
@@ -295,7 +332,7 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if ext == "vmdk" {
+    if ext == "vmdk" && partition_filter.is_none() {
         log::info!("Trying VMDK grain-direct scan for registry hives");
         let mut vmdk = crate::disk::vmdk::VmdkDisk::open(path)?;
         match vmdk_scan::scan_vmdk_grains_for_hives(&mut vmdk) {
@@ -322,7 +359,15 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
 /// Extract SAM hashes via NTFS partitions only (no fallback raw scans).
 /// Faster for batch scanning where most VMDKs are sparse or non-Windows.
 pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
-    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    extract_secrets_ntfs_only_scoped(reader, None)
+}
+
+/// Like [`extract_secrets_ntfs_only`], restricted to one partition offset.
+pub fn extract_secrets_ntfs_only_scoped<R: Read + Seek>(
+    reader: &mut R,
+    partition_filter: Option<u64>,
+) -> Result<DiskSecrets> {
+    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
     let mut bitlocker_found = false;
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
@@ -352,7 +397,16 @@ pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskS
 
 /// Extract SAM hashes + LSA secrets from any Read+Seek source.
 pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
-    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    extract_secrets_from_reader_scoped(reader, None)
+}
+
+/// Like [`extract_secrets_from_reader`], restricted to one partition offset.
+/// When a filter is set, the raw regf/hbin whole-disk fallbacks are skipped.
+pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
+    reader: &mut R,
+    partition_filter: Option<u64>,
+) -> Result<DiskSecrets> {
+    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
     let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {
@@ -370,6 +424,18 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
                 log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
         }
+    }
+
+    if partition_filter.is_some() {
+        return Err(if bitlocker_found {
+            crate::error::VmkatzError::DecryptionError(
+                "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
+            )
+        } else {
+            crate::error::VmkatzError::DecryptionError(
+                "No registry hives found on the selected NTFS partition".to_string(),
+            )
+        });
     }
 
     // Fallback 1: scan raw disk for "regf" hive signatures (contiguous hives).
@@ -406,7 +472,15 @@ pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Dis
 
 /// Extract NTDS artifacts from any Read+Seek source.
 pub fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
-    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    extract_ntds_artifacts_from_reader_scoped(reader, None)
+}
+
+/// Like [`extract_ntds_artifacts_from_reader`], restricted to one partition offset.
+pub fn extract_ntds_artifacts_from_reader_scoped<R: Read + Seek>(
+    reader: &mut R,
+    partition_filter: Option<u64>,
+) -> Result<NtdsArtifacts> {
+    let partitions = select_partition(find_ntfs_partitions(reader).unwrap_or_default(), partition_filter)?;
     let mut bitlocker_found = false;
 
     for &partition_offset in &partitions {

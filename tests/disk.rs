@@ -289,3 +289,19 @@ fn test_list_path_healthy_root() {
         list_path(&mut disk, 0x100000, "\\Windows").unwrap()
     );
 }
+
+#[test]
+fn test_qcow2_scoped_partition_extraction() {
+    let path = Path::new("/tmp/test.qcow2");
+    if !path.exists() {
+        eprintln!("SKIP test_qcow2_scoped_partition_extraction: /tmp/test.qcow2 not present");
+        return;
+    }
+    let secrets = vmkatz::sam::extract_disk_secrets_scoped(path, Some(0x100000))
+        .expect("scoped SAM extraction failed");
+    assert!(
+        secrets.sam_entries.iter().any(|e| e.rid == 500),
+        "Administrator account not found"
+    );
+    assert!(vmkatz::sam::extract_disk_secrets_scoped(path, Some(0xDEAD_BEEF)).is_err());
+}
