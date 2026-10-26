@@ -442,6 +442,11 @@ fn looks_like_iv(candidate: &[u8]) -> bool {
     }
     // Pointer-shaped qword: heap address with canonical-form high bits and
     // 8-byte alignment.
+    // Canonical-form, 8-byte-aligned heap/stack address. Alignment IS required:
+    // dropping it rejected too much — a random IV qword that happens to look
+    // like an unaligned canonical pointer was discarded, breaking data_fallback
+    // on Win8.0. The adjacent-pointer-pair case (Win7) is caught by the
+    // structured-data check below, not by flagging unaligned pointers here.
     let looks_like_ptr =
         |q: u64| -> bool { q > 0x10000 && (q >> 48 == 0 || q >> 48 == 0xFFFF) && q & 0x7 == 0 };
     let v0 = super::types::read_u64_le(candidate, 0).unwrap_or(0);
@@ -1051,7 +1056,12 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
             if let Ok(iv_addr) = patterns::resolve_rip_relative(vmem, pattern_addr, offsets.iv_disp)
             {
                 if let Ok(iv_data) = vmem.read_virt_bytes(iv_addr, 16) {
-                    if iv_data.len() == 16 && iv_data.iter().any(|&b| b != 0) {
+                    // Gate on looks_like_iv, not merely non-zero: a mismatched
+                    // offset set reads a displacement from mid-instruction and
+                    // resolves to arbitrary readable bytes. Requiring an
+                    // IV-shaped value lets the correct set (Win7: iv_disp 59)
+                    // win over earlier sets that resolve to code/pointers.
+                    if iv_data.len() == 16 && looks_like_iv(&iv_data) {
                         log::info!(
                             "Physical scan: IV at 0x{:x}: {}",
                             iv_addr,
@@ -1079,18 +1089,12 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
                     if candidate.iter().all(|&b| b == 0) {
                         continue;
                     }
-                    let val = super::types::read_u64_le(candidate, 0).unwrap_or(0);
-                    if val > 0x10000 && (val >> 48 == 0 || val >> 48 == 0xFFFF) && val & 0x7 == 0 {
-                        continue; // looks like a pointer
-                    }
-                    let val2 = super::types::read_u64_le(candidate, 8).unwrap_or(0);
-                    if val2 > 0x10000
-                        && (val2 >> 48 == 0 || val2 >> 48 == 0xFFFF)
-                        && val2 & 0x7 == 0
-                    {
-                        continue;
-                    }
-                    if count_unique_bytes(candidate) < 4 {
+                    // Reject pointer pairs, UTF-16 strings and low-entropy data.
+                    // The inline aligned-pointer test used here before missed
+                    // unaligned pointers: on Win7-x64 two adjacent 0x00007ffe…
+                    // pointers ending in non-8-aligned bytes were taken as the
+                    // IV, corrupting the first 3DES-CBC block of every credential.
+                    if !looks_like_iv(candidate) {
                         continue;
                     }
                     log::info!(

@@ -11,7 +11,29 @@ use crate::windows::peb::{self, LoadedModule};
 use crate::windows::process::Process;
 
 /// KUSER_SHARED_DATA.NtBuildNumber (mapped at 0x7FFE0000 in all user processes).
+/// This field only exists on Win10+; on Win7/8 offset 0x260 is reserved and reads 0.
 const KUSER_NT_BUILD_NUMBER: u64 = 0x7FFE_0260;
+
+/// `_PEB.OSBuildNumber` (USHORT) — present on every Windows version, used as the
+/// cross-version build source when KUSER_SHARED_DATA.NtBuildNumber reads 0 (Win7/8).
+const PEB_OS_BUILD_NUMBER_X64: u64 = 0x120;
+const PEB_OS_BUILD_NUMBER_X86: u64 = 0x0AC;
+
+/// Read the Windows build number, preferring KUSER_SHARED_DATA.NtBuildNumber and
+/// falling back to `_PEB.OSBuildNumber` on builds (Win7/8) that lack the KUSER field.
+fn read_build_number(vmem: &dyn VirtualMemory, peb_vaddr: u64, arch: Arch) -> u32 {
+    let kuser = vmem.read_virt_u32(KUSER_NT_BUILD_NUMBER).unwrap_or(0) & 0xFFFF;
+    if kuser != 0 {
+        return kuser;
+    }
+    let off = match arch {
+        Arch::X64 => PEB_OS_BUILD_NUMBER_X64,
+        Arch::X86 => PEB_OS_BUILD_NUMBER_X86,
+    };
+    let peb_build = vmem.read_virt_u16(peb_vaddr + off).map_or(0, u32::from);
+    log::info!("KUSER NtBuildNumber=0 (pre-Win10); _PEB.OSBuildNumber={peb_build}");
+    peb_build
+}
 
 /// Status of an SSP provider extraction attempt.
 #[derive(Clone, Copy, PartialEq)]
@@ -653,10 +675,8 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
         VmkatzError::ProcessNotFound("lsasrv.dll not found in x86 LSASS".to_string())
     })?;
 
-    // Read Windows build number from KUSER_SHARED_DATA (0x7FFE0000 on x86 too)
-    let build_number = vmem
-        .read_virt_u32(KUSER_NT_BUILD_NUMBER)
-        .map_or(0, |v| v & 0xFFFF);
+    // Build number: KUSER_SHARED_DATA.NtBuildNumber, or _PEB.OSBuildNumber on Win7/8.
+    let build_number = read_build_number(&vmem, lsass.peb_vaddr, Arch::X86);
     log::info!("Windows x86 build number: {build_number}");
 
     // Extract Vista+ crypto keys (AES/3DES) — same algorithm, x86 patterns
@@ -863,10 +883,8 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         .lsasrv
         .ok_or_else(|| VmkatzError::ProcessNotFound("lsasrv.dll not found in LSASS".to_string()))?;
 
-    // Read Windows build number from KUSER_SHARED_DATA (always at VA 0x7FFE0000)
-    let build_number = lsass_vmem
-        .read_virt_u32(KUSER_NT_BUILD_NUMBER)
-        .map_or(0, |v| v & 0xFFFF); // Low 16 bits = build number
+    // Build number: KUSER_SHARED_DATA.NtBuildNumber, or _PEB.OSBuildNumber on Win7/8.
+    let build_number = read_build_number(&lsass_vmem, lsass.peb_vaddr, Arch::X64);
     log::info!("Windows build number: {build_number}");
 
     let keys = match crypto::extract_crypto_keys(&lsass_vmem, lsasrv.base, lsasrv.size) {
