@@ -556,6 +556,20 @@ const fn addr_tbz(addr: u64) -> u8 {
     ((addr >> 7) & 0xFF) as u8
 }
 
+/// Offset of file block `block_num` within its containing Large File Block.
+/// An LFB spans `1 << sfb_to_lfb_shift` file blocks; all share one LFB address,
+/// so the sub-block offset is `(block_num % blocks_per_lfb) * file_block_size`.
+const fn lfb_intra_offset(sfb_to_lfb_shift: u16, file_block_size: u64, block_num: u64) -> u64 {
+    // sfb_to_lfb_shift is read from the untrusted superblock; guard the shift so a
+    // corrupt value cannot panic (`1u64 << >=64`). An implausible shift ⇒ no offset.
+    let shift = sfb_to_lfb_shift as u32;
+    if shift >= 64 {
+        return 0;
+    }
+    let blocks_per_lfb = 1u64 << shift;
+    (block_num % blocks_per_lfb) * file_block_size
+}
+
 // ── Directory Entry ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1503,7 +1517,7 @@ impl Vmfs6Volume {
             ZLA_FILE_BLOCK | ZLA_SUB_BLOCK => {
                 // Direct: blocks[block_num] is the block address
                 let addr = fd.blocks.get(block_num as usize).copied().unwrap_or(0);
-                Ok(self.resolve_block_addr(addr))
+                Ok(self.resolve_block_addr_at(addr, block_num))
             }
             ZLA_POINTER_BLOCK | ZLA_POINTER2_BLOCK => {
                 // Single indirect via PB or PB2
@@ -1539,7 +1553,7 @@ impl Vmfs6Volume {
                     log::debug!("  pb[{secondary}] = 0x{sfb_addr:x}");
                 }
 
-                Ok(self.resolve_block_addr(sfb_addr))
+                Ok(self.resolve_block_addr_at(sfb_addr, block_num))
             }
             ZLA_DOUBLE_INDIRECT => {
                 // Double indirect: blocks[i] → PB → PB → SFB
@@ -1562,7 +1576,7 @@ impl Vmfs6Volume {
 
                 let sfb_addr = self.read_pb_pointer(&pb2, tertiary);
 
-                Ok(self.resolve_block_addr(sfb_addr))
+                Ok(self.resolve_block_addr_at(sfb_addr, block_num))
             }
             _ => Ok(None),
         }
@@ -1616,6 +1630,27 @@ impl Vmfs6Volume {
                 );
                 None
             }
+        }
+    }
+
+    /// Resolve a block address to a volume offset, accounting for a file block's
+    /// position inside a Large File Block. A single LFB spans `1 << sfb_to_lfb_shift`
+    /// file blocks, and every file block in it shares the same LFB address; the file
+    /// `block_num` selects the sub-block within the LFB. Without this, all file blocks
+    /// of an LFB would map to the LFB's first file block (wrong data). SFB and other
+    /// address types map 1:1 and are returned unchanged.
+    fn resolve_block_addr_at(&self, addr: u64, block_num: u64) -> Option<u64> {
+        let vol = self.resolve_block_addr(addr)?;
+        if addr_type(addr) == ADDR_LFB {
+            Some(
+                vol + lfb_intra_offset(
+                    self.sb.sfb_to_lfb_shift,
+                    self.sb.file_block_size,
+                    block_num,
+                ),
+            )
+        } else {
+            Some(vol)
         }
     }
 
@@ -1747,7 +1782,7 @@ impl Vmfs6Volume {
                     if i >= total_blocks as usize {
                         break;
                     }
-                    if let Some(vol_off) = self.resolve_block_addr(addr) {
+                    if let Some(vol_off) = self.resolve_block_addr_at(addr, i as u64) {
                         if let Some(phys) = self.lvm.logical_to_physical(vol_off) {
                             block_map[i] = Some(phys);
                         }
@@ -1774,7 +1809,9 @@ impl Vmfs6Volume {
                         if sfb_addr == 0 {
                             continue;
                         }
-                        if let Some(vol_off) = self.resolve_block_addr(sfb_addr) {
+                        if let Some(vol_off) =
+                            self.resolve_block_addr_at(sfb_addr, (base_block + secondary) as u64)
+                        {
                             if let Some(phys) = self.lvm.logical_to_physical(vol_off) {
                                 block_map[base_block + secondary] = Some(phys);
                             }
@@ -1813,7 +1850,9 @@ impl Vmfs6Volume {
                             let sfb_addr = self.read_pb_pointer(&pb2, tertiary);
                             let block_idx = base + tertiary;
                             if block_idx < total_blocks as usize {
-                                if let Some(vol_off) = self.resolve_block_addr(sfb_addr) {
+                                if let Some(vol_off) =
+                                    self.resolve_block_addr_at(sfb_addr, block_idx as u64)
+                                {
                                     if let Some(phys) = self.lvm.logical_to_physical(vol_off) {
                                         block_map[block_idx] = Some(phys);
                                     }
@@ -2113,6 +2152,26 @@ fn read_vmfs_label(f: &mut File) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: a Large File Block spans `1 << sfb_to_lfb_shift` file blocks,
+    // all sharing one LFB address. Every file block in the LFB must get its own
+    // sub-block offset; previously they all mapped to the LFB base (file block 0),
+    // so e.g. a Windows partition starting mid-LFB read block 0's bytes instead.
+    // Confirmed on real hardware: a GPT Windows VMDK's NTFS VBR lived at
+    // lfb_base + 117 MiB (block 117, 1 MiB blocks, shift=9 → 512 blocks/LFB).
+    #[test]
+    fn lfb_intra_offset_selects_subblock_within_large_file_block() {
+        let fbs = 0x0010_0000u64; // 1 MiB file blocks
+        let shift = 9u16; // 512 file blocks per LFB
+        // Block 0 is at the LFB base.
+        assert_eq!(lfb_intra_offset(shift, fbs, 0), 0);
+        // Block 117 (the real NTFS-VBR case) is 117 MiB into the LFB.
+        assert_eq!(lfb_intra_offset(shift, fbs, 117), 117 * fbs);
+        // The first block of the next LFB wraps back to offset 0.
+        assert_eq!(lfb_intra_offset(shift, fbs, 512), 0);
+        // A block inside the second LFB maps to its in-LFB position.
+        assert_eq!(lfb_intra_offset(shift, fbs, 600), 88 * fbs);
+    }
 
     fn sb_with_md_alignment(md_alignment: u32) -> VmfsSuperblock {
         VmfsSuperblock {
