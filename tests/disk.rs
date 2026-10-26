@@ -42,6 +42,29 @@ fn test_qcow2_sam_extraction() {
 }
 
 #[test]
+fn test_list_directory_lists_windows() {
+    let path = Path::new("/tmp/test.qcow2");
+    if !path.exists() {
+        return;
+    }
+    let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");
+    let mut reader = vmkatz::fs::PartitionReader::new(&mut disk, 0x100000);
+    let ntfs = ntfs::Ntfs::new(&mut reader).expect("NTFS parse failed");
+    let root = ntfs.root_directory(&mut reader).expect("root dir failed");
+    let entries = vmkatz::fs::list_directory(&ntfs, &root, &mut reader).expect("list failed");
+    assert!(
+        entries.contains(&("Windows".to_string(), true)),
+        "Windows dir not listed"
+    );
+    // finalize policy: all directories sort before all files
+    let first_file = entries.iter().position(|(_, d)| !*d);
+    let last_dir = entries.iter().rposition(|(_, d)| *d);
+    if let (Some(f), Some(d)) = (first_file, last_dir) {
+        assert!(d < f, "directories must precede files");
+    }
+}
+
+#[test]
 fn test_open_base_vdi() {
     let path = Path::new("/home/user/vm/windows10-clean/windows10-clean.vdi");
     if !path.exists() {

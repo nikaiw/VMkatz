@@ -189,36 +189,50 @@ pub fn finalize(raw: Vec<DirEntry>, show_metafiles: bool) -> Vec<DirEntry> {
     out
 }
 
-/// List all file/directory names in a directory.
-pub fn list_directory<'n, R: Read + Seek>(
+/// Iterate a healthy directory index, skipping DOS 8.3 short names.
+/// Filtering, dedup and ordering are left to `finalize`.
+fn list_index<'n, R: Read + Seek>(
     _ntfs: &'n ntfs::Ntfs,
     dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
-) -> Result<Vec<(String, bool)>> {
+) -> Result<Vec<DirEntry>> {
     let index = dir.directory_index(reader).map_err(|e| {
         crate::error::VmkatzError::DecryptionError(format!("Directory index error: {e}"))
     })?;
     let mut entries = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut iter = index.entries();
     while let Some(entry) = iter.next(reader) {
         let Ok(entry) = entry else { continue };
         let Some(Ok(key)) = entry.key() else { continue };
-        // Skip DOS 8.3 short names — always prefer the Win32 long name
         if key.namespace() == NtfsFileNamespace::Dos {
             continue;
         }
-        let name = key.name().to_string_lossy().clone();
-        // Skip NTFS special entries and dedup
-        if name == "." || name == ".." || name.starts_with('$') {
-            continue;
-        }
-        let is_dir = key.is_directory();
-        if seen.insert(name.to_lowercase()) {
-            entries.push((name, is_dir));
-        }
+        let kind = if key.is_directory() {
+            EntryKind::Dir
+        } else {
+            EntryKind::File {
+                size: key.data_size(),
+            }
+        };
+        entries.push(DirEntry {
+            name: key.name().to_string_lossy().clone(),
+            kind,
+        });
     }
     Ok(entries)
+}
+
+/// List all file/directory names in a directory.
+pub fn list_directory<'n, R: Read + Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    dir: &ntfs::NtfsFile<'n>,
+    reader: &mut R,
+) -> Result<Vec<(String, bool)>> {
+    let entries = finalize(list_index(ntfs, dir, reader)?, false);
+    Ok(entries
+        .into_iter()
+        .map(|e| (e.name, matches!(e.kind, EntryKind::Dir)))
+        .collect())
 }
 
 /// Navigate to a directory by path components.
