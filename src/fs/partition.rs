@@ -121,12 +121,6 @@ fn is_ntfs_vbr<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
 
 /// Parse GPT partition table and find NTFS partitions (Basic Data GUID or NTFS VBR).
 fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
-    // "Microsoft Basic Data" GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
-    // Mixed-endian byte representation
-    const BASIC_DATA_GUID: [u8; 16] = [
-        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
-        0xC7,
-    ];
     const MAX_ENTRIES: u32 = 256;
 
     // GPT header at LBA 1 (offset 512)
@@ -174,13 +168,16 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         }
 
         let first_lba = crate::utils::read_u64_le(&entry, 0x20).unwrap_or(0);
-        let Some(offset) = first_lba.checked_mul(512).filter(|_| first_lba > 0) else {
+        if first_lba == 0 {
+            continue;
+        }
+        let Some(offset) = first_lba.checked_mul(512) else {
             continue;
         };
 
-        if (type_guid == BASIC_DATA_GUID || is_ntfs_vbr(reader, offset))
-            && !partitions.contains(&offset)
-        {
+        // The Basic Data GUID also covers FAT/exFAT volumes, so a valid NTFS VBR
+        // is required for every accepted offset.
+        if is_ntfs_vbr(reader, offset) && !partitions.contains(&offset) {
             log::debug!("GPT partition {i}: NTFS candidate at LBA {first_lba}");
             partitions.push(offset);
         }
@@ -268,23 +265,36 @@ mod tests {
     }
 
     #[test]
-    fn gpt_basic_data_without_ntfs_vbr_is_rejected() {
+    fn gpt_other_guid_without_ntfs_vbr_is_rejected() {
         let mut c = std::io::Cursor::new(gpt_disk([0x11; 16], 8, false));
-        let r = find_ntfs_partitions(&mut c).unwrap_or_default();
-        assert!(!r.contains(&(8 * 512)));
+        assert!(find_ntfs_partitions(&mut c).is_err());
+    }
+
+    #[test]
+    fn gpt_basic_data_without_ntfs_vbr_is_rejected() {
+        let mut c = std::io::Cursor::new(gpt_disk(BASIC, 8, false));
+        assert!(find_ntfs_partitions(&mut c).is_err());
     }
 
     #[test]
     fn gpt_garbage_entry_count_is_bounded() {
         let mut d = gpt_disk(BASIC, 8, true);
+        // absurd count and entry size
         d[512 + 0x50..512 + 0x54].copy_from_slice(&u32::MAX.to_le_bytes());
         d[512 + 0x54..512 + 0x58].copy_from_slice(&u32::MAX.to_le_bytes());
-        let mut c = std::io::Cursor::new(d.clone());
-        assert!(find_ntfs_partitions(&mut c).unwrap_or_default().is_empty());
-        // absurd count with sane size must also terminate quickly
+        assert!(find_ntfs_partitions(&mut std::io::Cursor::new(d.clone())).is_err());
+        // absurd count, sane size
         d[512 + 0x54..512 + 0x58].copy_from_slice(&128u32.to_le_bytes());
-        let mut c = std::io::Cursor::new(d);
-        let _ = find_ntfs_partitions(&mut c);
+        assert!(find_ntfs_partitions(&mut std::io::Cursor::new(d.clone())).is_err());
+        // MAX_ENTRIES + 1
+        d[512 + 0x50..512 + 0x54].copy_from_slice(&257u32.to_le_bytes());
+        assert!(find_ntfs_partitions(&mut std::io::Cursor::new(d.clone())).is_err());
+        // exactly MAX_ENTRIES
+        d[512 + 0x50..512 + 0x54].copy_from_slice(&256u32.to_le_bytes());
+        assert_eq!(
+            find_ntfs_partitions(&mut std::io::Cursor::new(d)).unwrap(),
+            vec![8 * 512]
+        );
     }
 
     #[test]
