@@ -33,10 +33,13 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          # --no-install-recommends: wine64 Recommends pulls ~100 pkgs / 265 MB
-          # (gstreamer, va-drivers, sdl2…) none of which a console test needs under
-          # wine; skipping them cuts install time and the chance of a stalled pkg.
-          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+          # Keep wine's full recommends: the `wine` launcher cargo invokes
+          # (CARGO_TARGET_..._RUNNER=wine) ships with them — --no-install-recommends
+          # drops /usr/bin/wine and the test can't execute. Retries + a per-request
+          # timeout stop a stalled mirror from hanging apt (the original failure);
+          # the job-level timeout-minutes bounds anything else.
+          sudo apt-get install -y \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             gcc-mingw-w64-x86-64 wine64
 
       - name: Format
