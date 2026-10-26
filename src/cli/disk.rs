@@ -511,7 +511,7 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     // Extract DPAPI master key hashes from user profiles (independent of SAM)
-    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
     let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         found_anything = true;
@@ -587,7 +587,7 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     // Also extract DPAPI master key hashes from user profiles on the same disk
-    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
     let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         match args.format.as_str() {

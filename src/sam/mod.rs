@@ -71,8 +71,18 @@ pub struct DiskSecrets {
 /// Scans user profiles for encrypted master key files and returns
 /// Hashcat-compatible hashes (modes 15300/15900).
 pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
+    extract_dpapi_masterkeys_scoped(path, None)
+}
+
+/// Like `extract_dpapi_masterkeys`, but restricts the scan to a single partition
+/// when `partition_filter` is `Some` — keeps `--partition` consistent across SAM,
+/// NTDS and DPAPI. `None` scans every NTFS partition (unchanged default).
+pub fn extract_dpapi_masterkeys_scoped(
+    path: &Path,
+    partition_filter: Option<u64>,
+) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
     match crate::disk::open_disk(path) {
-        Ok(mut disk) => dpapi_masterkey::extract_from_disk(&mut disk),
+        Ok(mut disk) => extract_dpapi_masterkeys_from_reader(&mut disk, partition_filter),
         Err(e) => {
             log::info!("Cannot open disk for DPAPI scan: {e}");
             Vec::new()
