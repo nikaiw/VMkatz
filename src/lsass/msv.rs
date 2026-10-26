@@ -155,11 +155,14 @@ pub const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
         lm_hash: 0x46,
         sha1_hash: 0x56,
     },
-    // Win10 1507/1511
+    // Win10 1507/1511 — verified on a live 15063-domain dump: the OWF fields
+    // sit 2 bytes below the values guessed here before (NT at 0x26). Reading
+    // +2 shifted every hash by two bytes and leaked the next field's head
+    // into each display (NT tail 0000 = LM head, LM tail 217e = SHA1 head).
     PrimaryCredOffsets {
-        nt_hash: 0x28,
-        lm_hash: 0x38,
-        sha1_hash: 0x48,
+        nt_hash: 0x26,
+        lm_hash: 0x36,
+        sha1_hash: 0x46,
     },
     // Win7/8/8.1
     PrimaryCredOffsets {
@@ -192,6 +195,14 @@ pub const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
         nt_hash: 0x46,
         lm_hash: 0x56,
         sha1_hash: 0x66,
+    },
+    // Variant 7: Win10 1511 (10586) — same shape as TH1 but the OWF fields
+    // moved +2 (NT at 0x28). Verified on a live 10586-domain dump: reading
+    // 0x26 yields two zero bytes ahead of the real NT.
+    PrimaryCredOffsets {
+        nt_hash: 0x28,
+        lm_hash: 0x38,
+        sha1_hash: 0x48,
     },
 ];
 
@@ -2581,9 +2592,13 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
                 }
             }
         }
-        // Win10 1507/1511
-        0x28 if blob.len() >= 0x28 => {
-            let flags = &blob[0x20..0x24]; // isIso..isShaOwPassword
+        // Win10 TH1 (10240): NT at 0x26 / TH2 (10586): NT at 0x28. The two
+        // builds differ by exactly this 2-byte offset, and the empty-LM
+        // discriminator below tells them apart: only the TRUE layout reads
+        // the LM field as all-zero when the account stores no LM hash — a
+        // 2-byte-shifted layout bleeds the neighbouring field's head into it.
+        0x26 | 0x28 if blob.len() >= lm_off + 16 => {
+            let flags = &blob[0x20..nt_off];
             let all_bool = flags.iter().all(|&b| b <= 1);
             if all_bool {
                 score += 10;
@@ -2591,6 +2606,9 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
                     // isNtOwfPassword == true
                     score += 5;
                 }
+            }
+            if blob[lm_off..lm_off + 16] == [0u8; 16] {
+                score += 6;
             }
         }
         // Win7/Win8: no flags before hashes
