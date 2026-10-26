@@ -269,7 +269,11 @@ const KERB_OFFSET_VARIANTS_X86: &[KerbOffsets] = &[
 
 /// x86 key entry offsets (SIZE_T=4, PVOID=4).
 const KEY_ENTRY_1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
-    entry_size: 0x1C, // salt(USTRING 8) + stringToKey(PVOID 4) + unk0(PVOID 4) + generic(0x0C)
+    // Verified against a live Win10 19045 x86 domain dump: each entry is
+    // salt(UNICODE_STRING 8) + iterations(u32) + unk0(PVOID 4) + generic(0x10).
+    // The u32 at entry+0x08 is the PBKDF2 iteration count (4096 here), which the
+    // 0x1C stride used to misalign: only the first key of a multi-key list parsed.
+    entry_size: 0x20,
     generic_offset: 0x10,
 };
 const KEY_ENTRY_PRE1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
@@ -295,6 +299,32 @@ const TICKET_OFFSETS_1607_X86: TicketOffsets = TicketOffsets {
     ticket_kvno: 0xAC,
     ticket_length: 0xB0,
     ticket_value: 0xB4,
+};
+
+/// x86 ticket structure offsets for 19041+ (verified on a live Win10 19045 x86
+/// domain dump). Same story as the x64 19041 table: KERB_ENCRYPTION_KEY gained a
+/// leading flag ULONG, so Type/Length/Value all move +4 (x86 has no padding to
+/// absorb it, unlike x64 where only Type moved). The flag reads 1 — the same
+/// sentinel `extract_single_ticket` uses to tell this layout from 1607.
+/// Everything past the key sits 8 bytes further than the guessed 1607_X86 table:
+/// start/end/renew at 0x80/0x88/0x90, enc_type/kvno/length/value at
+/// 0xB0/0xB4/0xB8/0xBC.
+const TICKET_OFFSETS_19041_X86: TicketOffsets = TicketOffsets {
+    service_name_ptr: 0x10,
+    domain_name: 0x18,
+    target_domain_name: 0x20,
+    client_name_ptr: 0x48,
+    ticket_flags: 0x50,
+    key_type: 0x60,
+    key_length: 0x64,
+    key_value: 0x68,
+    start_time: 0x80,
+    end_time: 0x88,
+    renew_until: 0x90,
+    ticket_enc_type: 0xB0,
+    ticket_kvno: 0xB4,
+    ticket_length: 0xB8,
+    ticket_value: 0xBC,
 };
 
 /// x86 ticket structure offsets (Win10 1507-1511, KIWI_KERBEROS_INTERNAL_TICKET_10).
@@ -891,7 +921,14 @@ fn extract_single_ticket(
     let key_type = vmem
         .read_virt_u32(ticket_addr + offsets.key_type)
         .unwrap_or(0);
-    if offsets.key_type == TICKET_OFFSETS_1607.key_type && key_type == KERB_KEY_FLAG_SENTINEL {
+    // Same probe as x64, but the pre-19041 key Type slot is arch-dependent:
+    // 0xB0 on x64, 0x5C on x86.
+    let legacy_key_type_off = if arch == Arch::X64 {
+        TICKET_OFFSETS_1607.key_type
+    } else {
+        TICKET_OFFSETS_1607_X86.key_type
+    };
+    if offsets.key_type == legacy_key_type_off && key_type == KERB_KEY_FLAG_SENTINEL {
         return None;
     }
     let key_length = vmem
@@ -1218,7 +1255,7 @@ const fn ticket_offsets_for(variant_idx: usize, arch: Arch) -> &'static [&'stati
             _ => &[&TICKET_OFFSETS_6],
         },
         Arch::X86 => match variant_idx {
-            0 => &[&TICKET_OFFSETS_1607_X86],
+            0 => &[&TICKET_OFFSETS_1607_X86, &TICKET_OFFSETS_19041_X86],
             1 => &[&TICKET_OFFSETS_10_X86],
             _ => &[&TICKET_OFFSETS_6_X86],
         },
