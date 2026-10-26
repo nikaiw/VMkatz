@@ -1,10 +1,12 @@
-//! MFTMirr-based NTFS fallback for reading registry hives from incomplete disks.
+//! MFTMirr-based NTFS fallback for reading registry hives and NTDS.dit from
+//! incomplete disks.
 //!
 //! When the primary MFT start is inaccessible (e.g., truncated/missing extent),
 //! this module bootstraps MFT access via $MFTMirr:
 //! 1. Parse NTFS boot sector → locate $MFTMirr
 //! 2. Read $MFT record from MFTMirr → parse $DATA data runs
 //! 3. Scan accessible MFT segments for FILE records named SAM/SYSTEM/SECURITY
+//!    (and ntds.dit for the NTDS workflow)
 //! 4. Read file contents via their $DATA data runs
 
 use std::io::{Read, Seek, SeekFrom};
@@ -494,9 +496,9 @@ fn parse_attribute_list_from_record<R: Read + Seek>(
     extension_records
 }
 
-/// Read hive file data from an MFT record, with $ATTRIBUTE_LIST support
+/// Read file data from an MFT record, with $ATTRIBUTE_LIST support
 /// for files whose $DATA spans multiple MFT records.
-fn read_hive_from_record<R: Read + Seek>(
+fn read_file_from_record<R: Read + Seek>(
     reader: &mut R,
     record: &[u8],
     name: &str,
@@ -582,16 +584,97 @@ fn read_hive_from_record<R: Read + Seek>(
     ))
 }
 
-/// Verify that a parent record chain leads to \Windows\System32\config.
-/// Checks 3 levels up: parent=config, grandparent=System32, great-grandparent=Windows.
-fn verify_config_parent<R: Read + Seek>(
+/// A file the MFTMirr scan looks for, with its expected parent chain
+/// (parent ← grandparent) and a content signature for validation when
+/// parent records are inaccessible.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanTarget {
+    Sam,
+    System,
+    Security,
+    NtdsDit,
+}
+
+impl ScanTarget {
+    /// Filename as stored in $FILE_NAME (compared case-insensitively).
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Sam => "SAM",
+            Self::System => "SYSTEM",
+            Self::Security => "SECURITY",
+            Self::NtdsDit => "ntds.dit",
+        }
+    }
+
+    /// Name used in log messages.
+    const fn log_name(self) -> &'static str {
+        match self {
+            Self::Sam => "SAM",
+            Self::System => "SYSTEM",
+            Self::Security => "SECURITY",
+            Self::NtdsDit => "NTDS.DIT",
+        }
+    }
+
+    /// Expected parent and grandparent directory names.
+    const fn parent_chain(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Sam | Self::System | Self::Security => ("config", "System32"),
+            Self::NtdsDit => ("NTDS", "Windows"),
+        }
+    }
+
+    /// Validate the first bytes of file data (used when the parent records
+    /// are inaccessible and the directory chain cannot be verified).
+    fn content_signature_ok(self, data: &[u8]) -> bool {
+        match self {
+            Self::Sam | Self::System | Self::Security => data.len() >= 4 && &data[0..4] == b"regf",
+            // ESE database header magic at offset 4 (see crate::ntds::ese)
+            Self::NtdsDit => data.len() >= 8 && data[4..8] == [0xEF, 0xCD, 0xAB, 0x89],
+        }
+    }
+}
+
+/// MFT records found by the scan, per target.
+#[derive(Default)]
+struct ScanRecords {
+    records: Vec<(ScanTarget, Vec<u8>)>,
+}
+
+impl ScanRecords {
+    fn get(&self, target: ScanTarget) -> Option<&Vec<u8>> {
+        self.records
+            .iter()
+            .find(|(t, _)| *t == target)
+            .map(|(_, record)| record)
+    }
+
+    fn is_found(&self, target: ScanTarget) -> bool {
+        self.records.iter().any(|(t, _)| *t == target)
+    }
+
+    fn insert(&mut self, target: ScanTarget, record: Vec<u8>) {
+        self.records.push((target, record));
+    }
+
+    fn all_found(&self, wanted: &[ScanTarget]) -> bool {
+        wanted.iter().all(|&target| self.is_found(target))
+    }
+}
+
+/// Verify that a parent record chain matches the expected directory names.
+/// Checks 2 levels up: parent=expected_parent, grandparent=expected_grandparent
+/// (e.g. config/System32 for registry hives, NTDS/Windows for ntds.dit).
+fn verify_parent_chain<R: Read + Seek>(
     reader: &mut R,
     parent_ref: u64,
     mft_runs: &[DataRun],
     params: &NtfsParams,
     partition_offset: u64,
+    expected_parent: &str,
+    expected_grandparent: &str,
 ) -> bool {
-    // Read parent record (should be "config")
+    // Read parent record
     let Some(parent) = read_mft_record(reader, parent_ref, mft_runs, params, partition_offset)
     else {
         return false;
@@ -599,11 +682,11 @@ fn verify_config_parent<R: Read + Seek>(
     let Some((parent_name, grandparent_ref)) = extract_filename(&parent) else {
         return false;
     };
-    if !parent_name.eq_ignore_ascii_case("config") {
+    if !parent_name.eq_ignore_ascii_case(expected_parent) {
         return false;
     }
 
-    // Read grandparent (should be "System32")
+    // Read grandparent record
     let Some(grandparent) =
         read_mft_record(reader, grandparent_ref, mft_runs, params, partition_offset)
     else {
@@ -612,17 +695,23 @@ fn verify_config_parent<R: Read + Seek>(
     let Some((gp_name, _)) = extract_filename(&grandparent) else {
         return false;
     };
-    gp_name.eq_ignore_ascii_case("System32")
+    gp_name.eq_ignore_ascii_case(expected_grandparent)
 }
 
-/// Try to read registry hives via $MFTMirr bootstrap.
-///
-/// This is the main entry point. Called when `ntfs.root_directory()` fails
-/// because the primary MFT start is in an inaccessible disk region.
-pub fn try_mftmirr_fallback<R: Read + Seek>(
+/// MFT access bootstrapped via $MFTMirr.
+struct MftBootstrap {
+    params: NtfsParams,
+    mft_runs: Vec<DataRun>,
+    /// Accessible MFT segments: (absolute offset, first record, record count)
+    accessible_segments: Vec<(u64, u64, u64)>,
+}
+
+/// Bootstrap MFT access via $MFTMirr: parse the boot sector, read the mirrored
+/// $MFT record, and map which MFT segments are accessible on this disk.
+fn mftmirr_bootstrap<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
-) -> Result<super::HiveFiles> {
+) -> Result<MftBootstrap> {
     // Read and parse NTFS boot sector
     reader.seek(SeekFrom::Start(partition_offset))?;
     let mut boot = [0u8; 512];
@@ -702,15 +791,30 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
         ));
     }
 
-    // Scan accessible MFT records for SAM, SYSTEM, SECURITY filenames
-    let rs = params.record_size as usize;
-    let mut sam_record: Option<Vec<u8>> = None;
-    let mut system_record: Option<Vec<u8>> = None;
-    let mut security_record: Option<Vec<u8>> = None;
+    Ok(MftBootstrap {
+        params,
+        mft_runs,
+        accessible_segments,
+    })
+}
 
+/// Scan accessible MFT segments for records matching the wanted targets.
+///
+/// With `verify_parents`, a candidate is accepted only if its parent chain
+/// matches the target's expected path. Otherwise the file's content signature
+/// is validated instead (parent records may be in inaccessible segments).
+fn scan_mft_segments<R: Read + Seek>(
+    reader: &mut R,
+    bootstrap: &MftBootstrap,
+    partition_offset: u64,
+    wanted: &[ScanTarget],
+    records: &mut ScanRecords,
+    verify_parents: bool,
+) {
+    let rs = bootstrap.params.record_size as usize;
     let batch_records = 256usize;
 
-    'segments: for &(abs_offset, first_rec, num_recs) in &accessible_segments {
+    'segments: for &(abs_offset, first_rec, num_recs) in &bootstrap.accessible_segments {
         let mut rec_idx = 0u64;
         while rec_idx < num_recs {
             let batch = batch_records.min((num_recs - rec_idx) as usize);
@@ -736,157 +840,172 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
                     continue;
                 }
 
-                if let Some((name, parent_ref)) = extract_filename(&record) {
-                    let name_upper = name.to_uppercase();
-                    let target = match name_upper.as_str() {
-                        "SAM" if sam_record.is_none() => &mut sam_record,
-                        "SYSTEM" if system_record.is_none() => &mut system_record,
-                        "SECURITY" if security_record.is_none() => &mut security_record,
-                        _ => continue,
-                    };
+                let Some((name, parent_ref)) = extract_filename(&record) else {
+                    continue;
+                };
 
-                    // Verify parent chain: parent=config, grandparent=System32
-                    if verify_config_parent(
+                let Some(&target) = wanted.iter().find(|&&target| {
+                    !records.is_found(target) && name.eq_ignore_ascii_case(target.file_name())
+                }) else {
+                    continue;
+                };
+
+                let rec_num = first_rec + rec_idx + i as u64;
+
+                if verify_parents {
+                    let (parent, grandparent) = target.parent_chain();
+                    if verify_parent_chain(
                         reader,
                         parent_ref,
-                        &mft_runs,
-                        &params,
+                        &bootstrap.mft_runs,
+                        &bootstrap.params,
                         partition_offset,
+                        parent,
+                        grandparent,
                     ) {
-                        let rec_num = first_rec + rec_idx + i as u64;
                         log::info!(
-                            "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (parent verified)",
+                            "MFTMirr scan: found {} at MFT record #{rec_num} (parent verified)",
+                            target.log_name()
                         );
-                        *target = Some(record);
+                        records.insert(target, record);
                     } else {
                         log::debug!(
-                            "MFTMirr scan: {} at record #{} — parent chain mismatch, skipping",
-                            name_upper,
-                            first_rec + rec_idx + i as u64,
+                            "MFTMirr scan: {} at record #{rec_num} — parent chain mismatch, skipping",
+                            target.log_name()
                         );
                     }
-
-                    if sam_record.is_some() && system_record.is_some() && security_record.is_some()
+                } else {
+                    // Without parent check, validate the file's content signature
+                    match try_read_file_start(reader, &record, &bootstrap.params, partition_offset)
                     {
-                        break 'segments;
+                        Some(start) if target.content_signature_ok(&start) => {
+                            log::info!(
+                                "MFTMirr scan: found {} at MFT record #{rec_num} (content-validated)",
+                                target.log_name()
+                            );
+                            records.insert(target, record);
+                        }
+                        Some(_) => {
+                            log::info!(
+                                "MFTMirr scan: found {} at MFT record #{rec_num} (wrong content signature, skipping)",
+                                target.log_name()
+                            );
+                        }
+                        None => {
+                            // First extent inaccessible — accept the record anyway.
+                            // Block-level resilient I/O in read_from_data_runs will
+                            // zero-fill only the specific 4KB blocks that fail.
+                            // For live VMs, most blocks are readable.
+                            log::info!(
+                                "MFTMirr scan: found {} at MFT record #{rec_num} (first extent check failed, accepting for resilient read)",
+                                target.log_name()
+                            );
+                            records.insert(target, record);
+                        }
                     }
+                }
+
+                if records.all_found(wanted) {
+                    break 'segments;
                 }
             }
 
             rec_idx += batch as u64;
         }
     }
+}
+
+/// Scan for all wanted targets: first with parent verification, then — if any
+/// required target is still missing — without parent verification (candidates
+/// are content-signature validated instead).
+fn scan_for_targets<R: Read + Seek>(
+    reader: &mut R,
+    bootstrap: &MftBootstrap,
+    partition_offset: u64,
+    wanted: &[ScanTarget],
+    required: &[ScanTarget],
+) -> ScanRecords {
+    let mut records = ScanRecords::default();
+    scan_mft_segments(
+        reader,
+        bootstrap,
+        partition_offset,
+        wanted,
+        &mut records,
+        true,
+    );
 
     // If parent verification failed for all candidates, retry without parent check
     // (parent MFT records may be in inaccessible segments)
-    if sam_record.is_none() || system_record.is_none() {
+    if required.iter().any(|&target| !records.is_found(target)) {
         log::info!(
             "MFTMirr: retrying without parent verification (parent records may be inaccessible)"
         );
-
-        'segments2: for &(abs_offset, first_rec, num_recs) in &accessible_segments {
-            let mut rec_idx = 0u64;
-            while rec_idx < num_recs {
-                let batch = batch_records.min((num_recs - rec_idx) as usize);
-                let read_pos = abs_offset + rec_idx * rs as u64;
-
-                if reader.seek(SeekFrom::Start(read_pos)).is_err() {
-                    rec_idx += batch as u64;
-                    continue;
-                }
-                let mut batch_data = vec![0u8; batch * rs];
-                resilient_read_blocks(reader, &mut batch_data, rs);
-
-                for i in 0..batch {
-                    let mut record = batch_data[i * rs..(i + 1) * rs].to_vec();
-                    if !fixup_file_record(&mut record) {
-                        continue;
-                    }
-                    let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
-                    if flags & 1 == 0 || flags & 2 != 0 {
-                        continue;
-                    }
-
-                    if let Some((name, _parent)) = extract_filename(&record) {
-                        let name_upper = name.to_uppercase();
-                        let target = match name_upper.as_str() {
-                            "SAM" if sam_record.is_none() => &mut sam_record,
-                            "SYSTEM" if system_record.is_none() => &mut system_record,
-                            "SECURITY" if security_record.is_none() => &mut security_record,
-                            _ => continue,
-                        };
-
-                        // Without parent check, validate data starts with "regf"
-                        let rec_num = first_rec + rec_idx + i as u64;
-                        let hive_check =
-                            try_read_hive_start(reader, &record, &params, partition_offset);
-
-                        match hive_check {
-                            Some(true) => {
-                                log::info!(
-                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (regf-validated)",
-                                );
-                                *target = Some(record);
-                            }
-                            Some(false) => {
-                                log::info!(
-                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (not a regf hive, skipping)",
-                                );
-                            }
-                            None => {
-                                // First extent inaccessible — accept the record anyway.
-                                // Block-level resilient I/O in read_from_data_runs will
-                                // zero-fill only the specific 4KB blocks that fail.
-                                // For live VMs, most blocks are readable.
-                                log::info!(
-                                    "MFTMirr scan: found {name_upper} at MFT record #{rec_num} (first extent check failed, accepting for resilient read)",
-                                );
-                                *target = Some(record);
-                            }
-                        }
-
-                        if sam_record.is_some()
-                            && system_record.is_some()
-                            && security_record.is_some()
-                        {
-                            break 'segments2;
-                        }
-                    }
-                }
-
-                rec_idx += batch as u64;
-            }
-        }
+        scan_mft_segments(
+            reader,
+            bootstrap,
+            partition_offset,
+            wanted,
+            &mut records,
+            false,
+        );
     }
+    records
+}
+
+/// Try to read registry hives via $MFTMirr bootstrap.
+///
+/// This is the main entry point for SAM/SYSTEM/SECURITY. Called when
+/// `ntfs.root_directory()` fails because the primary MFT start is in an
+/// inaccessible disk region.
+pub fn try_mftmirr_fallback<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<super::HiveFiles> {
+    let bootstrap = mftmirr_bootstrap(reader, partition_offset)?;
+    let wanted = [ScanTarget::Sam, ScanTarget::System, ScanTarget::Security];
+    // SECURITY is optional — do not rescan the whole MFT for it alone
+    let required = [ScanTarget::Sam, ScanTarget::System];
+    let records = scan_for_targets(reader, &bootstrap, partition_offset, &wanted, &required);
 
     // Read file data from found records
-    let sam_data = match sam_record {
-        Some(ref rec) => {
-            read_hive_from_record(reader, rec, "SAM", &mft_runs, &params, partition_offset)?
-        }
+    let sam_data = match records.get(ScanTarget::Sam) {
+        Some(rec) => read_file_from_record(
+            reader,
+            rec,
+            "SAM",
+            &bootstrap.mft_runs,
+            &bootstrap.params,
+            partition_offset,
+        )?,
         None => {
             return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SAM hive not found in accessible MFT segments".into(),
             ));
         }
     };
-    let system_data = match system_record {
-        Some(ref rec) => {
-            read_hive_from_record(reader, rec, "SYSTEM", &mft_runs, &params, partition_offset)?
-        }
+    let system_data = match records.get(ScanTarget::System) {
+        Some(rec) => read_file_from_record(
+            reader,
+            rec,
+            "SYSTEM",
+            &bootstrap.mft_runs,
+            &bootstrap.params,
+            partition_offset,
+        )?,
         None => {
             return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SYSTEM hive not found in accessible MFT segments".into(),
             ));
         }
     };
-    let security_data = security_record.as_ref().and_then(|rec| {
-        read_hive_from_record(
+    let security_data = records.get(ScanTarget::Security).and_then(|rec| {
+        read_file_from_record(
             reader,
             rec,
             "SECURITY",
-            &mft_runs,
-            &params,
+            &bootstrap.mft_runs,
+            &bootstrap.params,
             partition_offset,
         )
         .ok()
@@ -924,30 +1043,388 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     Ok((sam_data, system_data, security_data))
 }
 
-/// Try to read the first 4 bytes of a file's data to check if it's "regf".
-fn try_read_hive_start<R: Read + Seek>(
+/// Try to read NTDS.dit + SYSTEM hive via $MFTMirr bootstrap.
+///
+/// Mirrors `try_mftmirr_fallback` for domain controllers: ntds.dit lives in
+/// \Windows\NTDS, so its parent chain is NTDS/Windows instead of config/System32.
+pub fn try_mftmirr_fallback_ntds<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let bootstrap = mftmirr_bootstrap(reader, partition_offset)?;
+    let wanted = [ScanTarget::NtdsDit, ScanTarget::System];
+    let records = scan_for_targets(reader, &bootstrap, partition_offset, &wanted, &wanted);
+
+    // NTDS.dit is heavily fragmented on real DCs — read_file_from_record
+    // resolves $ATTRIBUTE_LIST extension records as needed.
+    let ntds_data = match records.get(ScanTarget::NtdsDit) {
+        Some(rec) => read_file_from_record(
+            reader,
+            rec,
+            "NTDS.dit",
+            &bootstrap.mft_runs,
+            &bootstrap.params,
+            partition_offset,
+        )?,
+        None => {
+            return Err(VmkatzError::DecryptionError(
+                "MFTMirr: ntds.dit not found in accessible MFT segments".into(),
+            ));
+        }
+    };
+    let system_data = match records.get(ScanTarget::System) {
+        Some(rec) => read_file_from_record(
+            reader,
+            rec,
+            "SYSTEM",
+            &bootstrap.mft_runs,
+            &bootstrap.params,
+            partition_offset,
+        )?,
+        None => {
+            return Err(VmkatzError::DecryptionError(
+                "MFTMirr: SYSTEM hive not found in accessible MFT segments".into(),
+            ));
+        }
+    };
+
+    // Validate NTDS data — ESE database header magic at offset 4
+    if ntds_data.len() < 0x1000 || ntds_data[4..8] != [0xEF, 0xCD, 0xAB, 0x89] {
+        return Err(VmkatzError::DecryptionError(
+            "MFTMirr: NTDS.dit data is not a valid ESE database".into(),
+        ));
+    }
+    // Validate SYSTEM hive — same rule as the hive fallback (regf may be
+    // zero-filled on live block devices)
+    if system_data.len() < 0x1000
+        || (&system_data[0..4] != b"regf"
+            && system_data[0x1000..].get(..4).is_none_or(|s| s != b"hbin"))
+    {
+        return Err(VmkatzError::DecryptionError(
+            "MFTMirr: SYSTEM data is not a valid registry hive".into(),
+        ));
+    }
+
+    log::info!(
+        "MFTMirr: NTDS.dit {} bytes, SYSTEM {} bytes",
+        ntds_data.len(),
+        system_data.len()
+    );
+
+    Ok((ntds_data, system_data))
+}
+
+/// Try to read the first bytes of a file's data so the caller can validate its
+/// content signature ("regf" for registry hives, the ESE magic for ntds.dit).
+/// Returns None when the first extent is inaccessible.
+fn try_read_file_start<R: Read + Seek>(
     reader: &mut R,
     record: &[u8],
     params: &NtfsParams,
     partition_offset: u64,
-) -> Option<bool> {
-    // Check resident data
+) -> Option<Vec<u8>> {
+    // Resident data is small and already in the record
     if let Some(data) = read_resident_data(record) {
-        return Some(data.len() >= 4 && &data[0..4] == b"regf");
+        return Some(data);
     }
 
-    // Non-resident: read first cluster of first data run
+    // Non-resident: read the start of the first data run
     let (runs, _size) = extract_data_attribute(record)?;
-    if runs.is_empty() {
-        return None;
-    }
     let abs_offset = partition_offset + runs[0].lcn_start * params.cluster_size;
     if reader.seek(SeekFrom::Start(abs_offset)).is_err() {
         return None;
     }
-    let mut sig = [0u8; 4];
-    if reader.read_exact(&mut sig).is_err() {
+    let mut start = [0u8; 8];
+    if reader.read_exact(&mut start).is_err() {
         return None;
     }
-    Some(&sig == b"regf")
+    Some(start.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PART_OFF: u64 = 0x1000;
+    const CLUSTER: u64 = 512;
+
+    // MFT record numbers
+    const REC_MFT: u32 = 0;
+    const REC_DECOY_SYSTEM: u32 = 3;
+    const REC_DECOY_NTDSDIT: u32 = 4;
+    const REC_WINDOWS: u32 = 5;
+    const REC_SYSTEM32: u32 = 6;
+    const REC_CONFIG: u32 = 7;
+    const REC_NTDS: u32 = 8;
+    const REC_SYSTEM: u32 = 9;
+    const REC_NTDSDIT: u32 = 10;
+    const REC_SAM: u32 = 11;
+    const REC_SECURITY: u32 = 12;
+
+    // Cluster assignments (all clusters, 512 B each)
+    const CL_MFTMIRR: u64 = 2; // 4 records = 8 clusters
+    const CL_MFT: u64 = 16; // 16 records = 32 clusters
+    const CL_REGF_SYSTEM: u64 = 60;
+    const CL_ESE: u64 = 80;
+    const CL_REGF_SAM: u64 = 100;
+    const CL_REGF_SECURITY: u64 = 120;
+    const CL_DECOY: u64 = 140;
+
+    const FILE_SIZE: u64 = 0x2000; // every file's $DATA size
+
+    /// Build a resident $FILE_NAME attribute (type 0x30).
+    fn file_name_attr(name: &str, parent: u64) -> Vec<u8> {
+        let name_utf16: Vec<u16> = name.encode_utf16().collect();
+        let value_len = 0x42 + name_utf16.len() * 2;
+        let value_offset = 0x18usize;
+        let mut attr = vec![0u8; value_offset + value_len];
+        attr[0..4].copy_from_slice(&0x30u32.to_le_bytes());
+        let len = attr.len() as u32;
+        attr[4..8].copy_from_slice(&len.to_le_bytes());
+        attr[0x0A..0x0C].copy_from_slice(&(value_offset as u16).to_le_bytes());
+        attr[0x10..0x14].copy_from_slice(&(value_len as u32).to_le_bytes());
+        attr[0x14..0x16].copy_from_slice(&(value_offset as u16).to_le_bytes());
+        let value = &mut attr[value_offset..];
+        value[0..8].copy_from_slice(&parent.to_le_bytes());
+        value[0x40] = name_utf16.len() as u8;
+        value[0x41] = 0; // Win32 namespace
+        for (i, ch) in name_utf16.iter().enumerate() {
+            value[0x42 + i * 2..0x44 + i * 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        attr
+    }
+
+    /// Build a non-resident $DATA attribute (type 0x80) with one data run.
+    fn data_attr(lcn: u64, n_clusters: u64, real_size: u64) -> Vec<u8> {
+        let runs_offset = 0x48usize;
+        // Run header 0x21: length field 1 byte, offset field 2 bytes
+        let mut runs = vec![0x21u8];
+        runs.push(n_clusters as u8);
+        runs.extend_from_slice(&lcn.to_le_bytes()[..2]);
+
+        let mut attr = vec![0u8; runs_offset + runs.len()];
+        attr[0..4].copy_from_slice(&0x80u32.to_le_bytes());
+        let len = attr.len() as u32;
+        attr[4..8].copy_from_slice(&len.to_le_bytes());
+        attr[8] = 1; // non-resident
+        attr[0x18..0x20].copy_from_slice(&(n_clusters - 1).to_le_bytes()); // last VCN
+        attr[0x20..0x22].copy_from_slice(&(runs_offset as u16).to_le_bytes());
+        attr[0x30..0x38].copy_from_slice(&real_size.to_le_bytes());
+        attr[runs_offset..].copy_from_slice(&runs);
+        attr
+    }
+
+    /// Assemble a 1024-byte FILE record with a valid fixup array.
+    fn make_record(is_dir: bool, attrs: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes()); // fixup array offset
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes()); // signature + 2 sector ends
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes()); // first attribute
+        rec[0x16..0x18].copy_from_slice(&(if is_dir { 3u16 } else { 1u16 }).to_le_bytes()); // in-use (+dir)
+        rec[0x18..0x1C].copy_from_slice(&1024u32.to_le_bytes()); // used size
+        rec[0x1C..0x20].copy_from_slice(&1024u32.to_le_bytes()); // allocated size
+
+        // Fixup array: on-disk sector ends carry the signature, the array holds
+        // the replacements (mirroring what fixup_file_record expects).
+        rec[0x30..0x32].copy_from_slice(&0x1122u16.to_le_bytes());
+        rec[0x32..0x34].copy_from_slice(&0x3344u16.to_le_bytes());
+        rec[0x34..0x36].copy_from_slice(&0x5566u16.to_le_bytes());
+        rec[510..512].copy_from_slice(&0x1122u16.to_le_bytes());
+        rec[1022..1024].copy_from_slice(&0x1122u16.to_le_bytes());
+
+        let mut pos = 0x38;
+        for attr in attrs {
+            rec[pos..pos + attr.len()].copy_from_slice(&attr);
+            pos += attr.len();
+        }
+        rec[pos..pos + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        rec
+    }
+
+    /// Write a "regf" header at a cluster.
+    fn put_regf(image: &mut [u8], cluster: u64) {
+        let off = (PART_OFF + cluster * CLUSTER) as usize;
+        image[off..off + 4].copy_from_slice(b"regf");
+    }
+
+    /// Place an MFT record at its number within the MFT extent.
+    fn put_mft(image: &mut [u8], rec: u32, r: &[u8]) {
+        let off = (PART_OFF + CL_MFT * CLUSTER + u64::from(rec) * 1024) as usize;
+        image[off..off + 1024].copy_from_slice(r);
+    }
+
+    /// Build a synthetic NTFS volume. `ntds_parent`/`system_parent` set the
+    /// parent MFT references of ntds.dit/SYSTEM (use record numbers beyond the
+    /// MFT extent to make the parent chain unverifiable).
+    fn build_volume(ntds_parent: u64, system_parent: u64, hives: bool, decoys: bool) -> Vec<u8> {
+        let mut image = vec![0u8; 0x14000];
+
+        // Boot sector
+        let boot = PART_OFF as usize;
+        image[boot + 3..boot + 7].copy_from_slice(b"NTFS");
+        image[boot + 0x0B..boot + 0x0D].copy_from_slice(&512u16.to_le_bytes());
+        image[boot + 0x0D] = 1; // sectors per cluster
+        image[boot + 0x30..boot + 0x38].copy_from_slice(&CL_MFT.to_le_bytes());
+        image[boot + 0x38..boot + 0x40].copy_from_slice(&CL_MFTMIRR.to_le_bytes());
+        image[boot + 0x40] = 0xF6; // -10 → record size 2^10
+
+        // File contents
+        put_regf(&mut image, CL_REGF_SYSTEM);
+        put_regf(&mut image, CL_REGF_SAM);
+        put_regf(&mut image, CL_REGF_SECURITY);
+        let off = (PART_OFF + CL_ESE * CLUSTER) as usize;
+        image[off + 4..off + 8].copy_from_slice(&[0xEF, 0xCD, 0xAB, 0x89]);
+
+        // Place an MFT record at its number within the MFT extent
+
+        // Record 0 ($MFT): $DATA covering the 16-record MFT extent; mirrored
+        // into $MFTMirr, which is how the fallback bootstraps MFT access.
+        let mft_record = make_record(false, vec![data_attr(CL_MFT, 32, 16 * 1024)]);
+        put_mft(&mut image, REC_MFT, &mft_record);
+        let mirr = (PART_OFF + CL_MFTMIRR * CLUSTER) as usize;
+        image[mirr..mirr + 1024].copy_from_slice(&mft_record);
+
+        // Directory records (parents)
+        put_mft(
+            &mut image,
+            REC_WINDOWS,
+            &make_record(true, vec![file_name_attr("Windows", 5)]),
+        );
+        put_mft(
+            &mut image,
+            REC_SYSTEM32,
+            &make_record(
+                true,
+                vec![file_name_attr("System32", u64::from(REC_WINDOWS))],
+            ),
+        );
+        put_mft(
+            &mut image,
+            REC_CONFIG,
+            &make_record(
+                true,
+                vec![file_name_attr("config", u64::from(REC_SYSTEM32))],
+            ),
+        );
+        put_mft(
+            &mut image,
+            REC_NTDS,
+            &make_record(true, vec![file_name_attr("NTDS", u64::from(REC_WINDOWS))]),
+        );
+
+        // Registry hives and ntds.dit
+        put_mft(
+            &mut image,
+            REC_SYSTEM,
+            &make_record(
+                false,
+                vec![
+                    file_name_attr("SYSTEM", system_parent),
+                    data_attr(CL_REGF_SYSTEM, FILE_SIZE / CLUSTER, FILE_SIZE),
+                ],
+            ),
+        );
+        put_mft(
+            &mut image,
+            REC_NTDSDIT,
+            &make_record(
+                false,
+                vec![
+                    file_name_attr("ntds.dit", ntds_parent),
+                    data_attr(CL_ESE, FILE_SIZE / CLUSTER, FILE_SIZE),
+                ],
+            ),
+        );
+        if hives {
+            put_mft(
+                &mut image,
+                REC_SAM,
+                &make_record(
+                    false,
+                    vec![
+                        file_name_attr("SAM", u64::from(REC_CONFIG)),
+                        data_attr(CL_REGF_SAM, FILE_SIZE / CLUSTER, FILE_SIZE),
+                    ],
+                ),
+            );
+            put_mft(
+                &mut image,
+                REC_SECURITY,
+                &make_record(
+                    false,
+                    vec![
+                        file_name_attr("SECURITY", u64::from(REC_CONFIG)),
+                        data_attr(CL_REGF_SECURITY, FILE_SIZE / CLUSTER, FILE_SIZE),
+                    ],
+                ),
+            );
+        }
+
+        if decoys {
+            // Same names but a wrong parent chain — pass 1 must reject them.
+            put_mft(
+                &mut image,
+                REC_DECOY_SYSTEM,
+                &make_record(
+                    false,
+                    vec![
+                        file_name_attr("SYSTEM", u64::from(REC_SYSTEM32)),
+                        data_attr(CL_REGF_SYSTEM, FILE_SIZE / CLUSTER, FILE_SIZE),
+                    ],
+                ),
+            );
+            put_mft(
+                &mut image,
+                REC_DECOY_NTDSDIT,
+                &make_record(
+                    false,
+                    vec![
+                        file_name_attr("ntds.dit", u64::from(REC_CONFIG)),
+                        data_attr(CL_DECOY, FILE_SIZE / CLUSTER, FILE_SIZE),
+                    ],
+                ),
+            );
+        }
+
+        image
+    }
+
+    #[test]
+    fn mftmirr_fallback_finds_hives_and_ntds_with_verified_parents() {
+        let image = build_volume(u64::from(REC_NTDS), u64::from(REC_CONFIG), true, true);
+        let mut reader = std::io::Cursor::new(image);
+
+        let (ntds, system) = try_mftmirr_fallback_ntds(&mut reader, PART_OFF).unwrap();
+        assert_eq!(ntds.len(), FILE_SIZE as usize);
+        assert_eq!(ntds[4..8], [0xEF, 0xCD, 0xAB, 0x89]); // ESE magic
+        assert_eq!(&system[0..4], b"regf");
+
+        let (sam, sys, security) = try_mftmirr_fallback(&mut reader, PART_OFF).unwrap();
+        assert_eq!(&sam[0..4], b"regf");
+        assert_eq!(&sys[0..4], b"regf");
+        let security = security.expect("SECURITY hive not found");
+        assert_eq!(&security[0..4], b"regf");
+    }
+
+    #[test]
+    fn mftmirr_fallback_ntds_accepts_content_validated_records_without_parents() {
+        // Parent records 998/999 are beyond the MFT extent — pass 1 cannot
+        // verify the chain, so pass 2 must validate the content signatures.
+        let image = build_volume(999, 998, false, false);
+        let mut reader = std::io::Cursor::new(image);
+
+        let (ntds, system) = try_mftmirr_fallback_ntds(&mut reader, PART_OFF).unwrap();
+        assert_eq!(ntds[4..8], [0xEF, 0xCD, 0xAB, 0x89]);
+        assert_eq!(&system[0..4], b"regf");
+    }
+
+    #[test]
+    fn mftmirr_fallback_reports_missing_sam() {
+        let image = build_volume(u64::from(REC_NTDS), u64::from(REC_CONFIG), false, false);
+        let mut reader = std::io::Cursor::new(image);
+
+        let err = try_mftmirr_fallback(&mut reader, PART_OFF).unwrap_err();
+        assert!(err.to_string().contains("SAM hive not found"));
+    }
 }
