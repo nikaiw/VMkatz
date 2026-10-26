@@ -63,13 +63,8 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         ));
     }
 
-    // Check for GPT protective MBR (partition type 0xEE)
-    let first_type = mbr[0x1BE + 4];
-    if first_type == 0xEE {
-        return find_gpt_ntfs_partitions(reader);
-    }
-
     let mut partitions = Vec::new();
+    let mut protective = false;
 
     // Parse MBR partition table entries (4 entries at offsets 0x1BE, 0x1CE, 0x1DE, 0x1EE)
     for i in 0..4 {
@@ -84,22 +79,47 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
 
         log::debug!("MBR Partition {i}: type=0x{part_type:02x}, LBA_start={lba_start}");
 
+        if part_type == 0xEE {
+            protective = true;
+        }
         // NTFS partition type is 0x07
         if part_type == 0x07 && lba_start > 0 {
             partitions.push(u64::from(lba_start) * 512);
         }
     }
 
+    // Protective MBR, or nothing found in the MBR: try GPT.
+    if protective || partitions.is_empty() {
+        match find_gpt_ntfs_partitions(reader) {
+            Ok(gpt) => {
+                for off in gpt {
+                    if !partitions.contains(&off) {
+                        partitions.push(off);
+                    }
+                }
+            }
+            Err(e) => log::debug!("GPT scan: {e}"),
+        }
+    }
+
     if partitions.is_empty() {
         return Err(crate::error::VmkatzError::DecryptionError(
-            "No NTFS partition found in MBR".to_string(),
+            "No NTFS partition found in MBR/GPT".to_string(),
         ));
     }
 
     Ok(partitions)
 }
 
-/// Parse GPT partition table and find NTFS (Basic Data) partitions.
+/// Check for an NTFS volume boot record (OEM id "NTFS    " at +3).
+fn is_ntfs_vbr<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
+    let mut vbr = [0u8; 512];
+    reader.seek(SeekFrom::Start(offset)).is_ok()
+        && reader.read_exact(&mut vbr).is_ok()
+        && &vbr[3..11] == b"NTFS    "
+}
+
+/// Parse GPT partition table and find NTFS partitions (Basic Data GUID or NTFS VBR).
 fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     // "Microsoft Basic Data" GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
     // Mixed-endian byte representation
@@ -107,6 +127,7 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
         0xC7,
     ];
+    const MAX_ENTRIES: u32 = 256;
 
     // GPT header at LBA 1 (offset 512)
     reader.seek(SeekFrom::Start(512))?;
@@ -121,31 +142,28 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     }
 
     let entry_lba = crate::utils::read_u64_le(&hdr, 0x48).unwrap_or(0);
-    // Standard GPTs reserve 128 entries; cap at 4096 so a forged count can't spin
-    // the per-entry seek/read loop ~4e9 times.
-    let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0).min(4096);
+    let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0);
     let entry_size = crate::utils::read_u32_le(&hdr, 0x54).unwrap_or(0);
 
-    // GPT spec: entry_size is typically 128 bytes; reject invalid values
-    if !(128..=4096).contains(&entry_size) {
+    // Untrusted header: reject implausible values rather than looping/allocating.
+    if !(128..=4096).contains(&entry_size) || num_entries > MAX_ENTRIES {
         return Err(crate::error::VmkatzError::DecryptionError(format!(
-            "Invalid GPT entry size: {entry_size} (expected 128-4096)",
+            "Implausible GPT header: entries={num_entries}, entry_size={entry_size}",
         )));
     }
 
     log::debug!("GPT: entry_lba={entry_lba}, num_entries={num_entries}, entry_size={entry_size}");
 
     let mut partitions = Vec::new();
-    let entries_offset = entry_lba * 512;
+    let entries_offset = entry_lba.saturating_mul(512);
+    let mut entry = vec![0u8; entry_size as usize];
 
     for i in 0..num_entries {
-        let entry_offset = entries_offset + u64::from(i) * u64::from(entry_size);
-        if reader.seek(SeekFrom::Start(entry_offset)).is_err() {
-            continue; // Skip entries we can't seek to
-        }
-        let mut entry = vec![0u8; entry_size as usize];
-        if reader.read_exact(&mut entry).is_err() {
-            continue; // Skip entries we can't read (I/O error)
+        let entry_offset = entries_offset.saturating_add(u64::from(i) * u64::from(entry_size));
+        if reader.seek(SeekFrom::Start(entry_offset)).is_err()
+            || reader.read_exact(&mut entry).is_err()
+        {
+            continue;
         }
 
         let type_guid = &entry[0..16];
@@ -156,17 +174,16 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         }
 
         let first_lba = crate::utils::read_u64_le(&entry, 0x20).unwrap_or(0);
+        let Some(offset) = first_lba.checked_mul(512).filter(|_| first_lba > 0) else {
+            continue;
+        };
 
-        if type_guid == BASIC_DATA_GUID {
-            log::debug!("GPT partition {i}: Basic Data at LBA {first_lba}");
-            partitions.push(first_lba * 512);
+        if (type_guid == BASIC_DATA_GUID || is_ntfs_vbr(reader, offset))
+            && !partitions.contains(&offset)
+        {
+            log::debug!("GPT partition {i}: NTFS candidate at LBA {first_lba}");
+            partitions.push(offset);
         }
-    }
-
-    if partitions.is_empty() {
-        return Err(crate::error::VmkatzError::DecryptionError(
-            "No NTFS partition found in GPT".to_string(),
-        ));
     }
 
     Ok(partitions)
@@ -209,5 +226,75 @@ mod tests {
         let err = select_partition(vec![], Some(0x100000)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("0x100000") && msg.contains("none"), "{msg}");
+    }
+
+    const BASIC: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
+    ];
+
+    /// Build a GPT disk image with one entry (type `guid`, first LBA `lba`).
+    fn gpt_disk(guid: [u8; 16], lba: u64, ntfs_vbr: bool) -> Vec<u8> {
+        let mut d = vec![0u8; 512 * 64];
+        d[0x1BE + 4] = 0xEE;
+        d[0x1BE + 8] = 1;
+        d[510] = 0x55;
+        d[511] = 0xAA;
+        d[512..520].copy_from_slice(b"EFI PART");
+        d[512 + 0x48..512 + 0x50].copy_from_slice(&2u64.to_le_bytes());
+        d[512 + 0x50..512 + 0x54].copy_from_slice(&128u32.to_le_bytes());
+        d[512 + 0x54..512 + 0x58].copy_from_slice(&128u32.to_le_bytes());
+        let e = 2 * 512;
+        d[e..e + 16].copy_from_slice(&guid);
+        d[e + 0x20..e + 0x28].copy_from_slice(&lba.to_le_bytes());
+        if ntfs_vbr {
+            let v = lba as usize * 512;
+            d[v..v + 3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+            d[v + 3..v + 11].copy_from_slice(b"NTFS    ");
+        }
+        d
+    }
+
+    #[test]
+    fn gpt_disk_with_ntfs_basic_data_is_found() {
+        let mut c = std::io::Cursor::new(gpt_disk(BASIC, 8, true));
+        assert_eq!(find_ntfs_partitions(&mut c).unwrap(), vec![8 * 512]);
+    }
+
+    #[test]
+    fn gpt_non_basic_guid_with_ntfs_vbr_is_found() {
+        let mut c = std::io::Cursor::new(gpt_disk([0x11; 16], 8, true));
+        assert_eq!(find_ntfs_partitions(&mut c).unwrap(), vec![8 * 512]);
+    }
+
+    #[test]
+    fn gpt_basic_data_without_ntfs_vbr_is_rejected() {
+        let mut c = std::io::Cursor::new(gpt_disk([0x11; 16], 8, false));
+        let r = find_ntfs_partitions(&mut c).unwrap_or_default();
+        assert!(!r.contains(&(8 * 512)));
+    }
+
+    #[test]
+    fn gpt_garbage_entry_count_is_bounded() {
+        let mut d = gpt_disk(BASIC, 8, true);
+        d[512 + 0x50..512 + 0x54].copy_from_slice(&u32::MAX.to_le_bytes());
+        d[512 + 0x54..512 + 0x58].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut c = std::io::Cursor::new(d.clone());
+        assert!(find_ntfs_partitions(&mut c).unwrap_or_default().is_empty());
+        // absurd count with sane size must also terminate quickly
+        d[512 + 0x54..512 + 0x58].copy_from_slice(&128u32.to_le_bytes());
+        let mut c = std::io::Cursor::new(d);
+        let _ = find_ntfs_partitions(&mut c);
+    }
+
+    #[test]
+    fn mbr_ntfs_still_detected() {
+        let mut d = vec![0u8; 512 * 4];
+        d[0x1BE + 4] = 0x07;
+        d[0x1BE + 8] = 2;
+        d[510] = 0x55;
+        d[511] = 0xAA;
+        let mut c = std::io::Cursor::new(d);
+        assert_eq!(find_ntfs_partitions(&mut c).unwrap(), vec![1024]);
     }
 }
