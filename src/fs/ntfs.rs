@@ -155,6 +155,40 @@ pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> 
     }
 }
 
+/// Kind of a directory entry; a directory carries no size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File { size: u64 },
+}
+
+/// One entry in a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: EntryKind,
+}
+
+/// Shared listing policy: drop `.`/`..`, drop `$`-prefixed metafiles unless
+/// `show_metafiles`, dedup case-insensitively (first wins), sort directories
+/// first then by case-insensitive name.
+pub fn finalize(raw: Vec<DirEntry>, show_metafiles: bool) -> Vec<DirEntry> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<DirEntry> = raw
+        .into_iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .filter(|e| show_metafiles || !e.name.starts_with('$'))
+        .filter(|e| seen.insert(e.name.to_lowercase()))
+        .collect();
+    out.sort_by_key(|e| {
+        (
+            matches!(e.kind, EntryKind::File { .. }),
+            e.name.to_lowercase(),
+        )
+    });
+    out
+}
+
 /// List all file/directory names in a directory.
 pub fn list_directory<'n, R: Read + Seek>(
     _ntfs: &'n ntfs::Ntfs,
@@ -200,4 +234,53 @@ pub fn navigate_to_dir<'n, R: Read + Seek>(
         current = find_entry(ntfs, &current, reader, component)?;
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(n: &str) -> DirEntry {
+        DirEntry {
+            name: n.into(),
+            kind: EntryKind::Dir,
+        }
+    }
+    fn f(n: &str, size: u64) -> DirEntry {
+        DirEntry {
+            name: n.into(),
+            kind: EntryKind::File { size },
+        }
+    }
+    fn names(v: &[DirEntry]) -> Vec<&str> {
+        v.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn finalize_sorts_dirs_first_then_alpha() {
+        let out = finalize(
+            vec![f("b.txt", 1), d("Zeta"), f("A.txt", 2), d("alpha")],
+            false,
+        );
+        assert_eq!(names(&out), ["alpha", "Zeta", "A.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn finalize_drops_dot_entries() {
+        let out = finalize(vec![d("."), d(".."), f("x", 0)], false);
+        assert_eq!(names(&out), ["x"]);
+    }
+
+    #[test]
+    fn finalize_metafile_policy() {
+        let raw = || vec![f("$MFT", 10), f("a", 1)];
+        assert_eq!(names(&finalize(raw(), false)), ["a"]);
+        assert_eq!(names(&finalize(raw(), true)), ["$MFT", "a"]);
+    }
+
+    #[test]
+    fn finalize_dedups_case_insensitively() {
+        let out = finalize(vec![d("Windows"), d("WINDOWS")], false);
+        assert_eq!(names(&out), ["Windows"]);
+    }
 }
