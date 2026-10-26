@@ -1252,10 +1252,10 @@ fn try_read_file_start<R: Read + Seek>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const PART_OFF: u64 = 0x1000;
+    pub(crate) const PART_OFF: u64 = 0x1000;
     const CLUSTER: u64 = 512;
 
     // MFT record numbers
@@ -1372,7 +1372,7 @@ mod tests {
     /// Build a synthetic NTFS volume. `ntds_parent`/`system_parent` set the
     /// parent MFT references of ntds.dit/SYSTEM (use record numbers beyond the
     /// MFT extent to make the parent chain unverifiable).
-    fn build_volume(ntds_parent: u64, system_parent: u64, hives: bool, decoys: bool) -> Vec<u8> {
+    pub(crate) fn build_volume(ntds_parent: u64, system_parent: u64, hives: bool, decoys: bool) -> Vec<u8> {
         let mut image = vec![0u8; 0x14000];
 
         // Boot sector

@@ -263,3 +263,28 @@ fn test_vdi_zero_block_size_rejected() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn test_list_path_healthy_root() {
+    use vmkatz::sam::{ListOutcome, list_path};
+    let path = Path::new("/tmp/test.qcow2");
+    if !path.exists() {
+        return;
+    }
+    let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");
+    match list_path(&mut disk, 0x100000, "").expect("list root") {
+        ListOutcome::Listed { entries, degraded } => {
+            assert!(!degraded);
+            assert!(entries.iter().any(|e| e.name == "Windows"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        list_path(&mut disk, 0x100000, "\\NoSuchDir").unwrap(),
+        ListOutcome::PathNotFound
+    );
+    assert_eq!(
+        list_path(&mut disk, 0x100000, "/Windows/").unwrap(),
+        list_path(&mut disk, 0x100000, "\\Windows").unwrap()
+    );
+}

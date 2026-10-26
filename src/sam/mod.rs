@@ -4,11 +4,14 @@ pub mod cm_hive;
 mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
+pub mod listing;
 pub mod lsa;
 pub mod mem_hive;
 mod ntfs_fallback;
 mod ntfs_reader;
 mod vmdk_scan;
+
+pub use listing::{ListOutcome, list_path};
 
 pub mod aes_xts;
 pub mod bitlocker_decrypt;

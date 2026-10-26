@@ -191,7 +191,7 @@ pub fn finalize(raw: Vec<DirEntry>, show_metafiles: bool) -> Vec<DirEntry> {
 
 /// Iterate a healthy directory index, skipping DOS 8.3 short names.
 /// Filtering, dedup and ordering are left to `finalize`.
-fn list_index<'n, R: Read + Seek>(
+pub(crate) fn list_index<'n, R: Read + Seek>(
     _ntfs: &'n ntfs::Ntfs,
     dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
