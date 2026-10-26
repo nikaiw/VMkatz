@@ -209,6 +209,56 @@ pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
     }
 }
 
+/// Print DPAPI master key hashes found on a VMFS-backed disk (same formats as `run_sam`).
+fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(disk: &mut R, args: &Args, c: &super::args::Colors) {
+    let hashes = vmkatz::sam::extract_dpapi_masterkeys_from_reader(disk, args.partition);
+    let hashes = dedup_dpapi_hashes(hashes, args.all);
+    if !hashes.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_dpapi_masterkey_csv(&hashes),
+            "hashcat" => print_dpapi_masterkey_hashcat(&hashes),
+            _ => print_dpapi_masterkey_text(&hashes, c),
+        }
+    }
+}
+
+/// NTDS extraction from a VMFS-backed disk; mirrors `run_ntds` (NTDS output, then DPAPI).
+#[cfg(feature = "ntds.dit")]
+fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
+    disk: &mut R,
+    args: &Args,
+    c: &super::args::Colors,
+) -> anyhow::Result<()> {
+    let artifacts = vmkatz::sam::extract_ntds_artifacts_from_reader_scoped(disk, args.partition)
+        .context("NTDS artifact extraction failed")?;
+    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
+        .context("NTDS context validation failed")?;
+    let hashes = vmkatz::ntds::extract_ad_hashes(
+        &artifacts.ntds_data,
+        &artifacts.system_data,
+        args.ntds_history,
+    )
+    .context("NTDS hash extraction failed")?;
+
+    eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
+    eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
+    eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
+    eprintln!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
+    eprintln!("  Bootkey          : {}", hex::encode(ctx.boot_key));
+    eprintln!("  Hashes extracted : {}", hashes.len());
+
+    match args.format.as_str() {
+        "csv" => print_ntds_csv(&hashes),
+        "hashcat" => print_ntds_hashcat(&hashes),
+        "ntlm" => print_ntds_ntlm(&hashes),
+        "brief" => print_ntds_brief(&hashes),
+        _ => print_ntds_text(&hashes, c),
+    }
+
+    vmfs_emit_dpapi(disk, args, c);
+    Ok(())
+}
+
 #[cfg(feature = "vmfs")]
 pub(crate) fn run_vmfs(
     device_path: &Path,
@@ -241,6 +291,12 @@ pub(crate) fn run_vmfs(
 
         if let Some(ref ls_path) = args.ls {
             return run_ls(&mut disk, ls_path, args.partition);
+        }
+
+        // NTDS replaces the plain SAM flow, as in the local-disk path.
+        #[cfg(feature = "ntds.dit")]
+        if args.ntds {
+            return vmfs_emit_ntds(&mut disk, args, c);
         }
 
         // Extract secrets via the standard pipeline
@@ -293,6 +349,8 @@ pub(crate) fn run_vmfs(
                 eprintln!("[!] Extraction failed for {vmdk}: {e}");
             }
         }
+
+        vmfs_emit_dpapi(&mut disk, args, c);
     } else {
         // Auto-scan mode: list all VMs and extract from each
         eprintln!(
@@ -329,6 +387,16 @@ pub(crate) fn run_vmfs(
                         println!("=== {vmdk_path} ===");
                         if let Err(e) = run_ls(&mut disk, ls_path, args.partition) {
                             eprintln!("[!] {vm_name}: {e}");
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "ntds.dit")]
+                    if args.ntds {
+                        println!("=== {vmdk_path} ===");
+                        match vmfs_emit_ntds(&mut disk, args, c) {
+                            Err(e) if args.partition.is_some() => return Err(e),
+                            Err(e) => eprintln!("[!] {vm_name}: {e:#}"),
+                            Ok(()) => {}
                         }
                         continue;
                     }
@@ -372,6 +440,7 @@ pub(crate) fn run_vmfs(
                             eprintln!("[!] {vm_name}: {e}");
                         }
                     }
+                    vmfs_emit_dpapi(&mut disk, args, c);
                 }
                 Err(e) => {
                     eprintln!("[!] Failed to open {vmdk_path}: {e}");
