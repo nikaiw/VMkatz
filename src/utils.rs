@@ -198,13 +198,9 @@ pub fn file_size(file: &mut std::fs::File) -> std::io::Result<u64> {
 /// File-backed memory: mmap when available, pread fallback for platforms
 /// where mmap is unsupported (e.g. ESXi 6.5 VMkernel returns EINVAL on VMFS).
 ///
-/// Memory profile: the mmap variant keeps whatever pages the scan has faulted
-/// resident until told otherwise, so a full-image sweep would grow RSS to the
-/// image size. Callers doing large sequential scans call [`advise_dontneed`] on
-/// each range as they finish with it, which drops those pages and bounds RSS to
-/// roughly one scan window. The pread variant is intrinsically low-memory (each
-/// read only touches the caller's buffer), which is why it stays the safe path
-/// on old ESXi where mmap is unavailable.
+/// The mmap variant keeps faulted pages resident; large sequential scans call
+/// [`advise_dontneed`] per range to bound RSS to ~one scan window. The pread
+/// variant is intrinsically low-memory (reads only touch the caller's buffer).
 ///
 /// [`advise_dontneed`]: MappedFile::advise_dontneed
 pub enum MappedFile {
@@ -287,14 +283,10 @@ impl MappedFile {
         matches!(self, Self::Pread { .. })
     }
 
-    /// Tell the kernel the pages backing `[offset, offset + len)` won't be needed
-    /// again soon, so it can reclaim them. Used by large sequential scans to drop
-    /// each chunk once consumed, keeping resident memory near one scan window
-    /// instead of the whole image — the key to not ballooning RSS on a
-    /// memory-constrained host (e.g. an ESXi userworld).
-    ///
-    /// No-op on the pread fallback (nothing is resident there) and best-effort on
-    /// mmap (an advisory call; harmless if the platform ignores it).
+    /// Hint the kernel that `[offset, offset + len)` won't be needed soon so it
+    /// can reclaim those pages — large sequential scans drop each chunk once
+    /// consumed, bounding RSS to ~one scan window instead of the whole image.
+    /// No-op on pread (nothing resident); best-effort advisory on mmap.
     pub fn advise_dontneed(&self, offset: u64, len: u64) {
         // Round the range inward to page boundaries: only whole pages fully
         // inside the scanned span are dropped, never a partial page that may
@@ -326,13 +318,9 @@ impl MappedFile {
         }
         #[cfg(windows)]
         {
-            // Windows has no madvise. VirtualUnlock on a range that was never
-            // locked still removes those pages from the process working set (it
-            // reports ERROR_NOT_LOCKED, which we ignore) — the documented
-            // equivalent, and safe here because the view is read-only and
-            // file-backed, so the pages re-fault from the file on next access.
-            // Without this the whole image stays in the working set and the RSS
-            // bound promised above simply does not hold.
+            // Windows has no madvise; VirtualUnlock on a never-locked range
+            // still drops those pages from the working set (reports
+            // ERROR_NOT_LOCKED, ignored). Needed for the RSS bound to hold.
             // SAFETY: `[off, off + n)` lies inside the mapping (clamped above).
             unsafe {
                 let _ = VirtualUnlock(m.as_ptr().add(off).cast(), n);

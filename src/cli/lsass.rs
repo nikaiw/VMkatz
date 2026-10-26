@@ -90,14 +90,10 @@ fn merge_findings(
     dst.autofill.append(&mut extra.autofill);
 }
 
-/// Run the hybrid chrome flow: open the disk once, extract SAM/LSA secrets +
-/// build disk-side DPAPI keyrings, combine them with the mem-side keyring, and
-/// run chrome discovery + decrypt — all sharing the same file handle.
-///
-/// Opening the disk twice (separate `open_disk()` calls for the SAM step and
-/// the discovery step) can race against external filesystem locks (e.g. ESXi
-/// system datastores) and fail the whole hybrid flow with EBUSY, even when the
-/// first open succeeded.
+/// Run the hybrid chrome flow sharing one file handle: SAM/LSA secrets +
+/// disk-side DPAPI keyrings, combined with the mem-side keyring, then chrome
+/// discovery + decrypt. One handle avoids a second `open_disk()` racing
+/// external FS locks (e.g. ESXi datastores) into EBUSY.
 #[cfg(all(
     feature = "chrome",
     any(
@@ -281,13 +277,10 @@ pub(crate) fn run_lsass(
             }
             #[cfg(feature = "qemu")]
             LsassFormat::QemuSavevm => {
-                // The savevm stream does not record the MMIO gap that splits
-                // pc.ram into the below-4G and above-4G GPA regions. A wrong
-                // guess misplaces every page at/above the gap — on 32-bit
-                // guests that is all of kernel physical memory, so System is
-                // never found. Probe the machine/firmware gap candidates and
-                // keep the one whose page mapping yields a valid System
-                // EPROCESS (PID + DTB + Flink translation all check out).
+                // The savevm stream omits the MMIO gap splitting pc.ram into
+                // below-4G / above-4G GPA regions; a wrong gap misplaces all
+                // high memory (all of kernel RAM on 32-bit guests). Probe the
+                // candidates, keep the one yielding a valid System EPROCESS.
                 const GAP_CANDIDATES: &[u64] =
                     &[0x8000_0000, 0xB000_0000, 0xC000_0000, 0xE000_0000];
                 let mut chosen_gap: Option<u64> = None;
@@ -296,11 +289,9 @@ pub(crate) fn run_lsass(
                     else {
                         continue;
                     };
-                    // A wrong gap can still find System (its own EPROCESS chain
-                    // may live entirely below the gap), but the process-list
-                    // walk faults one or two hops in when a page table lands in
-                    // the misplaced region. Require a healthy process list, not
-                    // just a System hit, to accept a gap.
+                    // Require a healthy process-list walk, not just a System
+                    // hit: a wrong gap can still find System but then faults a
+                    // hop or two in when a page table lands misplaced.
                     let healthy_list = match process::find_system_process_auto(&layer) {
                         Ok((system, offsets)) => {
                             process::enumerate_processes(&layer, &system, &offsets)
@@ -684,12 +675,10 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 
     let layer = make_layer()?;
 
-    // Registry (SAM/LSA) recovery now runs inside run_with_system: the exact CM
-    // hive-map walk first, the signature carve only as a fallback. The carve no
-    // longer runs eagerly up front — it scanned all of physical RAM and reassembled
-    // scattered bins (high memory, slow), which the hive-map walk avoids when page
-    // tables are available. When no System process can be found at all (VBS with no
-    // recoverable page tables), the carve is still reached as the last resort below.
+    // Registry (SAM/LSA) recovery runs inside run_with_system: the exact CM
+    // hive-map walk first, the signature carve (scans all RAM, reassembles
+    // scattered bins — slow) only as a fallback. The carve is still reached
+    // below when no System process is found at all (VBS without page tables).
 
     // -- Phase 1: Direct L1 scan for System process --
     let t_system = std::time::Instant::now();
@@ -902,12 +891,10 @@ fn run_with_system<L: PhysicalMemory>(
         }
     }
 
-    // Registry recovery: the CM hive-map walk is primary — it reconstructs each
-    // hive exactly from the _HHIVE/_HMAP (O(hive size), low memory) using the
-    // Registry process DTB (Win10 1803+; else System's). The signature carve —
-    // which scans all of physical RAM and reassembles scattered bins from stale
-    // copies — is only a fallback for hives the map walk can't resolve (fragmented,
-    // pre-1803). LSASS extraction still runs afterwards either way.
+    // Registry recovery: the CM hive-map walk (exact, low-memory, Registry
+    // process DTB on 1803+ else System's) is primary; the signature carve
+    // (scans all RAM, reassembles scattered bins) is a fallback for hives it
+    // can't resolve. LSASS extraction runs afterwards either way.
     #[cfg(feature = "sam")]
     if !args.no_mem_registry && !args.list_processes {
         let reg_dtb = processes
@@ -1020,12 +1007,10 @@ fn run_with_system<L: PhysicalMemory>(
                 .collect();
             let mem_keyring = vmkatz::chrome::runner::keyring_from_pairs(pairs);
 
-            // Feed every plaintext password LSASS gave us (WDigest / Kerberos /
-            // TsPkg / SSP / LiveSSP / CredMan) into the DPAPI masterkey decrypt
-            // as extra candidates, alongside `--chrome-password`. This lets the
-            // SHA1 pre-key path unlock a (domain or local) user's on-disk
-            // masterkey from a memory-recovered password even when that user's
-            // DPAPI masterkey isn't sitting in the LSASS cache (`mem_keyring`).
+            // Feed every plaintext password LSASS gave us (WDigest/Kerberos/
+            // TsPkg/SSP/LiveSSP/CredMan) into the DPAPI masterkey decrypt as
+            // extra candidates: the SHA1 pre-key path can then unlock a user's
+            // on-disk masterkey when it isn't in the LSASS cache.
             let mut chrome_passwords: Vec<String> = args.chrome_password.clone();
             for c in &credentials {
                 let provider_pw = [
@@ -1064,11 +1049,10 @@ fn run_with_system<L: PhysicalMemory>(
             chrome_nt_hashes.sort();
             chrome_nt_hashes.dedup();
 
-            // In-process scan: walk every chromium browser/utility process,
-            // dump its mapped userland through the page-table walker, and run
-            // the heuristic password / cookie scans on the bytes. Opt-in
-            // via `--chrome-process-scan` because the heuristic produces
-            // noisy results; the disk-side decrypt is the high-fidelity path.
+            // In-process scan: walk each chromium process, dump its userland
+            // via the page-table walker, run the heuristic password/cookie
+            // scans. Opt-in (`--chrome-process-scan`) — noisy; disk-side is the
+            // high-fidelity path.
             let mem_findings = if args.chrome_process_scan {
                 match vmkatz::chrome::process_scan::scan_chromium_processes(layer, &processes) {
                     Ok(f) => f,

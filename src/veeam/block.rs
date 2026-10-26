@@ -531,12 +531,11 @@ fn validate_descriptor_profile(header: &crate::veeam::BackupHeader) -> Result<()
         });
     }
     // The header `DigestType` names the storage's nominal digest engine, but per-block
-    // digests choose their engine independently and flag it in-band (compression high byte
-    // for physical records, state high nibble for logical records): `0` = MD5,
-    // `1` = BLAKE3-128. Every server-managed Windows Agent full observed keeps this string
-    // at `md5` while its blocks are BLAKE3-128, so the string is not the dispatch signal.
-    // Accept both engines the block layer can actually verify; reject only SHA-256 (a
-    // 32-byte digest that does not fit the 16-byte in-band scheme) and unrecognised names.
+    // digests flag their engine in-band (compression high byte for physical records,
+    // state high nibble for logical): `0` = MD5, `1` = BLAKE3-128. The header string is
+    // not the dispatch signal (it stays `md5` even for BLAKE3-128 blocks). Accept both
+    // in-band engines; reject only SHA-256 (32-byte, doesn't fit the 16-byte scheme) and
+    // unrecognised names.
     match header.digest_engine.as_deref() {
         Some("md5" | "MD5" | "blake3_128" | "BLAKE3-128") => Ok(()),
         Some("sha256" | "SHA256") => Err(VbkError::UnsupportedDigest {

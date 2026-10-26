@@ -491,17 +491,11 @@ fn finalize_credentials(
 
 /// Repair a Kerberos RC4 key from the session's MSV NT hash.
 ///
-/// The Kerberos RC4 key of an account is by definition the NT hash of its
-/// password. lsasrv encrypts 8-byte-aligned credential blobs with 3DES-CBC
-/// whose IV is the live chaining state of the protected-memory key object, so
-/// the first 8-byte block of older blobs decrypts to garbage when the chain
-/// has advanced between the encryption and the snapshot (see the x86 domain
-/// dumps: the machine RC4 garbles to `<8 random bytes><low half of NT>`).
-/// MSV blobs are unaffected (odd lengths take the AES-CFB path, which is
-/// insensitive to the chain state). When both are present and disagree, the
-/// MSV NT hash is the ground truth — heal the RC4 key so downstream consumers
-/// (and the key-group-to-session assignment, which matches on RC4 == NT)
-/// keep working on stale dumps.
+/// The RC4 key is by definition the NT hash. In stale dumps the first 3DES-CBC
+/// block of older Kerberos blobs can decrypt to garbage (the chaining state
+/// advanced after encryption); MSV blobs take the AES-CFB path and are
+/// unaffected. When the two disagree, the MSV NT hash is ground truth — heal
+/// the RC4 so downstream (and the RC4 == NT session matching) keeps working.
 fn heal_rc4_from_nt(cred: &mut Credential) {
     let Some(msv) = &cred.msv else { return };
     let nt = msv.nt_hash;
@@ -1226,19 +1220,12 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 ///   +0x18: Credentials (UNICODE_STRING: encrypted blob)
 ///
 /// The distinctive signature is bytes 07 00 08 00 at offset +0x08.
-/// Recover the 3DES IV by deriving it from an MSV primary credential.
-///
-/// The IV is one global reused for every lsasrv 3DES-CBC decryption. When the
-/// normal resolution yields a wrong IV (Win8.0 9200 / Vista, where lsasrv .text
-/// is paged out of the lsass working set so the code pattern can't be found),
-/// only CBC block 0 (the first 8 bytes) of each credential is corrupted; blocks
-/// 1+ are correct. The MSV primary credential begins with LogonDomainName (an
-/// LSA_UNICODE_STRING whose {Length, MaxLength} live in block 0 and whose pad
-/// bytes 4-7 are zero), and the domain string itself sits in a later, correct
-/// block — so its length, hence the true block-0 plaintext P0, is known. Then
-/// `IV[..8] = D(C[0]) XOR P0`, where `D(C[0]) = block0_current XOR current_iv[..8]`.
-/// This is a no-op when the IV is already correct (it recomputes the same value).
-/// x64 only; the x86 path resolves its IV separately.
+/// Recover the 3DES IV from an MSV primary credential, for the fallback where
+/// the code-pattern resolution yields a wrong IV (only CBC block 0 is then
+/// corrupt). Block 0 of the cred is the LogonDomainName header {Length,
+/// MaxLength, pad=0}; its Length is known from the domain string in a later
+/// (correct) block, so `IV[..8] = D(C[0]) XOR P0` with `D(C[0]) = block0_current
+/// XOR current_iv[..8]`. No-op when the IV is already correct. x64 only.
 fn recover_3des_iv_x64<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
@@ -1318,12 +1305,8 @@ fn recover_3des_iv_x64<P: PhysicalMemory>(
                 continue;
             }
             let length = (chars * 2) as u16;
-            // Pure-fallback guard: if the current IV already decrypts block 0 to a
-            // valid LogonDomainName header (pad bytes 4-7 zero AND Length equal to
-            // the domain's actual byte-length), the IV is correct — leave it. Builds
-            // whose lsasrv .text is resident (all Win10/11/Server, resolved by the
-            // code pattern) thus pass through untouched; only a broken IV (Win8.0/
-            // Vista, paged-out .text) triggers derivation.
+            // Guard: if the current IV already decrypts block 0 to a valid header
+            // (pad 4-7 zero, Length matches the domain), the IV is correct — leave it.
             if dec[4..8] == [0u8; 4] && u16::from_le_bytes([dec[0], dec[1]]) == length {
                 decided = true;
                 return;

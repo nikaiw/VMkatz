@@ -211,9 +211,7 @@ pub fn extract_crypto_keys(
             },
             Err(_) => continue,
         };
-        // The IV global's page can be paged out — reads return zeros and
-        // silently corrupt the first CBC block of every cred decrypt. Detect
-        // and recover by scanning .data for a non-zero, high-entropy candidate.
+        // IV global page paged out (reads zero): recover from .data.
         let iv: [u8; 16] = if iv_raw.iter().all(|&b| b == 0) {
             log::info!(
                 "IV global at 0x{iv_addr:x} is all zeros (page paged out); scanning .data for fallback"
@@ -380,12 +378,8 @@ fn extract_crypto_keys_data_fallback(
     })
 }
 
-/// Best-effort IV recovery when the LEA-resolved IV global is paged out.
-/// Searches a bounded window of .data around the BCrypt handle pointer for a
-/// plausible 16-byte IV (non-zero, non-pointer, non-UTF-16-string, high
-/// entropy). Empirically the IV lives within ~0x100 bytes of the handle on
-/// every observed build, so we cap the search at IV_SEARCH_RADIUS to avoid
-/// picking up unrelated strings deep in .data.
+/// Recover the IV when the LEA-resolved global is paged out: search a bounded
+/// window (IV_SEARCH_RADIUS) of .data around the handle for a plausible IV.
 fn recover_iv_from_data(
     vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
@@ -440,13 +434,8 @@ fn looks_like_iv(candidate: &[u8]) -> bool {
     if candidate.len() != 16 || candidate.iter().all(|&b| b == 0) {
         return false;
     }
-    // Pointer-shaped qword: heap address with canonical-form high bits and
-    // 8-byte alignment.
-    // Canonical-form, 8-byte-aligned heap/stack address. Alignment IS required:
-    // dropping it rejected too much — a random IV qword that happens to look
-    // like an unaligned canonical pointer was discarded, breaking data_fallback
-    // on Win8.0. The adjacent-pointer-pair case (Win7) is caught by the
-    // structured-data check below, not by flagging unaligned pointers here.
+    // Canonical-form, 8-byte-aligned pointer. Alignment is required; the
+    // adjacent-pointer case is caught by the structured-data check below.
     let looks_like_ptr =
         |q: u64| -> bool { q > 0x10000 && (q >> 48 == 0 || q >> 48 == 0xFFFF) && q & 0x7 == 0 };
     let v0 = super::types::read_u64_le(candidate, 0).unwrap_or(0);
@@ -454,9 +443,7 @@ fn looks_like_iv(candidate: &[u8]) -> bool {
     if looks_like_ptr(v0) || looks_like_ptr(v1) {
         return false;
     }
-    // UTF-16-LE ASCII: every odd byte is 0x00 and even bytes are printable.
-    // 8 odd positions; if >= 6 of them are 0x00 with printable evens, it's a
-    // string fragment, not random bytes.
+    // UTF-16-LE ASCII string fragment: >=6 of 8 odd bytes zero with printable evens.
     let mut odd_zeros = 0;
     let mut printable_evens = 0;
     for i in 0..8 {
@@ -470,11 +457,7 @@ fn looks_like_iv(candidate: &[u8]) -> bool {
     if odd_zeros >= 6 && printable_evens >= 6 {
         return false;
     }
-    // Structured-data check: two consecutive pointer-like qwords usually share
-    // most of their high bytes. If bytes 1..8 of the first half equal bytes
-    // 9..16 of the second half (i.e. only byte 0 and byte 8 differ), this is
-    // almost certainly a pointer table, not a random IV. Observed on Win7-x64
-    // where the data fallback picked up two adjacent pointers as an "IV".
+    // Two adjacent pointers (halves equal outside byte 0/8) — a pointer table, not an IV.
     let halves_match_outside_first_byte = candidate[1..8] == candidate[9..16];
     if halves_match_outside_first_byte {
         return false;
@@ -500,9 +483,6 @@ fn find_iv_near_handles(
     for off in (search_start..search_end).step_by(8) {
         let candidate = &data[off..off + 16];
 
-        // Single source of truth: same heuristics as the paged-out recovery
-        // path — zero / pointer / UTF-16-string / structured / low-entropy
-        // candidates are rejected.
         if !looks_like_iv(candidate) {
             continue;
         }
@@ -630,13 +610,8 @@ fn extract_crypto_keys_x86_from_pattern(
             }
         }
 
-        // IV candidate: pick the referenced global with the HIGHEST byte entropy.
-        // The IV is 16 random bytes; the earlier "first dword isn't a 32-bit
-        // pointer" test wrongly discarded it, because a random IV dword routinely
-        // falls in the user-address range (0x10000..0x80000000) — leaving the
-        // first 3DES-CBC block corrupted (then healed from the NT hash). A pointer
-        // table or mostly-zero struct has far lower entropy, so entropy separates
-        // them cleanly.
+        // IV candidate: pick the referenced global with the highest byte entropy
+        // (the IV is random; pointer tables and zero-padded structs score lower).
         if let Ok(candidate) = vmem.read_virt_bytes(addr, 16) {
             if candidate.len() == 16 {
                 let uniq = count_unique_bytes(&candidate);
@@ -649,8 +624,7 @@ fn extract_crypto_keys_x86_from_pattern(
         }
     }
 
-    // A genuine IV is near-maximal entropy; require a high bar so a low-entropy
-    // struct is never mistaken for one.
+    // A genuine IV is near-maximal entropy; require a high bar.
     let iv = best_iv
         .filter(|&(_, uniq)| uniq >= 12)
         .map(|(arr, _)| arr)
@@ -760,11 +734,8 @@ fn find_iv_near_handles_x86(data: &[u8], handle_offset: u64) -> Result<[u8; 16]>
     let search_start = handle_off.saturating_sub(0x200);
     let search_end = (handle_off + 0x200).min(data.len().saturating_sub(16));
 
-    // The IV is 16 random bytes → near-maximal byte entropy. Pick the
-    // highest-entropy 4-aligned window; pointer tables and mostly-zero structs
-    // in the same neighbourhood have much lower entropy. (The old "first two
-    // dwords aren't pointers" test both let a low-entropy near-zero window
-    // through and could reject a random IV, corrupting the first CBC block.)
+    // Pick the highest-entropy 4-aligned window (the IV is random; pointer
+    // tables and near-zero structs nearby score lower).
     let mut best: Option<(usize, u16)> = None;
     for off in (search_start..search_end).step_by(4) {
         let candidate = &data[off..off + 16];
@@ -1061,11 +1032,8 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
             if let Ok(iv_addr) = patterns::resolve_rip_relative(vmem, pattern_addr, offsets.iv_disp)
             {
                 if let Ok(iv_data) = vmem.read_virt_bytes(iv_addr, 16) {
-                    // Gate on looks_like_iv, not merely non-zero: a mismatched
-                    // offset set reads a displacement from mid-instruction and
-                    // resolves to arbitrary readable bytes. Requiring an
-                    // IV-shaped value lets the correct set (Win7: iv_disp 59)
-                    // win over earlier sets that resolve to code/pointers.
+                    // Require an IV-shaped value, not merely non-zero, so a
+                    // mismatched offset set resolving to code/pointers is skipped.
                     if iv_data.len() == 16 && looks_like_iv(&iv_data) {
                         log::info!(
                             "Physical scan: IV at 0x{:x}: {}",
@@ -1095,10 +1063,6 @@ pub fn extract_crypto_keys_physical_scan<P: crate::memory::PhysicalMemory>(
                         continue;
                     }
                     // Reject pointer pairs, UTF-16 strings and low-entropy data.
-                    // The inline aligned-pointer test used here before missed
-                    // unaligned pointers: on Win7-x64 two adjacent 0x00007ffe…
-                    // pointers ending in non-8-aligned bytes were taken as the
-                    // IV, corrupting the first 3DES-CBC block of every credential.
                     if !looks_like_iv(candidate) {
                         continue;
                     }

@@ -132,14 +132,10 @@ impl QemuSavevmLayer {
         })
     }
 
-    /// Open with an explicit MMIO gap (below_4g). The savevm stream stores
-    /// pc.ram as ONE contiguous block and does not record where the MMIO gap
-    /// splits it; the heuristic in `open` guesses 0x8000_0000 (q35+OVMF).
-    /// Wrong guess = every guest-phys address at/above the gap (all kernel
-    /// physical memory on 32-bit guests) decodes to the wrong file offset.
-    /// The CLI probes the known machine/firmware gap values and validates by
-    /// finding the System EPROCESS; this entry point lets it re-open the
-    /// state with the winning gap instead of re-parsing the stream by hand.
+    /// Re-open with an explicit MMIO gap (below_4g). The stream stores pc.ram
+    /// as one contiguous block without recording the gap split; a wrong gap
+    /// misdecodes every GPA at/above it. Lets the CLI re-open with the gap its
+    /// EPROCESS probe validated, without re-parsing the stream.
     pub fn open_with_gap(path: &Path, below_4g: u64) -> Result<Self> {
         let file = fs::File::open(path)?;
         let mmap = crate::utils::mmap_file(&file, path)?;

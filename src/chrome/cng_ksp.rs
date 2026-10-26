@@ -13,9 +13,6 @@
 //!      under a SYSTEM masterkey with the fixed CNG entropy `xT5rZW5qVVbrvpuA\0`).
 //!   3. Decrypt it and parse the `KDBM` (BCRYPT_KEY_DATA_BLOB) to get the 32-byte
 //!      AES key.
-//!
-//! Reverse-engineered from Chrome 154 `elevation_service.exe`; validated
-//! end-to-end against a real Win11 host.
 
 use std::io::{Read, Seek};
 

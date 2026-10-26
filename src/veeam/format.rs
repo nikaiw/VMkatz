@@ -212,11 +212,10 @@ fn parse_modern(reader: &FileReader, version: u32) -> Result<BackupHeader> {
 ///
 /// `inspect_reader` walks the first 16 MiB of the file looking for password hints, storage
 /// descriptors, and wrapped keyset records. Its per-hint heuristic (`identifier + 4 zeros +
-/// printable ASCII`) can trip inside compressed LZ4/UTF-16 payloads far past the actual
-/// metadata bank, which historically caused unencrypted "SERVER MANAGED" agent backups to
-/// be misreported as encrypted (see `metabank_decrypt_load` @ `0x14036A0E0`). The bank
-/// header keyset field is the same source of truth that `Extract.exe` consults, so it wins
-/// against any raw-byte finding.
+/// printable ASCII`) can trip inside compressed LZ4/UTF-16 payloads past the metadata bank,
+/// misreporting an unencrypted "SERVER MANAGED" agent backup as encrypted. The bank-header
+/// keyset field is the same source of truth `Extract.exe` consults, so it wins against any
+/// raw-byte finding.
 fn reconcile_encryption(
     reader: &FileReader,
     metadata: &MetadataLayout,

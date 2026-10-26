@@ -356,11 +356,10 @@ fn read_kind(
     // `DirItemType` per `dissect.archive`: `1` = SubFolder (directory), `2` = ExtFib,
     // `3` = IntFib, `4` = Patch, `5` = Increment. All four file types share an identical
     // on-disk header (name, block count at `+0xa0`, size at `+0xa8`) and each names a stored
-    // file, so they are decoded the same way. This matters for incremental (`.vib`/`.vrb`)
-    // backups: a VM's disk extents are stored as `Increment` records (`-flat.vmdk`), so
-    // stopping the record run at the first `4`/`5` used to drop every disk — and every
-    // record that followed it on the page — from the listing. `4`/`5` name data that is an
-    // incremental patch on the parent chain, so they are surfaced with `is_patch = true`.
+    // file, so they are decoded the same way. A VM's incremental (`.vib`/`.vrb`) disk
+    // extents are stored as `Increment` records, so the run must not stop at the first
+    // `4`/`5`. `4`/`5` name incremental-patch data on the parent chain, surfaced with
+    // `is_patch = true`.
     match read_slice_u32(page, relative, page_offset)? {
         1 => Ok(Some((StoredItemKind::Directory, false))),
         2 | 3 => Ok(Some((StoredItemKind::File, false))),

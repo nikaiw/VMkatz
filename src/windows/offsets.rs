@@ -179,11 +179,8 @@ const WIN8_X86_EPROCESS: EprocessOffsets = EprocessOffsets {
 
 // The four Win10 x86 layouts below are read from `_EPROCESS`/`_KPROCESS` in the
 // 32-bit ntdll PDBs (wntdll.pdb carries the kernel types; Winbindex has no x86
-// ntoskrnl). The two sets that used to stand here had five of six fields copied
-// from Win7, so the System scan derived a bad EPROCESS base and every candidate
-// failed DTB/Flink validation — no process was found at all on a Win10 x86 image.
-// Four ranges, not two: ImageFileName moves at 1511 and the whole struct shifts
-// at 2004.
+// ntoskrnl). Four ranges, not two: ImageFileName moves at 1511 and the whole
+// struct shifts at 2004.
 
 /// Windows 10 1507 x86 (build 10240)
 const WIN10_1507_X86_EPROCESS: EprocessOffsets = EprocessOffsets {

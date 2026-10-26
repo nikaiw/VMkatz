@@ -9,21 +9,13 @@
 //! - [4096..4142]: Backup header (same format, alternate writes)
 //! - [data_offset..]: Data region containing ObjectTable, KeyTables, values
 //!
-//! Memory reconstruction is byte-exact: every RamBlock decompresses (XPRESS) to
-//! a full 1 MB page. Two subtleties are essential for virtual-address translation:
+//! Each RamBlock decompresses (XPRESS) to a full 1 MB page. Two subtleties matter
+//! for virtual-address translation:
 //!
-//! 1. RamBlock references live in several KeyTable copies — ObjectTable-referenced
-//!    leaves, tables inline in the data region, and a set near the file start. The
-//!    low-memory leaf (RamBlock0..15) and ~200 scattered indices appear only in the
-//!    inline/early tables, so all of them must be swept (see
-//!    `VmrsLayer::parse_ramblock_references`); otherwise kernel page tables (e.g.
-//!    behind KUSER_SHARED_DATA) are missing and translation fails.
-//!
-//! 2. RamBlock indices are contiguous RAM offsets, but the guest's GPA space has a
-//!    low MMIO gap: RAM under it is remapped above 4 GB. read_phys therefore maps
-//!    GPA -> RAM offset across the gap (see `VmrsLayer::gpa_to_ram_offset`).
-//!    Without this, high-memory page-table entries translate out of range and the
-//!    EPROCESS list can't be walked.
+//! 1. RamBlock references live in several KeyTable copies; some appear only in the
+//!    inline/early tables, so all must be swept (`parse_ramblock_references`).
+//! 2. The guest GPA space has a low MMIO gap: RAM under it is remapped above 4 GB,
+//!    so read_phys maps GPA -> RAM offset across the gap (`gpa_to_ram_offset`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -410,12 +402,7 @@ impl VmrsLayer {
         // Now parse all KeyTables referenced by the ObjectTable
         self.parse_key_tables()?;
 
-        // Some RAM blocks (the low-memory leaf covering RamBlock0..15 plus scattered
-        // indices) live in KeyTables not referenced by any ObjectTable entry — inline
-        // in the data region, near the file start, or in backup copies. Without them
-        // low guest physical memory (e.g. the kernel page tables backing
-        // KUSER_SHARED_DATA) is missing and virtual-address translation fails. Sweep
-        // the file to recover every RamBlock reference.
+        // Recover RamBlocks not referenced by any ObjectTable (see the fn doc).
         self.parse_ramblock_references()?;
 
         Ok(())
@@ -423,23 +410,15 @@ impl VmrsLayer {
 
     /// Recover every `RamBlock<N>` reference by sweeping the whole file.
     ///
-    /// A VMRS stores its KeyTables in several places: ObjectTable-referenced leaf
-    /// tables (handled by [`Self::parse_key_tables`]), a primary set inline in the
-    /// data region, an early set near the start of the file (the first blocks
-    /// flushed during save), and backup copies. The low-memory leaf (RamBlock0..15)
-    /// and ~200 scattered indices live only in the inline/early tables, so without
-    /// them low guest physical memory — including the kernel page tables backing
-    /// KUSER_SHARED_DATA — is absent and virtual-address translation fails. Missing
-    /// a page-table page also yields garbage PFNs that translate out of range.
-    ///
-    /// Rather than locate every KeyTable header exactly, scan the file for
-    /// `RamBlock<N>` entries and resolve each in place. A RamBlock entry is a
-    /// reference entry (type 7, flag bit0 set) whose NUL-terminated name is
-    /// immediately followed by the 12-byte descriptor `{ u32 size; u64 file_offset }`
-    /// (see [`Self::walk_key_entries`]). Strict checks (exact name-length field,
-    /// entry type/flags, reference bounds) reject the rare coincidental "RamBlock"
-    /// byte sequence inside compressed page data. Inserts keep the first valid
-    /// reference, so entries already found via KeyTables are preserved.
+    /// The low-memory leaf (RamBlock0..15) and ~200 scattered indices live only in
+    /// KeyTables not referenced by any ObjectTable (inline, near the file start, or
+    /// backup copies); without them low GPA memory — the kernel page tables backing
+    /// KUSER_SHARED_DATA — is absent and VA translation fails. So scan for
+    /// `RamBlock<N>` entries and resolve each in place rather than locating every
+    /// KeyTable header. A RamBlock is a reference entry (type 7, flag bit0) whose
+    /// NUL-terminated name is followed by `{ u32 size; u64 file_offset }` (see
+    /// [`Self::walk_key_entries`]). Strict checks reject coincidental "RamBlock"
+    /// bytes in compressed page data; inserts keep the first valid reference.
     fn parse_ramblock_references(&mut self) -> Result<()> {
         let file_size = {
             let mut inner = self.inner.borrow_mut();

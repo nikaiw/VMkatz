@@ -74,11 +74,8 @@ fn fmt_password(password: &str, c: &Colors) -> String {
     }
 }
 
-/// Virtual service accounts — Desktop Window Manager (`DWM-N`, logon domain
-/// "Window Manager") and User Mode Font Driver (`UMFD-N`, "Font Driver Host") —
-/// hold a per-boot LSA-generated random password, not a real reusable credential.
-/// Its cleartext is noise, so the plaintext-password lines are suppressed for them
-/// (hashes/keys are still shown).
+/// DWM-N (domain "Window Manager") and UMFD-N ("Font Driver Host") virtual
+/// accounts: their per-boot random password is noise, so cleartext is suppressed.
 fn is_virtual_account(username: &str, domain: &str) -> bool {
     domain.eq_ignore_ascii_case("Window Manager")
         || domain.eq_ignore_ascii_case("Font Driver Host")
@@ -1488,9 +1485,8 @@ fn report_extraction_summary(credentials: &[Credential], format: &str) {
     let with_pw = credentials
         .iter()
         .filter(|c| {
-            // Match the display filter: machine account passwords (binary blobs)
-            // and virtual-account (DWM/UMFD) random secrets have their cleartext
-            // suppressed, so counting them overstates the useful plaintext found.
+            // Match the display filter — machine ($) and virtual-account cleartext
+            // is suppressed, so don't count it.
             if is_virtual_account(&c.username, &c.domain) {
                 return false;
             }
