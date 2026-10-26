@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, dev]
 
+# A new push to the same ref cancels an in-flight run, so a stuck run (e.g. a
+# hung wine install) doesn't pile up or keep burning a runner.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -28,19 +34,25 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Install mingw + wine (Windows cross-check)
-        env:
-          # Never block on a debconf prompt (a package in wine's tree can hang apt).
-          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          # Keep wine's full recommends: the `wine` launcher cargo invokes
-          # (CARGO_TARGET_..._RUNNER=wine) ships with them — --no-install-recommends
-          # drops /usr/bin/wine and the test can't execute. Retries + a per-request
-          # timeout stop a stalled mirror from hanging apt (the original failure);
-          # the job-level timeout-minutes bounds anything else.
-          sudo apt-get install -y \
-            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-            gcc-mingw-w64-x86-64 wine64
+          # This install has intermittently hung on the Ubuntu runner (a stalled
+          # mirror, or dpkg configure blocking). HTTP retries/timeout alone did not
+          # catch it, so bound each attempt with a hard `timeout` and retry: a stall
+          # now fails fast and self-heals on a fresh mirror instead of hanging the
+          # job. Full recommends are kept — the `wine` launcher cargo invokes
+          # (CARGO_TARGET_..._RUNNER=wine) ships with them.
+          for attempt in 1 2 3; do
+            sudo timeout 300 bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+                gcc-mingw-w64-x86-64 wine64
+            ' && exit 0
+            echo "::warning::wine install attempt ${attempt} stalled or failed; retrying"
+            sleep 10
+          done
+          echo "::error::wine install failed after 3 attempts"
+          exit 1
 
       - name: Format
         run: cargo fmt --all --check
