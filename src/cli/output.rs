@@ -74,6 +74,18 @@ fn fmt_password(password: &str, c: &Colors) -> String {
     }
 }
 
+/// Virtual service accounts — Desktop Window Manager (`DWM-N`, logon domain
+/// "Window Manager") and User Mode Font Driver (`UMFD-N`, "Font Driver Host") —
+/// hold a per-boot LSA-generated random password, not a real reusable credential.
+/// Its cleartext is noise, so the plaintext-password lines are suppressed for them
+/// (hashes/keys are still shown).
+fn is_virtual_account(username: &str, domain: &str) -> bool {
+    domain.eq_ignore_ascii_case("Window Manager")
+        || domain.eq_ignore_ascii_case("Font Driver Host")
+        || username.starts_with("DWM-")
+        || username.starts_with("UMFD-")
+}
+
 /// Print `DiskSecrets` (SAM + LSA + cached creds) using the current output format.
 #[cfg(all(
     feature = "sam",
@@ -1141,6 +1153,7 @@ fn print_text(
         if let Some(wd) = &cred.wdigest {
             if !wd.password.is_empty()
                 && !cred.username.ends_with('$')
+                && !is_virtual_account(&cred.username, &cred.domain)
                 && should_show(providers, "wdigest")
             {
                 println!("  {}[WDigest]{}", c.cyan, c.reset);
@@ -1151,7 +1164,11 @@ fn print_text(
             if should_show(providers, "kerberos") {
                 println!("  {}[Kerberos]{}", c.cyan, c.reset);
                 // Skip machine account passwords (binary blobs, use keys instead)
-                if !krb.password.is_empty() && !cred.username.ends_with('$') {
+                // and virtual-account random secrets.
+                if !krb.password.is_empty()
+                    && !cred.username.ends_with('$')
+                    && !is_virtual_account(&cred.username, &cred.domain)
+                {
                     println!("    Password: {}", fmt_password(&krb.password, c));
                 }
                 // Deduplicate keys by value — show each unique key once with primary etype
@@ -1192,7 +1209,10 @@ fn print_text(
             }
         }
         if let Some(ts) = &cred.tspkg {
-            if !ts.password.is_empty() && should_show(providers, "tspkg") {
+            if !ts.password.is_empty()
+                && !is_virtual_account(&cred.username, &cred.domain)
+                && should_show(providers, "tspkg")
+            {
                 println!("  {}[TsPkg]{}", c.cyan, c.reset);
                 println!("    Password: {}", fmt_password(&ts.password, c));
             }
@@ -1468,7 +1488,12 @@ fn report_extraction_summary(credentials: &[Credential], format: &str) {
     let with_pw = credentials
         .iter()
         .filter(|c| {
-            // Don't count machine account passwords (binary blobs, not useful)
+            // Match the display filter: machine account passwords (binary blobs)
+            // and virtual-account (DWM/UMFD) random secrets have their cleartext
+            // suppressed, so counting them overstates the useful plaintext found.
+            if is_virtual_account(&c.username, &c.domain) {
+                return false;
+            }
             let is_machine = c.username.ends_with('$');
             (!is_machine
                 && (c.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
