@@ -1,14 +1,27 @@
 # Changelog
 
-## Unreleased
+## v1.5.2
+
+A VMFS reliability release. The headline fix is a block-resolution bug that made
+thick-provisioned / GPT Windows VMs read the wrong data over VMFS and silently
+extract **nothing**; VMFS mode now also reaches parity with the local-disk path
+(NTDS + DPAPI), partition detection handles GPT, and a column mix-up that mislabeled
+NTDS NT hashes is corrected. ~10 fixes + 2 new flags, validated on real ESXi 8.0.2.
 
 ### New Features
 - **`--ls[=PATH]`** — read-only NTFS directory listing. Without a path, lists the root of every NTFS partition on the target; with a path given in equals form (e.g. `--ls='\Windows\System32'`) lists that directory. Works on local disk images and VMFS (`--vmfs-device [--vmdk]`), and falls back to an MFTMirr scan when the directory index is unreadable
 - **`--partition <OFFSET>`** — restrict any operation to a single partition by byte offset (hex `0x...` or decimal, as shown in logs and `--ls` headers)
 
 ### Fixes
-- **MFTMirr fallback scope** — a clean `NTFS entry not found` no longer triggers the MFTMirr scan: partitions without `\Windows` (WinRE/OEM/System Reserved) are reported and skipped without a wasted MFT scan. The fallback only runs when the directory index itself could not be enumerated (I/O or parse errors), which is the case it exists for
-- **NTDS via MFTMirr fallback** — `--ntds` now falls back to the MFTMirr scan on degraded disks (incomplete VMDKs, live block devices): `ntds.dit` is matched by name plus its `\Windows\NTDS` parent chain, and content-validated via the ESE magic when parent records are unreadable. Previously only SAM/SYSTEM/SECURITY had a fallback, so a DC whose NTFS index was unreadable yielded `NTDS.dit not found`
+- **VMFS reader — Large File Block resolution (critical)** — a single LFB spans many file blocks (e.g. 512 × 1 MB), but every file block in an LFB was mapped to the LFB's base, so any data past the first block read the wrong bytes. On thick-provisioned / GPT Windows VMDKs the NTFS volume sits mid-LFB, so the volume read as boot code: `find_ntfs_partitions` saw no NTFS and **all** extraction (SAM/LSA/NTDS/DPAPI/Chrome) silently returned nothing. Each file block now gets its intra-LFB offset
+- **GPT partition detection** — `find_ntfs_partitions` now parses GPT (not just MBR), accepting a partition only when a valid NTFS VBR is present, so modern UEFI/GPT Windows VMs are handled
+- **NTDS NT/LM columns swapped** — the AD hash extractor read `unicodePwd`/`dBCSPwd` from the wrong attribute IDs, emitting the real NT hash under the LM label (and zero under NT). Now `unicodePwd`=`ATTk589914` (NT), `dBCSPwd`=`ATTk589879` (LM)
+- **VMFS parity — NTDS + DPAPI** — `--vmfs-device … --ntds` now extracts domain hashes (previously SAM/LSA only), and VMFS runs now also emit DPAPI master-key hashes. VMFS mode now matches the local-disk path
+- **DPAPI master keys scoped by `--partition`** — a reader-based extractor honors `--partition` consistently across SAM/NTDS/DPAPI, on both the local-disk and VMFS paths
+- **`--ls` robustness** — bad `--partition` offset is fatal with the available offsets listed; a per-partition failure no longer aborts the whole sweep; `--partition` requires `--vmdk` in VMFS mode (an offset is specific to one disk)
+- **MFTMirr fallback scope** — a clean `NTFS entry not found` no longer triggers the MFTMirr scan: partitions without `\Windows` (WinRE/OEM/System Reserved) are reported and skipped without a wasted MFT scan. The fallback only runs when the directory index itself could not be enumerated (I/O or parse errors)
+- **NTDS via MFTMirr fallback** — `--ntds` now falls back to the MFTMirr scan on degraded disks (incomplete VMDKs, live block devices): `ntds.dit` is matched by name plus its `\Windows\NTDS` parent chain, and content-validated via the ESE magic when parent records are unreadable
+- **CI** — the Windows cross-check's `apt`/wine install no longer hangs the pipeline (noninteractive, retries, per-request timeout, 20-minute job cap)
 
 ## v1.5.1
 
