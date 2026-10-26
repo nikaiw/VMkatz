@@ -74,9 +74,10 @@ pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMaster
     extract_dpapi_masterkeys_scoped(path, None)
 }
 
-/// Like `extract_dpapi_masterkeys`, but restricts the scan to a single partition
-/// when `partition_filter` is `Some` — keeps `--partition` consistent across SAM,
-/// NTDS and DPAPI. `None` scans every NTFS partition (unchanged default).
+/// DPAPI master-key scan restricted to one partition when `partition_filter` is `Some`.
+///
+/// Keeps `--partition` consistent across SAM, NTDS and DPAPI; `None` scans every NTFS
+/// partition (the unchanged default used by `extract_dpapi_masterkeys`).
 pub fn extract_dpapi_masterkeys_scoped(
     path: &Path,
     partition_filter: Option<u64>,
