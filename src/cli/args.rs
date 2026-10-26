@@ -37,6 +37,10 @@ use clap::Parser;
         vmkatz --dump lsass -o out.dmp snap.vmsn    Dump with custom output filename\n  \
         vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
         vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
+        vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
+        vmkatz --ls '\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
+        vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \
+        vmkatz --vmfs-device /dev/sdb --vmdk 'DC01/DC01-flat.vmdk' --ls   List from VMFS\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
 )]
 pub(crate) struct Args {

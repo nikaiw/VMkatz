@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New Features
+- **`--ls [PATH]`** — read-only NTFS directory listing. Without a path, lists the root of every NTFS partition on the target; with a path (e.g. `'\Windows\System32'`) lists that directory. Works on local disk images and VMFS (`--vmfs-device [--vmdk]`), and falls back to an MFTMirr scan when the directory index is unreadable
+- **`--partition <OFFSET>`** — restrict any operation to a single partition by byte offset (hex `0x...` or decimal, as shown in logs and `--ls` headers)
+
 ### Fixes
 - **MFTMirr fallback scope** — a clean `NTFS entry not found` no longer triggers the MFTMirr scan: partitions without `\Windows` (WinRE/OEM/System Reserved) are reported and skipped without a wasted MFT scan. The fallback only runs when the directory index itself could not be enumerated (I/O or parse errors), which is the case it exists for
 - **NTDS via MFTMirr fallback** — `--ntds` now falls back to the MFTMirr scan on degraded disks (incomplete VMDKs, live block devices): `ntds.dit` is matched by name plus its `\Windows\NTDS` parent chain, and content-validated via the ESE magic when parent records are unreadable. Previously only SAM/SYSTEM/SECURITY had a fallback, so a DC whose NTFS index was unreadable yielded `NTDS.dit not found`
