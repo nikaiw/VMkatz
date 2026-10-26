@@ -12,6 +12,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Result, VmkatzError};
+use crate::fs::ntfs::finalize;
+use crate::fs::{DirEntry, EntryKind};
 use crate::utils::{u16_le_or0, u32_le_or0, u64_le_or0};
 
 /// Read into `buf` in block-sized chunks. On I/O error, zero-fill the failing
@@ -243,6 +245,12 @@ fn find_all_attributes(record: &[u8], attr_type: u32) -> Vec<(usize, usize)> {
 
 /// Extract filename from a $FILE_NAME attribute instance.
 fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
+    filename_info_from_attr(record, attr_pos).map(|(name, parent, _)| (name, parent))
+}
+
+/// Like `filename_from_attr`, also returning the real data size recorded in
+/// the $FILE_NAME attribute (offset 0x30).
+fn filename_info_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64, u64)> {
     let non_resident = record[attr_pos + 8];
     if non_resident != 0 {
         return None; // $FILE_NAME is always resident
@@ -271,6 +279,7 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     Some((
         crate::utils::utf16le_decode(&fname[0x42..0x42 + name_len * 2]),
         parent_ref,
+        u64_le_or0(fname, 0x30),
     ))
 }
 
@@ -953,6 +962,107 @@ fn scan_for_targets<R: Read + Seek>(
     records
 }
 
+/// Visit every in-use, parseable MFT record in the accessible segments.
+/// The callback receives (record number, fixed-up record) and returns `true`
+/// to stop the scan early.
+fn for_each_accessible_record<R: Read + Seek>(
+    reader: &mut R,
+    bootstrap: &MftBootstrap,
+    mut visit: impl FnMut(u64, &[u8]) -> bool,
+) {
+    let rs = bootstrap.params.record_size as usize;
+    let batch_records = 256usize;
+    for &(abs_offset, first_rec, num_recs) in &bootstrap.accessible_segments {
+        let mut rec_idx = 0u64;
+        while rec_idx < num_recs {
+            let batch = batch_records.min((num_recs - rec_idx) as usize);
+            let read_pos = abs_offset + rec_idx * rs as u64;
+            if reader.seek(SeekFrom::Start(read_pos)).is_err() {
+                rec_idx += batch as u64;
+                continue;
+            }
+            let mut batch_data = vec![0u8; batch * rs];
+            resilient_read_blocks(reader, &mut batch_data, rs);
+            for i in 0..batch {
+                let mut record = batch_data[i * rs..(i + 1) * rs].to_vec();
+                if !fixup_file_record(&mut record) {
+                    continue;
+                }
+                let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
+                if flags & 1 == 0 {
+                    continue;
+                }
+                if visit(first_rec + rec_idx + i as u64, &record) {
+                    return;
+                }
+            }
+            rec_idx += batch as u64;
+        }
+    }
+}
+
+/// Enumerate directory entries by scanning accessible MFT records for
+/// `$FILE_NAME` parent references, for when the directory index is unreadable.
+///
+/// `Ok(None)` means a path component could not be resolved from accessible
+/// records; `Err` means the MFT bootstrap itself failed.
+pub fn list_path_degraded<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    path: &str,
+) -> Result<Option<Vec<DirEntry>>> {
+    let bootstrap = mftmirr_bootstrap(reader, partition_offset)?;
+
+    // Resolve the path to a directory record number (root = record 5).
+    let mut current = 5u64;
+    for comp in path.split(['\\', '/']).filter(|c| !c.is_empty()) {
+        let mut found = None;
+        for_each_accessible_record(reader, &bootstrap, |rec_num, record| {
+            if record[0x16] & 0x02 == 0 || rec_num == current {
+                return false;
+            }
+            let hit = find_all_attributes(record, 0x30)
+                .into_iter()
+                .any(|(pos, _)| {
+                    filename_info_from_attr(record, pos).is_some_and(|(name, parent, _)| {
+                        parent == current && name.eq_ignore_ascii_case(comp)
+                    })
+                });
+            if hit {
+                found = Some(rec_num);
+            }
+            hit
+        });
+        match found {
+            Some(n) => current = n,
+            None => return Ok(None),
+        }
+    }
+
+    let mut raw = Vec::new();
+    for_each_accessible_record(reader, &bootstrap, |rec_num, record| {
+        // Skip the directory's own self-reference (root lists itself as a child).
+        if rec_num == current {
+            return false;
+        }
+        let is_dir = record[0x16] & 0x02 != 0;
+        for (pos, _) in find_all_attributes(record, 0x30) {
+            if let Some((name, parent, size)) = filename_info_from_attr(record, pos) {
+                if parent == current {
+                    let kind = if is_dir {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::File { size }
+                    };
+                    raw.push(DirEntry { name, kind });
+                }
+            }
+        }
+        false
+    });
+    Ok(Some(finalize(raw, true)))
+}
+
 /// Try to read registry hives via $MFTMirr bootstrap.
 ///
 /// This is the main entry point for SAM/SYSTEM/SECURITY. Called when
@@ -1170,10 +1280,14 @@ mod tests {
     const CL_REGF_SECURITY: u64 = 120;
     const CL_DECOY: u64 = 140;
 
+    const REC_ROOT_DIR: u32 = 13;
+    const REC_ROOT_FILE: u32 = 14;
+    const ROOT_FILE_SIZE: u64 = 0x1234_5678;
+
     const FILE_SIZE: u64 = 0x2000; // every file's $DATA size
 
     /// Build a resident $FILE_NAME attribute (type 0x30).
-    fn file_name_attr(name: &str, parent: u64) -> Vec<u8> {
+    fn file_name_attr(name: &str, parent: u64, size: u64) -> Vec<u8> {
         let name_utf16: Vec<u16> = name.encode_utf16().collect();
         let value_len = 0x42 + name_utf16.len() * 2;
         let value_offset = 0x18usize;
@@ -1186,6 +1300,7 @@ mod tests {
         attr[0x14..0x16].copy_from_slice(&(value_offset as u16).to_le_bytes());
         let value = &mut attr[value_offset..];
         value[0..8].copy_from_slice(&parent.to_le_bytes());
+        value[0x30..0x38].copy_from_slice(&size.to_le_bytes());
         value[0x40] = name_utf16.len() as u8;
         value[0x41] = 0; // Win32 namespace
         for (i, ch) in name_utf16.iter().enumerate() {
@@ -1289,14 +1404,14 @@ mod tests {
         put_mft(
             &mut image,
             REC_WINDOWS,
-            &make_record(true, vec![file_name_attr("Windows", 5)]),
+            &make_record(true, vec![file_name_attr("Windows", 5, 0)]),
         );
         put_mft(
             &mut image,
             REC_SYSTEM32,
             &make_record(
                 true,
-                vec![file_name_attr("System32", u64::from(REC_WINDOWS))],
+                vec![file_name_attr("System32", u64::from(REC_WINDOWS), 0)],
             ),
         );
         put_mft(
@@ -1304,13 +1419,16 @@ mod tests {
             REC_CONFIG,
             &make_record(
                 true,
-                vec![file_name_attr("config", u64::from(REC_SYSTEM32))],
+                vec![file_name_attr("config", u64::from(REC_SYSTEM32), 0)],
             ),
         );
         put_mft(
             &mut image,
             REC_NTDS,
-            &make_record(true, vec![file_name_attr("NTDS", u64::from(REC_WINDOWS))]),
+            &make_record(
+                true,
+                vec![file_name_attr("NTDS", u64::from(REC_WINDOWS), 0)],
+            ),
         );
 
         // Registry hives and ntds.dit
@@ -1320,7 +1438,7 @@ mod tests {
             &make_record(
                 false,
                 vec![
-                    file_name_attr("SYSTEM", system_parent),
+                    file_name_attr("SYSTEM", system_parent, 0),
                     data_attr(CL_REGF_SYSTEM, FILE_SIZE / CLUSTER, FILE_SIZE),
                 ],
             ),
@@ -1331,7 +1449,7 @@ mod tests {
             &make_record(
                 false,
                 vec![
-                    file_name_attr("ntds.dit", ntds_parent),
+                    file_name_attr("ntds.dit", ntds_parent, 0),
                     data_attr(CL_ESE, FILE_SIZE / CLUSTER, FILE_SIZE),
                 ],
             ),
@@ -1343,7 +1461,7 @@ mod tests {
                 &make_record(
                     false,
                     vec![
-                        file_name_attr("SAM", u64::from(REC_CONFIG)),
+                        file_name_attr("SAM", u64::from(REC_CONFIG), 0),
                         data_attr(CL_REGF_SAM, FILE_SIZE / CLUSTER, FILE_SIZE),
                     ],
                 ),
@@ -1354,12 +1472,27 @@ mod tests {
                 &make_record(
                     false,
                     vec![
-                        file_name_attr("SECURITY", u64::from(REC_CONFIG)),
+                        file_name_attr("SECURITY", u64::from(REC_CONFIG), 0),
                         data_attr(CL_REGF_SECURITY, FILE_SIZE / CLUSTER, FILE_SIZE),
                     ],
                 ),
             );
         }
+
+        // Root children (parent = record 5): one directory, one file with a known size
+        put_mft(
+            &mut image,
+            REC_ROOT_DIR,
+            &make_record(true, vec![file_name_attr("Users", 5, 0)]),
+        );
+        put_mft(
+            &mut image,
+            REC_ROOT_FILE,
+            &make_record(
+                false,
+                vec![file_name_attr("pagefile.sys", 5, ROOT_FILE_SIZE)],
+            ),
+        );
 
         if decoys {
             // Same names but a wrong parent chain — pass 1 must reject them.
@@ -1369,7 +1502,7 @@ mod tests {
                 &make_record(
                     false,
                     vec![
-                        file_name_attr("SYSTEM", u64::from(REC_SYSTEM32)),
+                        file_name_attr("SYSTEM", u64::from(REC_SYSTEM32), 0),
                         data_attr(CL_REGF_SYSTEM, FILE_SIZE / CLUSTER, FILE_SIZE),
                     ],
                 ),
@@ -1380,7 +1513,7 @@ mod tests {
                 &make_record(
                     false,
                     vec![
-                        file_name_attr("ntds.dit", u64::from(REC_CONFIG)),
+                        file_name_attr("ntds.dit", u64::from(REC_CONFIG), 0),
                         data_attr(CL_DECOY, FILE_SIZE / CLUSTER, FILE_SIZE),
                     ],
                 ),
@@ -1426,5 +1559,39 @@ mod tests {
 
         let err = try_mftmirr_fallback(&mut reader, PART_OFF).unwrap_err();
         assert!(err.to_string().contains("SAM hive not found"));
+    }
+
+    #[test]
+    fn degraded_lists_root_children() {
+        let image = build_volume(u64::from(REC_NTDS), u64::from(REC_CONFIG), true, false);
+        let mut reader = std::io::Cursor::new(image);
+
+        let entries = list_path_degraded(&mut reader, PART_OFF, "")
+            .unwrap()
+            .expect("root should resolve");
+        let find = |n: &str| entries.iter().find(|e| e.name == n).expect(n);
+        assert_eq!(find("Users").kind, EntryKind::Dir);
+        assert_eq!(
+            find("pagefile.sys").kind,
+            EntryKind::File {
+                size: ROOT_FILE_SIZE
+            }
+        );
+        // Harness record 5 doubles as "Windows", so System32/NTDS also have
+        // parent 5; the self-referencing record 5 itself must not be listed.
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().all(|e| e.name != "Windows"));
+        assert_eq!(entries[3].name, "pagefile.sys"); // files after dirs
+    }
+
+    #[test]
+    fn degraded_deep_path_unresolvable() {
+        let image = build_volume(u64::from(REC_NTDS), u64::from(REC_CONFIG), true, false);
+        let mut reader = std::io::Cursor::new(image);
+
+        let res = list_path_degraded(&mut reader, PART_OFF, "Users\\Missing\\Deeper").unwrap();
+        assert!(res.is_none());
+        let res = list_path_degraded(&mut reader, PART_OFF, "/NoSuchDir").unwrap();
+        assert!(res.is_none());
     }
 }
