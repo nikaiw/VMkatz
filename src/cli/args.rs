@@ -171,10 +171,10 @@ pub(crate) struct Args {
     /// on-disk DPAPI masterkeys with SAM/LSA secrets.
     #[arg(long, default_value_t = false)]
     pub(crate) credman: bool,
+
     /// With `--credman`: enumerate CREDENTIAL attributes and show each
     /// attribute's encrypted value as hex (offline decryption of entropy-bound
     /// WindowsLive/SSO blobs is not supported).
-    /// nested DPAPI blob (e.g. Windows Live SSO tokens), decrypted.
     #[arg(long, default_value_t = false)]
     pub(crate) credman_attributes: bool,
 
