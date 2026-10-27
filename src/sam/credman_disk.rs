@@ -182,6 +182,28 @@ struct Walker<'a, 'n, R: Read + Seek> {
     root: &'a ntfs::NtfsFile<'n>,
     rd: &'a mut R,
     secrets: &'a SecretTable,
+    /// SYSTEM Protect dirs, tried when a profile's own store lacks a masterkey.
+    system_protect: Vec<ProtectDir>,
+}
+
+/// The SYSTEM masterkey folders (`...\S-1-5-18\User` first, then `...\S-1-5-18`).
+fn system_protect_dirs() -> Vec<ProtectDir> {
+    let prot = "Windows\\System32\\Microsoft\\Protect\\S-1-5-18";
+    vec![
+        ProtectDir {
+            path: format!("{prot}\\User"),
+            sid: SYSTEM_SID.into(),
+        },
+        ProtectDir {
+            path: prot.into(),
+            sid: SYSTEM_SID.into(),
+        },
+    ]
+}
+
+/// SYSTEM fallback dirs for `prof_name`; empty for SYSTEM itself (already searched).
+fn fallback_dirs<'a>(prof_name: &str, system: &'a [ProtectDir]) -> &'a [ProtectDir] {
+    if prof_name == "SYSTEM" { &[] } else { system }
 }
 
 impl<R: Read + Seek> Walker<'_, '_, R> {
@@ -238,23 +260,13 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
 
     fn system_profile() -> Profile {
         let base = "Windows\\System32\\config\\systemprofile";
-        let prot = "Windows\\System32\\Microsoft\\Protect\\S-1-5-18";
         Profile {
             name: "SYSTEM".into(),
             cred_dirs: vec![
                 format!("{base}\\AppData\\Local\\Microsoft\\Credentials"),
                 format!("{base}\\AppData\\Roaming\\Microsoft\\Credentials"),
             ],
-            protect: vec![
-                ProtectDir {
-                    path: format!("{prot}\\User"),
-                    sid: SYSTEM_SID.into(),
-                },
-                ProtectDir {
-                    path: prot.into(),
-                    sid: SYSTEM_SID.into(),
-                },
-            ],
+            protect: system_protect_dirs(),
         }
     }
 
@@ -296,16 +308,23 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             default_sid,
             format!("masterkey {guid} not found in Protect folders"),
         );
-        for pd in &prof.protect {
+        let system = std::mem::take(&mut self.system_protect);
+        let fallback = fallback_dirs(&prof.name, &system);
+        let mut found = None;
+        for pd in prof.protect.iter().chain(fallback) {
             let Ok(mk_bytes) = self.read(&pd.path, guid) else {
                 continue;
             };
             match unlock(self.secrets, &pd.sid, &mk_bytes) {
-                Ok(k) => return Ok((k, pd.sid.clone())),
+                Ok(k) => {
+                    found = Some((k, pd.sid.clone()));
+                    break;
+                }
                 Err(reason) => last = (pd.sid.clone(), reason),
             }
         }
-        Err(last)
+        self.system_protect = system;
+        found.ok_or(last)
     }
 
     fn scan_profile(&mut self, prof: &Profile, report: &mut CredmanReport) {
@@ -409,6 +428,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
             root: &root,
             rd: &mut part,
             secrets,
+            system_protect: system_protect_dirs(),
         };
         for prof in w.profiles() {
             w.scan_profile(&prof, &mut report);
@@ -443,6 +463,30 @@ mod tests {
         };
         assert!(t.secret_for("S-1-5-18").is_system());
         assert!(t.secret_for("S-1-5-21-1-2-3-1106").is_none());
+    }
+
+    #[test]
+    fn system_fallback_resolves() {
+        let sys = system_protect_dirs();
+        assert_eq!(sys.len(), 2);
+        assert!(sys[0].path.ends_with("S-1-5-18\\User"));
+        assert!(sys.iter().all(|p| p.sid == "S-1-5-18"));
+        // Non-SYSTEM profiles fall back to the SYSTEM dirs, in order.
+        let fb = fallback_dirs("NetworkService", &sys);
+        assert_eq!(fb.len(), 2);
+        assert_eq!(fb[0].path, sys[0].path);
+        // SYSTEM itself is never re-searched.
+        assert!(fallback_dirs("SYSTEM", &sys).is_empty());
+        // The fallback SID is unlockable via DPAPI_SYSTEM.
+        let t = SecretTable {
+            dpapi_system: Some([0u8; 20]),
+            ..Default::default()
+        };
+        assert!(t.secret_for(&fb[0].sid).is_system());
+        assert_eq!(
+            Walker::<std::io::Cursor<Vec<u8>>>::system_profile().protect[0].sid,
+            fb[0].sid
+        );
     }
 
     #[test]
