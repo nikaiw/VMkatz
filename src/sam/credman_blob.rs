@@ -97,12 +97,7 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     let username = read_lp_utf16(decrypted, &mut cur)?;
     let blob = read_lp_bytes(decrypted, &mut cur)?;
     let password = decode_utf16(blob).unwrap_or_else(|| hex::encode(blob));
-    // With attributes present, a reserved leading u32 precedes the first one.
-    let attributes = if attr_count > 0 && read_u32(decrypted, &mut cur).is_ok() {
-        parse_attributes(decrypted, &mut cur, attr_count)
-    } else {
-        Vec::new()
-    };
+    let attributes = parse_attributes(decrypted, &mut cur, attr_count);
     Ok(CredmanEntry {
         target,
         username,
@@ -121,12 +116,12 @@ fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttr
         if bytes.len().saturating_sub(*cur) < MIN_ATTR {
             break;
         }
-        let Ok(keyword) = read_lp_utf16(bytes, cur) else {
-            break;
-        };
         if read_u32(bytes, cur).is_err() {
             break; // Flags
         }
+        let Ok(keyword) = read_lp_utf16(bytes, cur) else {
+            break;
+        };
         let Ok(value) = read_lp_bytes(bytes, cur) else {
             break;
         };
@@ -175,12 +170,9 @@ mod tests {
         lp(&mut v, user);
         v.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         v.extend_from_slice(blob);
-        if declared > 0 {
-            v.extend_from_slice(&0u32.to_le_bytes()); // reserved leading u32
-        }
         for (kw, val) in attrs {
-            lp(&mut v, kw);
             v.extend_from_slice(&0u32.to_le_bytes()); // Flags
+            lp(&mut v, kw);
             v.extend_from_slice(&(val.len() as u32).to_le_bytes());
             v.extend_from_slice(val);
         }
