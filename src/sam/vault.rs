@@ -1,5 +1,9 @@
 //! Windows Vault `Policy.vpol` parsing and vault AES key extraction.
 
+use aes::{Aes128, Aes256};
+use cbc::cipher::block_padding::NoPadding;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+
 use crate::error::{Result, VmkatzError};
 
 /// The two AES keys held in a decrypted `Policy.vpol`.
@@ -14,8 +18,12 @@ fn err(msg: &str) -> VmkatzError {
 }
 
 fn take<'a>(bytes: &'a [u8], cur: &mut usize, n: usize) -> Result<&'a [u8]> {
-    let end = cur.checked_add(n).ok_or_else(|| err("vault offset overflow"))?;
-    let s = bytes.get(*cur..end).ok_or_else(|| err("vault data truncated"))?;
+    let end = cur
+        .checked_add(n)
+        .ok_or_else(|| err("vault offset overflow"))?;
+    let s = bytes
+        .get(*cur..end)
+        .ok_or_else(|| err("vault data truncated"))?;
     *cur = end;
     Ok(s)
 }
@@ -83,6 +91,150 @@ pub fn parse_vault_keys(decrypted_vpol: &[u8]) -> Result<VaultKeys> {
     Ok(VaultKeys { aes128, aes256 })
 }
 
+/// A decrypted Vault credential (resource / identity / authenticator).
+#[derive(Debug, Clone)]
+pub struct VaultCred {
+    pub resource: String,
+    pub identity: String,
+    pub secret: String,
+}
+
+/// Cap on attribute-map entries and on any single decoded string.
+const MAX_ATTRS: usize = 64;
+
+fn utf16(b: &[u8]) -> String {
+    let u: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&u)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+/// AES-CBC decrypt (no padding) then strip PKCS#7 padding when valid.
+fn aes_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
+        return Err(err("vault ciphertext not block aligned"));
+    }
+    let mut buf = data.to_vec();
+    let bad = |_| err("vault AES key size invalid");
+    match key.len() {
+        32 => {
+            cbc::Decryptor::<Aes256>::new_from_slices(key, iv)
+                .map_err(bad)?
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|_| err("vault AES decrypt failed"))?;
+        }
+        16 => {
+            cbc::Decryptor::<Aes128>::new_from_slices(key, iv)
+                .map_err(bad)?
+                .decrypt_padded_mut::<NoPadding>(&mut buf)
+                .map_err(|_| err("vault AES decrypt failed"))?;
+        }
+        _ => return Err(err("vault AES key size invalid")),
+    }
+    if let Some(&p) = buf.last() {
+        let p = p as usize;
+        if (1..=16).contains(&p)
+            && p <= buf.len()
+            && buf[buf.len() - p..].iter().all(|&b| b as usize == p)
+        {
+            buf.truncate(buf.len() - p);
+        }
+    }
+    Ok(buf)
+}
+
+/// Parse and decrypt one VAULT_ATTRIBUTE at `off`, returning the clear data.
+fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8>> {
+    let mut cur = off;
+    let id = read_u32(file, &mut cur)?;
+    for _ in 0..3 {
+        read_u32(file, &mut cur)?;
+    }
+    if id >= 100 {
+        read_u32(file, &mut cur)?;
+    }
+    let size = read_u32(file, &mut cur)? as usize;
+    let has_iv = take(file, &mut cur, 1)?[0] != 0;
+    let (iv, overhead) = if has_iv {
+        let ivlen = read_u32(file, &mut cur)? as usize;
+        if ivlen != 16 {
+            return Err(err("unexpected vault IV size"));
+        }
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(take(file, &mut cur, 16)?);
+        (iv, 1 + 4 + 16)
+    } else {
+        ([0u8; 16], 1)
+    };
+    let dlen = size
+        .checked_sub(overhead)
+        .ok_or_else(|| err("vault attribute size too small"))?;
+    let data = take(file, &mut cur, dlen)?;
+    let key = if has_iv { &keys.aes256 } else { &keys.aes128 };
+    aes_cbc(key, &iv, data)
+}
+
+/// Read a u32-length-prefixed UTF-16LE string from the decoded clear.
+fn read_item(clear: &[u8], cur: &mut usize) -> Result<String> {
+    let n = read_u32(clear, cur)? as usize;
+    Ok(utf16(take(clear, cur, n)?))
+}
+
+/// Parse a `.vcrd` file: VAULT_VCRD header (schema GUID, unknown, FILETIME,
+/// two unknowns, friendly name, attribute map of {id, offset, unknown}), then
+/// each attribute (optional IV + AES ciphertext). The first attribute whose
+/// clear parses as three length-prefixed strings (resource, identity,
+/// authenticator) is returned.
+///
+/// EXPERIMENTAL: unvalidated against real .vcrd (synthetic fixtures only).
+pub fn parse_vcrd(file: &[u8], keys: &VaultKeys) -> Result<VaultCred> {
+    let mut cur = 0usize;
+    take(file, &mut cur, 16)?; // schema GUID
+    read_u32(file, &mut cur)?;
+    take(file, &mut cur, 8)?; // last written
+    read_u32(file, &mut cur)?;
+    read_u32(file, &mut cur)?;
+    let name_len = read_u32(file, &mut cur)? as usize;
+    take(file, &mut cur, name_len)?;
+    let maps_len = read_u32(file, &mut cur)? as usize;
+    let count = maps_len / 12;
+    if count == 0 || count > MAX_ATTRS {
+        return Err(err("vcrd attribute map size out of range"));
+    }
+    let mut offsets = Vec::with_capacity(count);
+    for _ in 0..count {
+        read_u32(file, &mut cur)?;
+        offsets.push(read_u32(file, &mut cur)? as usize);
+        read_u32(file, &mut cur)?;
+    }
+    let mut last = err("vcrd has no usable attribute");
+    for off in offsets {
+        let clear = match decrypt_attribute(file, off, keys) {
+            Ok(c) => c,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        let mut c = 0usize;
+        let parsed = (|| {
+            Ok(VaultCred {
+                resource: read_item(&clear, &mut c)?,
+                identity: read_item(&clear, &mut c)?,
+                secret: read_item(&clear, &mut c)?,
+            })
+        })();
+        match parsed {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +243,10 @@ mod tests {
         let mut v = Vec::new();
         v.extend_from_slice(&1u32.to_le_bytes());
         v.extend_from_slice(&[0xAA; 16]);
-        let desc: Vec<u8> = "Web Credentials\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let desc: Vec<u8> = "Web Credentials\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
         v.extend_from_slice(&(desc.len() as u32).to_le_bytes());
         v.extend_from_slice(&desc);
         for x in [1u32, 0, 1] {
@@ -149,5 +304,107 @@ mod tests {
             assert!(parse_vault_keys(&d[..n]).is_err(), "len {n}");
         }
         assert!(parse_vault_keys(&[0xFF; 64]).is_err());
+    }
+
+    fn enc(key: &[u8], iv: &[u8; 16], clear: &[u8]) -> Vec<u8> {
+        use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
+        if key.len() == 32 {
+            cbc::Encryptor::<Aes256>::new_from_slices(key, iv)
+                .unwrap()
+                .encrypt_padded_vec_mut::<Pkcs7>(clear)
+        } else {
+            cbc::Encryptor::<Aes128>::new_from_slices(key, iv)
+                .unwrap()
+                .encrypt_padded_vec_mut::<Pkcs7>(clear)
+        }
+    }
+
+    fn item(s: &str) -> Vec<u8> {
+        let b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut v = (b.len() as u32).to_le_bytes().to_vec();
+        v.extend(b);
+        v
+    }
+
+    fn keys() -> VaultKeys {
+        VaultKeys {
+            aes128: vec![0x11; 16],
+            aes256: vec![0x22; 32],
+        }
+    }
+
+    fn vcrd(with_iv: bool) -> Vec<u8> {
+        let mut clear = item("https://example.com\0");
+        clear.extend(item("alice"));
+        clear.extend(item("s3cret!"));
+        let iv = [0x33u8; 16];
+        let k = keys();
+        let ct = if with_iv {
+            enc(&k.aes256, &iv, &clear)
+        } else {
+            enc(&k.aes128, &[0; 16], &clear)
+        };
+        let mut attr = Vec::new();
+        attr.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..3 {
+            attr.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let size = 1 + if with_iv { 4 + 16 } else { 0 } + ct.len();
+        attr.extend_from_slice(&(size as u32).to_le_bytes());
+        attr.push(u8::from(with_iv));
+        if with_iv {
+            attr.extend_from_slice(&16u32.to_le_bytes());
+            attr.extend_from_slice(&iv);
+        }
+        attr.extend(ct);
+        let name: Vec<u8> = "Web\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut v = vec![0xEE; 16];
+        v.extend_from_slice(&[0; 4]);
+        v.extend_from_slice(&[0; 8]);
+        v.extend_from_slice(&[0; 8]);
+        v.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        v.extend(name);
+        v.extend_from_slice(&12u32.to_le_bytes());
+        let off = v.len() + 12;
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&(off as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend(attr);
+        v
+    }
+
+    #[test]
+    fn parse_vcrd_roundtrip() {
+        for iv in [true, false] {
+            let c = parse_vcrd(&vcrd(iv), &keys()).unwrap();
+            assert_eq!(c.resource, "https://example.com");
+            assert_eq!(c.identity, "alice");
+            assert_eq!(c.secret, "s3cret!");
+        }
+    }
+
+    #[test]
+    fn parse_vcrd_bounds() {
+        let f = vcrd(true);
+        for n in 0..f.len() {
+            assert!(parse_vcrd(&f[..n], &keys()).is_err(), "len {n}");
+        }
+        assert!(parse_vcrd(&[0xFF; 128], &keys()).is_err());
+        assert!(parse_vcrd(&[], &keys()).is_err());
+    }
+
+    #[test]
+    fn parse_vcrd_bad_key() {
+        let f = vcrd(true);
+        let short = VaultKeys {
+            aes128: vec![1; 16],
+            aes256: vec![1; 7],
+        };
+        assert!(parse_vcrd(&f, &short).is_err());
+        let wrong = VaultKeys {
+            aes128: vec![9; 16],
+            aes256: vec![9; 32],
+        };
+        assert!(parse_vcrd(&f, &wrong).is_err());
     }
 }

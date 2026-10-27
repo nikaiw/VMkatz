@@ -12,6 +12,7 @@ use super::credman_blob::{CredmanEntry, parse_credential_blob};
 use super::dpapi_blob::{decrypt_blob, parse_blob};
 use super::dpapi_masterkey::{decrypt_local_user_masterkey, decrypt_system_masterkey};
 use super::lsa::{LsaSecret, LsaSecretType};
+use super::vault::{VaultCred, VaultKeys, parse_vault_keys, parse_vcrd, parse_vpol};
 use crate::error::Result;
 
 const SYSTEM_SID: &str = "S-1-5-18";
@@ -19,6 +20,9 @@ const SYSTEM_SID: &str = "S-1-5-18";
 const MAX_PROFILES: usize = 256;
 const MAX_PROTECT_DIRS: usize = 16;
 const MAX_CRED_FILES: usize = 512;
+/// Max vault GUID folders per Vault root, and `.vcrd` files per vault folder.
+const MAX_VAULT_DIRS: usize = 32;
+const MAX_VCRD_FILES: usize = 512;
 /// Max size of any single file read (Credentials blobs and masterkey files are tiny).
 const MAX_FILE_LEN: u64 = 4 << 20;
 
@@ -48,11 +52,22 @@ pub struct Undecrypted {
     pub reason: String,
 }
 
+/// A decrypted Vault credential (EXPERIMENTAL: `.vcrd` parsing is synthetic-tested only).
+#[derive(Debug, Clone)]
+pub struct ProfileVaultCred {
+    pub profile: String,
+    pub vault_guid: String,
+    pub cred: VaultCred,
+}
+
 /// Result of a credman sweep.
 #[derive(Debug, Default)]
 pub struct CredmanReport {
     pub entries: Vec<ProfileCred>,
     pub undecrypted: Vec<Undecrypted>,
+    pub vault: Vec<ProfileVaultCred>,
+    /// Per-vault notes: `<profile>\<guid>: keys=<n> vcrd=<n>` for each unlocked vault.
+    pub vault_notes: Vec<String>,
 }
 
 /// Secrets available to unlock DPAPI masterkeys.
@@ -183,6 +198,7 @@ struct ProtectDir {
 struct Profile {
     name: String,
     cred_dirs: Vec<String>,
+    vault_roots: Vec<String>,
     protect: Vec<ProtectDir>,
 }
 
@@ -213,6 +229,13 @@ fn system_protect_dirs() -> Vec<ProtectDir> {
 /// SYSTEM fallback dirs for `prof_name`; empty for SYSTEM itself (already searched).
 fn fallback_dirs<'a>(prof_name: &str, system: &'a [ProtectDir]) -> &'a [ProtectDir] {
     if prof_name == "SYSTEM" { &[] } else { system }
+}
+
+fn vault_roots(base: &str) -> Vec<String> {
+    vec![
+        format!("{base}\\AppData\\Local\\Microsoft\\Vault"),
+        format!("{base}\\AppData\\Roaming\\Microsoft\\Vault"),
+    ]
 }
 
 impl<R: Read + Seek> Walker<'_, '_, R> {
@@ -263,6 +286,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                 format!("{base}\\AppData\\Local\\Microsoft\\Credentials"),
                 format!("{base}\\AppData\\Roaming\\Microsoft\\Credentials"),
             ],
+            vault_roots: vault_roots(base),
             protect: self.user_protect_dirs(base),
         }
     }
@@ -275,6 +299,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                 format!("{base}\\AppData\\Local\\Microsoft\\Credentials"),
                 format!("{base}\\AppData\\Roaming\\Microsoft\\Credentials"),
             ],
+            vault_roots: vault_roots(base),
             protect: system_protect_dirs(),
         }
     }
@@ -361,6 +386,95 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                 }
             }
         }
+    }
+
+    /// Scan `<base>\AppData\{Local,Roaming}\Microsoft\Vault\<GUID>\` folders.
+    /// Failures go to `undecrypted`; nothing here aborts the walk.
+    fn scan_vaults(&mut self, prof: &Profile, report: &mut CredmanReport) {
+        for root in &prof.vault_roots {
+            let Some(dirs) = self.list(root, MAX_VAULT_DIRS) else {
+                continue;
+            };
+            for (guid, is_dir) in dirs {
+                if !is_dir {
+                    continue;
+                }
+                let dir = format!("{root}\\{guid}");
+                let vcrds: Vec<String> = self
+                    .list(&dir, MAX_VCRD_FILES)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(n, d)| !*d && n.to_lowercase().ends_with(".vcrd"))
+                    .map(|(n, _)| n)
+                    .collect();
+                let (keys, sid) = match self.vault_keys(prof, &dir) {
+                    Ok(k) => k,
+                    Err((sid, reason)) => {
+                        // A folder without Policy.vpol and without records is not a vault.
+                        if !vcrds.is_empty() || !reason.starts_with("Policy.vpol read") {
+                            report.undecrypted.push(Undecrypted {
+                                profile: prof.name.clone(),
+                                sid,
+                                file: format!("{dir}\\Policy.vpol"),
+                                reason,
+                            });
+                        }
+                        continue;
+                    }
+                };
+                let mut n_ok = 0usize;
+                for name in &vcrds {
+                    let res = self.read(&dir, name).and_then(|b| parse_vcrd(&b, &keys));
+                    match res {
+                        Ok(cred) => {
+                            n_ok += 1;
+                            report.vault.push(ProfileVaultCred {
+                                profile: prof.name.clone(),
+                                vault_guid: guid.clone(),
+                                cred,
+                            });
+                        }
+                        Err(e) => report.undecrypted.push(Undecrypted {
+                            profile: prof.name.clone(),
+                            sid: sid.clone(),
+                            file: format!("{dir}\\{name}"),
+                            reason: format!("vcrd: {e}"),
+                        }),
+                    }
+                }
+                report.vault_notes.push(format!(
+                    "{}\\{guid}: keys=2 vcrd={}/{}",
+                    prof.name,
+                    n_ok,
+                    vcrds.len()
+                ));
+            }
+        }
+    }
+
+    /// Policy.vpol -> DPAPI blob -> masterkey -> clear -> AES keys.
+    fn vault_keys(
+        &mut self,
+        prof: &Profile,
+        dir: &str,
+    ) -> std::result::Result<(VaultKeys, String), (String, String)> {
+        let sid0 = prof
+            .protect
+            .first()
+            .map(|p| p.sid.clone())
+            .unwrap_or_default();
+        let raw = self
+            .read(dir, "Policy.vpol")
+            .map_err(|e| (sid0.clone(), format!("Policy.vpol read: {e}")))?;
+        let inner = parse_vpol(&raw).map_err(|e| (sid0.clone(), format!("vpol parse: {e}")))?;
+        let blob =
+            parse_blob(inner).map_err(|e| (sid0.clone(), format!("vpol blob parse: {e}")))?;
+        let (mk, sid) = self.resolve_masterkey(prof, &blob.mk_guid_str)?;
+        let clear = decrypt_blob(&blob, &mk)
+            .map_err(|e| (sid.clone(), format!("vpol blob decrypt: {e}")))?;
+        let keys =
+            parse_vault_keys(&clear).map_err(|e| (sid.clone(), format!("vault keys: {e}")))?;
+        Ok((keys, sid))
     }
 
     fn decrypt_one(
@@ -463,6 +577,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
         };
         for prof in w.profiles() {
             w.scan_profile(&prof, &mut report);
+            w.scan_vaults(&prof, &mut report);
         }
     }
     Ok(report)
