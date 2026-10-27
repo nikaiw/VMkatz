@@ -1,5 +1,6 @@
 //! Parser for the decrypted Windows `CREDENTIAL` on-disk structure.
 
+use super::dpapi_blob::parse_blob_with_len;
 use crate::error::{Result, VmkatzError};
 
 /// A parsed Credential Manager entry.
@@ -108,27 +109,33 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
 }
 
 /// Best-effort attribute parse: stops at the first malformed/truncated attribute,
-/// bounded by `count` and the remaining data (each attribute is >= 12 bytes).
+/// bounded by `count` and the remaining data.
+///
+/// Per attribute: Flags u32, Keyword SIZED_WSTR, Reserved u32 (ignored), then a
+/// self-delimiting DPAPI blob whose real length is what `parse_blob_with_len` consumes.
 fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttribute> {
-    const MIN_ATTR: usize = 12;
     let mut out = Vec::new();
     for _ in 0..count {
-        if bytes.len().saturating_sub(*cur) < MIN_ATTR {
-            break;
-        }
         if read_u32(bytes, cur).is_err() {
             break; // Flags
         }
         let Ok(keyword) = read_lp_utf16(bytes, cur) else {
             break;
         };
-        let Ok(value) = read_lp_bytes(bytes, cur) else {
+        if read_u32(bytes, cur).is_err() {
+            break; // Reserved
+        }
+        let Some(rest) = bytes.get(*cur..) else {
+            break;
+        };
+        let Ok((_, len)) = parse_blob_with_len(rest) else {
             break;
         };
         out.push(CredAttribute {
             keyword,
-            value: value.to_vec(),
+            value: rest[..len].to_vec(),
         });
+        *cur += len;
     }
     out
 }
@@ -173,7 +180,7 @@ mod tests {
         for (kw, val) in attrs {
             v.extend_from_slice(&0u32.to_le_bytes()); // Flags
             lp(&mut v, kw);
-            v.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            v.extend_from_slice(&0x100u32.to_le_bytes()); // Reserved
             v.extend_from_slice(val);
         }
         v
@@ -232,37 +239,66 @@ mod tests {
         assert_eq!(e.password, "010203");
     }
 
-    const ATTRS: [(&str, &[u8]); 2] = [
-        ("Microsoft_WindowsLive:authstate:a", &[1, 2, 3, 4]),
-        ("kw2", &[9]),
-    ];
+    /// Minimal valid DPAPI blob with `data_len` bytes of ciphertext tagged `tag`.
+    fn dpapi(tag: u8, data_len: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&[
+            0xD0, 0x8C, 0x9D, 0xDF, 1, 0x15, 0xD1, 0x11, 0x8C, 0x7A, 0, 0xC0, 0x4F, 0xC2, 0x97,
+            0xEB,
+        ]);
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&[tag; 16]);
+        for x in [0u32, 0, 0x6610, 256, 0, 0, 0x800E, 512, 0] {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&(data_len as u32).to_le_bytes());
+        b.extend(std::iter::repeat_n(tag, data_len));
+        b.extend_from_slice(&0u32.to_le_bytes()); // sign len
+        b
+    }
+
+    fn attrs_fixture() -> (Vec<u8>, [Vec<u8>; 2]) {
+        let vals = [dpapi(0xAA, 300), dpapi(0xBB, 20)];
+        let b = build_fixture_attrs(
+            "t",
+            b"p\0",
+            "u",
+            &[
+                ("Microsoft_WindowsLive:authstate:a", &vals[0]),
+                ("kw2", &vals[1]),
+            ],
+            2,
+        );
+        (b, vals)
+    }
 
     #[test]
     fn parses_two_attributes() {
-        let b = build_fixture_attrs("t", b"p\0", "u", &ATTRS, 2);
+        let (b, vals) = attrs_fixture();
         let e = parse_credential_blob(&b).unwrap();
         assert_eq!(e.attributes.len(), 2);
         assert_eq!(e.attributes[0].keyword, "Microsoft_WindowsLive:authstate:a");
-        assert_eq!(e.attributes[0].value, vec![1, 2, 3, 4]);
         assert_eq!(e.attributes[1].keyword, "kw2");
-        assert_eq!(e.attributes[1].value, vec![9]);
+        for (a, v) in e.attributes.iter().zip(&vals) {
+            assert_eq!(&a.value, v);
+            assert!(super::super::dpapi_blob::parse_blob(&a.value).is_ok());
+        }
     }
 
     #[test]
     fn attributes_truncated_best_effort() {
-        let full = build_fixture_attrs("tgt", b"p\0", "usr", &ATTRS, 2);
-        let base = build_fixture_attrs("tgt", b"p\0", "usr", &[], 0).len();
+        let (full, _) = attrs_fixture();
+        let base = build_fixture_attrs("t", b"p\0", "u", &[], 0).len();
         for n in base..full.len() {
             let e = parse_credential_blob(&full[..n]).unwrap();
-            assert_eq!(e.target, "tgt");
-            assert_eq!(e.username, "usr");
+            assert_eq!(e.target, "t");
+            assert_eq!(e.username, "u");
             assert!(e.attributes.len() < 2);
         }
-        // Huge declared count / huge value size: bounded, no panic.
-        let mut b = build_fixture_attrs("tgt", b"p\0", "usr", &ATTRS, u32::MAX);
+        // Huge declared count: bounded by data.
+        let mut b = full.clone();
+        b[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(parse_credential_blob(&b).unwrap().attributes.len(), 2);
-        let l = b.len();
-        b[l - 5..l - 1].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(parse_credential_blob(&b).unwrap().attributes.len(), 1);
     }
 }

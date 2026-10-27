@@ -66,6 +66,11 @@ fn read_len(bytes: &[u8], cur: &mut usize, cap: usize, label: &'static str) -> R
 }
 
 pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
+    parse_blob_with_len(bytes).map(|(b, _)| b)
+}
+
+/// Like [`parse_blob`] but also returns the total number of bytes the blob occupies.
+pub fn parse_blob_with_len(bytes: &[u8]) -> Result<(DpapiBlob<'_>, usize)> {
     // DPAPI_BLOB layout (all little-endian unless noted):
     //  u32 version
     //  16   provider_guid
@@ -112,18 +117,21 @@ pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
     let sign_len = read_len(bytes, &mut cur, MAX_SIGN, "sign")?;
     let sign = take(bytes, &mut cur, sign_len)?;
 
-    Ok(DpapiBlob {
-        mk_guid,
-        mk_guid_str,
-        flags,
-        description,
-        crypt_alg,
-        hmac_alg,
-        salt,
-        hmac,
-        cipher_text,
-        sign,
-    })
+    Ok((
+        DpapiBlob {
+            mk_guid,
+            mk_guid_str,
+            flags,
+            description,
+            crypt_alg,
+            hmac_alg,
+            salt,
+            hmac,
+            cipher_text,
+            sign,
+        },
+        cur,
+    ))
 }
 
 /// Decrypt a DPAPI blob using a cleartext masterkey (typically 64 bytes).
