@@ -37,6 +37,7 @@ use clap::Parser;
         vmkatz --dump lsass -o out.dmp snap.vmsn    Dump with custom output filename\n  \
         vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
         vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
+        vmkatz --credman disk.vmdk                   Decrypt Windows Credential Manager (offline)\n  \
         vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
         vmkatz --ls='\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
         vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \

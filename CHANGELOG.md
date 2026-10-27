@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- **`--credman`** — offline Windows Credential Manager extraction. Decrypts the on-disk `Credentials` store (including saved RDP/TERMSRV credentials) from a disk image by recovering DPAPI masterkeys: local users via their SAM NT hash, SYSTEM via `DPAPI_SYSTEM` (no extra input), and domain users via `--dpapi-nthash USER:HASH` (repeatable). Prints target, login and password. The Vault store (`Policy.vpol` / `*.vcrd`) is planned for a follow-up
+
 ## v1.5.2
 
 A large bug-fix roll-up since v1.5.1 (~70 commits). The VMFS highlights below head
