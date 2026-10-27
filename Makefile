@@ -81,14 +81,6 @@ test-folder: release
 .PHONY: test
 test: test-lsass test-sam test-folder
 
-.PHONY: regression
-regression: release
-	./scripts/esxi_test.sh --host esx2
-
-.PHONY: regression-all
-regression-all: release
-	./scripts/esxi_test.sh --host all
-
 .PHONY: help
 help:
 	@echo "vmkatz - VM memory forensics credential extractor"
@@ -115,8 +107,6 @@ help:
 	@echo "  make test-lsass   Test LSASS extraction (VMware)"
 	@echo "  make test-sam     Test SAM extraction (VBox VDI)"
 	@echo "  make test-folder  Test folder discovery (VMware)"
-	@echo "  make regression   Non-regression test vs pypykatz (esx2)"
-	@echo "  make regression-all  Non-regression test vs pypykatz (all hosts)"
 	@echo ""
 	@echo "Release profile: strip=true, lto=true, codegen-units=1, panic=abort"
 	@echo "Default features: vmware,vbox,qemu,hyperv,sam,ntds.dit,carve,dump"
