@@ -218,7 +218,10 @@ fn resolve_nthash_sids(
 ) -> Vec<(String, [u8; 16])> {
     let mut out = Vec::new();
     for (user, nt) in specs {
-        if user.len() > 4 && user[..4].eq_ignore_ascii_case("S-1-") {
+        if user
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
+        {
             out.push((user, nt));
             continue;
         }
