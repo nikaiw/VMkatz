@@ -1649,7 +1649,12 @@ pub(crate) fn print_credman_text(
     c: &super::args::Colors,
     attributes: bool,
 ) {
+    let has_vault = !report.vault.is_empty() || !report.vault_notes.is_empty();
+    if report.entries.is_empty() && report.undecrypted.is_empty() && !has_vault {
+        return;
+    }
     if report.entries.is_empty() && report.undecrypted.is_empty() {
+        print_vault_text(report, c);
         return;
     }
     println!("{}[+] Credential Manager{}", c.green, c.reset);
@@ -1695,6 +1700,38 @@ pub(crate) fn print_credman_text(
             println!("    {} ({}): {} - {}", u.profile, u.sid, u.file, u.reason);
         }
     }
+    if has_vault {
+        print_vault_text(report, c);
+    }
+}
+
+/// Print the experimental Vault section grouped by profile + vault GUID.
+#[cfg(feature = "sam")]
+fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors) {
+    println!("{}[+] Vault (experimental){}", c.green, c.reset);
+    let mut groups: Vec<(&str, &str)> = Vec::new();
+    for v in &report.vault {
+        let k = (v.profile.as_str(), v.vault_guid.as_str());
+        if !groups.contains(&k) {
+            groups.push(k);
+        }
+    }
+    for (profile, guid) in groups {
+        println!("  {}{profile}{} ({guid})", c.cyan, c.reset);
+        for v in report
+            .vault
+            .iter()
+            .filter(|v| v.profile == profile && v.vault_guid == guid)
+        {
+            println!("    Resource : {}", v.cred.resource);
+            println!("    Identity : {}", v.cred.identity);
+            println!("    Secret   : {}", v.cred.secret);
+            println!();
+        }
+    }
+    for n in &report.vault_notes {
+        println!("  {}{n}{}", c.yellow, c.reset);
+    }
 }
 
 /// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
@@ -1726,6 +1763,19 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
                     a.token_hex,
                 );
             }
+        }
+    }
+    if !report.vault.is_empty() {
+        println!("profile,vault_guid,resource,identity,secret");
+        for v in &report.vault {
+            println!(
+                "{},{},{},{},{}",
+                csv_escape(&v.profile),
+                csv_escape(&v.vault_guid),
+                csv_escape(&v.cred.resource),
+                csv_escape(&v.cred.identity),
+                csv_escape(&v.cred.secret),
+            );
         }
     }
 }
