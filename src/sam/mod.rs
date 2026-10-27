@@ -17,6 +17,7 @@ pub use listing::{ListOutcome, list_path};
 
 pub mod aes_xts;
 pub mod bitlocker_decrypt;
+pub mod dpapi_blob;
 pub mod dpapi_masterkey;
 
 use crate::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};
