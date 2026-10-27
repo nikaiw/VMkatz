@@ -1641,3 +1641,64 @@ fn print_brief(credentials: &[Credential], providers: &[String]) {
         }
     }
 }
+
+/// Print the Credential Manager section grouped by profile.
+#[cfg(feature = "sam")]
+pub(crate) fn print_credman_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors) {
+    if report.entries.is_empty() && report.undecrypted.is_empty() {
+        return;
+    }
+    println!("{}[+] Credential Manager{}", c.green, c.reset);
+    let mut profiles: Vec<(&str, &str)> = Vec::new();
+    for e in &report.entries {
+        let k = (e.profile.as_str(), e.sid.as_str());
+        if !profiles.contains(&k) {
+            profiles.push(k);
+        }
+    }
+    for (profile, sid) in profiles {
+        let n = report
+            .entries
+            .iter()
+            .filter(|e| e.profile == profile && e.sid == sid)
+            .count();
+        println!("  {}{profile}{} ({sid}) - {n} decrypted", c.cyan, c.reset);
+        for e in report
+            .entries
+            .iter()
+            .filter(|e| e.profile == profile && e.sid == sid)
+        {
+            println!("    Target   : {}", e.entry.target);
+            println!("    User     : {}", e.entry.username);
+            println!("    Password : {}", e.entry.password);
+            println!();
+        }
+    }
+    if !report.undecrypted.is_empty() {
+        println!(
+            "  {}Undecrypted: {}{}",
+            c.yellow,
+            report.undecrypted.len(),
+            c.reset
+        );
+        for u in &report.undecrypted {
+            println!("    {} ({}): {} - {}", u.profile, u.sid, u.file, u.reason);
+        }
+    }
+}
+
+/// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
+#[cfg(feature = "sam")]
+pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport) {
+    println!("profile,sid,target,username,password");
+    for e in &report.entries {
+        println!(
+            "{},{},{},{},{}",
+            csv_escape(&e.profile),
+            csv_escape(&e.sid),
+            csv_escape(&e.entry.target),
+            csv_escape(&e.entry.username),
+            csv_escape(&e.entry.password),
+        );
+    }
+}

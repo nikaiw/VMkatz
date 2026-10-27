@@ -18,7 +18,7 @@ use super::args::Colors;
 #[cfg(feature = "chrome")]
 use super::args::parse_chrome_nthashes;
 #[cfg(feature = "sam")]
-use super::args::{RawFileType, get_colors};
+use super::args::{RawFileType, get_colors, parse_dpapi_nthashes};
 #[cfg(all(
     feature = "sam",
     any(
@@ -48,10 +48,10 @@ use super::lsass::run_lsass;
 use super::output::print_disk_secrets;
 #[cfg(feature = "sam")]
 use super::output::{
-    dedup_dpapi_hashes, export_dpapi_backup_keys, print_cached_credentials, print_dcc2_csv,
-    print_dcc2_hashcat, print_dpapi_masterkey_csv, print_dpapi_masterkey_hashcat,
-    print_dpapi_masterkey_text, print_lsa_csv, print_lsa_secrets, print_sam_brief, print_sam_csv,
-    print_sam_hashcat, print_sam_ntlm, print_sam_text,
+    dedup_dpapi_hashes, export_dpapi_backup_keys, print_cached_credentials, print_credman_csv,
+    print_credman_text, print_dcc2_csv, print_dcc2_hashcat, print_dpapi_masterkey_csv,
+    print_dpapi_masterkey_hashcat, print_dpapi_masterkey_text, print_lsa_csv, print_lsa_secrets,
+    print_sam_brief, print_sam_csv, print_sam_hashcat, print_sam_ntlm, print_sam_text,
 };
 #[cfg(feature = "ntds.dit")]
 use super::output::{
@@ -209,13 +209,103 @@ pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
     }
 }
 
+/// Resolve `--dpapi-nthash` user specs (SID, SAM/profile name, or `DOMAIN\\name`) to SIDs.
+fn resolve_nthash_sids(
+    specs: Vec<(String, [u8; 16])>,
+    machine_sid: Option<&str>,
+    secrets: Option<&vmkatz::sam::DiskSecrets>,
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+) -> Vec<(String, [u8; 16])> {
+    let mut out = Vec::new();
+    for (user, nt) in specs {
+        if user.len() > 4 && user[..4].eq_ignore_ascii_case("S-1-") {
+            out.push((user, nt));
+            continue;
+        }
+        let bare = user.rsplit_once('\\').map_or(user.as_str(), |(_, n)| n);
+        let sid = hashes
+            .iter()
+            .find(|h| h.username.eq_ignore_ascii_case(bare))
+            .map(|h| h.sid.clone())
+            .or_else(|| {
+                let m = machine_sid?;
+                secrets?
+                    .sam_entries
+                    .iter()
+                    .find(|e| e.username.eq_ignore_ascii_case(bare))
+                    .map(|e| format!("{m}-{}", e.rid))
+            });
+        if let Some(sid) = sid {
+            out.push((sid, nt));
+        } else {
+            log::warn!("--dpapi-nthash: cannot resolve user {user:?} to a SID");
+        }
+    }
+    out
+}
+
+/// Machine SID: the SID prefix of a profile whose RID and name match a SAM account.
+fn find_machine_sid(
+    secrets: Option<&vmkatz::sam::DiskSecrets>,
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+) -> Option<String> {
+    let secrets = secrets?;
+    hashes.iter().find_map(|h| {
+        let (prefix, rid) = h.sid.rsplit_once('-')?;
+        let rid: u32 = rid.parse().ok()?;
+        secrets
+            .sam_entries
+            .iter()
+            .any(|e| e.rid == rid && e.username.eq_ignore_ascii_case(&h.username))
+            .then(|| prefix.to_string())
+    })
+}
+
+/// `--credman`: build the secret table from already-extracted SAM/LSA and sweep the disk.
+fn emit_credman<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    args: &Args,
+    c: &super::args::Colors,
+    secrets: Option<&vmkatz::sam::DiskSecrets>,
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+) {
+    let machine_sid = find_machine_sid(secrets, hashes);
+    let domain = resolve_nthash_sids(
+        parse_dpapi_nthashes(&args.dpapi_nthash),
+        machine_sid.as_deref(),
+        secrets,
+        hashes,
+    );
+    let empty = vmkatz::sam::DiskSecrets::default();
+    let table = vmkatz::sam::build_secret_table(
+        secrets.unwrap_or(&empty),
+        secrets.map_or(&[][..], |s| &s.lsa_secrets),
+        machine_sid.as_deref().unwrap_or(""),
+        &domain,
+    );
+    match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
+        Ok(report) => match args.format.as_str() {
+            "csv" => print_credman_csv(&report),
+            "hashcat" => {}
+            _ => print_credman_text(&report, c),
+        },
+        Err(e) => eprintln!("[!] Credential Manager extraction failed: {e}"),
+    }
+}
+
 /// Print DPAPI master key hashes found on a VMFS-backed disk (same formats as `run_sam`).
 fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
     args: &Args,
     c: &super::args::Colors,
+    secrets: Option<&vmkatz::sam::DiskSecrets>,
 ) {
     let hashes = vmkatz::sam::extract_dpapi_masterkeys_from_reader(disk, args.partition);
+    let all_hashes = if args.credman {
+        hashes.clone()
+    } else {
+        Vec::new()
+    };
     let hashes = dedup_dpapi_hashes(hashes, args.all);
     if !hashes.is_empty() {
         match args.format.as_str() {
@@ -223,6 +313,9 @@ fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
             "hashcat" => print_dpapi_masterkey_hashcat(&hashes),
             _ => print_dpapi_masterkey_text(&hashes, c),
         }
+    }
+    if args.credman {
+        emit_credman(disk, args, c, secrets, &all_hashes);
     }
 }
 
@@ -259,7 +352,7 @@ fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
         _ => print_ntds_text(&hashes, c),
     }
 
-    vmfs_emit_dpapi(disk, args, c);
+    vmfs_emit_dpapi(disk, args, c, None);
     Ok(())
 }
 
@@ -304,6 +397,7 @@ pub(crate) fn run_vmfs(
         }
 
         // Extract secrets via the standard pipeline
+        let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
         match vmkatz::sam::extract_secrets_from_reader_scoped(&mut disk, args.partition) {
             Ok(secrets) => {
                 match args.format.as_str() {
@@ -347,6 +441,7 @@ pub(crate) fn run_vmfs(
                         Err(e) => log::warn!("chrome (vmfs) failed: {e}"),
                     }
                 }
+                disk_secrets = Some(secrets);
             }
             Err(e) if args.partition.is_some() => return Err(e.into()),
             Err(e) => {
@@ -354,7 +449,7 @@ pub(crate) fn run_vmfs(
             }
         }
 
-        vmfs_emit_dpapi(&mut disk, args, c);
+        vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref());
     } else {
         // A --partition offset is specific to one disk's partition table and is
         // meaningless across the many differently-laid-out VMDKs an auto-scan visits.
@@ -412,6 +507,7 @@ pub(crate) fn run_vmfs(
                         continue;
                     }
                     // Use NTFS-only extraction (no raw fallback scans) for batch mode
+                    let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
                     match vmkatz::sam::extract_secrets_ntfs_only_scoped(&mut disk, args.partition) {
                         Ok(secrets) => {
                             if !secrets.sam_entries.is_empty() {
@@ -445,12 +541,13 @@ pub(crate) fn run_vmfs(
                                     _ => print_cached_credentials(&secrets.cached_credentials, c),
                                 }
                             }
+                            disk_secrets = Some(secrets);
                         }
                         Err(e) => {
                             eprintln!("[!] {vm_name}: {e}");
                         }
                     }
-                    vmfs_emit_dpapi(&mut disk, args, c);
+                    vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref());
                 }
                 Err(e) => {
                     eprintln!("[!] Failed to open {vmdk_path}: {e}");
@@ -477,6 +574,7 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     let c = get_colors(args);
     let mut found_anything = false;
+    let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
 
     // SAM/LSA extraction — non-fatal so DPAPI masterkey scan can still proceed
     match vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition) {
@@ -509,6 +607,7 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
                     _ => print_cached_credentials(&secrets.cached_credentials, c),
                 }
             }
+            disk_secrets = Some(secrets);
         }
         Err(e) if args.partition.is_some() => return Err(e.into()),
         Err(e) => {
@@ -518,6 +617,11 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Extract DPAPI master key hashes from user profiles (independent of SAM)
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
+    let all_dpapi_hashes = if args.credman {
+        dpapi_hashes.clone()
+    } else {
+        Vec::new()
+    };
     let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         found_anything = true;
@@ -525,6 +629,15 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
             "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
             _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    if args.credman {
+        match vmkatz::disk::open_disk(input_path) {
+            Ok(mut disk) => {
+                emit_credman(&mut disk, args, c, disk_secrets.as_ref(), &all_dpapi_hashes);
+            }
+            Err(e) => eprintln!("[!] Credential Manager: cannot open disk: {e}"),
         }
     }
 

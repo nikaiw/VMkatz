@@ -71,7 +71,7 @@ struct MasterKeySection {
 }
 
 /// A DPAPI master key hash ready for Hashcat output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DpapiMasterKeyHash {
     /// User account name (from NTFS path).
     pub username: String,
