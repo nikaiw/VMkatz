@@ -2,6 +2,7 @@ pub mod bootkey;
 pub mod cache;
 pub mod cm_hive;
 mod credman_blob;
+mod credman_disk;
 mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
@@ -13,6 +14,10 @@ mod ntfs_reader;
 mod vmdk_scan;
 
 pub use credman_blob::{CredmanEntry, parse_credential_blob};
+pub use credman_disk::{
+    CredmanReport, ProfileCred, Secret, SecretTable, Undecrypted, build_secret_table,
+    extract_credman_from_reader_scoped, machine_sid_from_user_sid,
+};
 pub use listing::{ListOutcome, list_path};
 
 pub mod aes_xts;
