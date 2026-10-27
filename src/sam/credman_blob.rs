@@ -53,13 +53,14 @@ fn decode_utf16(b: &[u8]) -> Option<String> {
 /// Read a u32 byte-length-prefixed UTF-16LE string (lossy on bad data).
 fn read_lp_utf16(bytes: &[u8], cur: &mut usize) -> Result<String> {
     let raw = read_lp_bytes(bytes, cur)?;
-    Ok(decode_utf16(raw).unwrap_or_else(|| {
+    let s = decode_utf16(raw).unwrap_or_else(|| {
         let units: Vec<u16> = raw
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&units)
-    }))
+    });
+    Ok(s.trim_end_matches('\0').to_owned())
 }
 
 /// Parse a decrypted DPAPI `CREDENTIAL_BLOB` (impacket layout).
@@ -136,6 +137,15 @@ mod tests {
         assert_eq!(e.username, "LAB\\jdoe");
         assert_eq!(e.password, "P@ss");
         assert_eq!(e.cred_type, 1);
+    }
+
+    #[test]
+    fn wide_string_trailing_nul_trimmed() {
+        let bytes = build_fixture("TERMSRV/dc01\0", "P@ss", "LAB\\jdoe\0");
+        let e = parse_credential_blob(&bytes).unwrap();
+        assert_eq!(e.target, "TERMSRV/dc01");
+        assert_eq!(e.username, "LAB\\jdoe");
+        assert_eq!(e.password, "P@ss");
     }
 
     #[test]
