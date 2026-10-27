@@ -38,7 +38,7 @@ use clap::Parser;
         vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
         vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
         vmkatz --credman disk.vmdk                   Decrypt Windows Credential Manager (offline)\n  \
-        vmkatz --credman --credman-attributes disk.vmdk   Also decrypt credential attribute tokens\n  \
+        vmkatz --credman --credman-attributes disk.vmdk   Also enumerate credential attributes (encrypted values; offline decryption unsupported)\n  \
         vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
         vmkatz --ls='\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
         vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \
@@ -171,8 +171,9 @@ pub(crate) struct Args {
     /// on-disk DPAPI masterkeys with SAM/LSA secrets.
     #[arg(long, default_value_t = false)]
     pub(crate) credman: bool,
-
-    /// With `--credman`: also show CREDENTIAL attributes whose value is a
+    /// With `--credman`: enumerate CREDENTIAL attributes and show each
+    /// attribute's encrypted value as hex (offline decryption of entropy-bound
+    /// WindowsLive/SSO blobs is not supported).
     /// nested DPAPI blob (e.g. Windows Live SSO tokens), decrypted.
     #[arg(long, default_value_t = false)]
     pub(crate) credman_attributes: bool,
