@@ -62,28 +62,29 @@ fn read_lp_utf16(bytes: &[u8], cur: &mut usize) -> Result<String> {
     }))
 }
 
-/// Parse a decrypted `CREDENTIAL` blob.
+/// Parse a decrypted DPAPI `CREDENTIAL_BLOB` (impacket layout).
 ///
-/// Layout: flags u32, type u32, TargetName, Comment, LastWritten (8),
-/// CredentialBlobSize u32 + blob, Persist u32, AttributeCount u32,
-/// attributes (keyword, flags u32, value), TargetAlias, UserName.
+/// Layout: Version, Size, Unknown0, Type, Flags (u32 each), LastWritten u64,
+/// Unknown1, Persist, AttributeCount, Unknown2, Unknown3 (u32 each), then
+/// SIZED_WSTRs Target, TargetAlias, Comment, Unknown4, UserName, then
+/// CredentialBlobSize u32 + CredentialBlob. Trailing attributes are ignored.
 pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     let mut cur = 0usize;
-    let _flags = read_u32(decrypted, &mut cur)?;
+    let _version = read_u32(decrypted, &mut cur)?;
+    let _size = read_u32(decrypted, &mut cur)?;
+    let _unknown0 = read_u32(decrypted, &mut cur)?;
     let cred_type = read_u32(decrypted, &mut cur)?;
-    let target = read_lp_utf16(decrypted, &mut cur)?;
-    let _comment = read_lp_utf16(decrypted, &mut cur)?;
+    let _flags = read_u32(decrypted, &mut cur)?;
     read_bytes(decrypted, &mut cur, 8)?; // LastWritten
-    let blob = read_lp_bytes(decrypted, &mut cur)?;
-    let _persist = read_u32(decrypted, &mut cur)?;
-    let attr_count = read_u32(decrypted, &mut cur)?;
-    for _ in 0..attr_count {
-        read_lp_bytes(decrypted, &mut cur)?; // keyword
-        read_u32(decrypted, &mut cur)?; // flags
-        read_lp_bytes(decrypted, &mut cur)?; // value
+    for _ in 0..5 {
+        read_u32(decrypted, &mut cur)?; // Unknown1, Persist, AttrCount, Unknown2, Unknown3
     }
+    let target = read_lp_utf16(decrypted, &mut cur)?;
     let _alias = read_lp_utf16(decrypted, &mut cur)?;
+    let _comment = read_lp_utf16(decrypted, &mut cur)?;
+    let _unknown4 = read_lp_utf16(decrypted, &mut cur)?;
     let username = read_lp_utf16(decrypted, &mut cur)?;
+    let blob = read_lp_bytes(decrypted, &mut cur)?;
     let password = decode_utf16(blob).unwrap_or_else(|| hex::encode(blob));
     Ok(CredmanEntry {
         target,
@@ -105,17 +106,20 @@ mod tests {
 
     fn build_fixture_raw_blob(target: &str, blob: &[u8], user: &str) -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(&0u32.to_le_bytes()); // flags
-        v.extend_from_slice(&1u32.to_le_bytes()); // type
-        lp(&mut v, target);
-        lp(&mut v, ""); // comment
+        for x in [1u32, 0x100, 0, 1, 0] {
+            v.extend_from_slice(&x.to_le_bytes()); // Version, Size, Unk0, Type, Flags
+        }
         v.extend_from_slice(&0u64.to_le_bytes()); // LastWritten
+        for x in [0u32, 2, 0, 0, 0] {
+            v.extend_from_slice(&x.to_le_bytes()); // Unk1, Persist, AttrCount, Unk2, Unk3
+        }
+        lp(&mut v, target);
+        lp(&mut v, ""); // alias
+        lp(&mut v, ""); // comment
+        lp(&mut v, ""); // unknown4
+        lp(&mut v, user);
         v.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         v.extend_from_slice(blob);
-        v.extend_from_slice(&2u32.to_le_bytes()); // persist
-        v.extend_from_slice(&0u32.to_le_bytes()); // attribute count
-        lp(&mut v, ""); // target alias
-        lp(&mut v, user);
         v
     }
 
@@ -151,7 +155,7 @@ mod tests {
 
     #[test]
     fn huge_length_prefix_errors() {
-        let mut b = vec![0u8; 8];
+        let mut b = vec![0u8; 48];
         b.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_credential_blob(&b).is_err());
     }
