@@ -134,6 +134,29 @@ pub fn build_secret_table(
     t
 }
 
+/// Strip the 12-byte `CredentialFile` header (version, blob size, unknown) and
+/// return the inner DPAPI blob bytes.
+fn credential_file_blob(file: &[u8]) -> Result<&[u8]> {
+    const HDR: usize = 12;
+    let size = file
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .filter(|_| file.len() >= HDR)
+        .ok_or_else(|| {
+            crate::error::VmkatzError::Parse("CredentialFile header truncated".into())
+        })?;
+    let end = HDR
+        .checked_add(size)
+        .filter(|&e| e <= file.len())
+        .ok_or_else(|| {
+            crate::error::VmkatzError::Parse(format!(
+                "CredentialFile blob size {size} exceeds file length {}",
+                file.len()
+            ))
+        })?;
+    Ok(&file[HDR..end])
+}
+
 /// True if `name` looks like a SID folder (`S-1-...`); safe for non-ASCII names.
 fn is_sid_dir_name(name: &str) -> bool {
     name.len() > 4
@@ -325,7 +348,8 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         let raw = self
             .read(dir, fname)
             .map_err(|e| (sid0.clone(), e.to_string()))?;
-        let blob = parse_blob(&raw).map_err(|e| (sid0.clone(), format!("blob parse: {e}")))?;
+        let inner = credential_file_blob(&raw).map_err(|e| (sid0.clone(), e.to_string()))?;
+        let blob = parse_blob(inner).map_err(|e| (sid0.clone(), format!("blob parse: {e}")))?;
         let (mk, sid) = self.resolve_masterkey(prof, &blob.mk_guid_str)?;
         let clear =
             decrypt_blob(&blob, &mk).map_err(|e| (sid.clone(), format!("blob decrypt: {e}")))?;
@@ -429,6 +453,45 @@ mod tests {
         assert!(!is_sid_dir_name("a\u{e9}\u{e9}\u{e9}xyz"));
         assert!(!is_sid_dir_name("S-1\u{e9}-5"));
         assert!(!is_sid_dir_name("S-1-"));
+    }
+
+    #[test]
+    fn credential_file_header_is_stripped() {
+        // Minimal DPAPI blob: 4+16+4+16+4 header, then empty description etc.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&[
+            0xD0, 0x8C, 0x9D, 0xDF, 1, 0x15, 0xD1, 0x11, 0x8C, 0x7A, 0, 0xC0, 0x4F, 0xC2, 0x97,
+            0xEB,
+        ]);
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&[0x11u8; 16]);
+        blob.extend_from_slice(&0u32.to_le_bytes()); // flags
+        blob.extend_from_slice(&0u32.to_le_bytes()); // desc len
+        blob.extend_from_slice(&0x6610u32.to_le_bytes());
+        blob.extend_from_slice(&256u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // salt len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // hmac_key len
+        blob.extend_from_slice(&0x800Eu32.to_le_bytes());
+        blob.extend_from_slice(&512u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // hmac len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // data len
+        blob.extend_from_slice(&0u32.to_le_bytes()); // sign len
+        let mut file = Vec::new();
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&u32::try_from(blob.len()).unwrap().to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&blob);
+        let inner = credential_file_blob(&file).unwrap();
+        assert_eq!(inner, &blob[..]);
+        assert!(parse_blob(inner).is_ok());
+        // Whole-file parse (the old bug) must not be what succeeds.
+        assert!(credential_file_blob(&file[..11]).is_err());
+        assert!(credential_file_blob(&[]).is_err());
+        // Declared size beyond the file.
+        let mut bad = file.clone();
+        bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(credential_file_blob(&bad).is_err());
     }
 
     #[test]
