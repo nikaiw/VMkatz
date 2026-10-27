@@ -16,8 +16,8 @@ mod vmdk_scan;
 
 pub use credman_blob::{CredAttribute, CredmanEntry, parse_credential_blob};
 pub use credman_disk::{
-    CredmanReport, DecryptedAttr, ProfileCred, Secret, SecretTable, Undecrypted,
-    build_secret_table, extract_credman_from_reader_scoped, machine_sid_from_user_sid,
+    AttrInfo, CredmanReport, ProfileCred, Secret, SecretTable, Undecrypted, build_secret_table,
+    extract_credman_from_reader_scoped, machine_sid_from_user_sid,
 };
 pub use listing::{ListOutcome, list_path};
 pub use vault::{VaultKeys, parse_vault_keys, parse_vpol};

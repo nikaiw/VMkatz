@@ -1683,7 +1683,16 @@ pub(crate) fn print_credman_text(
             if attributes {
                 println!("    Attributes ({}):", e.attributes.len());
                 for a in &e.attributes {
-                    println!("      {} = {}", a.keyword, a.token_hex);
+                    let shown: String = a.value_hex.chars().take(64).collect();
+                    let more = if a.value_hex.len() > 64 {
+                        "\u{2026}"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "      {} = {shown}{more} [encrypted, offline decryption unsupported]",
+                        a.keyword
+                    );
                 }
             }
             println!();
@@ -1735,8 +1744,8 @@ fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors
 }
 
 /// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
-/// With `attributes`, a second `profile,sid,target,attr_keyword,attr_token_hex`
-/// table follows (separate header) with one row per decrypted attribute.
+/// With `attributes`, a second `profile,sid,target,attr_keyword,attr_value_hex`
+/// table follows (separate header) with one row per enumerated attribute.
 #[cfg(feature = "sam")]
 pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes: bool) {
     println!("profile,sid,target,username,password");
@@ -1751,7 +1760,7 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
         );
     }
     if attributes {
-        println!("profile,sid,target,attr_keyword,attr_token_hex");
+        println!("profile,sid,target,attr_keyword,attr_value_hex");
         for e in &report.entries {
             for a in &e.attributes {
                 println!(
@@ -1760,7 +1769,7 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
                     csv_escape(&e.sid),
                     csv_escape(&e.entry.target),
                     csv_escape(&a.keyword),
-                    a.token_hex,
+                    a.value_hex,
                 );
             }
         }

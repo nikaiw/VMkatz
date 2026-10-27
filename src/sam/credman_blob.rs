@@ -1,6 +1,5 @@
 //! Parser for the decrypted Windows `CREDENTIAL` on-disk structure.
 
-use super::dpapi_blob::parse_blob_with_len;
 use crate::error::{Result, VmkatzError};
 
 /// A parsed Credential Manager entry.
@@ -111,8 +110,7 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
 /// Best-effort attribute parse: stops at the first malformed/truncated attribute,
 /// bounded by `count` and the remaining data.
 ///
-/// Per attribute: Flags u32, Keyword SIZED_WSTR, Reserved u32 (ignored), then a
-/// self-delimiting DPAPI blob whose real length is what `parse_blob_with_len` consumes.
+/// Per attribute: Flags u32, Keyword SIZED_WSTR, ValueSize u32, Value[ValueSize].
 fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttribute> {
     let mut out = Vec::new();
     for _ in 0..count {
@@ -122,20 +120,13 @@ fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttr
         let Ok(keyword) = read_lp_utf16(bytes, cur) else {
             break;
         };
-        if read_u32(bytes, cur).is_err() {
-            break; // Reserved
-        }
-        let Some(rest) = bytes.get(*cur..) else {
-            break;
-        };
-        let Ok((_, len)) = parse_blob_with_len(rest) else {
+        let Ok(value) = read_lp_bytes(bytes, cur) else {
             break;
         };
         out.push(CredAttribute {
             keyword,
-            value: rest[..len].to_vec(),
+            value: value.to_vec(),
         });
-        *cur += len;
     }
     out
 }
@@ -180,7 +171,7 @@ mod tests {
         for (kw, val) in attrs {
             v.extend_from_slice(&0u32.to_le_bytes()); // Flags
             lp(&mut v, kw);
-            v.extend_from_slice(&0x100u32.to_le_bytes()); // Reserved
+            v.extend_from_slice(&(val.len() as u32).to_le_bytes()); // ValueSize
             v.extend_from_slice(val);
         }
         v
@@ -239,23 +230,8 @@ mod tests {
         assert_eq!(e.password, "010203");
     }
 
-    /// Minimal valid DPAPI blob with `data_len` bytes of ciphertext tagged `tag`.
     fn dpapi(tag: u8, data_len: usize) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&[
-            0xD0, 0x8C, 0x9D, 0xDF, 1, 0x15, 0xD1, 0x11, 0x8C, 0x7A, 0, 0xC0, 0x4F, 0xC2, 0x97,
-            0xEB,
-        ]);
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&[tag; 16]);
-        for x in [0u32, 0, 0x6610, 256, 0, 0, 0x800E, 512, 0] {
-            b.extend_from_slice(&x.to_le_bytes());
-        }
-        b.extend_from_slice(&(data_len as u32).to_le_bytes());
-        b.extend(std::iter::repeat_n(tag, data_len));
-        b.extend_from_slice(&0u32.to_le_bytes()); // sign len
-        b
+        vec![tag; data_len]
     }
 
     fn attrs_fixture() -> (Vec<u8>, [Vec<u8>; 2]) {
@@ -282,7 +258,6 @@ mod tests {
         assert_eq!(e.attributes[1].keyword, "kw2");
         for (a, v) in e.attributes.iter().zip(&vals) {
             assert_eq!(&a.value, v);
-            assert!(super::super::dpapi_blob::parse_blob(&a.value).is_ok());
         }
     }
 
