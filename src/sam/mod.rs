@@ -19,8 +19,8 @@ pub use credman_disk::{
     CredmanReport, DecryptedAttr, ProfileCred, Secret, SecretTable, Undecrypted,
     build_secret_table, extract_credman_from_reader_scoped, machine_sid_from_user_sid,
 };
-pub use vault::{VaultKeys, parse_vault_keys, parse_vpol};
 pub use listing::{ListOutcome, list_path};
+pub use vault::{VaultKeys, parse_vault_keys, parse_vpol};
 
 pub mod aes_xts;
 pub mod bitlocker_decrypt;
