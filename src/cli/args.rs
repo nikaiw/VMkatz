@@ -171,6 +171,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) credman: bool,
 
+    /// With `--credman`: also show CREDENTIAL attributes whose value is a
+    /// nested DPAPI blob (e.g. Windows Live SSO tokens), decrypted.
+    #[arg(long, default_value_t = false)]
+    pub(crate) credman_attributes: bool,
+
     /// `USER:HEX` NT hash for `--credman` (repeatable). USER is a SID, a
     /// SAM/profile name, or `DOMAIN\\name`. For domain users not in the local SAM.
     #[arg(long, value_name = "USER:HEX")]

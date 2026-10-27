@@ -288,9 +288,9 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     );
     match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
         Ok(report) => match args.format.as_str() {
-            "csv" => print_credman_csv(&report),
+            "csv" => print_credman_csv(&report, args.credman_attributes),
             "hashcat" => {}
-            _ => print_credman_text(&report, c),
+            _ => print_credman_text(&report, c, args.credman_attributes),
         },
         Err(e) => eprintln!("[!] Credential Manager extraction failed: {e}"),
     }

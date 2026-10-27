@@ -9,6 +9,14 @@ pub struct CredmanEntry {
     pub username: String,
     pub password: String,
     pub cred_type: u32,
+    pub attributes: Vec<CredAttribute>,
+}
+
+/// A `CREDENTIAL_ATTRIBUTE` (keyword + raw value; may be a nested DPAPI blob).
+#[derive(Debug, Clone)]
+pub struct CredAttribute {
+    pub keyword: String,
+    pub value: Vec<u8>,
 }
 
 fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
@@ -68,7 +76,7 @@ fn read_lp_utf16(bytes: &[u8], cur: &mut usize) -> Result<String> {
 /// Layout: Version, Size, Unknown0, Type, Flags (u32 each), LastWritten u64,
 /// Unknown1, Persist, AttributeCount, Unknown2, Unknown3 (u32 each), then
 /// SIZED_WSTRs Target, TargetAlias, Comment, Unknown4, UserName, then
-/// CredentialBlobSize u32 + CredentialBlob. Trailing attributes are ignored.
+/// CredentialBlobSize u32 + CredentialBlob. Trailing attributes are parsed best-effort.
 pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     let mut cur = 0usize;
     let _version = read_u32(decrypted, &mut cur)?;
@@ -77,9 +85,11 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     let cred_type = read_u32(decrypted, &mut cur)?;
     let _flags = read_u32(decrypted, &mut cur)?;
     read_bytes(decrypted, &mut cur, 8)?; // LastWritten
-    for _ in 0..5 {
-        read_u32(decrypted, &mut cur)?; // Unknown1, Persist, AttrCount, Unknown2, Unknown3
-    }
+    read_u32(decrypted, &mut cur)?; // Unknown1
+    read_u32(decrypted, &mut cur)?; // Persist
+    let attr_count = read_u32(decrypted, &mut cur)? as usize;
+    read_u32(decrypted, &mut cur)?; // Unknown2
+    read_u32(decrypted, &mut cur)?; // Unknown3
     let target = read_lp_utf16(decrypted, &mut cur)?;
     let _alias = read_lp_utf16(decrypted, &mut cur)?;
     let _comment = read_lp_utf16(decrypted, &mut cur)?;
@@ -92,7 +102,34 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
         username,
         password,
         cred_type,
+        attributes: parse_attributes(decrypted, &mut cur, attr_count),
     })
+}
+
+/// Best-effort attribute parse: stops at the first malformed/truncated attribute,
+/// bounded by `count` and the remaining data (each attribute is >= 12 bytes).
+fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttribute> {
+    const MIN_ATTR: usize = 12;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if bytes.len().saturating_sub(*cur) < MIN_ATTR {
+            break;
+        }
+        let Ok(keyword) = read_lp_utf16(bytes, cur) else {
+            break;
+        };
+        if read_u32(bytes, cur).is_err() {
+            break; // Flags
+        }
+        let Ok(value) = read_lp_bytes(bytes, cur) else {
+            break;
+        };
+        out.push(CredAttribute {
+            keyword,
+            value: value.to_vec(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -106,12 +143,23 @@ mod tests {
     }
 
     fn build_fixture_raw_blob(target: &str, blob: &[u8], user: &str) -> Vec<u8> {
+        build_fixture_attrs(target, blob, user, &[], 0)
+    }
+
+    /// `declared` is the AttributeCount header value (may differ from `attrs.len()`).
+    fn build_fixture_attrs(
+        target: &str,
+        blob: &[u8],
+        user: &str,
+        attrs: &[(&str, &[u8])],
+        declared: u32,
+    ) -> Vec<u8> {
         let mut v = Vec::new();
         for x in [1u32, 0x100, 0, 1, 0] {
             v.extend_from_slice(&x.to_le_bytes()); // Version, Size, Unk0, Type, Flags
         }
         v.extend_from_slice(&0u64.to_le_bytes()); // LastWritten
-        for x in [0u32, 2, 0, 0, 0] {
+        for x in [0u32, 2, declared, 0, 0] {
             v.extend_from_slice(&x.to_le_bytes()); // Unk1, Persist, AttrCount, Unk2, Unk3
         }
         lp(&mut v, target);
@@ -121,6 +169,12 @@ mod tests {
         lp(&mut v, user);
         v.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         v.extend_from_slice(blob);
+        for (kw, val) in attrs {
+            lp(&mut v, kw);
+            v.extend_from_slice(&0u32.to_le_bytes()); // Flags
+            v.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            v.extend_from_slice(val);
+        }
         v
     }
 
@@ -175,5 +229,39 @@ mod tests {
         let e =
             parse_credential_blob(&build_fixture_raw_blob("x", &[0x01, 0x02, 0x03], "u")).unwrap();
         assert_eq!(e.password, "010203");
+    }
+
+    const ATTRS: [(&str, &[u8]); 2] = [
+        ("Microsoft_WindowsLive:authstate:a", &[1, 2, 3, 4]),
+        ("kw2", &[9]),
+    ];
+
+    #[test]
+    fn parses_two_attributes() {
+        let b = build_fixture_attrs("t", b"p\0", "u", &ATTRS, 2);
+        let e = parse_credential_blob(&b).unwrap();
+        assert_eq!(e.attributes.len(), 2);
+        assert_eq!(e.attributes[0].keyword, "Microsoft_WindowsLive:authstate:a");
+        assert_eq!(e.attributes[0].value, vec![1, 2, 3, 4]);
+        assert_eq!(e.attributes[1].keyword, "kw2");
+        assert_eq!(e.attributes[1].value, vec![9]);
+    }
+
+    #[test]
+    fn attributes_truncated_best_effort() {
+        let full = build_fixture_attrs("tgt", b"p\0", "usr", &ATTRS, 2);
+        let base = build_fixture_attrs("tgt", b"p\0", "usr", &[], 0).len();
+        for n in base..full.len() {
+            let e = parse_credential_blob(&full[..n]).unwrap();
+            assert_eq!(e.target, "tgt");
+            assert_eq!(e.username, "usr");
+            assert!(e.attributes.len() < 2);
+        }
+        // Huge declared count / huge value size: bounded, no panic.
+        let mut b = build_fixture_attrs("tgt", b"p\0", "usr", &ATTRS, u32::MAX);
+        assert_eq!(parse_credential_blob(&b).unwrap().attributes.len(), 2);
+        let l = b.len();
+        b[l - 5..l - 1].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_credential_blob(&b).unwrap().attributes.len(), 1);
     }
 }

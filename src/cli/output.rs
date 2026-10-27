@@ -1644,7 +1644,11 @@ fn print_brief(credentials: &[Credential], providers: &[String]) {
 
 /// Print the Credential Manager section grouped by profile.
 #[cfg(feature = "sam")]
-pub(crate) fn print_credman_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors) {
+pub(crate) fn print_credman_text(
+    report: &vmkatz::sam::CredmanReport,
+    c: &super::args::Colors,
+    attributes: bool,
+) {
     if report.entries.is_empty() && report.undecrypted.is_empty() {
         return;
     }
@@ -1671,6 +1675,12 @@ pub(crate) fn print_credman_text(report: &vmkatz::sam::CredmanReport, c: &super:
             println!("    Target   : {}", e.entry.target);
             println!("    User     : {}", e.entry.username);
             println!("    Password : {}", e.entry.password);
+            if attributes {
+                println!("    Attributes ({}):", e.attributes.len());
+                for a in &e.attributes {
+                    println!("      {} = {}", a.keyword, a.token_hex);
+                }
+            }
             println!();
         }
     }
@@ -1688,8 +1698,10 @@ pub(crate) fn print_credman_text(report: &vmkatz::sam::CredmanReport, c: &super:
 }
 
 /// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
+/// With `attributes`, a second `profile,sid,target,attr_keyword,attr_token_hex`
+/// table follows (separate header) with one row per decrypted attribute.
 #[cfg(feature = "sam")]
-pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport) {
+pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes: bool) {
     println!("profile,sid,target,username,password");
     for e in &report.entries {
         println!(
@@ -1700,5 +1712,20 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport) {
             csv_escape(&e.entry.username),
             csv_escape(&e.entry.password),
         );
+    }
+    if attributes {
+        println!("profile,sid,target,attr_keyword,attr_token_hex");
+        for e in &report.entries {
+            for a in &e.attributes {
+                println!(
+                    "{},{},{},{},{}",
+                    csv_escape(&e.profile),
+                    csv_escape(&e.sid),
+                    csv_escape(&e.entry.target),
+                    csv_escape(&a.keyword),
+                    a.token_hex,
+                );
+            }
+        }
     }
 }

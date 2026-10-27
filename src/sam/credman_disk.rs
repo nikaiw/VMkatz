@@ -28,6 +28,15 @@ pub struct ProfileCred {
     pub profile: String,
     pub sid: String,
     pub entry: CredmanEntry,
+    /// Attributes whose value was a DPAPI blob that decrypted successfully.
+    pub attributes: Vec<DecryptedAttr>,
+}
+
+/// A decrypted nested-DPAPI credential attribute (e.g. a Live SSO token).
+#[derive(Debug, Clone)]
+pub struct DecryptedAttr {
+    pub keyword: String,
+    pub token_hex: String,
 }
 
 /// A Credentials file that could not be decrypted/parsed, with the reason.
@@ -337,10 +346,11 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                     continue;
                 }
                 match self.decrypt_one(prof, dir, &fname) {
-                    Ok((sid, entry)) => report.entries.push(ProfileCred {
+                    Ok((sid, entry, attributes)) => report.entries.push(ProfileCred {
                         profile: prof.name.clone(),
                         sid,
                         entry,
+                        attributes,
                     }),
                     Err((sid, reason)) => report.undecrypted.push(Undecrypted {
                         profile: prof.name.clone(),
@@ -358,7 +368,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         prof: &Profile,
         dir: &str,
         fname: &str,
-    ) -> std::result::Result<(String, CredmanEntry), (String, String)> {
+    ) -> std::result::Result<(String, CredmanEntry, Vec<DecryptedAttr>), (String, String)> {
         let sid0 = prof
             .protect
             .first()
@@ -374,7 +384,28 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             decrypt_blob(&blob, &mk).map_err(|e| (sid.clone(), format!("blob decrypt: {e}")))?;
         let entry = parse_credential_blob(&clear)
             .map_err(|e| (sid.clone(), format!("credential parse: {e}")))?;
-        Ok((sid, entry))
+        let attrs = self.decrypt_attributes(prof, &entry);
+        Ok((sid, entry, attrs))
+    }
+
+    /// Decrypt attributes whose value is a nested DPAPI blob; others/failures are skipped.
+    fn decrypt_attributes(&mut self, prof: &Profile, entry: &CredmanEntry) -> Vec<DecryptedAttr> {
+        let mut out = Vec::new();
+        for a in &entry.attributes {
+            let Ok(ab) = parse_blob(&a.value) else {
+                continue;
+            };
+            let Ok((mk, _)) = self.resolve_masterkey(prof, &ab.mk_guid_str) else {
+                continue;
+            };
+            if let Ok(tok) = decrypt_blob(&ab, &mk) {
+                out.push(DecryptedAttr {
+                    keyword: a.keyword.clone(),
+                    token_hex: hex::encode(tok),
+                });
+            }
+        }
+        out
     }
 }
 
