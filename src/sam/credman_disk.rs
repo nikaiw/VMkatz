@@ -134,6 +134,14 @@ pub fn build_secret_table(
     t
 }
 
+/// True if `name` looks like a SID folder (`S-1-...`); safe for non-ASCII names.
+fn is_sid_dir_name(name: &str) -> bool {
+    name.len() > 4
+        && name
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
+}
+
 /// A directory holding masterkey files for `sid`.
 struct ProtectDir {
     path: String,
@@ -170,7 +178,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             .data(self.rd, "")
             .and_then(std::result::Result::ok)
             .and_then(|i| i.to_attribute().ok().map(|a| a.value_length()))
-            .unwrap_or(0);
+            .ok_or_else(|| crate::error::VmkatzError::Parse("unreadable data length".into()))?;
         if len > MAX_FILE_LEN {
             return Err(crate::error::VmkatzError::Parse(format!(
                 "file too large: {len} bytes"
@@ -185,7 +193,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         self.list(&root, MAX_PROTECT_DIRS * 4)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(n, is_dir)| *is_dir && n.len() > 4 && n[..4].eq_ignore_ascii_case("S-1-"))
+            .filter(|(n, is_dir)| *is_dir && is_sid_dir_name(n))
             .take(MAX_PROTECT_DIRS)
             .map(|(n, _)| ProtectDir {
                 path: format!("{root}\\{n}"),
@@ -411,6 +419,16 @@ mod tests {
         };
         assert!(t.secret_for("S-1-5-18").is_system());
         assert!(t.secret_for("S-1-5-21-1-2-3-1106").is_none());
+    }
+
+    #[test]
+    fn sid_dir_name_filter_no_panic_on_multibyte() {
+        assert!(is_sid_dir_name("S-1-5-21-1-2-3-1001"));
+        assert!(is_sid_dir_name("s-1-5-18"));
+        // byte index 4 falls inside a multibyte char: must not panic
+        assert!(!is_sid_dir_name("a\u{e9}\u{e9}\u{e9}xyz"));
+        assert!(!is_sid_dir_name("S-1\u{e9}-5"));
+        assert!(!is_sid_dir_name("S-1-"));
     }
 
     #[test]
