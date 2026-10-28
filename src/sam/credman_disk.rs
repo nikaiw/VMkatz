@@ -59,6 +59,8 @@ pub struct Undecrypted {
 #[derive(Debug, Clone)]
 pub struct ProfileVaultCred {
     pub profile: String,
+    /// SID whose masterkey opened this vault's `Policy.vpol`.
+    pub sid: String,
     pub vault_guid: String,
     pub cred: VaultCred,
 }
@@ -448,6 +450,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                             n_ok += 1;
                             report.vault.push(ProfileVaultCred {
                                 profile: prof.name.clone(),
+                                sid: sid.clone(),
                                 vault_guid: guid.clone(),
                                 cred,
                             });

@@ -1775,11 +1775,12 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
         }
     }
     if !report.vault.is_empty() {
-        println!("profile,vault_guid,resource,identity,secret");
+        println!("profile,sid,vault_guid,resource,identity,secret");
         for v in &report.vault {
             println!(
-                "{},{},{},{},{}",
+                "{},{},{},{},{},{}",
                 csv_escape(&v.profile),
+                csv_escape(&v.sid),
                 csv_escape(&v.vault_guid),
                 csv_escape(&v.cred.resource),
                 csv_escape(&v.cred.identity),

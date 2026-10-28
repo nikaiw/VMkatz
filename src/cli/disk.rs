@@ -1111,16 +1111,34 @@ fn extract_ntds_from_reader<R: std::io::Read + std::io::Seek>(
 
     // DPAPI master key hashes from the same disk, as run_ntds does.
     reader.seek(SeekFrom::Start(0))?;
-    let dpapi_hashes = dedup_dpapi_hashes(
-        vmkatz::sam::dpapi_masterkey::extract_from_disk(reader),
-        args.all,
-    );
+    let raw_dpapi = vmkatz::sam::dpapi_masterkey::extract_from_disk(reader);
+    let all_dpapi = if args.credman {
+        raw_dpapi.clone()
+    } else {
+        Vec::new()
+    };
+    let dpapi_hashes = dedup_dpapi_hashes(raw_dpapi, args.all);
     if !dpapi_hashes.is_empty() {
         match args.format.as_str() {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
             "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
             _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
         }
+    }
+
+    // `--credman` on the VMFS NTDS path, mirroring run_ntds: this disk is a DC,
+    // so its own NTDS.dit supplies the NT hashes that open its domain users'
+    // masterkeys with no extra flag.
+    if args.credman {
+        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
+            .iter()
+            .filter(|h| !h.is_history)
+            .map(|h| (h.username.clone(), h.nt_hash))
+            .collect();
+        reader.seek(SeekFrom::Start(0))?;
+        let secrets = vmkatz::sam::extract_secrets_from_reader_scoped(reader, args.partition).ok();
+        reader.seek(SeekFrom::Start(0))?;
+        emit_credman(reader, args, c, secrets.as_ref(), &all_dpapi, &ntds_by_name);
     }
 
     Ok(!hashes.is_empty() || !dpapi_hashes.is_empty())
