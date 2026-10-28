@@ -281,6 +281,7 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     c: &super::args::Colors,
     secrets: Option<&vmkatz::sam::DiskSecrets>,
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+    ntds_by_name: &[(String, [u8; 16])],
 ) {
     let machine_sid = find_machine_sid(secrets, hashes);
     let (domain, domain_by_name) = resolve_secret_sids(
@@ -305,6 +306,12 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
         &domain,
         &passwords,
     );
+    // Domain accounts extracted from this disk's own NTDS.dit: their masterkeys
+    // are context 3 (PBKDF2 from the NT hash), so these open them with no flag.
+    // Seeded first so an explicit --dpapi-nthash/--dpapi-password still wins.
+    for (name, h) in ntds_by_name {
+        table.nt_by_name.insert(name.to_lowercase(), *h);
+    }
     for (name, h) in domain_by_name {
         table.nt_by_name.insert(name.to_lowercase(), h);
     }
@@ -343,7 +350,7 @@ fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
         }
     }
     if args.credman {
-        emit_credman(disk, args, c, secrets, &all_hashes);
+        emit_credman(disk, args, c, secrets, &all_hashes, &[]);
     }
 }
 
@@ -663,7 +670,14 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     if args.credman {
         match vmkatz::disk::open_disk(input_path) {
             Ok(mut disk) => {
-                emit_credman(&mut disk, args, c, disk_secrets.as_ref(), &all_dpapi_hashes);
+                emit_credman(
+                    &mut disk,
+                    args,
+                    c,
+                    disk_secrets.as_ref(),
+                    &all_dpapi_hashes,
+                    &[],
+                );
             }
             Err(e) => eprintln!("[!] Credential Manager: cannot open disk: {e}"),
         }
@@ -735,12 +749,41 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Also extract DPAPI master key hashes from user profiles on the same disk
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
+    let all_dpapi_hashes = if args.credman {
+        dpapi_hashes.clone()
+    } else {
+        Vec::new()
+    };
     let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         match args.format.as_str() {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
             "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
             _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    // `--credman` alongside `--ntds`: this disk is a DC, so its own NTDS.dit
+    // supplies the NT hashes that open its domain users' masterkeys (context 3)
+    // without any flag. SAM/LSA are re-read here because run_ntds does not.
+    if args.credman {
+        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
+            .iter()
+            .filter(|h| !h.is_history)
+            .map(|h| (h.username.clone(), h.nt_hash))
+            .collect();
+        let disk_secrets =
+            vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition).ok();
+        match vmkatz::disk::open_disk(input_path) {
+            Ok(mut disk) => emit_credman(
+                &mut disk,
+                args,
+                c,
+                disk_secrets.as_ref(),
+                &all_dpapi_hashes,
+                &ntds_by_name,
+            ),
+            Err(e) => eprintln!("[!] Credential Manager: cannot open disk: {e}"),
         }
     }
 
