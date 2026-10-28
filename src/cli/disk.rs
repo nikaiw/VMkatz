@@ -334,6 +334,7 @@ fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
     args: &Args,
     c: &super::args::Colors,
     secrets: Option<&vmkatz::sam::DiskSecrets>,
+    ntds_by_name: &[(String, [u8; 16])],
 ) {
     let hashes = vmkatz::sam::extract_dpapi_masterkeys_from_reader(disk, args.partition);
     let all_hashes = if args.credman {
@@ -350,7 +351,7 @@ fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
         }
     }
     if args.credman {
-        emit_credman(disk, args, c, secrets, &all_hashes, &[]);
+        emit_credman(disk, args, c, secrets, &all_hashes, ntds_by_name);
     }
 }
 
@@ -387,7 +388,21 @@ fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
         _ => print_ntds_text(&hashes, c),
     }
 
-    vmfs_emit_dpapi(disk, args, c, None);
+    // `--credman` here previously got `None` for secrets, so even SYSTEM
+    // entries failed for want of DPAPI_SYSTEM. Supply this disk's SAM/LSA and,
+    // as on the local-disk path, its own NTDS hashes for domain users.
+    let (secrets, ntds_by_name) = if args.credman {
+        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
+            .iter()
+            .filter(|h| !h.is_history)
+            .map(|h| (h.username.clone(), h.nt_hash))
+            .collect();
+        let secrets = vmkatz::sam::extract_secrets_from_reader_scoped(disk, args.partition).ok();
+        (secrets, ntds_by_name)
+    } else {
+        (None, Vec::new())
+    };
+    vmfs_emit_dpapi(disk, args, c, secrets.as_ref(), &ntds_by_name);
     Ok(())
 }
 
@@ -484,7 +499,7 @@ pub(crate) fn run_vmfs(
             }
         }
 
-        vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref());
+        vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref(), &[]);
     } else {
         // A --partition offset is specific to one disk's partition table and is
         // meaningless across the many differently-laid-out VMDKs an auto-scan visits.
@@ -582,7 +597,7 @@ pub(crate) fn run_vmfs(
                             eprintln!("[!] {vm_name}: {e}");
                         }
                     }
-                    vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref());
+                    vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref(), &[]);
                 }
                 Err(e) => {
                     eprintln!("[!] Failed to open {vmdk_path}: {e}");
