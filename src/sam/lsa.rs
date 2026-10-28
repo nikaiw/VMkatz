@@ -499,6 +499,17 @@ fn aes256_ecb_decrypt(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Strip the `G$` / `L$` scope prefix Windows puts on some LSA secret names.
+/// Leaves names like `$MACHINE.ACC` untouched.
+fn strip_secret_scope(name: &str) -> &str {
+    let b = name.as_bytes();
+    if b.len() > 2 && b[1] == b'$' && matches!(b[0] | 0x20, b'g' | b'l') {
+        &name[2..]
+    } else {
+        name
+    }
+}
+
 /// Parse a decrypted secret by its name into a typed variant.
 fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
     if name.eq_ignore_ascii_case("DPAPI_SYSTEM") {
@@ -516,7 +527,10 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
         log::debug!("DPAPI_SYSTEM: expected 44 bytes, got {}", data.len());
     }
 
-    // DPAPI domain backup keys: BCKUPKEY_P (preferred GUID) and BCKUPKEY_{GUID} (RSA key)
+    // DPAPI backup keys: BCKUPKEY_P (preferred GUID) and BCKUPKEY_{GUID} (RSA key).
+    // Windows stores them scope-prefixed as `G$BCKUPKEY_*` (domain, on DCs) or
+    // `L$BCKUPKEY_*` (local); match on the name with that prefix removed.
+    let name = strip_secret_scope(name);
     if name.eq_ignore_ascii_case("BCKUPKEY_P") || name.eq_ignore_ascii_case("BCKUPKEY_PREFERRED") {
         // 24 bytes: version(4) + reserved(4) + GUID(16)
         if data.len() >= 24 {
@@ -664,4 +678,44 @@ fn build_pvk(key_data: &[u8]) -> Vec<u8> {
 
 fn lsa_err(msg: &str) -> VmkatzError {
     VmkatzError::DecryptionError(format!("LSA: {msg}"))
+}
+
+#[cfg(test)]
+mod scope_prefix_tests {
+    use super::{LsaSecretType, parse_secret, strip_secret_scope};
+
+    #[test]
+    fn strips_scope_prefix_only_where_expected() {
+        assert_eq!(
+            strip_secret_scope("G$BCKUPKEY_PREFERRED"),
+            "BCKUPKEY_PREFERRED"
+        );
+        assert_eq!(strip_secret_scope("l$BCKUPKEY_P"), "BCKUPKEY_P");
+        // Names that merely contain `$` must be left alone.
+        assert_eq!(strip_secret_scope("$MACHINE.ACC"), "$MACHINE.ACC");
+        assert_eq!(strip_secret_scope("NL$KM"), "NL$KM");
+    }
+
+    #[test]
+    fn scope_prefixed_backup_preferred_is_recognised() {
+        let mut data = vec![0u8; 24];
+        data[8..24].copy_from_slice(&[0x11u8; 16]);
+        for name in ["G$BCKUPKEY_PREFERRED", "L$BCKUPKEY_P", "BCKUPKEY_P"] {
+            assert!(
+                matches!(
+                    parse_secret(name, &data),
+                    LsaSecretType::DpapiBackupPreferred { .. }
+                ),
+                "{name} was not recognised as a preferred backup key"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_account_still_classified_after_prefix_change() {
+        assert!(matches!(
+            parse_secret("$MACHINE.ACC", &[1u8; 16]),
+            LsaSecretType::MachineAccount { .. }
+        ));
+    }
 }
