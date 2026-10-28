@@ -4,9 +4,10 @@
 
 ### New Features
 - **`--credman`** — offline Windows Credential Manager extraction. Decrypts the on-disk `Credentials` store (including saved RDP/TERMSRV credentials) from a disk image by recovering DPAPI masterkeys: local users via their SAM NT hash, SYSTEM via `DPAPI_SYSTEM` (no extra input), and domain users via `--dpapi-nthash USER:HASH` (repeatable). Prints target, login and password.
+- **`--dpapi-password USER:PASSWORD`** — supply a cleartext password so `--credman` can open a LOCAL account's DPAPI masterkey. Local (context-1) user masterkeys derive from the password, so an NT hash alone cannot open them; this is what unlocks a local user's saved RDP/Windows credentials and Vault
 - **`--credman` SYSTEM Protect fallback** — credman entries whose masterkey is not found in the user's Protect store (e.g. service profiles) are retried against the SYSTEM Protect store
 - **`--credman-attributes`** — enumerates CREDENTIAL attributes (keyword + encrypted value as hex); offline decryption of entropy-bound WindowsLive/SSO attribute blobs is not supported; adds an attribute table to `--format csv`
-- **`--credman` Vault store (experimental, not yet validated against real vault data)** — parses `Policy.vpol` to recover vault AES keys and decodes `*.vcrd` records; printed in a `[+] Vault (experimental)` section (and an extra csv table)
+- **`--credman` Vault store** — recovers the Windows Vault: decrypts `Policy.vpol` to the vault AES keys, then decodes each `*.vcrd` record (per-attribute AES, optional IV) into resource / identity / secret, printed in a `[+] Vault` section (and an extra csv table). Validated end-to-end against a real Windows 10 web-credential vault
 
 ## v1.5.2
 

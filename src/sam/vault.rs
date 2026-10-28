@@ -92,7 +92,7 @@ pub fn parse_vault_keys(decrypted_vpol: &[u8]) -> Result<VaultKeys> {
 }
 
 /// A decrypted Vault credential (resource / identity / authenticator).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VaultCred {
     pub resource: String,
     pub identity: String,
@@ -156,7 +156,13 @@ fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8
     if id >= 100 {
         read_u32(file, &mut cur)?;
     }
-    let size = read_u32(file, &mut cur)? as usize;
+    let mut size = read_u32(file, &mut cur)? as usize;
+    // Observed on real vaults: some attributes carry an extra unknown DWORD
+    // (reading 0) plus two padding bytes before the real size field.
+    if size == 0 {
+        take(file, &mut cur, 2)?;
+        size = read_u32(file, &mut cur)? as usize;
+    }
     let has_iv = take(file, &mut cur, 1)?[0] != 0;
     let (iv, overhead) = if has_iv {
         let ivlen = read_u32(file, &mut cur)? as usize;
@@ -177,10 +183,41 @@ fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8
     aes_cbc(key, &iv, data)
 }
 
-/// Read a u32-length-prefixed UTF-16LE string from the decoded clear.
-fn read_item(clear: &[u8], cur: &mut usize) -> Result<String> {
-    let n = read_u32(clear, cur)? as usize;
-    Ok(utf16(take(clear, cur, n)?))
+/// Parse a decrypted vault attribute: a 12-byte header (version, item count,
+/// unknown) followed by `count` items of `{u32 type, u32 byte-len, UTF-16LE}`.
+/// Item types follow the Windows vault schema: 1 = resource, 2 = identity,
+/// 3 = authenticator. Validated against a real Windows 10 web-credential vault.
+fn parse_vault_items(clear: &[u8]) -> Result<VaultCred> {
+    let mut cur = 0usize;
+    read_u32(clear, &mut cur)?; // version
+    let count = read_u32(clear, &mut cur)? as usize;
+    read_u32(clear, &mut cur)?; // unknown
+    if count == 0 || count > MAX_ATTRS {
+        return Err(err("vault item count out of range"));
+    }
+    let mut out = VaultCred::default();
+    let mut unknown: Vec<String> = Vec::new();
+    for _ in 0..count {
+        let ty = read_u32(clear, &mut cur)?;
+        let len = read_u32(clear, &mut cur)? as usize;
+        let s = utf16(take(clear, &mut cur, len)?)
+            .trim_end_matches('\0')
+            .to_string();
+        match ty {
+            1 => out.resource = s,
+            2 => out.identity = s,
+            3 => out.secret = s,
+            _ => unknown.push(s),
+        }
+    }
+    if out.resource.is_empty() && out.identity.is_empty() && out.secret.is_empty() {
+        // Unknown schema: fall back to positional order.
+        let mut it = unknown.into_iter();
+        out.resource = it.next().unwrap_or_default();
+        out.identity = it.next().unwrap_or_default();
+        out.secret = it.next().unwrap_or_default();
+    }
+    Ok(out)
 }
 
 /// Parse a `.vcrd` file: VAULT_VCRD header (schema GUID, unknown, FILETIME,
@@ -189,7 +226,7 @@ fn read_item(clear: &[u8], cur: &mut usize) -> Result<String> {
 /// clear parses as three length-prefixed strings (resource, identity,
 /// authenticator) is returned.
 ///
-/// EXPERIMENTAL: unvalidated against real .vcrd (synthetic fixtures only).
+/// Attribute framing validated against a real Windows 10 `.vcrd`.
 pub fn parse_vcrd(file: &[u8], keys: &VaultKeys) -> Result<VaultCred> {
     let mut cur = 0usize;
     take(file, &mut cur, 16)?; // schema GUID
@@ -219,15 +256,7 @@ pub fn parse_vcrd(file: &[u8], keys: &VaultKeys) -> Result<VaultCred> {
                 continue;
             }
         };
-        let mut c = 0usize;
-        let parsed = (|| {
-            Ok(VaultCred {
-                resource: read_item(&clear, &mut c)?,
-                identity: read_item(&clear, &mut c)?,
-                secret: read_item(&clear, &mut c)?,
-            })
-        })();
-        match parsed {
+        match parse_vault_items(&clear) {
             Ok(v) => return Ok(v),
             Err(e) => last = e,
         }
@@ -333,10 +362,24 @@ mod tests {
         }
     }
 
-    fn vcrd(with_iv: bool) -> Vec<u8> {
-        let mut clear = item("https://example.com\0");
-        clear.extend(item("alice"));
-        clear.extend(item("s3cret!"));
+    fn vcrd_ext(with_iv: bool, ext: bool) -> Vec<u8> {
+        // Real layout: u32 version, u32 item count, u32 unknown, then items of
+        // {u32 type, u32 byte-len, UTF-16LE}. Identity (type 2) is emitted
+        // first, as real vaults do, so type-based mapping is exercised.
+        let mut clear = Vec::new();
+        clear.extend_from_slice(&1u32.to_le_bytes());
+        clear.extend_from_slice(&3u32.to_le_bytes());
+        clear.extend_from_slice(&1u32.to_le_bytes());
+        for (ty, text) in [
+            (2u32, "alice\0"),
+            (1u32, "https://example.com\0"),
+            (3u32, "s3cret!\0"),
+        ] {
+            let w: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            clear.extend_from_slice(&ty.to_le_bytes());
+            clear.extend_from_slice(&(w.len() as u32).to_le_bytes());
+            clear.extend(w);
+        }
         let iv = [0x33u8; 16];
         let k = keys();
         let ct = if with_iv {
@@ -350,6 +393,11 @@ mod tests {
             attr.extend_from_slice(&0u32.to_le_bytes());
         }
         let size = 1 + if with_iv { 4 + 16 } else { 0 } + ct.len();
+        if ext {
+            // Real vaults emit an extra zero DWORD + 2 padding bytes here.
+            attr.extend_from_slice(&0u32.to_le_bytes());
+            attr.extend_from_slice(&[0u8; 2]);
+        }
         attr.extend_from_slice(&(size as u32).to_le_bytes());
         attr.push(u8::from(with_iv));
         if with_iv {
@@ -375,8 +423,9 @@ mod tests {
 
     #[test]
     fn parse_vcrd_roundtrip() {
-        for iv in [true, false] {
-            let c = parse_vcrd(&vcrd(iv), &keys()).unwrap();
+        // ext=true reproduces the 6-byte size extension seen on real vaults.
+        for (iv, ext) in [(true, false), (false, false), (true, true)] {
+            let c = parse_vcrd(&vcrd_ext(iv, ext), &keys()).unwrap();
             assert_eq!(c.resource, "https://example.com");
             assert_eq!(c.identity, "alice");
             assert_eq!(c.secret, "s3cret!");
@@ -385,7 +434,7 @@ mod tests {
 
     #[test]
     fn parse_vcrd_bounds() {
-        let f = vcrd(true);
+        let f = vcrd_ext(true, false);
         for n in 0..f.len() {
             assert!(parse_vcrd(&f[..n], &keys()).is_err(), "len {n}");
         }
@@ -395,7 +444,7 @@ mod tests {
 
     #[test]
     fn parse_vcrd_bad_key() {
-        let f = vcrd(true);
+        let f = vcrd_ext(true, false);
         let short = VaultKeys {
             aes128: vec![1; 16],
             aes256: vec![1; 7],

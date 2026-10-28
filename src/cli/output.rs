@@ -1714,10 +1714,10 @@ pub(crate) fn print_credman_text(
     }
 }
 
-/// Print the experimental Vault section grouped by profile + vault GUID.
+/// Print the Vault section grouped by profile + vault GUID.
 #[cfg(feature = "sam")]
 fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors) {
-    println!("{}[+] Vault (experimental){}", c.green, c.reset);
+    println!("{}[+] Vault{}", c.green, c.reset);
     let mut groups: Vec<(&str, &str)> = Vec::new();
     for v in &report.vault {
         let k = (v.profile.as_str(), v.vault_guid.as_str());
