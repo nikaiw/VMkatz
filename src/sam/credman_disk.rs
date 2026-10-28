@@ -10,7 +10,9 @@ use std::io::{Read, Seek};
 use super::DiskSecrets;
 use super::credman_blob::{CredmanEntry, parse_credential_blob};
 use super::dpapi_blob::{decrypt_blob, parse_blob};
-use super::dpapi_masterkey::{decrypt_local_user_masterkey, decrypt_system_masterkey};
+use super::dpapi_masterkey::{
+    decrypt_local_user_masterkey, decrypt_local_user_masterkey_pw, decrypt_system_masterkey,
+};
 use super::lsa::{LsaSecret, LsaSecretType};
 use super::vault::{VaultCred, VaultKeys, parse_vault_keys, parse_vcrd, parse_vpol};
 use crate::error::Result;
@@ -53,7 +55,7 @@ pub struct Undecrypted {
     pub reason: String,
 }
 
-/// A decrypted Vault credential (EXPERIMENTAL: `.vcrd` parsing is synthetic-tested only).
+/// A decrypted Vault credential (resource / identity / authenticator).
 #[derive(Debug, Clone)]
 pub struct ProfileVaultCred {
     pub profile: String,
@@ -80,6 +82,9 @@ pub struct SecretTable {
     pub domain_nt_by_sid: HashMap<String, [u8; 16]>,
     /// DPAPI_SYSTEM user key (for `S-1-5-18\User` masterkeys).
     pub dpapi_system_user: Option<[u8; 20]>,
+    /// Cleartext passwords by SID. A local (context-1) user masterkey is derived
+    /// from the password, not the NT hash, so only this opens those.
+    pub pw_by_sid: HashMap<String, String>,
 }
 
 /// The secret (if any) that applies to a SID.
@@ -133,6 +138,7 @@ pub fn build_secret_table(
     lsa: &[LsaSecret],
     machine_sid: &str,
     domain_nthashes: &[(String, [u8; 16])],
+    passwords: &[(String, String)],
 ) -> SecretTable {
     let mut t = SecretTable::default();
     for e in &disk_secrets.sam_entries {
@@ -155,6 +161,9 @@ pub fn build_secret_table(
     }
     for (sid, h) in domain_nthashes {
         t.domain_nt_by_sid.insert(sid.clone(), *h);
+    }
+    for (sid, pw) in passwords {
+        t.pw_by_sid.insert(sid.clone(), pw.clone());
     }
     t
 }
@@ -517,8 +526,17 @@ fn unlock(
     sid: &str,
     mk_bytes: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
+    // A supplied cleartext password is tried first: local (context-1) user
+    // masterkeys derive from the password, which an NT hash cannot reproduce.
+    let mut pw_err = None;
+    if let Some(pw) = secrets.pw_by_sid.get(sid) {
+        match decrypt_local_user_masterkey_pw(mk_bytes, pw, sid) {
+            Ok(k) => return Ok(k),
+            Err(e) => pw_err = Some(format!("masterkey decrypt (password): {e}")),
+        }
+    }
     match secrets.secret_for(sid) {
-        Secret::None => Err(format!("no secret for {sid}")),
+        Secret::None => Err(pw_err.unwrap_or_else(|| format!("no secret for {sid}"))),
         Secret::Nt(h) => decrypt_local_user_masterkey(mk_bytes, &h, sid)
             .map_err(|e| format!("masterkey decrypt: {e}")),
         Secret::System { machine, user } => {
@@ -692,14 +710,14 @@ mod tests {
             acb_flags: 0,
         });
         let dom = vec![("S-1-5-21-9-9-9-1106".to_string(), [3u8; 16])];
-        let st = build_secret_table(&ds, &[], "S-1-5-21-1-2-3", &dom);
+        let st = build_secret_table(&ds, &[], "S-1-5-21-1-2-3", &dom, &[]);
         assert!(!st.local_nt_by_sid.contains_key("S-1-5-21-1-2-3-501"));
         assert!(st.secret_for("S-1-5-21-9-9-9-1106").is_nt());
     }
 
     #[test]
     fn build_secret_table_maps_rid_to_sid() {
-        let st = build_secret_table(&disk_secrets_fixture(), &[], "S-1-5-21-1-2-3", &[]);
+        let st = build_secret_table(&disk_secrets_fixture(), &[], "S-1-5-21-1-2-3", &[], &[]);
         assert_eq!(
             st.local_nt_by_sid.get("S-1-5-21-1-2-3-500"),
             Some(&[7u8; 16])

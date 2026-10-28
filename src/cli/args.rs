@@ -39,6 +39,7 @@ use clap::Parser;
         vmkatz --chrome disk.vmdk                    Discover browser profiles (build with --features chrome)\n  \
         vmkatz --credman disk.vmdk                   Decrypt Windows Credential Manager (offline)\n  \
         vmkatz --credman --credman-attributes disk.vmdk   Also enumerate credential attributes (encrypted values; offline decryption unsupported)\n  \
+        vmkatz --credman --dpapi-password vmkz:P@ss disk.vmdk   Supply a local user's password (needed to open their masterkey)\n  \
         vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
         vmkatz --ls='\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
         vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \
@@ -182,6 +183,13 @@ pub(crate) struct Args {
     /// SAM/profile name, or `DOMAIN\\name`. For domain users not in the local SAM.
     #[arg(long, value_name = "USER:HEX")]
     pub(crate) dpapi_nthash: Vec<String>,
+
+    /// `USER:PASSWORD` cleartext password for `--credman` (repeatable). USER is a
+    /// SID, a SAM/profile name, or `DOMAIN\\name`. Required for LOCAL accounts:
+    /// their masterkey derives from the password, not the NT hash. Everything
+    /// after the first `:` is the password. Note: visible in the process list.
+    #[arg(long, value_name = "USER:PASSWORD")]
+    pub(crate) dpapi_password: Vec<String>,
 
     /// Also scan running chrome.exe / msedge.exe / brave.exe process memory
     /// for cookies and saved passwords (ChromeKatz-style). Uses heuristic
@@ -414,6 +422,23 @@ mod offset_tests {
 /// Parse `--dpapi-nthash` specs into `(USER, 16-byte NT hash)` pairs.
 /// Requires `USER:HEX`; malformed entries are skipped with a warning.
 #[cfg(feature = "sam")]
+pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for spec in specs {
+        // Split on the FIRST colon: a password may itself contain colons.
+        let Some((user, pw)) = spec.split_once(':') else {
+            log::warn!("--dpapi-password: expected USER:PASSWORD in {spec:?}");
+            continue;
+        };
+        if pw.is_empty() {
+            log::warn!("--dpapi-password: empty password in {spec:?}");
+            continue;
+        }
+        out.push((user.trim().to_string(), pw.to_string()));
+    }
+    out
+}
+
 pub(crate) fn parse_dpapi_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
     let mut out: Vec<(String, [u8; 16])> = Vec::new();
     for spec in specs {

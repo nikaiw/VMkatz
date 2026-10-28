@@ -18,7 +18,7 @@ use super::args::Colors;
 #[cfg(feature = "chrome")]
 use super::args::parse_chrome_nthashes;
 #[cfg(feature = "sam")]
-use super::args::{RawFileType, get_colors, parse_dpapi_nthashes};
+use super::args::{RawFileType, get_colors, parse_dpapi_nthashes, parse_dpapi_passwords};
 #[cfg(all(
     feature = "sam",
     any(
@@ -210,19 +210,20 @@ pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
 }
 
 /// Resolve `--dpapi-nthash` user specs (SID, SAM/profile name, or `DOMAIN\\name`) to SIDs.
-fn resolve_nthash_sids(
-    specs: Vec<(String, [u8; 16])>,
+fn resolve_secret_sids<T>(
+    specs: Vec<(String, T)>,
     machine_sid: Option<&str>,
     secrets: Option<&vmkatz::sam::DiskSecrets>,
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-) -> Vec<(String, [u8; 16])> {
+    flag: &str,
+) -> Vec<(String, T)> {
     let mut out = Vec::new();
-    for (user, nt) in specs {
+    for (user, val) in specs {
         if user
             .get(..4)
             .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
         {
-            out.push((user, nt));
+            out.push((user, val));
             continue;
         }
         let bare = user.rsplit_once('\\').map_or(user.as_str(), |(_, n)| n);
@@ -239,9 +240,9 @@ fn resolve_nthash_sids(
                     .map(|e| format!("{m}-{}", e.rid))
             });
         if let Some(sid) = sid {
-            out.push((sid, nt));
+            out.push((sid, val));
         } else {
-            log::warn!("--dpapi-nthash: cannot resolve user {user:?} to a SID");
+            log::warn!("{flag}: cannot resolve user {user:?} to a SID");
         }
     }
     out
@@ -273,11 +274,19 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
 ) {
     let machine_sid = find_machine_sid(secrets, hashes);
-    let domain = resolve_nthash_sids(
+    let domain = resolve_secret_sids(
         parse_dpapi_nthashes(&args.dpapi_nthash),
         machine_sid.as_deref(),
         secrets,
         hashes,
+        "--dpapi-nthash",
+    );
+    let passwords = resolve_secret_sids(
+        parse_dpapi_passwords(&args.dpapi_password),
+        machine_sid.as_deref(),
+        secrets,
+        hashes,
+        "--dpapi-password",
     );
     let empty = vmkatz::sam::DiskSecrets::default();
     let table = vmkatz::sam::build_secret_table(
@@ -285,6 +294,7 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
         secrets.map_or(&[][..], |s| &s.lsa_secrets),
         machine_sid.as_deref().unwrap_or(""),
         &domain,
+        &passwords,
     );
     match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
         Ok(report) => match args.format.as_str() {
