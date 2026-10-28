@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use super::DiskSecrets;
+use super::credhist;
 use super::credman_blob::{CredmanEntry, parse_credential_blob};
 use super::dpapi_blob::{decrypt_blob, parse_blob};
 use super::dpapi_masterkey::{
-    decrypt_local_user_masterkey, decrypt_local_user_masterkey_pw, decrypt_system_masterkey,
+    decrypt_local_user_masterkey, decrypt_local_user_masterkey_pw, decrypt_masterkey_with_prekey,
+    decrypt_system_masterkey, prekey_from_hash, prekey_from_password,
 };
 use super::lsa::{LsaSecret, LsaSecretType};
 use super::vault::{VaultCred, VaultKeys, parse_vault_keys, parse_vcrd, parse_vpol};
@@ -120,6 +122,26 @@ impl Secret {
 
 impl SecretTable {
     /// Look up the secret for a profile SID.
+    /// Pre-key derived from whatever credential we hold for this profile, used
+    /// as the entry point of a CREDHIST walk. A password is preferred: it is
+    /// what a local account's masterkey (and its CREDHIST) is keyed to.
+    pub(crate) fn start_prekey(&self, sid: &str, name: &str) -> Option<[u8; 20]> {
+        let lower = name.to_lowercase();
+        if let Some(pw) = self
+            .pw_by_sid
+            .get(sid)
+            .or_else(|| self.pw_by_name.get(&lower))
+        {
+            return prekey_from_password(pw, sid).ok();
+        }
+        let h = self
+            .local_nt_by_sid
+            .get(sid)
+            .or_else(|| self.domain_nt_by_sid.get(sid))
+            .or_else(|| self.nt_by_name.get(&lower))?;
+        prekey_from_hash(h, sid).ok()
+    }
+
     pub fn secret_for(&self, sid: &str) -> Secret {
         if sid.eq_ignore_ascii_case(SYSTEM_SID) {
             return Secret::System {
@@ -375,10 +397,41 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                     found = Some((k, pd.sid.clone()));
                     break;
                 }
-                Err(reason) => last = (pd.sid.clone(), reason),
+                Err(reason) => {
+                    // The masterkey may predate the current password; CREDHIST
+                    // holds the older hashes that still open it.
+                    if let Some(k) = self.try_credhist(pd, &prof.name, &mk_bytes) {
+                        found = Some((k, pd.sid.clone()));
+                        break;
+                    }
+                    last = (pd.sid.clone(), reason);
+                }
             }
         }
         found.ok_or(last)
+    }
+
+    /// Walk `CREDHIST` (one level above the per-SID folder) for previous
+    /// password hashes and retry the masterkey with each of them.
+    fn try_credhist(&mut self, pd: &ProtectDir, profile: &str, mk_bytes: &[u8]) -> Option<Vec<u8>> {
+        let start = self.secrets.start_prekey(&pd.sid, profile)?;
+        let (parent, _) = pd.path.rsplit_once('\\')?;
+        let file = self.read(parent, "CREDHIST").ok()?;
+        let chain = credhist::recover_previous_hashes(&file, &pd.sid, &start).ok()?;
+        for h in chain {
+            for key in [
+                prekey_from_hash(&h.sha1, &pd.sid),
+                prekey_from_hash(&h.ntlm, &pd.sid),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(clear) = decrypt_masterkey_with_prekey(mk_bytes, &key) {
+                    return Some(clear);
+                }
+            }
+        }
+        None
     }
 
     fn scan_profile(&mut self, prof: &Profile, report: &mut CredmanReport) {

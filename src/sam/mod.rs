@@ -1,6 +1,7 @@
 pub mod bootkey;
 pub mod cache;
 pub mod cm_hive;
+mod credhist;
 mod credman_blob;
 mod credman_disk;
 mod disk_fallbacks;
