@@ -85,6 +85,12 @@ pub struct SecretTable {
     /// Cleartext passwords by SID. A local (context-1) user masterkey is derived
     /// from the password, not the NT hash, so only this opens those.
     pub pw_by_sid: HashMap<String, String>,
+    /// NT hashes keyed by lowercased profile name, for specs the CLI could not
+    /// map to a SID (a domain user has no SAM entry and may have no masterkey
+    /// hash to look the SID up from).
+    pub nt_by_name: HashMap<String, [u8; 16]>,
+    /// Cleartext passwords keyed by lowercased profile name, same rationale.
+    pub pw_by_name: HashMap<String, String>,
 }
 
 /// The secret (if any) that applies to a SID.
@@ -359,7 +365,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             let Ok(mk_bytes) = self.read(&pd.path, guid) else {
                 continue;
             };
-            match unlock(self.secrets, &pd.sid, &mk_bytes) {
+            match unlock(self.secrets, &pd.sid, &prof.name, &mk_bytes) {
                 Ok(k) => {
                     found = Some((k, pd.sid.clone()));
                     break;
@@ -524,19 +530,30 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
 fn unlock(
     secrets: &SecretTable,
     sid: &str,
+    profile: &str,
     mk_bytes: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
+    let name = profile.to_lowercase();
     // A supplied cleartext password is tried first: local (context-1) user
     // masterkeys derive from the password, which an NT hash cannot reproduce.
     let mut pw_err = None;
-    if let Some(pw) = secrets.pw_by_sid.get(sid) {
+    for pw in [secrets.pw_by_sid.get(sid), secrets.pw_by_name.get(&name)]
+        .into_iter()
+        .flatten()
+    {
         match decrypt_local_user_masterkey_pw(mk_bytes, pw, sid) {
             Ok(k) => return Ok(k),
             Err(e) => pw_err = Some(format!("masterkey decrypt (password): {e}")),
         }
     }
     match secrets.secret_for(sid) {
-        Secret::None => Err(pw_err.unwrap_or_else(|| format!("no secret for {sid}"))),
+        Secret::None => {
+            if let Some(h) = secrets.nt_by_name.get(&name) {
+                return decrypt_local_user_masterkey(mk_bytes, h, sid)
+                    .map_err(|e| format!("masterkey decrypt: {e}"));
+            }
+            Err(pw_err.unwrap_or_else(|| format!("no secret for {sid}")))
+        }
         Secret::Nt(h) => decrypt_local_user_masterkey(mk_bytes, &h, sid)
             .map_err(|e| format!("masterkey decrypt: {e}")),
         Secret::System { machine, user } => {

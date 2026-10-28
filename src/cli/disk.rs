@@ -210,14 +210,19 @@ pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
 }
 
 /// Resolve `--dpapi-nthash` user specs (SID, SAM/profile name, or `DOMAIN\\name`) to SIDs.
+/// Supplied secrets split by how they can be matched: resolved to a SID, or
+/// (fallback) keyed by profile name for the walk to bind later.
+type ResolvedSecrets<T> = (Vec<(String, T)>, Vec<(String, T)>);
+
 fn resolve_secret_sids<T>(
     specs: Vec<(String, T)>,
     machine_sid: Option<&str>,
     secrets: Option<&vmkatz::sam::DiskSecrets>,
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
     flag: &str,
-) -> Vec<(String, T)> {
+) -> ResolvedSecrets<T> {
     let mut out = Vec::new();
+    let mut by_name = Vec::new();
     for (user, val) in specs {
         if user
             .get(..4)
@@ -242,10 +247,14 @@ fn resolve_secret_sids<T>(
         if let Some(sid) = sid {
             out.push((sid, val));
         } else {
-            log::warn!("{flag}: cannot resolve user {user:?} to a SID");
+            // No SID yet (typical for a domain user: no SAM entry and no
+            // masterkey hash to look one up from). Keep it keyed by profile
+            // name so the profile walk can bind it once the SID is known.
+            log::info!("{flag}: {user:?} not resolved to a SID; will match by profile name");
+            by_name.push((bare.to_string(), val));
         }
     }
-    out
+    (out, by_name)
 }
 
 /// Machine SID: the SID prefix of a profile whose RID and name match a SAM account.
@@ -274,14 +283,14 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
 ) {
     let machine_sid = find_machine_sid(secrets, hashes);
-    let domain = resolve_secret_sids(
+    let (domain, domain_by_name) = resolve_secret_sids(
         parse_dpapi_nthashes(&args.dpapi_nthash),
         machine_sid.as_deref(),
         secrets,
         hashes,
         "--dpapi-nthash",
     );
-    let passwords = resolve_secret_sids(
+    let (passwords, pw_by_name) = resolve_secret_sids(
         parse_dpapi_passwords(&args.dpapi_password),
         machine_sid.as_deref(),
         secrets,
@@ -289,13 +298,19 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
         "--dpapi-password",
     );
     let empty = vmkatz::sam::DiskSecrets::default();
-    let table = vmkatz::sam::build_secret_table(
+    let mut table = vmkatz::sam::build_secret_table(
         secrets.unwrap_or(&empty),
         secrets.map_or(&[][..], |s| &s.lsa_secrets),
         machine_sid.as_deref().unwrap_or(""),
         &domain,
         &passwords,
     );
+    for (name, h) in domain_by_name {
+        table.nt_by_name.insert(name.to_lowercase(), h);
+    }
+    for (name, pw) in pw_by_name {
+        table.pw_by_name.insert(name.to_lowercase(), pw);
+    }
     match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
         Ok(report) => match args.format.as_str() {
             "csv" => print_credman_csv(&report, args.credman_attributes),
