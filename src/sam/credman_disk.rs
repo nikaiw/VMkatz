@@ -206,6 +206,7 @@ fn is_sid_dir_name(name: &str) -> bool {
 }
 
 /// A directory holding masterkey files for `sid`.
+#[derive(Clone)]
 struct ProtectDir {
     path: String,
     sid: String,
@@ -358,10 +359,12 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             default_sid,
             format!("masterkey {guid} not found in Protect folders"),
         );
-        let system = std::mem::take(&mut self.system_protect);
-        let fallback = fallback_dirs(&prof.name, &system);
+        // Collect the search order up front: holding a borrow of
+        // `self.system_protect` across `self.read` would conflict, and taking
+        // it out would leave the cache empty if an early return ever crept in.
+        let fallback: Vec<ProtectDir> = fallback_dirs(&prof.name, &self.system_protect).to_vec();
         let mut found = None;
-        for pd in prof.protect.iter().chain(fallback) {
+        for pd in prof.protect.iter().chain(fallback.iter()) {
             let Ok(mk_bytes) = self.read(&pd.path, guid) else {
                 continue;
             };
@@ -373,7 +376,6 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                 Err(reason) => last = (pd.sid.clone(), reason),
             }
         }
-        self.system_protect = system;
         found.ok_or(last)
     }
 

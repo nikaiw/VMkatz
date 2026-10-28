@@ -86,9 +86,22 @@ fn read_key(buf: &[u8], cur: &mut usize) -> Result<Vec<u8>> {
 /// Extract the two AES keys from a decrypted VAULT_POL_STORE.
 pub fn parse_vault_keys(decrypted_vpol: &[u8]) -> Result<VaultKeys> {
     let mut cur = 0usize;
-    let aes128 = read_key(decrypted_vpol, &mut cur)?;
-    let aes256 = read_key(decrypted_vpol, &mut cur)?;
-    Ok(VaultKeys { aes128, aes256 })
+    let first = read_key(decrypted_vpol, &mut cur)?;
+    let second = read_key(decrypted_vpol, &mut cur)?;
+    // Label by actual key length rather than position, so a store that emits
+    // them the other way round still yields a usable pair. Real vaults seen so
+    // far are (16, 32), for which this is identical to positional.
+    if first.len() == 32 && second.len() == 16 {
+        Ok(VaultKeys {
+            aes128: second,
+            aes256: first,
+        })
+    } else {
+        Ok(VaultKeys {
+            aes128: first,
+            aes256: second,
+        })
+    }
 }
 
 /// A decrypted Vault credential (resource / identity / authenticator).
