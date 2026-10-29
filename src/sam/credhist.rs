@@ -23,7 +23,7 @@ use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
-use super::dpapi_masterkey::{MAX_PBKDF2_ROUNDS, derive_key_sha512, prekey_from_hash};
+use super::dpapi_masterkey::{derive_key_sha512, prekey_from_hash};
 use crate::error::{Result, VmkatzError as Error};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -31,6 +31,9 @@ type Aes256CbcDec = cbc::Decryptor<Aes256>;
 /// Walk at most this many of the newest entries.
 const MAX_ENTRIES: usize = 64;
 /// revision (4) + GUID (16) + entries_len (4).
+/// Real CREDHIST uses ~8000 rounds. A wrong key is undetectable so every
+/// entry is derived; keep the cap far below the masterkey one.
+const MAX_CREDHIST_ROUNDS: u32 = 1_000_000;
 const FOOTER_LEN: usize = 24;
 const CALG_AES_256: u32 = 0x0000_6610;
 const CALG_SHA_512: u32 = 0x0000_800e;
@@ -80,6 +83,8 @@ fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
     if entries_len > file.len() - FOOTER_LEN {
         return Err(err("credhist entries length out of range"));
     }
+    // Parse over the entries region only so no read can cross into the footer.
+    let file = &file[..entries_len];
     let mut out = Vec::new();
     let mut cur = 0usize;
     while cur < entries_len {
@@ -127,7 +132,7 @@ fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
 
 /// Decrypt one entry with `pre_key`, yielding the previous password's hashes.
 fn decrypt_entry(e: &Entry<'_>, pre_key: &[u8]) -> Result<CredHistHashes> {
-    if e.rounds == 0 || e.rounds > MAX_PBKDF2_ROUNDS {
+    if e.rounds == 0 || e.rounds > MAX_CREDHIST_ROUNDS {
         return Err(err("credhist PBKDF2 rounds out of range"));
     }
     let derived = derive_key_sha512(pre_key, &e.salt, 48, e.rounds);
@@ -265,7 +270,7 @@ mod tests {
 
     #[test]
     fn rounds_out_of_range_rejected_fast() {
-        for bad in [0u32, 0xFFFF_FFFF] {
+        for bad in [0u32, MAX_CREDHIST_ROUNDS + 1, 0xFFFF_FFFF] {
             let mut file = build(&[7u8; 20], &[0x11; 20], &[0x22; 16], 50);
             file[32..36].copy_from_slice(&bad.to_le_bytes());
             let t = std::time::Instant::now();
@@ -291,6 +296,12 @@ mod tests {
             );
         }
         assert!(recover_previous_hashes(&file, SID, &[7u8; 20]).is_ok());
+
+        // nt_len = 40 makes the ciphertext (64 bytes) overrun the entry by 16
+        // bytes into the footer; that must be an error, not a footer read.
+        let mut f = file;
+        f[48..52].copy_from_slice(&40u32.to_le_bytes());
+        assert!(recover_previous_hashes(&f, SID, &[7u8; 20]).is_err());
     }
 
     #[test]

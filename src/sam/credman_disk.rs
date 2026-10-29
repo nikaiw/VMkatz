@@ -278,6 +278,8 @@ struct Walker<'a, 'n, R: Read + Seek> {
     /// Resolved (or failed) masterkeys by (profile, GUID), so a masterkey that
     /// cannot be opened is not re-derived (PBKDF2 + CREDHIST) for every file.
     mk_cache: HashMap<(String, String), MkResolution>,
+    /// Walked CREDHIST chains by (parent dir, SID, start prekey); `None` = walk failed.
+    chain_cache: HashMap<(String, String, [u8; 20]), Option<Vec<credhist::CredHistHashes>>>,
 }
 
 type MkResolution = std::result::Result<(Vec<u8>, String), (String, String)>;
@@ -455,9 +457,19 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             return None;
         }
         let (parent, _) = pd.path.rsplit_once('\\')?;
-        let file = self.read(parent, "CREDHIST").ok()?;
+        let mut file: Option<Vec<u8>> = None;
         for start in &starts {
-            let Ok(chain) = credhist::recover_previous_hashes(&file, &pd.sid, start) else {
+            let key = (parent.to_string(), pd.sid.clone(), *start);
+            if !self.chain_cache.contains_key(&key) {
+                if file.is_none() {
+                    file = Some(self.read(parent, "CREDHIST").ok()?);
+                }
+                let walked = file
+                    .as_deref()
+                    .and_then(|f| credhist::recover_previous_hashes(f, &pd.sid, start).ok());
+                self.chain_cache.insert(key.clone(), walked);
+            }
+            let Some(chain) = self.chain_cache.get(&key).and_then(Option::as_ref) else {
                 continue;
             };
             for h in chain {
@@ -693,6 +705,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
             secrets,
             system_protect: system_protect_dirs(),
             mk_cache: HashMap::new(),
+            chain_cache: HashMap::new(),
         };
         for prof in w.profiles() {
             w.scan_profile(&prof, &mut report);

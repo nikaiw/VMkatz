@@ -28,7 +28,7 @@ type HmacSha512 = Hmac<Sha512>;
 
 /// Maximum allowed PBKDF2 rounds — prevents pathological inputs from
 /// burning CPU forever. Real-world MK files use 4k–8k rounds.
-pub(super) const MAX_PBKDF2_ROUNDS: u32 = 10_000_000;
+const MAX_PBKDF2_ROUNDS: u32 = 10_000_000;
 /// Minimum cleartext masterkey blob size (64 MK + 64 HMAC = 128, padding may extend).
 const MIN_DECRYPTED_LEN: usize = 64;
 
