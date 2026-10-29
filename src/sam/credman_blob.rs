@@ -58,6 +58,42 @@ fn decode_utf16(b: &[u8]) -> Option<String> {
         .ok()
 }
 
+/// True when every char is plausible text (no control / private-use / presentation-form / specials).
+fn looks_printable(s: &str) -> bool {
+    s.chars().all(|c| {
+        !c.is_control()
+            && !matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' | '\u{FFF0}'..='\u{FFFF}')
+    })
+}
+
+/// Decode a CredentialBlob password. Windows stores UTF-16LE, but some helpers
+/// (git-credential-manager, docker-credential-wincred) store raw UTF-8.
+/// Order: UTF-16LE if every odd byte is 0x00 (ASCII/Latin-1 range); else strict
+/// UTF-8 if printable; else UTF-16LE with other printable text (non-Latin scripts);
+/// else lowercase hex. Trailing NULs are trimmed from text results.
+fn decode_password(blob: &[u8]) -> String {
+    if blob.is_empty() {
+        return String::new();
+    }
+    let utf16 = decode_utf16(blob).map(|s| s.trim_end_matches('\0').to_owned());
+    let ascii_range = blob.len().is_multiple_of(2) && blob.chunks_exact(2).all(|c| c[1] == 0);
+    if ascii_range {
+        if let Some(s) = utf16.as_deref().filter(|s| looks_printable(s)) {
+            return s.to_owned();
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(blob) {
+        let s = s.trim_end_matches('\0');
+        if looks_printable(s) {
+            return s.to_owned();
+        }
+    }
+    if let Some(s) = utf16.filter(|s| looks_printable(s)) {
+        return s;
+    }
+    hex::encode(blob)
+}
+
 /// Read a u32 byte-length-prefixed UTF-16LE string (lossy on bad data).
 fn read_lp_utf16(bytes: &[u8], cur: &mut usize) -> Result<String> {
     let raw = read_lp_bytes(bytes, cur)?;
@@ -96,7 +132,7 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     let _unknown4 = read_lp_utf16(decrypted, &mut cur)?;
     let username = read_lp_utf16(decrypted, &mut cur)?;
     let blob = read_lp_bytes(decrypted, &mut cur)?;
-    let password = decode_utf16(blob).unwrap_or_else(|| hex::encode(blob));
+    let password = decode_password(blob);
     let attributes = parse_attributes(decrypted, &mut cur, attr_count);
     Ok(CredmanEntry {
         target,
@@ -228,6 +264,44 @@ mod tests {
         let e =
             parse_credential_blob(&build_fixture_raw_blob("x", &[0x01, 0x02, 0x03], "u")).unwrap();
         assert_eq!(e.password, "010203");
+    }
+
+    fn pw(blob: &[u8]) -> String {
+        parse_credential_blob(&build_fixture_raw_blob("x", blob, "u"))
+            .unwrap()
+            .password
+    }
+
+    #[test]
+    fn utf8_password_decoded_as_utf8() {
+        assert_eq!(pw(b"abcd"), "abcd");
+        assert_eq!(pw(b"ab"), "ab");
+        assert_eq!(pw(b"abc"), "abc");
+        assert_eq!(pw(b"abcd\0"), "abcd");
+    }
+
+    #[test]
+    fn utf16_password_still_decoded() {
+        assert_eq!(pw(&[0x50, 0, 0x40, 0, 0x73, 0, 0x73, 0]), "P@ss");
+        // non-Latin UTF-16 (Cyrillic "Пароль")
+        let cy: Vec<u8> = "Пароль".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(pw(&cy), "Пароль");
+    }
+
+    #[test]
+    fn password_trailing_nul_trimmed() {
+        let b: Vec<u8> = "P@ss\0\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(pw(&b), "P@ss");
+    }
+
+    #[test]
+    fn binary_password_hex() {
+        assert_eq!(pw(&[1, 2, 3]), "010203");
+        assert_eq!(pw(&[1, 0, 2, 0]), "01000200");
+        assert_eq!(pw(&[0xff, 0xfe, 0xfd, 0xfc]), "fffefdfc");
     }
 
     fn dpapi(tag: u8, data_len: usize) -> Vec<u8> {
