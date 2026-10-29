@@ -71,6 +71,13 @@ fn looks_printable(s: &str) -> bool {
 /// Order: UTF-16LE if every odd byte is 0x00 (ASCII/Latin-1 range); else strict
 /// UTF-8 if printable; else UTF-16LE with other printable text (non-Latin scripts);
 /// else lowercase hex. Trailing NULs are trimmed from text results.
+///
+/// Known trade-off: the byte-level ambiguity is irreducible (UTF-8 `abcd` and
+/// UTF-16LE "扡摣" are the same bytes). UTF-8 is preferred, so a short even-length
+/// UTF-16 CJK password whose bytes all fall in printable ASCII (e.g. "中" = `2D 4E`)
+/// is shown as its ASCII reading ("-N"). Accepted so tool-stored UTF-8 credentials
+/// (git-credential-manager, docker-credential-wincred) decode correctly; the bytes
+/// stay recoverable because the string prints as-is.
 fn decode_password(blob: &[u8]) -> String {
     if blob.is_empty() {
         return String::new();
@@ -302,6 +309,45 @@ mod tests {
         assert_eq!(pw(&[1, 2, 3]), "010203");
         assert_eq!(pw(&[1, 0, 2, 0]), "01000200");
         assert_eq!(pw(&[0xff, 0xfe, 0xfd, 0xfc]), "fffefdfc");
+    }
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn cjk_utf16_ambiguous_with_ascii_is_pinned() {
+        // Pins the documented UTF-8-preferred trade-off: "中" (2D 4E) reads as "-N".
+        // Changing this must be a conscious decision (it would regress UTF-8 creds).
+        assert_eq!(utf16("中"), vec![0x2D, 0x4E]);
+        assert_eq!(pw(&utf16("中")), "-N");
+    }
+
+    #[test]
+    fn latin1_utf16_password() {
+        assert_eq!(pw(&utf16("Pässw0rd!")), "Pässw0rd!");
+    }
+
+    #[test]
+    fn mixed_ascii_nonascii_utf16() {
+        let b = utf16("a€b");
+        assert_eq!(b, vec![0x61, 0, 0xAC, 0x20, 0x62, 0]);
+        assert_eq!(pw(&b), "a€b");
+    }
+
+    #[test]
+    fn emoji_surrogate_pair_utf16() {
+        assert_eq!(pw(&utf16("😀")), "😀");
+    }
+
+    #[test]
+    fn target_and_username_not_nul_trimmed_by_password_path() {
+        // target/username keep their own (wide) NUL trimming; password path is independent.
+        let bytes = build_fixture("T/x\0\0", "P@ss\0", "LAB\\u\0");
+        let e = parse_credential_blob(&bytes).unwrap();
+        assert_eq!(e.target, "T/x");
+        assert_eq!(e.username, "LAB\\u");
+        assert_eq!(e.password, "P@ss");
     }
 
     fn dpapi(tag: u8, data_len: usize) -> Vec<u8> {
