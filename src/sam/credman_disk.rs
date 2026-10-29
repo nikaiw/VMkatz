@@ -275,7 +275,12 @@ struct Walker<'a, 'n, R: Read + Seek> {
     secrets: &'a SecretTable,
     /// SYSTEM Protect dirs, tried when a profile's own store lacks a masterkey.
     system_protect: Vec<ProtectDir>,
+    /// Resolved (or failed) masterkeys by (profile, GUID), so a masterkey that
+    /// cannot be opened is not re-derived (PBKDF2 + CREDHIST) for every file.
+    mk_cache: HashMap<(String, String), MkResolution>,
 }
+
+type MkResolution = std::result::Result<(Vec<u8>, String), (String, String)>;
 
 /// The SYSTEM masterkey folders (`...\S-1-5-18\User` first, then `...\S-1-5-18`).
 fn system_protect_dirs() -> Vec<ProtectDir> {
@@ -394,11 +399,17 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     }
 
     /// Locate and decrypt the masterkey `guid`; returns (clear key, owning SID).
-    fn resolve_masterkey(
-        &mut self,
-        prof: &Profile,
-        guid: &str,
-    ) -> std::result::Result<(Vec<u8>, String), (String, String)> {
+    fn resolve_masterkey(&mut self, prof: &Profile, guid: &str) -> MkResolution {
+        let key = (prof.name.clone(), guid.to_string());
+        if let Some(hit) = self.mk_cache.get(&key) {
+            return hit.clone();
+        }
+        let res = self.resolve_masterkey_uncached(prof, guid);
+        self.mk_cache.insert(key, res.clone());
+        res
+    }
+
+    fn resolve_masterkey_uncached(&mut self, prof: &Profile, guid: &str) -> MkResolution {
         let default_sid = prof
             .protect
             .first()
@@ -681,6 +692,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
             rd: &mut part,
             secrets,
             system_protect: system_protect_dirs(),
+            mk_cache: HashMap::new(),
         };
         for prof in w.profiles() {
             w.scan_profile(&prof, &mut report);

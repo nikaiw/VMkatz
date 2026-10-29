@@ -23,13 +23,15 @@ use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
-use super::dpapi_masterkey::{derive_key_sha512, prekey_from_hash};
+use super::dpapi_masterkey::{MAX_PBKDF2_ROUNDS, derive_key_sha512, prekey_from_hash};
 use crate::error::{Result, VmkatzError as Error};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
-/// Windows caps the chain; refuse a bogus length rather than loop.
+/// Walk at most this many of the newest entries.
 const MAX_ENTRIES: usize = 64;
+/// revision (4) + GUID (16) + entries_len (4).
+const FOOTER_LEN: usize = 24;
 const CALG_AES_256: u32 = 0x0000_6610;
 const CALG_SHA_512: u32 = 0x0000_800e;
 
@@ -69,20 +71,18 @@ struct Entry<'a> {
 
 /// Parse every entry in the file, oldest first.
 fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
-    // The trailing u32 bounds the entries region; the 20-byte footer follows.
-    if file.len() < 24 {
+    // The trailing u32 bounds the entries region; the 24-byte footer
+    // (revision, GUID, entries_len) follows it.
+    if file.len() < FOOTER_LEN {
         return Err(err("credhist too short"));
     }
     let entries_len = u32::from_le_bytes(file[file.len() - 4..].try_into().unwrap()) as usize;
-    if entries_len > file.len() - 4 {
+    if entries_len > file.len() - FOOTER_LEN {
         return Err(err("credhist entries length out of range"));
     }
     let mut out = Vec::new();
     let mut cur = 0usize;
     while cur < entries_len {
-        if out.len() >= MAX_ENTRIES {
-            return Err(err("credhist chain too long"));
-        }
         read_u32(file, &mut cur)?; // version
         take(file, &mut cur, 16)?; // entry GUID
         read_u32(file, &mut cur)?; // unknown
@@ -118,11 +118,18 @@ fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
     if out.is_empty() {
         return Err(err("credhist has no entries"));
     }
+    // Keep only the newest entries (the tail); older ones are the least useful.
+    if out.len() > MAX_ENTRIES {
+        out.drain(..out.len() - MAX_ENTRIES);
+    }
     Ok(out)
 }
 
 /// Decrypt one entry with `pre_key`, yielding the previous password's hashes.
 fn decrypt_entry(e: &Entry<'_>, pre_key: &[u8]) -> Result<CredHistHashes> {
+    if e.rounds == 0 || e.rounds > MAX_PBKDF2_ROUNDS {
+        return Err(err("credhist PBKDF2 rounds out of range"));
+    }
     let derived = derive_key_sha512(pre_key, &e.salt, 48, e.rounds);
     let key: [u8; 32] = derived[..32].try_into().unwrap();
     let iv: [u8; 16] = derived[32..48].try_into().unwrap();
@@ -144,8 +151,11 @@ fn decrypt_entry(e: &Entry<'_>, pre_key: &[u8]) -> Result<CredHistHashes> {
 ///
 /// `pre_key` is derived from the credential that is known to work *now*. The
 /// newest entry is decrypted with it; each result then keys the entry before
-/// it. Walking stops at the first entry that will not decrypt, so a partial
-/// chain still returns everything recovered up to that point.
+/// it. CREDHIST has no integrity check and the ciphertext is always
+/// block-aligned, so a wrong key is *not* detectable here: it yields garbage
+/// hashes (the caller's masterkey HMAC rejects them). Walking only stops early
+/// on a structural failure (e.g. `rounds` out of range). At most the newest
+/// `MAX_ENTRIES` entries are walked.
 pub fn recover_previous_hashes(
     file: &[u8],
     sid: &str,
@@ -183,6 +193,19 @@ mod tests {
     /// Build a single-entry CREDHIST whose payload is `sha1 || ntlm || pad`,
     /// encrypted exactly the way Windows does it.
     fn build(pre_key: &[u8], sha1: &[u8; 20], ntlm: &[u8; 16], rounds: u32) -> Vec<u8> {
+        wrap(&build_entry(pre_key, sha1, ntlm, rounds))
+    }
+
+    /// Append the 24-byte footer to a run of entries.
+    fn wrap(entries: &[u8]) -> Vec<u8> {
+        let mut f = entries.to_vec();
+        f.extend_from_slice(&1u32.to_le_bytes()); // footer revision
+        f.extend_from_slice(&[0xBB; 16]); // footer GUID
+        f.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        f
+    }
+
+    fn build_entry(pre_key: &[u8], sha1: &[u8; 20], ntlm: &[u8; 16], rounds: u32) -> Vec<u8> {
         let salt = [0x5au8; 16];
         let derived = derive_key_sha512(pre_key, &salt, 48, rounds);
         let key: [u8; 32] = derived[..32].try_into().unwrap();
@@ -215,12 +238,7 @@ mod tests {
         e.extend_from_slice(&salt);
         e.extend_from_slice(&sid);
         e.extend_from_slice(&buf);
-
-        let mut f = e.clone();
-        f.extend_from_slice(&1u32.to_le_bytes()); // footer revision
-        f.extend_from_slice(&[0xBB; 16]); // footer GUID
-        f.extend_from_slice(&(e.len() as u32).to_le_bytes());
-        f
+        e
     }
 
     #[test]
@@ -236,12 +254,64 @@ mod tests {
     }
 
     #[test]
-    fn wrong_key_is_an_error_not_a_bogus_hash() {
+    fn wrong_key_yields_unverifiable_garbage_hash() {
+        // CREDHIST carries no integrity check, so a wrong pre-key cannot be
+        // detected here: it "decrypts" to noise. The caller's masterkey HMAC
+        // is what rejects such a hash. Pin that real behaviour.
         let file = build(&[7u8; 20], &[0x11; 20], &[0x22; 16], 50);
-        // A wrong pre-key decrypts to noise; the chain must report failure
-        // rather than hand back a hash that would never open a masterkey.
         let got = recover_previous_hashes(&file, SID, &[9u8; 20]).unwrap();
         assert_ne!(got[0].sha1, [0x11u8; 20]);
+    }
+
+    #[test]
+    fn rounds_out_of_range_rejected_fast() {
+        for bad in [0u32, 0xFFFF_FFFF] {
+            let mut file = build(&[7u8; 20], &[0x11; 20], &[0x22; 16], 50);
+            file[32..36].copy_from_slice(&bad.to_le_bytes());
+            let t = std::time::Instant::now();
+            assert!(recover_previous_hashes(&file, SID, &[7u8; 20]).is_err());
+            assert!(
+                t.elapsed().as_secs() < 2,
+                "rounds={bad} was not rejected fast"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_bounded_by_footer() {
+        let file = build(&[7u8; 20], &[0x11; 20], &[0x22; 16], 50);
+        for delta in [4usize, 23] {
+            let mut f = file.clone();
+            let n = f.len();
+            f[n - 4..].copy_from_slice(&((n - delta) as u32).to_le_bytes());
+            let e = recover_previous_hashes(&f, SID, &[7u8; 20]).unwrap_err();
+            assert!(
+                e.to_string().contains("entries length out of range"),
+                "delta {delta}: {e}"
+            );
+        }
+        assert!(recover_previous_hashes(&file, SID, &[7u8; 20]).is_ok());
+    }
+
+    #[test]
+    fn more_than_64_entries_keeps_newest() {
+        let pre_key = [7u8; 20];
+        let sha = |i: usize| [u8::try_from(i + 1).unwrap(); 20];
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        for i in (0..70).rev() {
+            let key = if i == 69 {
+                pre_key.to_vec()
+            } else {
+                prekey_from_hash(&sha(i + 1), SID).unwrap().to_vec()
+            };
+            entries.push(build_entry(&key, &sha(i), &[0x22; 16], 1));
+        }
+        entries.reverse(); // oldest first, as on disk
+        let file = wrap(&entries.concat());
+        let got = recover_previous_hashes(&file, SID, &pre_key).unwrap();
+        assert_eq!(got.len(), MAX_ENTRIES);
+        assert_eq!(got[0].sha1, sha(69));
+        assert_eq!(got[MAX_ENTRIES - 1].sha1, sha(6));
     }
 
     #[test]
