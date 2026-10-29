@@ -92,9 +92,9 @@ pub struct SecretTable {
     /// NT hashes keyed by lowercased profile name, for specs the CLI could not
     /// map to a SID (a domain user has no SAM entry and may have no masterkey
     /// hash to look the SID up from).
-    pub nt_by_name: HashMap<String, [u8; 16]>,
+    pub nt_by_name: HashMap<String, Vec<[u8; 16]>>,
     /// Cleartext passwords keyed by lowercased profile name, same rationale.
-    pub pw_by_name: HashMap<String, String>,
+    pub pw_by_name: HashMap<String, Vec<String>>,
 }
 
 /// One secret that may open a SID's masterkeys.
@@ -137,10 +137,8 @@ impl SecretTable {
         }
         let name = profile.to_lowercase();
         let mut out: Vec<Secret<'_>> = Vec::new();
-        for pw in [self.pw_by_sid.get(sid), self.pw_by_name.get(&name)]
-            .into_iter()
-            .flatten()
-        {
+        let pw_name = self.pw_by_name.get(&name).map_or(&[][..], Vec::as_slice);
+        for pw in self.pw_by_sid.get(sid).into_iter().chain(pw_name) {
             if !out
                 .iter()
                 .any(|c| matches!(c, Secret::Password(p) if *p == pw.as_str()))
@@ -148,13 +146,13 @@ impl SecretTable {
                 out.push(Secret::Password(pw));
             }
         }
-        for h in [
-            self.domain_nt_by_sid.get(sid),
-            self.local_nt_by_sid.get(sid),
-            self.nt_by_name.get(&name),
-        ]
-        .into_iter()
-        .flatten()
+        let nt_name = self.nt_by_name.get(&name).map_or(&[][..], Vec::as_slice);
+        for h in self
+            .domain_nt_by_sid
+            .get(sid)
+            .into_iter()
+            .chain(self.local_nt_by_sid.get(sid))
+            .chain(nt_name)
         {
             if !out.iter().any(|c| matches!(c, Secret::Nt(x) if x == h)) {
                 out.push(Secret::Nt(*h));
@@ -916,7 +914,7 @@ mod tests {
         // Same with the domain hash known only by profile name (NTDS).
         let mut t = SecretTable::default();
         t.local_nt_by_sid.insert(sid.into(), wrong);
-        t.nt_by_name.insert("administrator".into(), good);
+        t.nt_by_name.insert("administrator".into(), vec![good]);
         assert_eq!(unlock(&t, sid, "Administrator", &file).unwrap(), mk);
         // An explicit password beats a (wrong) SAM hash.
         let pw_file = fixture_mk_file(&prekey_from_password("P@ss", sid).unwrap(), &mk);
@@ -926,7 +924,7 @@ mod tests {
         assert_eq!(unlock(&t, sid, "Administrator", &pw_file).unwrap(), mk);
         // Order: explicit password, then explicit/domain hash, then SAM, then NTDS.
         t.domain_nt_by_sid.insert(sid.into(), good);
-        t.nt_by_name.insert("administrator".into(), [1u8; 16]);
+        t.nt_by_name.insert("administrator".into(), vec![[1u8; 16]]);
         let c = t.candidates(sid, "Administrator");
         assert!(matches!(c[0], Secret::Password("P@ss")));
         assert!(matches!(c[1], Secret::Nt(h) if h == good));
@@ -940,13 +938,45 @@ mod tests {
     }
 
     #[test]
+    fn by_name_tries_explicit_then_ntds() {
+        use crate::sam::dpapi_masterkey::fixture_mk_file;
+        let sid = "S-1-5-21-1-2-3-500";
+        let mk = [0x5Au8; 64];
+        let good = [9u8; 16];
+        let stale = [7u8; 16];
+        let file = fixture_mk_file(&prekey_from_hash(&good, sid).unwrap(), &mk);
+        let mut t = SecretTable::default();
+        // Explicit (stale) pushed first, NTDS (good) second.
+        t.nt_by_name
+            .entry("administrator".into())
+            .or_default()
+            .extend([stale, good]);
+        let c = t.candidates(sid, "Administrator");
+        assert_eq!(c.len(), 2);
+        assert!(matches!(c[0], Secret::Nt(h) if h == stale));
+        assert!(matches!(c[1], Secret::Nt(h) if h == good));
+        assert_eq!(unlock(&t, sid, "Administrator", &file).unwrap(), mk);
+        // Same for passwords: explicit first, both tried.
+        let pw_file = fixture_mk_file(&prekey_from_password("P@ss", sid).unwrap(), &mk);
+        let mut t = SecretTable::default();
+        t.pw_by_name
+            .entry("administrator".into())
+            .or_default()
+            .extend(["wrong".to_string(), "P@ss".to_string()]);
+        let c = t.candidates(sid, "Administrator");
+        assert!(matches!(c[0], Secret::Password("wrong")));
+        assert!(matches!(c[1], Secret::Password("P@ss")));
+        assert_eq!(unlock(&t, sid, "Administrator", &pw_file).unwrap(), mk);
+    }
+
+    #[test]
     fn system_sid_gets_no_user_secrets() {
         let mut t = SecretTable {
             dpapi_system: Some([0u8; 20]),
             ..Default::default()
         };
-        t.pw_by_name.insert("system".into(), "x".into());
-        t.nt_by_name.insert("system".into(), [1u8; 16]);
+        t.pw_by_name.insert("system".into(), vec!["x".into()]);
+        t.nt_by_name.insert("system".into(), vec![[1u8; 16]]);
         let c = t.candidates(SYSTEM_SID, "SYSTEM");
         assert_eq!(c.len(), 1);
         assert!(c[0].is_system());

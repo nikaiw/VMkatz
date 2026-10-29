@@ -469,6 +469,7 @@ mod tests {
             (false, true, 200, 0x0102_0304),
             (true, false, 100, 0x0A0B_0C0D),
             (true, true, 100, 0),
+            (false, true, 100, 0),
         ] {
             let c = parse_vcrd(&vcrd_attr(iv, ext, id, u5), &keys()).unwrap();
             assert_eq!(c.resource, "https://example.com");

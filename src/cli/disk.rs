@@ -416,15 +416,28 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     );
     // Domain accounts extracted from this disk's own NTDS.dit: their masterkeys
     // are context 3 (PBKDF2 from the NT hash), so these open them with no flag.
-    // Seeded first so an explicit --dpapi-nthash/--dpapi-password still wins.
-    for (name, h) in ntds_by_name {
-        table.nt_by_name.insert(name.to_lowercase(), *h);
-    }
+    // By-name slots hold every candidate: explicit first, then NTDS, so a stale
+    // explicit value cannot shadow the NTDS one (all are tried, in this order).
     for (name, h) in domain_by_name {
-        table.nt_by_name.insert(name.to_lowercase(), h);
+        table
+            .nt_by_name
+            .entry(name.to_lowercase())
+            .or_default()
+            .push(h);
+    }
+    for (name, h) in ntds_by_name {
+        table
+            .nt_by_name
+            .entry(name.to_lowercase())
+            .or_default()
+            .push(*h);
     }
     for (name, pw) in pw_by_name {
-        table.pw_by_name.insert(name.to_lowercase(), pw);
+        table
+            .pw_by_name
+            .entry(name.to_lowercase())
+            .or_default()
+            .push(pw);
     }
     match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
         Ok(report) => match args.format.as_str() {

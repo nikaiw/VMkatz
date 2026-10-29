@@ -30,10 +30,10 @@ type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 /// Walk at most this many of the newest entries.
 const MAX_ENTRIES: usize = 64;
-/// revision (4) + GUID (16) + entries_len (4).
 /// Real CREDHIST uses ~8000 rounds. A wrong key is undetectable so every
 /// entry is derived; keep the cap far below the masterkey one.
 const MAX_CREDHIST_ROUNDS: u32 = 1_000_000;
+/// revision (4) + GUID (16) + entries_len (4).
 const FOOTER_LEN: usize = 24;
 const CALG_AES_256: u32 = 0x0000_6610;
 const CALG_SHA_512: u32 = 0x0000_800e;
