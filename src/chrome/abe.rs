@@ -82,10 +82,10 @@ pub fn decrypt_aes_encrypted_key(
     key_map: &BrowserKeyMap,
     ksp_keys: &[[u8; 32]],
 ) -> Result<[u8; 32]> {
-    // Layout (after SYSTEM-DPAPI decrypt, post-PKCS#7-strip):
+    // Layout (after SYSTEM-DPAPI decrypt; `decrypt_blob` already strips PKCS#7):
     //   header_len(u32 LE) || flag(u8) || install_path((header_len - 1) bytes)
     //   cipher_len(u32 LE) || cipher(cipher_len bytes)
-    // PKCS#7 padding to a 16-byte boundary follows.
+    // Any trailing bytes after `cipher` are ignored.
     let (_header, cipher, _flag) = parse_aes_encrypted_key_struct(aes_encrypted_key)?;
 
     // Edge (Microsoft) stores the v20 key inline as 32 raw bytes — no inner crypto.
@@ -197,24 +197,16 @@ fn aead_open(algo: u8, key: &[u8; 32], nonce: &[u8], ct_tag: &[u8]) -> Result<Ve
     }
 }
 
-/// PKCS#7-strip then split `[header_len][flag][path][cipher_len][cipher]`.
+/// Split `[header_len][flag][path][cipher_len][cipher]`. No PKCS#7 strip here:
+/// `decrypt_blob` already removed it, and stripping again could eat real
+/// cipher bytes that happen to look like padding. Trailing bytes are ignored.
 /// Returns `(header_bytes, cipher_bytes, flag)`. `header_bytes` is the full
 /// `header_len + 4` prefix usable as AAD for the inner GCM decrypt.
 fn parse_aes_encrypted_key_struct(blob: &[u8]) -> Result<(&[u8], &[u8], u8)> {
     if blob.len() < 16 {
         return Err(Error::Parse("ABE blob too short".into()));
     }
-    // Strip PKCS#7 padding if present.
-    let pad = *blob.last().unwrap() as usize;
-    let unpadded_len = if (1..=16).contains(&pad)
-        && blob.len() >= pad
-        && blob[blob.len() - pad..].iter().all(|&b| b as usize == pad)
-    {
-        blob.len() - pad
-    } else {
-        blob.len()
-    };
-    let buf = &blob[..unpadded_len];
+    let buf = blob;
     if buf.len() < 4 {
         return Err(Error::Parse("ABE blob: missing header_len".into()));
     }
@@ -288,9 +280,9 @@ pub fn decrypt_v20(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 ///
 /// The same GUID can resolve to different bytes in the two keyrings — on some
 /// Win11 builds the lsass cache decrypt corrupts the first 8 bytes of the MK
-/// (wrong CBC IV). `decrypt_blob` has no HMAC verify, so a wrong MK silently
-/// produces garbage. We collect every candidate MK for the GUID and pick the
-/// one whose decrypted output has the shape expected for that layer.
+/// (wrong CBC IV). `decrypt_blob` verifies the blob signature, so a wrong MK
+/// is an error; we collect every candidate MK for the GUID and return the
+/// first that decrypts and whose output has the shape expected for the layer.
 pub fn unwrap_app_bound_with_resolvers<R, S>(
     appb: &[u8],
     user_resolver: &R,
@@ -343,11 +335,11 @@ impl AbeLayer {
     }
 
     /// True if `out` has the shape expected for this layer's plaintext.
-    /// Used to detect wrong-MK decrypts that succeeded (no HMAC verify in
-    /// `decrypt_blob`) but produced garbage bytes.
+    /// Defence in depth on top of `decrypt_blob`'s signature check. `out` is
+    /// already PKCS#7-stripped, so it is not stripped again here.
     fn validates(self, out: &[u8]) -> bool {
         match self {
-            Self::User => parse_blob(strip_pkcs7(out)).is_ok(),
+            Self::User => parse_blob(out).is_ok(),
             Self::System => {
                 if out.len() < 4 {
                     return false;
@@ -406,20 +398,6 @@ where
         }
     }
     Err(last_err)
-}
-
-fn strip_pkcs7(pt: &[u8]) -> &[u8] {
-    if let Some(&pad) = pt.last() {
-        let pad = pad as usize;
-        if pad > 0
-            && pad <= 16
-            && pt.len() >= pad
-            && pt[pt.len() - pad..].iter().all(|&b| b as usize == pad)
-        {
-            return &pt[..pt.len() - pad];
-        }
-    }
-    pt
 }
 
 #[cfg(test)]

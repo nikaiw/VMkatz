@@ -22,16 +22,14 @@ fn build_blob(plaintext: &[u8], masterkey: &[u8], salt: &[u8]) -> Vec<u8> {
     let session = h.finalize().into_bytes();
     let key = &session[..32];
     let iv = [0u8; 16];
-    assert_eq!(
-        plaintext.len() % 16,
-        0,
-        "test plaintext must be block-aligned"
-    );
-    let mut buf = vec![0u8; plaintext.len()];
-    buf[..plaintext.len()].copy_from_slice(plaintext);
+    // PKCS#7-pad like CryptEncrypt (a full pad block when already aligned).
+    let pad = 16 - plaintext.len() % 16;
+    let mut buf = plaintext.to_vec();
+    buf.extend(std::iter::repeat_n(pad as u8, pad));
+    let n = buf.len();
     let cipher = Aes256CbcEnc::new(key.into(), (&iv).into());
     let ct = cipher
-        .encrypt_padded_mut::<NoPadding>(&mut buf, plaintext.len())
+        .encrypt_padded_mut::<NoPadding>(&mut buf, n)
         .unwrap()
         .to_vec();
 
@@ -56,7 +54,13 @@ fn build_blob(plaintext: &[u8], masterkey: &[u8], salt: &[u8]) -> Vec<u8> {
     b.extend(&0u32.to_le_bytes());
     b.extend(&(ct.len() as u32).to_le_bytes());
     b.extend(&ct);
-    b.extend(&0u32.to_le_bytes());
+    // Sign (impacket, Win7+): HMAC-SHA512(SHA1(mk), hmac || entropy || raw[20..]);
+    // hmac and entropy are empty here.
+    let mut s = HmacSha512::new_from_slice(&mk_sha1).unwrap();
+    s.update(&b[20..]);
+    let sign = s.finalize().into_bytes();
+    b.extend(&(sign.len() as u32).to_le_bytes());
+    b.extend(&sign);
     b
 }
 
@@ -68,5 +72,7 @@ fn roundtrip_decrypt_dpapi_blob() {
     let blob_bytes = build_blob(plaintext, &masterkey, &salt);
     let blob = parse_blob(&blob_bytes).unwrap();
     let pt = decrypt_blob(&blob, &masterkey).unwrap();
-    assert_eq!(&pt[..plaintext.len()], plaintext);
+    assert_eq!(pt, plaintext);
+    // A wrong masterkey is now an integrity error, not Ok(garbage).
+    assert!(decrypt_blob(&blob, &[0xACu8; 64]).is_err());
 }

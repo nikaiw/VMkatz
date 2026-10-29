@@ -219,7 +219,8 @@ fn derive_v10_key<R: MasterkeyResolver>(raw: &[u8], mkr: &R) -> Option<[u8; 32]>
             return None;
         }
     };
-    // pt is CBC plaintext with PKCS#7 padding; the v10 key is the first 32 bytes.
+    // pt is the signature-verified, PKCS#7-stripped plaintext; the v10 key is
+    // its first 32 bytes.
     if pt.len() < 32 {
         return None;
     }
