@@ -75,10 +75,10 @@ fn vmkatz_main() -> anyhow::Result<()> {
         }
         Err(e) => e.exit(),
     };
-    let log_level = if args.verbose {
-        log::LevelFilter::Info
-    } else {
-        log::LevelFilter::Warn
+    let log_level = match args.verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
     };
     log::set_logger(&SimpleLogger).unwrap();
     log::set_max_level(log_level);
@@ -219,6 +219,10 @@ fn vmkatz_main() -> anyhow::Result<()> {
         #[cfg(not(feature = "ntds.dit"))]
         let sam_mode = (args.sam || is_disk_ext || is_block_device) && !is_memory_snapshot;
         if sam_mode {
+            if let Some(cp) = &args.cp {
+                let mut disk = vmkatz::disk::open_disk(input_path)?;
+                return cli::disk::run_cp(&mut disk, &cp[0], &cp[1], args.partition);
+            }
             if let Some(ref ls_path) = args.ls {
                 let mut disk = vmkatz::disk::open_disk(input_path)?;
                 return cli::disk::run_ls(&mut disk, ls_path, args.partition);

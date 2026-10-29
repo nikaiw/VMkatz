@@ -1,6 +1,9 @@
 pub mod bootkey;
 pub mod cache;
 pub mod cm_hive;
+mod credhist;
+mod credman_blob;
+mod credman_disk;
 mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
@@ -9,12 +12,20 @@ pub mod lsa;
 pub mod mem_hive;
 mod ntfs_fallback;
 mod ntfs_reader;
+mod vault;
 mod vmdk_scan;
 
+pub use credman_blob::{CredAttribute, CredmanEntry, parse_credential_blob};
+pub use credman_disk::{
+    AttrInfo, CredmanReport, ProfileCred, Secret, SecretTable, Undecrypted, build_secret_table,
+    extract_credman_from_reader_scoped, machine_sid_from_user_sid,
+};
 pub use listing::{ListOutcome, list_path};
+pub use vault::{VaultKeys, parse_vault_keys, parse_vpol};
 
 pub mod aes_xts;
 pub mod bitlocker_decrypt;
+pub mod dpapi_blob;
 pub mod dpapi_masterkey;
 
 use crate::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};

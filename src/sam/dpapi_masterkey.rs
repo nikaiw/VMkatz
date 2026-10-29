@@ -71,7 +71,7 @@ struct MasterKeySection {
 }
 
 /// A DPAPI master key hash ready for Hashcat output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DpapiMasterKeyHash {
     /// User account name (from NTFS path).
     pub username: String,
@@ -249,8 +249,14 @@ fn sid_utf16le_with_nul(sid: &str) -> Vec<u8> {
 /// For LOCAL accounts on Win10+, the canonical chain uses the actual password
 /// (`HMAC-SHA1(SHA1(UTF-16LE password), sid_utf16)`) — see [`user_local_prekey_pw`].
 fn user_local_prekey(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
+    prekey_from_hash(nt_hash, sid)
+}
+
+/// HMAC-SHA1(password-hash, SID) — the DPAPI user pre-key. Accepts any hash
+/// length so a CREDHIST-recovered SHA-1 works as well as an NT hash.
+pub(crate) fn prekey_from_hash(hash: &[u8], sid: &str) -> Result<[u8; 20]> {
     let msg = sid_utf16le_with_nul(sid);
-    let mut mac = HmacSha1::new_from_slice(nt_hash)
+    let mut mac = HmacSha1::new_from_slice(hash)
         .map_err(|_| VmkatzError::DecryptionError("HMAC-SHA1 key init".into()))?;
     mac.update(&msg);
     let tag = mac.finalize().into_bytes();
@@ -262,6 +268,11 @@ fn user_local_prekey(nt_hash: &[u8; 16], sid: &str) -> Result<[u8; 20]> {
 /// Compute the 20-byte DPAPI pre-key for a local-account user MK from a known password:
 ///   `HMAC-SHA1(key = SHA1(UTF-16LE password), msg = UTF-16LE(SID + "\0"))`.
 fn user_local_prekey_pw(password: &str, sid: &str) -> Result<[u8; 20]> {
+    prekey_from_password(password, sid)
+}
+
+/// HMAC-SHA1(SHA1(utf16(password)), SID) — the pre-key for a local account.
+pub(crate) fn prekey_from_password(password: &str, sid: &str) -> Result<[u8; 20]> {
     use sha1::{Digest, Sha1};
     let pwd_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let pwd_sha1 = Sha1::digest(&pwd_utf16);
@@ -424,6 +435,16 @@ fn decrypt_mk_section(mk: &MasterKeyDecryptInput, pre_key: &[u8]) -> Result<Vec<
 ///     for r in 1..count:
 ///       acc = acc XOR HMAC(passphrase, acc)
 ///     append acc to output
+/// Crate-visible alias: the CREDHIST chain uses the same derivation.
+pub(crate) fn derive_key_sha512(
+    passphrase: &[u8],
+    salt: &[u8],
+    keylen: usize,
+    count: u32,
+) -> Vec<u8> {
+    dpapi_derive_key_sha512(passphrase, salt, keylen, count)
+}
+
 fn dpapi_derive_key_sha512(passphrase: &[u8], salt: &[u8], keylen: usize, count: u32) -> Vec<u8> {
     use hmac::Mac;
     let mut out: Vec<u8> = Vec::with_capacity(keylen);

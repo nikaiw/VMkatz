@@ -130,13 +130,13 @@ fn run_chrome_hybrid(
 
 /// Handle LSASS minidump files.
 pub(crate) fn run_minidump(input_path: &Path, args: &Args) -> anyhow::Result<()> {
-    if args.verbose {
+    if args.verbose > 0 {
         eprintln!("[*] Parsing LSASS minidump: {}", input_path.display());
     }
 
     let mdmp = vmkatz::minidump::Minidump::open(input_path).context("Failed to parse minidump")?;
 
-    if args.verbose {
+    if args.verbose > 0 {
         eprintln!(
             "[+] Minidump: {} memory regions, {} modules, Windows {}.{} build {} ({:?})",
             mdmp.region_count(),
@@ -195,7 +195,7 @@ pub(crate) fn run_lsass(
         feature = "hyperv"
     ))]
     {
-        let verbose = args.verbose || args.list_processes;
+        let verbose = args.verbose > 0 || args.list_processes;
         let ext = input_path
             .extension()
             .and_then(|e| e.to_str())

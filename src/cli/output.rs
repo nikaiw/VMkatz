@@ -1468,7 +1468,7 @@ pub(crate) fn output_credentials(credentials: &[Credential], args: &Args) {
         "ntlm" => print_ntlm(creds, &args.provider),
         "hashcat" => print_hashcat(creds, &args.provider),
         "brief" => print_brief(creds, &args.provider),
-        _ => print_text(creds, c, args.all, args.verbose, &args.provider),
+        _ => print_text(creds, c, args.all, args.verbose > 0, &args.provider),
     }
     report_extraction_summary(creds, &args.format);
 }
@@ -1638,6 +1638,154 @@ fn print_brief(credentials: &[Credential], providers: &[String]) {
                 println!("{line}");
             }
             println!();
+        }
+    }
+}
+
+/// Print the Credential Manager section grouped by profile.
+#[cfg(feature = "sam")]
+pub(crate) fn print_credman_text(
+    report: &vmkatz::sam::CredmanReport,
+    c: &super::args::Colors,
+    attributes: bool,
+) {
+    let has_vault = !report.vault.is_empty() || !report.vault_notes.is_empty();
+    if report.entries.is_empty() && report.undecrypted.is_empty() && !has_vault {
+        return;
+    }
+    if report.entries.is_empty() && report.undecrypted.is_empty() {
+        print_vault_text(report, c);
+        return;
+    }
+    println!("{}[+] Credential Manager{}", c.green, c.reset);
+    let mut profiles: Vec<(&str, &str)> = Vec::new();
+    for e in &report.entries {
+        let k = (e.profile.as_str(), e.sid.as_str());
+        if !profiles.contains(&k) {
+            profiles.push(k);
+        }
+    }
+    for (profile, sid) in profiles {
+        let n = report
+            .entries
+            .iter()
+            .filter(|e| e.profile == profile && e.sid == sid)
+            .count();
+        println!("  {}{profile}{} ({sid}) - {n} decrypted", c.cyan, c.reset);
+        for e in report
+            .entries
+            .iter()
+            .filter(|e| e.profile == profile && e.sid == sid)
+        {
+            println!("    Target   : {}", e.entry.target);
+            println!("    User     : {}", e.entry.username);
+            println!("    Password : {}", e.entry.password);
+            if attributes {
+                println!("    Attributes ({}):", e.attributes.len());
+                for a in &e.attributes {
+                    let shown: String = a.value_hex.chars().take(64).collect();
+                    let more = if a.value_hex.len() > 64 {
+                        "\u{2026}"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "      {} = {shown}{more} [encrypted, offline decryption unsupported]",
+                        a.keyword
+                    );
+                }
+            }
+            println!();
+        }
+    }
+    if !report.undecrypted.is_empty() {
+        println!(
+            "  {}Undecrypted: {}{}",
+            c.yellow,
+            report.undecrypted.len(),
+            c.reset
+        );
+        for u in &report.undecrypted {
+            println!("    {} ({}): {} - {}", u.profile, u.sid, u.file, u.reason);
+        }
+    }
+    if has_vault {
+        print_vault_text(report, c);
+    }
+}
+
+/// Print the Vault section grouped by profile + vault GUID.
+#[cfg(feature = "sam")]
+fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors) {
+    println!("{}[+] Vault{}", c.green, c.reset);
+    let mut groups: Vec<(&str, &str)> = Vec::new();
+    for v in &report.vault {
+        let k = (v.profile.as_str(), v.vault_guid.as_str());
+        if !groups.contains(&k) {
+            groups.push(k);
+        }
+    }
+    for (profile, guid) in groups {
+        println!("  {}{profile}{} ({guid})", c.cyan, c.reset);
+        for v in report
+            .vault
+            .iter()
+            .filter(|v| v.profile == profile && v.vault_guid == guid)
+        {
+            println!("    Resource : {}", v.cred.resource);
+            println!("    Identity : {}", v.cred.identity);
+            println!("    Secret   : {}", v.cred.secret);
+            println!();
+        }
+    }
+    for n in &report.vault_notes {
+        println!("  {}{n}{}", c.yellow, c.reset);
+    }
+}
+
+/// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
+/// With `attributes`, a second `profile,sid,target,attr_keyword,attr_value_hex`
+/// table follows (separate header) with one row per enumerated attribute.
+#[cfg(feature = "sam")]
+pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes: bool) {
+    println!("profile,sid,target,username,password");
+    for e in &report.entries {
+        println!(
+            "{},{},{},{},{}",
+            csv_escape(&e.profile),
+            csv_escape(&e.sid),
+            csv_escape(&e.entry.target),
+            csv_escape(&e.entry.username),
+            csv_escape(&e.entry.password),
+        );
+    }
+    if attributes {
+        println!("profile,sid,target,attr_keyword,attr_value_hex");
+        for e in &report.entries {
+            for a in &e.attributes {
+                println!(
+                    "{},{},{},{},{}",
+                    csv_escape(&e.profile),
+                    csv_escape(&e.sid),
+                    csv_escape(&e.entry.target),
+                    csv_escape(&a.keyword),
+                    a.value_hex,
+                );
+            }
+        }
+    }
+    if !report.vault.is_empty() {
+        println!("profile,sid,vault_guid,resource,identity,secret");
+        for v in &report.vault {
+            println!(
+                "{},{},{},{},{},{}",
+                csv_escape(&v.profile),
+                csv_escape(&v.sid),
+                csv_escape(&v.vault_guid),
+                csv_escape(&v.cred.resource),
+                csv_escape(&v.cred.identity),
+                csv_escape(&v.cred.secret),
+            );
         }
     }
 }
