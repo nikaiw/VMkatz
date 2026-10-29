@@ -22,6 +22,23 @@ pub struct NtdsContext {
 const COL_UNICODE_PWD: &str = "ATTk589914";
 /// datatable column holding dBCSPwd (the LM hash; empty on modern AD).
 const COL_DBCS_PWD: &str = "ATTk589879";
+/// datatable column holding sAMAccountType — distinguishes real security
+/// principals (user/machine/trust) from groups/aliases/other objects.
+const COL_SAM_ACCOUNT_TYPE: &str = "ATTj590126";
+
+/// NT hash of the empty password (shown for accounts with no stored unicodePwd,
+/// matching impacket secretsdump). A blank-password account is high-value, so it
+/// must appear rather than be silently dropped.
+const EMPTY_NT: [u8; 16] = [
+    0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0, 0x89, 0xc0,
+];
+/// LM hash of the empty password.
+const EMPTY_LM: [u8; 16] = [
+    0xaa, 0xd3, 0xb4, 0x35, 0xb5, 0x14, 0x04, 0xee, 0xaa, 0xd3, 0xb4, 0x35, 0xb5, 0x14, 0x04, 0xee,
+];
+
+/// SAM account types that denote a credential-bearing principal.
+const SAM_ACCOUNT_TYPES: std::ops::RangeInclusive<u32> = 0x3000_0000..=0x3000_0002; // user, machine, trust
 
 /// A single AD NTLM hash entry extracted from NTDS.
 #[derive(Debug, Clone)]
@@ -115,8 +132,11 @@ pub fn extract_ad_hashes(
             .and_then(|d| crate::utils::read_u32_le(&d, 0))
             .unwrap_or(0);
 
-        // Read encrypted NT hash (unicodePwd) and LM hash (dBCSPwd)
-        let nt_raw = read_col(COL_UNICODE_PWD)
+        // Read encrypted NT hash (unicodePwd) and LM hash (dBCSPwd). unicodePwd is
+        // absent for accounts that never set a password (disabled, trust, etc.).
+        let nt_col = read_col(COL_UNICODE_PWD);
+        let nt_present = nt_col.is_some();
+        let nt_raw = nt_col
             .and_then(|data| decrypt_ad_hash(&data, &pek, rid).ok())
             .unwrap_or([0u8; 16]);
 
@@ -126,17 +146,32 @@ pub fn extract_ad_hashes(
 
         let zero = [0u8; 16];
 
-        // Columns map directly per the AD schema: unicodePwd (ATTk589914) is the
-        // NT hash, dBCSPwd (ATTk589879) is the LM hash. Never relabel dBCSPwd as
-        // NT when unicodePwd is empty — that emits a bogus, unusable NT hash
-        // (impacket keeps them in their own columns too).
-        let nt_hash = nt_raw;
-        let lm_hash = lm_raw;
+        // sAMAccountType gates credential-bearing principals (user/machine/trust)
+        // from groups/aliases/other objects, exactly as impacket secretsdump does.
+        let sam_type =
+            read_col(COL_SAM_ACCOUNT_TYPE).and_then(|d| crate::utils::read_u32_le(&d, 0));
+        let is_account = matches!(sam_type, Some(t) if SAM_ACCOUNT_TYPES.contains(&t));
+        let has_hash = nt_raw != zero || lm_raw != zero;
 
-        // Skip entries with no hashes at all
-        if nt_hash == zero && lm_hash == zero {
+        // Keep EVERY account, including those with no stored password. Dropping
+        // null-hash accounts silently lost "a large number of entries" vs
+        // secretsdump on real DCs (disabled/never-logged-on/trust accounts), and
+        // a blank-password account (NT 31d6cfe0…) is high-value. Only skip a
+        // non-account object that also carries no hash at all.
+        if !has_hash && !is_account {
             return;
         }
+
+        if nt_present && nt_raw == zero {
+            log::debug!("ntds: unicodePwd present but decrypted empty for rid={rid} ({username})");
+        }
+
+        // Columns map directly per the AD schema: unicodePwd (ATTk589914) is the
+        // NT hash, dBCSPwd (ATTk589879) is the LM hash. Never relabel dBCSPwd as
+        // NT. An absent/empty hash is rendered as the empty-password hash, matching
+        // secretsdump, so the account still appears.
+        let nt_hash = if nt_raw == zero { EMPTY_NT } else { nt_raw };
+        let lm_hash = if lm_raw == zero { EMPTY_LM } else { lm_raw };
 
         entries.push(AdHashEntry {
             username: username.clone(),
