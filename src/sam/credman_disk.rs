@@ -311,13 +311,31 @@ fn vault_roots(base: &str) -> Vec<String> {
     ]
 }
 
-impl<R: Read + Seek> Walker<'_, '_, R> {
-    /// List a directory (bounded); `None` if it does not exist.
-    fn list(&mut self, path: &str, cap: usize) -> Option<Vec<(String, bool)>> {
-        let dir = crate::fs::navigate_to_dir(self.ntfs, self.root, self.rd, path).ok()?;
-        let mut v = crate::fs::list_directory(self.ntfs, &dir, self.rd).ok()?;
+/// Keep the items matching `keep`, then cap to `cap`. A cap hit is recorded in
+/// `notes` and logged so the truncation is never silent.
+fn filter_cap<T>(
+    items: Vec<T>,
+    keep: impl Fn(&T) -> bool,
+    cap: usize,
+    what: &str,
+    notes: &mut Vec<String>,
+) -> Vec<T> {
+    let mut v: Vec<T> = items.into_iter().filter(|i| keep(i)).collect();
+    if v.len() > cap {
+        let msg = format!("{what}: cap hit, scanned {cap} of {} entries", v.len());
+        log::warn!("credman: {msg}");
+        notes.push(msg);
         v.truncate(cap);
-        Some(v)
+    }
+    v
+}
+
+impl<R: Read + Seek> Walker<'_, '_, R> {
+    /// List a directory (uncapped: callers filter first, then `filter_cap`);
+    /// `None` if it does not exist.
+    fn list(&mut self, path: &str) -> Option<Vec<(String, bool)>> {
+        let dir = crate::fs::navigate_to_dir(self.ntfs, self.root, self.rd, path).ok()?;
+        crate::fs::list_directory(self.ntfs, &dir, self.rd).ok()
     }
 
     /// Read a file by directory path + name, refusing oversized files.
@@ -338,21 +356,25 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     }
 
     /// Masterkey folders under `<base>\AppData\Roaming\Microsoft\Protect`.
-    fn user_protect_dirs(&mut self, base: &str) -> Vec<ProtectDir> {
+    fn user_protect_dirs(&mut self, base: &str, notes: &mut Vec<String>) -> Vec<ProtectDir> {
         let root = format!("{base}\\AppData\\Roaming\\Microsoft\\Protect");
-        self.list(&root, MAX_PROTECT_DIRS * 4)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(n, is_dir)| *is_dir && is_sid_dir_name(n))
-            .take(MAX_PROTECT_DIRS)
-            .map(|(n, _)| ProtectDir {
-                path: format!("{root}\\{n}"),
-                sid: n,
-            })
-            .collect()
+        let dirs = self.list(&root).unwrap_or_default();
+        filter_cap(
+            dirs,
+            |(n, is_dir)| *is_dir && is_sid_dir_name(n),
+            MAX_PROTECT_DIRS,
+            &format!("{root} (SID folders)"),
+            notes,
+        )
+        .into_iter()
+        .map(|(n, _)| ProtectDir {
+            path: format!("{root}\\{n}"),
+            sid: n,
+        })
+        .collect()
     }
 
-    fn user_profile(&mut self, name: &str, base: &str) -> Profile {
+    fn user_profile(&mut self, name: &str, base: &str, notes: &mut Vec<String>) -> Profile {
         Profile {
             name: name.to_string(),
             cred_dirs: vec![
@@ -360,7 +382,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                 format!("{base}\\AppData\\Roaming\\Microsoft\\Credentials"),
             ],
             vault_roots: vault_roots(base),
-            protect: self.user_protect_dirs(base),
+            protect: self.user_protect_dirs(base, notes),
         }
     }
 
@@ -378,22 +400,27 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     }
 
     /// Enumerate all profiles on the volume.
-    fn profiles(&mut self) -> Vec<Profile> {
+    fn profiles(&mut self, notes: &mut Vec<String>) -> Vec<Profile> {
         let mut out = vec![Self::system_profile()];
         for (parent, skip_builtin) in [("Users", true), ("Windows\\ServiceProfiles", false)] {
-            let names = self.list(parent, MAX_PROFILES).unwrap_or_default();
-            for (name, is_dir) in names {
-                let lower = name.to_lowercase();
-                if !is_dir
-                    || (skip_builtin
-                        && matches!(
-                            lower.as_str(),
-                            "public" | "default" | "default user" | "all users"
-                        ))
-                {
-                    continue;
-                }
-                let p = self.user_profile(&name, &format!("{parent}\\{name}"));
+            let all = self.list(parent).unwrap_or_default();
+            let names = filter_cap(
+                all,
+                |(name, is_dir)| {
+                    let lower = name.to_lowercase();
+                    *is_dir
+                        && !(skip_builtin
+                            && matches!(
+                                lower.as_str(),
+                                "public" | "default" | "default user" | "all users"
+                            ))
+                },
+                MAX_PROFILES,
+                &format!("{parent} (profiles)"),
+                notes,
+            );
+            for (name, _) in names {
+                let p = self.user_profile(&name, &format!("{parent}\\{name}"), notes);
                 out.push(p);
             }
         }
@@ -491,13 +518,17 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
 
     fn scan_profile(&mut self, prof: &Profile, report: &mut CredmanReport) {
         for dir in &prof.cred_dirs {
-            let Some(files) = self.list(dir, MAX_CRED_FILES) else {
+            let Some(all) = self.list(dir) else {
                 continue;
             };
-            for (fname, is_dir) in files {
-                if is_dir {
-                    continue;
-                }
+            let files = filter_cap(
+                all,
+                |(_, d)| !*d,
+                MAX_CRED_FILES,
+                &format!("{dir} (credential files)"),
+                &mut report.vault_notes,
+            );
+            for (fname, _) in files {
                 match self.decrypt_one(prof, dir, &fname) {
                     Ok((sid, entry, attributes)) => report.entries.push(ProfileCred {
                         profile: prof.name.clone(),
@@ -520,21 +551,29 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     /// Failures go to `undecrypted`; nothing here aborts the walk.
     fn scan_vaults(&mut self, prof: &Profile, report: &mut CredmanReport) {
         for root in &prof.vault_roots {
-            let Some(dirs) = self.list(root, MAX_VAULT_DIRS) else {
+            let Some(all) = self.list(root) else {
                 continue;
             };
-            for (guid, is_dir) in dirs {
-                if !is_dir {
-                    continue;
-                }
+            let dirs = filter_cap(
+                all,
+                |(_, d)| *d,
+                MAX_VAULT_DIRS,
+                &format!("{root} (vault folders)"),
+                &mut report.vault_notes,
+            );
+            for (guid, _) in dirs {
                 let dir = format!("{root}\\{guid}");
-                let vcrds: Vec<String> = self
-                    .list(&dir, MAX_VCRD_FILES)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(n, d)| !*d && n.to_lowercase().ends_with(".vcrd"))
-                    .map(|(n, _)| n)
-                    .collect();
+                let all = self.list(&dir).unwrap_or_default();
+                let vcrds: Vec<String> = filter_cap(
+                    all,
+                    |(n, d)| !*d && n.to_lowercase().ends_with(".vcrd"),
+                    MAX_VCRD_FILES,
+                    &format!("{dir} (.vcrd files)"),
+                    &mut report.vault_notes,
+                )
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
                 let (keys, sid) = match self.vault_keys(prof, &dir) {
                     Ok(k) => k,
                     Err((sid, reason)) => {
@@ -572,8 +611,9 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
                     }
                 }
                 report.vault_notes.push(format!(
-                    "{}\\{guid}: keys=2 vcrd={}/{}",
+                    "{}\\{guid}: keys={} vcrd={}/{}",
                     prof.name,
+                    keys.count(),
                     n_ok,
                     vcrds.len()
                 ));
@@ -707,7 +747,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
             mk_cache: HashMap::new(),
             chain_cache: HashMap::new(),
         };
-        for prof in w.profiles() {
+        for prof in w.profiles(&mut report.vault_notes) {
             w.scan_profile(&prof, &mut report);
             w.scan_vaults(&prof, &mut report);
         }
@@ -814,6 +854,25 @@ mod tests {
         let mut bad = file.clone();
         bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(credential_file_blob(&bad).is_err());
+    }
+
+    #[test]
+    fn cap_hit_is_reported() {
+        let mut notes = Vec::new();
+        // 5 noise entries must not eat the 3 cap slots (filter first).
+        let items: Vec<(String, bool)> = (0..5)
+            .map(|i| (format!("n{i}"), false))
+            .chain((0..5).map(|i| (format!("d{i}"), true)))
+            .collect();
+        let kept = filter_cap(items.clone(), |(_, d)| *d, 3, "dir", &mut notes);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().all(|(n, _)| n.starts_with('d')));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("cap hit") && notes[0].contains("3 of 5"));
+        let mut quiet = Vec::new();
+        let kept = filter_cap(items, |(_, d)| *d, 5, "dir", &mut quiet);
+        assert_eq!(kept.len(), 5);
+        assert!(quiet.is_empty());
     }
 
     #[test]

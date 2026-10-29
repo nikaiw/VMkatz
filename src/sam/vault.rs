@@ -13,6 +13,13 @@ pub struct VaultKeys {
     pub aes256: Vec<u8>,
 }
 
+impl VaultKeys {
+    /// Number of keys actually held (non-empty).
+    pub fn count(&self) -> usize {
+        usize::from(!self.aes128.is_empty()) + usize::from(!self.aes256.is_empty())
+    }
+}
+
 fn err(msg: &str) -> VmkatzError {
     VmkatzError::Parse(msg.to_string())
 }
@@ -77,7 +84,8 @@ fn read_key(buf: &[u8], cur: &mut usize) -> Result<Vec<u8>> {
     *cur += pos + 4;
     let _ver = read_u32(buf, cur)?;
     let len = read_u32(buf, cur)? as usize;
-    if len != 16 && len != 24 && len != 32 {
+    // `aes_cbc` only accepts AES-128/256; reject anything else here.
+    if len != 16 && len != 32 {
         return Err(err("unexpected vault key length"));
     }
     Ok(take(buf, cur, len)?.to_vec())
@@ -166,16 +174,18 @@ fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8
     for _ in 0..3 {
         read_u32(file, &mut cur)?;
     }
+    // impacket VAULT_ATTRIBUTE order: optional 6-byte zero pad (present iff
+    // the next 6 bytes are all zero), Unknown5 (u32, only when id >= 100), Size.
+    if file
+        .get(cur..cur + 6)
+        .is_some_and(|p| p.iter().all(|&b| b == 0))
+    {
+        cur += 6;
+    }
     if id >= 100 {
         read_u32(file, &mut cur)?;
     }
-    let mut size = read_u32(file, &mut cur)? as usize;
-    // Observed on real vaults: some attributes carry an extra unknown DWORD
-    // (reading 0) plus two padding bytes before the real size field.
-    if size == 0 {
-        take(file, &mut cur, 2)?;
-        size = read_u32(file, &mut cur)? as usize;
-    }
+    let size = read_u32(file, &mut cur)? as usize;
     let has_iv = take(file, &mut cur, 1)?[0] != 0;
     let (iv, overhead) = if has_iv {
         let ivlen = read_u32(file, &mut cur)? as usize;
@@ -376,6 +386,11 @@ mod tests {
     }
 
     fn vcrd_ext(with_iv: bool, ext: bool) -> Vec<u8> {
+        vcrd_attr(with_iv, ext, 1, 0)
+    }
+
+    /// `ext` = 6-byte zero pad; `unknown5` is emitted (after the pad) iff `id >= 100`.
+    fn vcrd_attr(with_iv: bool, ext: bool, id: u32, unknown5: u32) -> Vec<u8> {
         // Real layout: u32 version, u32 item count, u32 unknown, then items of
         // {u32 type, u32 byte-len, UTF-16LE}. Identity (type 2) is emitted
         // first, as real vaults do, so type-based mapping is exercised.
@@ -401,15 +416,17 @@ mod tests {
             enc(&k.aes128, &[0; 16], &clear)
         };
         let mut attr = Vec::new();
-        attr.extend_from_slice(&1u32.to_le_bytes());
+        attr.extend_from_slice(&id.to_le_bytes());
         for _ in 0..3 {
             attr.extend_from_slice(&0u32.to_le_bytes());
         }
         let size = 1 + if with_iv { 4 + 16 } else { 0 } + ct.len();
         if ext {
-            // Real vaults emit an extra zero DWORD + 2 padding bytes here.
-            attr.extend_from_slice(&0u32.to_le_bytes());
-            attr.extend_from_slice(&[0u8; 2]);
+            // Real vaults emit a 6-byte zero pad here.
+            attr.extend_from_slice(&[0u8; 6]);
+        }
+        if id >= 100 {
+            attr.extend_from_slice(&unknown5.to_le_bytes());
         }
         attr.extend_from_slice(&(size as u32).to_le_bytes());
         attr.push(u8::from(with_iv));
@@ -443,6 +460,34 @@ mod tests {
             assert_eq!(c.identity, "alice");
             assert_eq!(c.secret, "s3cret!");
         }
+    }
+
+    #[test]
+    fn vcrd_attr_id_ge_100_with_pad_and_unknown5() {
+        for (iv, ext, id, u5) in [
+            (true, true, 100u32, 0xDEAD_BEEFu32),
+            (false, true, 200, 0x0102_0304),
+            (true, false, 100, 0x0A0B_0C0D),
+            (true, true, 100, 0),
+        ] {
+            let c = parse_vcrd(&vcrd_attr(iv, ext, id, u5), &keys()).unwrap();
+            assert_eq!(c.resource, "https://example.com");
+            assert_eq!(c.identity, "alice");
+            assert_eq!(c.secret, "s3cret!");
+        }
+    }
+
+    #[test]
+    fn vault_key_24_rejected_at_parse() {
+        let mut d = key_entry(24);
+        d.extend(key_entry(32));
+        assert!(parse_vault_keys(&d).is_err());
+        let mut d = key_entry(16);
+        d.extend(key_entry(24));
+        assert!(parse_vault_keys(&d).is_err());
+        let mut d = key_entry(16);
+        d.extend(key_entry(32));
+        assert_eq!(parse_vault_keys(&d).unwrap().count(), 2);
     }
 
     #[test]

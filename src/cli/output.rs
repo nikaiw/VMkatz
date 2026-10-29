@@ -1748,9 +1748,17 @@ fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors
 /// table follows (separate header) with one row per enumerated attribute.
 #[cfg(feature = "sam")]
 pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes: bool) {
-    println!("profile,sid,target,username,password");
+    print!("{}", credman_csv_string(report, attributes));
+}
+
+#[cfg(feature = "sam")]
+fn credman_csv_string(report: &vmkatz::sam::CredmanReport, attributes: bool) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    let _ = writeln!(o, "profile,sid,target,username,password");
     for e in &report.entries {
-        println!(
+        let _ = writeln!(
+            o,
             "{},{},{},{},{}",
             csv_escape(&e.profile),
             csv_escape(&e.sid),
@@ -1760,10 +1768,11 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
         );
     }
     if attributes {
-        println!("profile,sid,target,attr_keyword,attr_value_hex");
+        let _ = writeln!(o, "profile,sid,target,attr_keyword,attr_value_hex");
         for e in &report.entries {
             for a in &e.attributes {
-                println!(
+                let _ = writeln!(
+                    o,
                     "{},{},{},{},{}",
                     csv_escape(&e.profile),
                     csv_escape(&e.sid),
@@ -1775,9 +1784,10 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
         }
     }
     if !report.vault.is_empty() {
-        println!("profile,sid,vault_guid,resource,identity,secret");
+        let _ = writeln!(o, "profile,sid,vault_guid,resource,identity,secret");
         for v in &report.vault {
-            println!(
+            let _ = writeln!(
+                o,
                 "{},{},{},{},{},{}",
                 csv_escape(&v.profile),
                 csv_escape(&v.sid),
@@ -1787,5 +1797,45 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
                 csv_escape(&v.cred.secret),
             );
         }
+    }
+    if !report.undecrypted.is_empty() {
+        let _ = writeln!(o, "profile,sid,file,reason");
+        for u in &report.undecrypted {
+            let _ = writeln!(
+                o,
+                "{},{},{},{}",
+                csv_escape(&u.profile),
+                csv_escape(&u.sid),
+                csv_escape(&u.file),
+                csv_escape(&u.reason),
+            );
+        }
+    }
+    if !report.vault_notes.is_empty() {
+        let _ = writeln!(o, "vault_note");
+        for n in &report.vault_notes {
+            let _ = writeln!(o, "{}", csv_escape(n));
+        }
+    }
+    o
+}
+
+#[cfg(all(test, feature = "sam"))]
+mod credman_csv_tests {
+    use super::*;
+
+    #[test]
+    fn csv_includes_undecrypted() {
+        let mut r = vmkatz::sam::CredmanReport::default();
+        r.undecrypted.push(vmkatz::sam::Undecrypted {
+            profile: "bob".into(),
+            sid: "S-1-5-21-1".into(),
+            file: "C:\\x,y".into(),
+            reason: "no key".into(),
+        });
+        r.vault_notes.push("bob\\G: keys=2 vcrd=0/1".into());
+        let out = credman_csv_string(&r, false);
+        assert!(out.contains("profile,sid,file,reason\nbob,S-1-5-21-1,\"C:\\x,y\",no key"));
+        assert!(out.contains("vault_note\nbob\\G: keys=2 vcrd=0/1"));
     }
 }
