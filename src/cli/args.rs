@@ -121,12 +121,18 @@ pub(crate) struct Args {
     pub(crate) bitlocker_fvek: Option<String>,
 
     /// Verbose output (show memory regions, process list, etc.)
-    #[arg(short, long, default_value_t = false)]
-    pub(crate) verbose: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
 
-    /// Show all logon sessions (disables deduplication and shows empty sessions)
+    /// Show all logon sessions (disables deduplication and shows empty sessions).
+    /// On a disk/VMDK, also extract every secret type (SAM/LSA/DCC2 + NTDS + DPAPI).
     #[arg(short, long, default_value_t = false)]
     pub(crate) all: bool,
+
+    /// Copy a file out of the disk image's NTFS to a local path, e.g.
+    /// --cp '\Windows\NTDS\ntds.dit' ./ntds.dit (disk images and VMFS --vmdk; honours --partition)
+    #[arg(long, num_args = 2, value_names = ["SRC", "DST"])]
+    pub(crate) cp: Option<Vec<String>>,
 
     /// Enable nested EPT scanning (for VBS/Credential Guard VMs)
     #[arg(long, default_value_t = false)]

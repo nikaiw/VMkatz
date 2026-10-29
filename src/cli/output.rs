@@ -1468,7 +1468,7 @@ pub(crate) fn output_credentials(credentials: &[Credential], args: &Args) {
         "ntlm" => print_ntlm(creds, &args.provider),
         "hashcat" => print_hashcat(creds, &args.provider),
         "brief" => print_brief(creds, &args.provider),
-        _ => print_text(creds, c, args.all, args.verbose, &args.provider),
+        _ => print_text(creds, c, args.all, args.verbose > 0, &args.provider),
     }
     report_extraction_summary(creds, &args.format);
 }

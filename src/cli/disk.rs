@@ -132,6 +132,61 @@ pub(crate) fn run_ls<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
+/// Copy a single file out of the disk image's NTFS to a local destination.
+/// Mirrors the `extract_file` helper's `get`, over any Read+Seek disk (local or VMFS).
+pub(crate) fn run_cp<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    src: &str,
+    dst: &str,
+    partition: Option<u64>,
+) -> anyhow::Result<()> {
+    use vmkatz::fs::{
+        PartitionReader, find_entry, find_ntfs_partitions, is_bitlocker_partition, navigate_to_dir,
+        read_file_data, select_partition,
+    };
+
+    let src_norm = src.replace('/', "\\");
+    let (parent, name) = src_norm.rsplit_once('\\').ok_or_else(|| {
+        anyhow::anyhow!("--cp SRC must be an absolute guest path, e.g. \\Windows\\NTDS\\ntds.dit")
+    })?;
+
+    let offsets = select_partition(find_ntfs_partitions(reader)?, partition)?;
+    for off in offsets {
+        if is_bitlocker_partition(reader, off) {
+            continue;
+        }
+        let mut pr = PartitionReader::new(reader, off);
+        let Ok(ntfs) = ntfs::Ntfs::new(&mut pr) else {
+            continue;
+        };
+        let Ok(root) = ntfs.root_directory(&mut pr) else {
+            continue;
+        };
+        let dir = match navigate_to_dir(&ntfs, &root, &mut pr, parent) {
+            Ok(d) => d,
+            Err(e) => {
+                log::info!("cp: navigate '{parent}' failed @ {off:#x}: {e}");
+                continue;
+            }
+        };
+        let file = match find_entry(&ntfs, &dir, &mut pr, name) {
+            Ok(f) => f,
+            Err(e) => {
+                log::info!("cp: '{name}' not found @ {off:#x}: {e}");
+                continue;
+            }
+        };
+        let data = read_file_data(&file, &mut pr)?;
+        std::fs::write(dst, &data).map_err(|e| anyhow::anyhow!("--cp: cannot write {dst}: {e}"))?;
+        eprintln!(
+            "[+] cp: wrote {} bytes from '{src}' (partition {off:#x}) to {dst}",
+            data.len()
+        );
+        return Ok(());
+    }
+    anyhow::bail!("--cp: '{src}' not found on any NTFS partition")
+}
+
 /// Quick check for MBR partition type 0x07 (NTFS/HPFS) in first sector.
 #[cfg(feature = "vmfs")]
 fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool {
@@ -362,6 +417,19 @@ fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
     args: &Args,
     c: &super::args::Colors,
 ) -> anyhow::Result<()> {
+    // `--all` also surfaces this disk's local SAM/LSA/DCC2 (the --ntds flow skips
+    // them). Extract once and reuse for the DPAPI/credman step below.
+    let secrets = if args.credman || args.all {
+        vmkatz::sam::extract_secrets_from_reader_scoped(disk, args.partition).ok()
+    } else {
+        None
+    };
+    if args.all {
+        if let Some(s) = &secrets {
+            print_disk_secrets(s, args);
+        }
+    }
+
     let artifacts = vmkatz::sam::extract_ntds_artifacts_from_reader_scoped(disk, args.partition)
         .context("NTDS artifact extraction failed")?;
     let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
@@ -388,19 +456,16 @@ fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
         _ => print_ntds_text(&hashes, c),
     }
 
-    // `--credman` here previously got `None` for secrets, so even SYSTEM
-    // entries failed for want of DPAPI_SYSTEM. Supply this disk's SAM/LSA and,
-    // as on the local-disk path, its own NTDS hashes for domain users.
-    let (secrets, ntds_by_name) = if args.credman {
-        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
+    // `--credman` needs this disk's own NTDS hashes to open its domain users'
+    // masterkeys; SAM/LSA were already extracted above into `secrets`.
+    let ntds_by_name: Vec<(String, [u8; 16])> = if args.credman {
+        hashes
             .iter()
             .filter(|h| !h.is_history)
             .map(|h| (h.username.clone(), h.nt_hash))
-            .collect();
-        let secrets = vmkatz::sam::extract_secrets_from_reader_scoped(disk, args.partition).ok();
-        (secrets, ntds_by_name)
+            .collect()
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
     vmfs_emit_dpapi(disk, args, c, secrets.as_ref(), &ntds_by_name);
     Ok(())
@@ -436,13 +501,18 @@ pub(crate) fn run_vmfs(
             c.reset
         );
 
+        if let Some(cp) = &args.cp {
+            return run_cp(&mut disk, &cp[0], &cp[1], args.partition);
+        }
+
         if let Some(ref ls_path) = args.ls {
             return run_ls(&mut disk, ls_path, args.partition);
         }
 
         // NTDS replaces the plain SAM flow, as in the local-disk path.
+        // `--all` routes here too and additionally prints SAM/LSA/DCC2.
         #[cfg(feature = "ntds.dit")]
-        if args.ntds {
+        if args.ntds || args.all {
             return vmfs_emit_ntds(&mut disk, args, c);
         }
 
@@ -510,6 +580,12 @@ pub(crate) fn run_vmfs(
                  auto-scan of all VMDKs. Select a disk with --vmdk (see --vmfs-list)."
             );
         }
+        if args.cp.is_some() {
+            anyhow::bail!(
+                "--cp requires --vmdk: a file copy targets one disk, not an auto-scan of all \
+                 VMDKs. Select a disk with --vmdk (see --vmfs-list)."
+            );
+        }
         // Auto-scan mode: list all VMs and extract from each
         eprintln!(
             "{}[*] VMFS-6: Scanning all VMs on {}{}",
@@ -549,7 +625,7 @@ pub(crate) fn run_vmfs(
                         continue;
                     }
                     #[cfg(feature = "ntds.dit")]
-                    if args.ntds {
+                    if args.ntds || args.all {
                         println!("=== {vmdk_path} ===");
                         if let Err(e) = vmfs_emit_ntds(&mut disk, args, c) {
                             eprintln!("[!] {vm_name}: {e:#}");
@@ -613,12 +689,12 @@ pub(crate) fn run_vmfs(
 pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(feature = "ntds.dit")]
     {
-        if args.ntds {
+        if args.ntds || args.all {
             return run_ntds(input_path, args);
         }
     }
 
-    if args.verbose {
+    if args.verbose > 0 {
         eprintln!("[*] SAM hash extraction from: {}", input_path.display());
     }
 
@@ -730,8 +806,18 @@ pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
 #[cfg(feature = "ntds.dit")]
 fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
-    if args.verbose {
+    if args.verbose > 0 {
         eprintln!("[*] NTDS extraction from: {}", input_path.display());
+    }
+
+    let c = get_colors(args);
+
+    // `--all` also surfaces this disk's local SAM/LSA/DCC2 (the --ntds flow skips them).
+    if args.all {
+        match vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition) {
+            Ok(s) => print_disk_secrets(&s, args),
+            Err(e) => eprintln!("[!] SAM/LSA extraction failed: {e}"),
+        }
     }
 
     let artifacts = vmkatz::sam::extract_ntds_artifacts_scoped(input_path, args.partition)
@@ -744,8 +830,6 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
         args.ntds_history,
     )
     .context("NTDS hash extraction failed")?;
-
-    let c = get_colors(args);
 
     eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
     eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
@@ -1389,7 +1473,7 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     if discovery.lsass_files.is_empty() && discovery.disk_files.is_empty() {
-        if args.verbose {
+        if args.verbose > 0 {
             eprintln!("[!] No processable VM files found in {}", dir.display());
         }
         return Ok(());
