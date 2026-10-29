@@ -286,19 +286,15 @@ fn resolve_secret_sids<T>(
             out.push((user, val));
             continue;
         }
-        let bare = user.rsplit_once('\\').map_or(user.as_str(), |(_, n)| n);
-        let sid = hashes
-            .iter()
-            .find(|h| h.username.eq_ignore_ascii_case(bare))
-            .map(|h| h.sid.clone())
-            .or_else(|| {
-                let m = machine_sid?;
-                secrets?
-                    .sam_entries
-                    .iter()
-                    .find(|e| e.username.eq_ignore_ascii_case(bare))
-                    .map(|e| format!("{m}-{}", e.rid))
-            });
+        let (domain, bare) = match user.rsplit_once('\\') {
+            Some((d, n)) if !d.is_empty() && d != "." => (Some(d), n),
+            Some((_, n)) => (None, n),
+            None => (None, user.as_str()),
+        };
+        let sid = domain.map_or_else(
+            || local_or_profile_sid(bare, machine_sid, secrets, hashes),
+            |d| domain_profile_sid(d, bare, machine_sid, hashes),
+        );
         if let Some(sid) = sid {
             out.push((sid, val));
         } else {
@@ -312,13 +308,66 @@ fn resolve_secret_sids<T>(
     (out, by_name)
 }
 
-/// Machine SID: the SID prefix of a profile whose RID and name match a SAM account.
+/// SID for an unqualified (or `.\\`) account name: a profile of that name,
+/// else the local SAM account.
+fn local_or_profile_sid(
+    bare: &str,
+    machine_sid: Option<&str>,
+    secrets: Option<&vmkatz::sam::DiskSecrets>,
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+) -> Option<String> {
+    hashes
+        .iter()
+        .find(|h| h.username.eq_ignore_ascii_case(bare))
+        .map(|h| h.sid.clone())
+        .or_else(|| {
+            let m = machine_sid?;
+            secrets?
+                .sam_entries
+                .iter()
+                .find(|e| e.username.eq_ignore_ascii_case(bare))
+                .map(|e| format!("{m}-{}", e.rid))
+        })
+}
+
+/// SID for `DOMAIN\\name`: only a profile named `name` or `name.DOMAIN` whose
+/// SID is outside the machine's account domain. Never a local SAM SID (a
+/// local homonym would otherwise steal the domain secret); without a known
+/// machine SID local and domain profiles cannot be told apart, so `None`
+/// (the caller then binds by profile name).
+fn domain_profile_sid(
+    domain: &str,
+    bare: &str,
+    machine_sid: Option<&str>,
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+) -> Option<String> {
+    let m = machine_sid?;
+    let qualified = format!("{bare}.{domain}");
+    hashes
+        .iter()
+        .filter(|h| {
+            h.username.eq_ignore_ascii_case(bare) || h.username.eq_ignore_ascii_case(&qualified)
+        })
+        .find(|h| {
+            vmkatz::sam::machine_sid_from_user_sid(&h.sid)
+                .is_some_and(|p| !p.eq_ignore_ascii_case(m))
+        })
+        .map(|h| h.sid.clone())
+}
+
+/// Machine (account-domain) SID: read from the SAM `Domains\\Account\\V` value.
+/// Only if that is unavailable, inferred from a profile whose RID and name
+/// match a SAM account -- which can pick a domain SID (domain Administrator
+/// vs. local RID 500), hence the warning.
 fn find_machine_sid(
     secrets: Option<&vmkatz::sam::DiskSecrets>,
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
 ) -> Option<String> {
     let secrets = secrets?;
-    hashes.iter().find_map(|h| {
+    if let Some(m) = &secrets.machine_sid {
+        return Some(m.clone());
+    }
+    let inferred = hashes.iter().find_map(|h| {
         let (prefix, rid) = h.sid.rsplit_once('-')?;
         let rid: u32 = rid.parse().ok()?;
         secrets
@@ -326,7 +375,11 @@ fn find_machine_sid(
             .iter()
             .any(|e| e.rid == rid && e.username.eq_ignore_ascii_case(&h.username))
             .then(|| prefix.to_string())
-    })
+    });
+    if let Some(m) = &inferred {
+        log::warn!("machine SID not found in SAM; inferred {m} from a profile (may be wrong)");
+    }
+    inferred
 }
 
 /// `--credman`: build the secret table from already-extracted SAM/LSA and sweep the disk.
@@ -357,7 +410,7 @@ fn emit_credman<R: std::io::Read + std::io::Seek>(
     let mut table = vmkatz::sam::build_secret_table(
         secrets.unwrap_or(&empty),
         secrets.map_or(&[][..], |s| &s.lsa_secrets),
-        machine_sid.as_deref().unwrap_or(""),
+        machine_sid.as_deref(),
         &domain,
         &passwords,
     );
@@ -1634,6 +1687,72 @@ pub(crate) fn run_recursive(root: &Path, args: &Args) -> anyhow::Result<()> {
 
     eprintln!("\n[*] Recursive scan complete: {success} processed, {errors} errors");
     Ok(())
+}
+
+#[cfg(all(test, feature = "sam"))]
+mod secret_sid_tests {
+    use super::resolve_secret_sids;
+    use vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash;
+    use vmkatz::sam::{DiskSecrets, SamEntry};
+
+    fn mk_hash(user: &str, sid: &str) -> DpapiMasterKeyHash {
+        DpapiMasterKeyHash {
+            username: user.into(),
+            sid: sid.into(),
+            guid: String::new(),
+            hash: String::new(),
+            mode: 15900,
+            modified: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_secret_sids_keeps_domain_prefix() {
+        let machine = "S-1-5-21-1-2-3";
+        let ds = DiskSecrets {
+            sam_entries: vec![SamEntry {
+                rid: 500,
+                username: "Administrator".into(),
+                nt_hash: [7u8; 16],
+                lm_hash: [0u8; 16],
+                acb_flags: 0,
+            }],
+            ..Default::default()
+        };
+        let local_only = [mk_hash("Administrator", "S-1-5-21-1-2-3-500")];
+        // `LAB\Administrator` must not bind to the local MACHINE-500 SID.
+        let (sids, by_name) = resolve_secret_sids(
+            vec![("LAB\\Administrator".to_string(), 1u8)],
+            Some(machine),
+            Some(&ds),
+            &local_only,
+            "--dpapi-nthash",
+        );
+        assert!(sids.is_empty(), "bound to {sids:?}");
+        assert_eq!(by_name, vec![("Administrator".to_string(), 1u8)]);
+        // With the domain profile present, it binds to the domain SID.
+        let both = [
+            mk_hash("Administrator", "S-1-5-21-1-2-3-500"),
+            mk_hash("Administrator.LAB", "S-1-5-21-9-9-9-500"),
+        ];
+        let (sids, _) = resolve_secret_sids(
+            vec![("LAB\\Administrator".to_string(), 1u8)],
+            Some(machine),
+            Some(&ds),
+            &both,
+            "--dpapi-nthash",
+        );
+        assert_eq!(sids, vec![("S-1-5-21-9-9-9-500".to_string(), 1u8)]);
+        // A bare name (or `.\name`) still resolves to the local SAM account.
+        let (sids, _) = resolve_secret_sids(
+            vec![(".\\Administrator".to_string(), 1u8)],
+            Some(machine),
+            Some(&ds),
+            &[],
+            "--dpapi-nthash",
+        );
+        assert_eq!(sids, vec![("S-1-5-21-1-2-3-500".to_string(), 1u8)]);
+    }
 }
 
 #[cfg(all(test, feature = "sam"))]

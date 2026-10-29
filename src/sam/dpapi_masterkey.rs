@@ -863,6 +863,39 @@ pub fn extract_from_disk_scoped<R: Read + Seek>(
     results
 }
 
+/// Test fixture: an AES-256/SHA-512 masterkey file that opens with `pre_key`.
+#[cfg(test)]
+pub(crate) fn fixture_mk_file(pre_key: &[u8; 20], mk_bytes: &[u8; 64]) -> Vec<u8> {
+    use hmac::Mac;
+    let salt = [0x42u8; 16];
+    let rounds: u32 = 1;
+    let derived = dpapi_derive_key_sha512(pre_key, &salt, 48, rounds);
+    let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
+    let iv: [u8; 16] = derived[32..48].try_into().unwrap();
+    let hmac_salt = [0x24u8; 16];
+    let mut k1 = HmacSha512::new_from_slice(pre_key).unwrap();
+    k1.update(&hmac_salt);
+    let key2 = k1.finalize().into_bytes();
+    let mut k2 = HmacSha512::new_from_slice(&key2).unwrap();
+    k2.update(mk_bytes);
+    let stored_hmac = k2.finalize().into_bytes();
+    let mut cleartext = Vec::with_capacity(144);
+    cleartext.extend_from_slice(&hmac_salt);
+    cleartext.extend_from_slice(&stored_hmac);
+    cleartext.extend_from_slice(mk_bytes);
+    let cipher = tests::aes_cbc_encrypt(&aes_key, &iv, &cleartext);
+    tests::build_mk_file(
+        2,
+        "aaaabbbb-cccc-dddd-eeee-ffff00002222",
+        2,
+        &salt,
+        rounds,
+        CALG_SHA_512,
+        CALG_AES_256,
+        &cipher,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,7 +1030,7 @@ mod tests {
 
     /// Build a synthetic MK file: 128-byte header + 32-byte MK sub-header +
     /// `ciphertext`. Returns the full file bytes.
-    fn build_mk_file(
+    pub(super) fn build_mk_file(
         version: u32,
         guid: &str,
         section_version: u32,
@@ -1029,7 +1062,7 @@ mod tests {
     }
 
     /// AES-256-CBC encrypt without padding for test fixture generation.
-    fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], pt: &[u8]) -> Vec<u8> {
+    pub(super) fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], pt: &[u8]) -> Vec<u8> {
         use aes::cipher::{BlockEncryptMut, KeyIvInit};
         type Enc = cbc::Encryptor<aes::Aes256>;
         assert_eq!(pt.len() % 16, 0);

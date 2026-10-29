@@ -389,6 +389,82 @@ pub(crate) fn decode_utf16le(data: &[u8]) -> String {
     crate::utils::utf16le_decode(data)
 }
 
+/// Account-domain (machine) SID from the SAM hive: the trailing SID of the
+/// `SAM\Domains\Account` `V` value. `None` if absent or malformed.
+pub fn extract_machine_sid(sam_hive_data: &[u8]) -> Option<String> {
+    let hive = Hive::new(sam_hive_data).ok()?;
+    let v = hive
+        .root_key()
+        .ok()?
+        .subkey(&hive, "SAM")
+        .ok()?
+        .subkey(&hive, "Domains")
+        .ok()?
+        .subkey(&hive, "Account")
+        .ok()?
+        .value(&hive, "V")
+        .ok()?;
+    account_domain_sid_from_v(&v)
+}
+
+/// Parse the account-domain SID at the end of an `Account\V` blob. It is
+/// always `S-1-5-21-a-b-c` (revision 1, 4 sub-authorities, NT authority):
+/// anything else is rejected rather than guessed.
+pub(crate) fn account_domain_sid_from_v(v: &[u8]) -> Option<String> {
+    const SID_LEN: usize = 8 + 4 * 4;
+    let sid = v.get(v.len().checked_sub(SID_LEN)?..)?;
+    let (hdr, subs) = sid.split_at(8);
+    if hdr != [1, 4, 0, 0, 0, 0, 0, 5] {
+        return None;
+    }
+    let subs: Vec<u32> = subs
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if subs.first() != Some(&21) {
+        return None;
+    }
+    Some(format!(
+        "S-1-5-{}",
+        subs.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("-")
+    ))
+}
+
 fn sam_err(msg: &str) -> VmkatzError {
     VmkatzError::DecryptionError(format!("SAM: {msg}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal `SAM\Domains\Account` `V` blob: opaque header bytes, then the
+    /// account-domain SID `S-1-5-21-1111-2222-3333` as the trailing 24 bytes.
+    fn account_v_fixture() -> Vec<u8> {
+        let mut v = vec![0xAAu8; 0x30];
+        v.extend_from_slice(&[1, 4, 0, 0, 0, 0, 0, 5]);
+        for sub in [21u32, 1111, 2222, 3333] {
+            v.extend_from_slice(&sub.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn machine_sid_parsed_from_sam_v() {
+        assert_eq!(
+            account_domain_sid_from_v(&account_v_fixture()).as_deref(),
+            Some("S-1-5-21-1111-2222-3333")
+        );
+        // Truncated / garbage blobs yield None, never a panic.
+        assert_eq!(account_domain_sid_from_v(&[]), None);
+        assert_eq!(account_domain_sid_from_v(&[1, 4, 0, 0]), None);
+        assert_eq!(account_domain_sid_from_v(&[0xAAu8; 64]), None);
+        let mut bad = account_v_fixture();
+        let n = bad.len();
+        bad[n - 24] = 2; // revision != 1
+        assert_eq!(account_domain_sid_from_v(&bad), None);
+    }
 }

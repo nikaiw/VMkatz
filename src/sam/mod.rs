@@ -75,6 +75,8 @@ pub struct DiskSecrets {
     pub sam_entries: Vec<SamEntry>,
     pub lsa_secrets: Vec<lsa::LsaSecret>,
     pub cached_credentials: Vec<cache::CachedCredential>,
+    /// Account-domain (machine) SID from `SAM\Domains\Account\V`, if parsed.
+    pub machine_sid: Option<String>,
 }
 
 /// Extract DPAPI master key hashes from a disk image.
@@ -595,6 +597,10 @@ fn process_hive_data_with_bootkey(
 
     // Extract SAM hashes
     let sam_entries = hashes::extract_hashes(sam_data, &boot_key)?;
+    let machine_sid = hashes::extract_machine_sid(sam_data);
+    if machine_sid.is_none() {
+        log::info!("SAM: account-domain SID not found in Domains\\Account\\V");
+    }
 
     // Extract LSA secrets from SECURITY hive (optional)
     let (lsa_secrets, cached_credentials) = if let Some(sec_data) = security_data {
@@ -623,6 +629,7 @@ fn process_hive_data_with_bootkey(
         sam_entries,
         lsa_secrets,
         cached_credentials,
+        machine_sid,
     })
 }
 

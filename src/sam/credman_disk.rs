@@ -97,62 +97,83 @@ pub struct SecretTable {
     pub pw_by_name: HashMap<String, String>,
 }
 
-/// The secret (if any) that applies to a SID.
+/// One secret that may open a SID's masterkeys.
 #[derive(Debug, Clone, Copy)]
-pub enum Secret {
+pub enum Secret<'a> {
     System {
         machine: Option<[u8; 20]>,
         user: Option<[u8; 20]>,
     },
+    Password(&'a str),
     Nt([u8; 16]),
-    None,
 }
 
-impl Secret {
+impl Secret<'_> {
     pub const fn is_system(&self) -> bool {
         matches!(self, Self::System { .. })
     }
     pub const fn is_nt(&self) -> bool {
         matches!(self, Self::Nt(_))
     }
-    pub const fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+    pub const fn is_password(&self) -> bool {
+        matches!(self, Self::Password(_))
     }
 }
 
 impl SecretTable {
-    /// Look up the secret for a profile SID.
-    /// Pre-key derived from whatever credential we hold for this profile, used
-    /// as the entry point of a CREDHIST walk. A password is preferred: it is
-    /// what a local account's masterkey (and its CREDHIST) is keyed to.
-    pub(crate) fn start_prekey(&self, sid: &str, name: &str) -> Option<[u8; 20]> {
-        let lower = name.to_lowercase();
-        if let Some(pw) = self
-            .pw_by_sid
-            .get(sid)
-            .or_else(|| self.pw_by_name.get(&lower))
-        {
-            return prekey_from_password(pw, sid).ok();
-        }
-        let h = self
-            .local_nt_by_sid
-            .get(sid)
-            .or_else(|| self.domain_nt_by_sid.get(sid))
-            .or_else(|| self.nt_by_name.get(&lower))?;
-        prekey_from_hash(h, sid).ok()
-    }
-
-    pub fn secret_for(&self, sid: &str) -> Secret {
+    /// Every secret that may open a masterkey of `sid` (owned by `profile`), in
+    /// the order they are tried: explicit/known passwords (by SID, then name),
+    /// explicit/domain NT hashes by SID, the local SAM hash, then NT hashes by
+    /// profile name (NTDS or unresolved `--dpapi-nthash`). Several are kept
+    /// because one can shadow another: on a DC the SAM holds the DSRM hash
+    /// under RID 500, which is not what the domain Administrator's keys use.
+    /// `S-1-5-18` gets only the DPAPI_SYSTEM keys. Duplicates are dropped.
+    pub fn candidates(&self, sid: &str, profile: &str) -> Vec<Secret<'_>> {
         if sid.eq_ignore_ascii_case(SYSTEM_SID) {
-            return Secret::System {
+            return vec![Secret::System {
                 machine: self.dpapi_system,
                 user: self.dpapi_system_user,
-            };
+            }];
         }
-        self.local_nt_by_sid
-            .get(sid)
-            .or_else(|| self.domain_nt_by_sid.get(sid))
-            .map_or(Secret::None, |h| Secret::Nt(*h))
+        let name = profile.to_lowercase();
+        let mut out: Vec<Secret<'_>> = Vec::new();
+        for pw in [self.pw_by_sid.get(sid), self.pw_by_name.get(&name)]
+            .into_iter()
+            .flatten()
+        {
+            if !out
+                .iter()
+                .any(|c| matches!(c, Secret::Password(p) if *p == pw.as_str()))
+            {
+                out.push(Secret::Password(pw));
+            }
+        }
+        for h in [
+            self.domain_nt_by_sid.get(sid),
+            self.local_nt_by_sid.get(sid),
+            self.nt_by_name.get(&name),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !out.iter().any(|c| matches!(c, Secret::Nt(x) if x == h)) {
+                out.push(Secret::Nt(*h));
+            }
+        }
+        out
+    }
+
+    /// Pre-keys derived from every user secret for this profile (same order
+    /// as [`Self::candidates`]), each a possible entry point of a CREDHIST walk.
+    pub(crate) fn start_prekeys(&self, sid: &str, profile: &str) -> Vec<[u8; 20]> {
+        self.candidates(sid, profile)
+            .into_iter()
+            .filter_map(|c| match c {
+                Secret::Password(pw) => prekey_from_password(pw, sid).ok(),
+                Secret::Nt(h) => prekey_from_hash(&h, sid).ok(),
+                Secret::System { .. } => None,
+            })
+            .collect()
     }
 }
 
@@ -166,16 +187,20 @@ pub fn machine_sid_from_user_sid(user_sid: &str) -> Option<&str> {
 pub fn build_secret_table(
     disk_secrets: &DiskSecrets,
     lsa: &[LsaSecret],
-    machine_sid: &str,
+    machine_sid: Option<&str>,
     domain_nthashes: &[(String, [u8; 16])],
     passwords: &[(String, String)],
 ) -> SecretTable {
     let mut t = SecretTable::default();
-    for e in &disk_secrets.sam_entries {
-        // An all-zero hash means no hash was recovered for the account.
-        if e.nt_hash != [0u8; 16] {
-            t.local_nt_by_sid
-                .insert(format!("{machine_sid}-{}", e.rid), e.nt_hash);
+    // Without the machine SID the SAM RIDs cannot be keyed: skip them rather
+    // than invent `-<rid>` SIDs.
+    if let Some(machine_sid) = machine_sid {
+        for e in &disk_secrets.sam_entries {
+            // An all-zero hash means no hash was recovered for the account.
+            if e.nt_hash != [0u8; 16] {
+                t.local_nt_by_sid
+                    .insert(format!("{machine_sid}-{}", e.rid), e.nt_hash);
+            }
         }
     }
     for s in lsa {
@@ -414,20 +439,27 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     /// Walk `CREDHIST` (one level above the per-SID folder) for previous
     /// password hashes and retry the masterkey with each of them.
     fn try_credhist(&mut self, pd: &ProtectDir, profile: &str, mk_bytes: &[u8]) -> Option<Vec<u8>> {
-        let start = self.secrets.start_prekey(&pd.sid, profile)?;
+        let starts = self.secrets.start_prekeys(&pd.sid, profile);
+        if starts.is_empty() {
+            return None;
+        }
         let (parent, _) = pd.path.rsplit_once('\\')?;
         let file = self.read(parent, "CREDHIST").ok()?;
-        let chain = credhist::recover_previous_hashes(&file, &pd.sid, &start).ok()?;
-        for h in chain {
-            for key in [
-                prekey_from_hash(&h.sha1, &pd.sid),
-                prekey_from_hash(&h.ntlm, &pd.sid),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Ok(clear) = decrypt_masterkey_with_prekey(mk_bytes, &key) {
-                    return Some(clear);
+        for start in &starts {
+            let Ok(chain) = credhist::recover_previous_hashes(&file, &pd.sid, start) else {
+                continue;
+            };
+            for h in chain {
+                for key in [
+                    prekey_from_hash(&h.sha1, &pd.sid),
+                    prekey_from_hash(&h.ntlm, &pd.sid),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Ok(clear) = decrypt_masterkey_with_prekey(mk_bytes, &key) {
+                        return Some(clear);
+                    }
                 }
             }
         }
@@ -584,47 +616,41 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     }
 }
 
-/// Decrypt a masterkey file with whatever secret applies to `sid`.
+/// Decrypt a masterkey file with each secret that applies to `sid`, in
+/// [`SecretTable::candidates`] order; the first that verifies wins.
 fn unlock(
     secrets: &SecretTable,
     sid: &str,
     profile: &str,
     mk_bytes: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
-    let name = profile.to_lowercase();
-    // A supplied cleartext password is tried first: local (context-1) user
-    // masterkeys derive from the password, which an NT hash cannot reproduce.
-    let mut pw_err = None;
-    for pw in [secrets.pw_by_sid.get(sid), secrets.pw_by_name.get(&name)]
-        .into_iter()
-        .flatten()
-    {
-        match decrypt_local_user_masterkey_pw(mk_bytes, pw, sid) {
-            Ok(k) => return Ok(k),
-            Err(e) => pw_err = Some(format!("masterkey decrypt (password): {e}")),
-        }
-    }
-    match secrets.secret_for(sid) {
-        Secret::None => {
-            if let Some(h) = secrets.nt_by_name.get(&name) {
-                return decrypt_local_user_masterkey(mk_bytes, h, sid)
-                    .map_err(|e| format!("masterkey decrypt: {e}"));
-            }
-            Err(pw_err.unwrap_or_else(|| format!("no secret for {sid}")))
-        }
-        Secret::Nt(h) => decrypt_local_user_masterkey(mk_bytes, &h, sid)
-            .map_err(|e| format!("masterkey decrypt: {e}")),
-        Secret::System { machine, user } => {
-            let mut last = format!("no DPAPI_SYSTEM secret for {sid}");
-            for key in [machine, user].into_iter().flatten() {
-                match decrypt_system_masterkey(mk_bytes, &key) {
-                    Ok(k) => return Ok(k),
-                    Err(e) => last = format!("masterkey decrypt: {e}"),
+    let mut last = None;
+    for cand in secrets.candidates(sid, profile) {
+        let res = match cand {
+            // A local (context-1) user masterkey derives from the password,
+            // which an NT hash cannot reproduce.
+            Secret::Password(pw) => decrypt_local_user_masterkey_pw(mk_bytes, pw, sid)
+                .map_err(|e| format!("masterkey decrypt (password): {e}")),
+            Secret::Nt(h) => decrypt_local_user_masterkey(mk_bytes, &h, sid)
+                .map_err(|e| format!("masterkey decrypt: {e}")),
+            Secret::System { machine, user } => {
+                let mut r = Err(format!("no DPAPI_SYSTEM secret for {sid}"));
+                for key in [machine, user].into_iter().flatten() {
+                    r = decrypt_system_masterkey(mk_bytes, &key)
+                        .map_err(|e| format!("masterkey decrypt: {e}"));
+                    if r.is_ok() {
+                        break;
+                    }
                 }
+                r
             }
-            Err(last)
+        };
+        match res {
+            Ok(k) => return Ok(k),
+            Err(e) => last = Some(e),
         }
     }
+    Err(last.unwrap_or_else(|| format!("no secret for {sid}")))
 }
 
 /// Sweep every NTFS partition (or only `partition`) for Credential Manager blobs.
@@ -688,8 +714,8 @@ mod tests {
             dpapi_system: Some([0u8; 20]),
             ..Default::default()
         };
-        assert!(t.secret_for("S-1-5-18").is_system());
-        assert!(t.secret_for("S-1-5-21-1-2-3-1106").is_none());
+        assert!(t.candidates("S-1-5-18", "SYSTEM")[0].is_system());
+        assert!(t.candidates("S-1-5-21-1-2-3-1106", "bob").is_empty());
     }
 
     #[test]
@@ -709,7 +735,7 @@ mod tests {
             dpapi_system: Some([0u8; 20]),
             ..Default::default()
         };
-        assert!(t.secret_for(&fb[0].sid).is_system());
+        assert!(t.candidates(&fb[0].sid, "NetworkService")[0].is_system());
         assert_eq!(
             Walker::<std::io::Cursor<Vec<u8>>>::system_profile().protect[0].sid,
             fb[0].sid
@@ -785,14 +811,79 @@ mod tests {
             acb_flags: 0,
         });
         let dom = vec![("S-1-5-21-9-9-9-1106".to_string(), [3u8; 16])];
-        let st = build_secret_table(&ds, &[], "S-1-5-21-1-2-3", &dom, &[]);
+        let st = build_secret_table(&ds, &[], Some("S-1-5-21-1-2-3"), &dom, &[]);
         assert!(!st.local_nt_by_sid.contains_key("S-1-5-21-1-2-3-501"));
-        assert!(st.secret_for("S-1-5-21-9-9-9-1106").is_nt());
+        assert!(st.candidates("S-1-5-21-9-9-9-1106", "bob")[0].is_nt());
+    }
+
+    #[test]
+    fn unlock_tries_every_candidate_explicit_first() {
+        use crate::sam::dpapi_masterkey::fixture_mk_file;
+        let sid = "S-1-5-21-1-2-3-500";
+        let mk = [0x5Au8; 64];
+        let good = [9u8; 16];
+        let wrong = [7u8; 16];
+        // DC case: the SAM (DSRM) hash for RID 500 is wrong, the domain hash opens it.
+        let file = fixture_mk_file(&prekey_from_hash(&good, sid).unwrap(), &mk);
+        let mut t = SecretTable::default();
+        t.local_nt_by_sid.insert(sid.into(), wrong);
+        t.domain_nt_by_sid.insert(sid.into(), good);
+        assert_eq!(unlock(&t, sid, "Administrator", &file).unwrap(), mk);
+        // Same with the domain hash known only by profile name (NTDS).
+        let mut t = SecretTable::default();
+        t.local_nt_by_sid.insert(sid.into(), wrong);
+        t.nt_by_name.insert("administrator".into(), good);
+        assert_eq!(unlock(&t, sid, "Administrator", &file).unwrap(), mk);
+        // An explicit password beats a (wrong) SAM hash.
+        let pw_file = fixture_mk_file(&prekey_from_password("P@ss", sid).unwrap(), &mk);
+        let mut t = SecretTable::default();
+        t.local_nt_by_sid.insert(sid.into(), wrong);
+        t.pw_by_sid.insert(sid.into(), "P@ss".into());
+        assert_eq!(unlock(&t, sid, "Administrator", &pw_file).unwrap(), mk);
+        // Order: explicit password, then explicit/domain hash, then SAM, then NTDS.
+        t.domain_nt_by_sid.insert(sid.into(), good);
+        t.nt_by_name.insert("administrator".into(), [1u8; 16]);
+        let c = t.candidates(sid, "Administrator");
+        assert!(matches!(c[0], Secret::Password("P@ss")));
+        assert!(matches!(c[1], Secret::Nt(h) if h == good));
+        assert!(matches!(c[2], Secret::Nt(h) if h == wrong));
+        assert!(matches!(c[3], Secret::Nt(h) if h == [1u8; 16]));
+        assert_eq!(c.len(), 4);
+        // Every candidate failing reports a decrypt failure, not "no secret".
+        let mut t = SecretTable::default();
+        t.local_nt_by_sid.insert(sid.into(), wrong);
+        assert!(unlock(&t, sid, "Administrator", &file).is_err());
+    }
+
+    #[test]
+    fn system_sid_gets_no_user_secrets() {
+        let mut t = SecretTable {
+            dpapi_system: Some([0u8; 20]),
+            ..Default::default()
+        };
+        t.pw_by_name.insert("system".into(), "x".into());
+        t.nt_by_name.insert("system".into(), [1u8; 16]);
+        let c = t.candidates(SYSTEM_SID, "SYSTEM");
+        assert_eq!(c.len(), 1);
+        assert!(c[0].is_system());
+        assert!(t.start_prekeys(SYSTEM_SID, "SYSTEM").is_empty());
+    }
+
+    #[test]
+    fn build_secret_table_without_machine_sid_skips_sam() {
+        let st = build_secret_table(&disk_secrets_fixture(), &[], None, &[], &[]);
+        assert!(st.local_nt_by_sid.is_empty());
     }
 
     #[test]
     fn build_secret_table_maps_rid_to_sid() {
-        let st = build_secret_table(&disk_secrets_fixture(), &[], "S-1-5-21-1-2-3", &[], &[]);
+        let st = build_secret_table(
+            &disk_secrets_fixture(),
+            &[],
+            Some("S-1-5-21-1-2-3"),
+            &[],
+            &[],
+        );
         assert_eq!(
             st.local_nt_by_sid.get("S-1-5-21-1-2-3-500"),
             Some(&[7u8; 16])
