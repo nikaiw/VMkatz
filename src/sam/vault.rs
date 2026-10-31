@@ -40,6 +40,11 @@ fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
+fn read_usize(bytes: &[u8], cur: &mut usize, label: &str) -> Result<usize> {
+    usize::try_from(read_u32(bytes, cur)?)
+        .map_err(|_| err(&format!("{label} does not fit this platform")))
+}
+
 /// Parse the `Policy.vpol` header and return the inner DPAPI blob slice.
 ///
 /// Layout: version u32, vault GUID (16), description (u32 byte length + UTF-16LE),
@@ -48,15 +53,15 @@ pub fn parse_vpol(file: &[u8]) -> Result<&[u8]> {
     let mut cur = 0usize;
     let _version = read_u32(file, &mut cur)?;
     take(file, &mut cur, 16)?;
-    let desc_len = read_u32(file, &mut cur)? as usize;
+    let desc_len = read_usize(file, &mut cur, "vpol description length")?;
     take(file, &mut cur, desc_len)?;
     for _ in 0..3 {
         read_u32(file, &mut cur)?;
     }
-    let store_size = read_u32(file, &mut cur)? as usize;
+    let store_size = read_usize(file, &mut cur, "vpol store size")?;
     let store_start = cur;
     take(file, &mut cur, 32)?;
-    let blob_size = read_u32(file, &mut cur)? as usize;
+    let blob_size = read_usize(file, &mut cur, "vpol blob size")?;
     let store_end = store_start
         .checked_add(store_size)
         .ok_or_else(|| err("vpol store size overflow"))?;
@@ -83,7 +88,7 @@ fn read_key(buf: &[u8], cur: &mut usize) -> Result<Vec<u8>> {
         .ok_or_else(|| err("vault key magic not found"))?;
     *cur += pos + 4;
     let _ver = read_u32(buf, cur)?;
-    let len = read_u32(buf, cur)? as usize;
+    let len = read_usize(buf, cur, "vault key length")?;
     // `aes_cbc` only accepts AES-128/256; reject anything else here.
     if len != 16 && len != 32 {
         return Err(err("unexpected vault key length"));
@@ -185,10 +190,10 @@ fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8
     if id >= 100 {
         read_u32(file, &mut cur)?;
     }
-    let size = read_u32(file, &mut cur)? as usize;
+    let size = read_usize(file, &mut cur, "vault attribute size")?;
     let has_iv = take(file, &mut cur, 1)?[0] != 0;
     let (iv, overhead) = if has_iv {
-        let ivlen = read_u32(file, &mut cur)? as usize;
+        let ivlen = read_usize(file, &mut cur, "vault IV length")?;
         if ivlen != 16 {
             return Err(err("unexpected vault IV size"));
         }
@@ -213,7 +218,7 @@ fn decrypt_attribute(file: &[u8], off: usize, keys: &VaultKeys) -> Result<Vec<u8
 fn parse_vault_items(clear: &[u8]) -> Result<VaultCred> {
     let mut cur = 0usize;
     read_u32(clear, &mut cur)?; // version
-    let count = read_u32(clear, &mut cur)? as usize;
+    let count = read_usize(clear, &mut cur, "vault item count")?;
     read_u32(clear, &mut cur)?; // unknown
     if count == 0 || count > MAX_ATTRS {
         return Err(err("vault item count out of range"));
@@ -222,7 +227,7 @@ fn parse_vault_items(clear: &[u8]) -> Result<VaultCred> {
     let mut unknown: Vec<String> = Vec::new();
     for _ in 0..count {
         let ty = read_u32(clear, &mut cur)?;
-        let len = read_u32(clear, &mut cur)? as usize;
+        let len = read_usize(clear, &mut cur, "vault item length")?;
         let s = utf16(take(clear, &mut cur, len)?)
             .trim_end_matches('\0')
             .to_string();
@@ -257,17 +262,28 @@ pub fn parse_vcrd(file: &[u8], keys: &VaultKeys) -> Result<VaultCred> {
     take(file, &mut cur, 8)?; // last written
     read_u32(file, &mut cur)?;
     read_u32(file, &mut cur)?;
-    let name_len = read_u32(file, &mut cur)? as usize;
+    let name_len = read_usize(file, &mut cur, "vcrd name length")?;
     take(file, &mut cur, name_len)?;
-    let maps_len = read_u32(file, &mut cur)? as usize;
+    let maps_len = read_usize(file, &mut cur, "vcrd attribute map length")?;
+    let maps_end = cur
+        .checked_add(maps_len)
+        .filter(|&end| end <= file.len())
+        .ok_or_else(|| err("vcrd attribute map out of range"))?;
+    if maps_len == 0 || !maps_len.is_multiple_of(12) {
+        return Err(err("vcrd attribute map size is not a multiple of 12"));
+    }
     let count = maps_len / 12;
-    if count == 0 || count > MAX_ATTRS {
+    if count > MAX_ATTRS {
         return Err(err("vcrd attribute map size out of range"));
     }
     let mut offsets = Vec::with_capacity(count);
     for _ in 0..count {
         read_u32(file, &mut cur)?;
-        offsets.push(read_u32(file, &mut cur)? as usize);
+        let offset = read_usize(file, &mut cur, "vcrd attribute offset")?;
+        if offset < maps_end || offset >= file.len() {
+            return Err(err("vcrd attribute offset out of range"));
+        }
+        offsets.push(offset);
         read_u32(file, &mut cur)?;
     }
     let mut last = err("vcrd has no usable attribute");
@@ -297,7 +313,7 @@ mod tests {
         v.extend_from_slice(&[0xAA; 16]);
         let desc: Vec<u8> = "Web Credentials\0"
             .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
+            .flat_map(u16::to_le_bytes)
             .collect();
         v.extend_from_slice(&(desc.len() as u32).to_le_bytes());
         v.extend_from_slice(&desc);
@@ -369,13 +385,6 @@ mod tests {
                 .unwrap()
                 .encrypt_padded_vec_mut::<Pkcs7>(clear)
         }
-    }
-
-    fn item(s: &str) -> Vec<u8> {
-        let b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let mut v = (b.len() as u32).to_le_bytes().to_vec();
-        v.extend(b);
-        v
     }
 
     fn keys() -> VaultKeys {
@@ -499,6 +508,17 @@ mod tests {
         }
         assert!(parse_vcrd(&[0xFF; 128], &keys()).is_err());
         assert!(parse_vcrd(&[], &keys()).is_err());
+    }
+
+    #[test]
+    fn parse_vcrd_rejects_malformed_map_size_and_offset() {
+        let mut bad_size = vcrd_ext(true, false);
+        bad_size[48..52].copy_from_slice(&13u32.to_le_bytes());
+        assert!(parse_vcrd(&bad_size, &keys()).is_err());
+
+        let mut bad_offset = vcrd_ext(true, false);
+        bad_offset[56..60].copy_from_slice(&0u32.to_le_bytes());
+        assert!(parse_vcrd(&bad_offset, &keys()).is_err());
     }
 
     #[test]

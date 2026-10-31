@@ -17,6 +17,16 @@ use clap::Parser;
 
 #[cfg(feature = "sam")]
 use cli::is_block_dev;
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
+use cli::run_associated_lsass_for_disk;
 #[cfg(feature = "ntds.dit")]
 use cli::run_raw_ntds;
 #[cfg(feature = "veeam")]
@@ -219,6 +229,22 @@ fn vmkatz_main() -> anyhow::Result<()> {
         #[cfg(not(feature = "ntds.dit"))]
         let sam_mode = (args.sam || is_disk_ext || is_block_device) && !is_memory_snapshot;
         if sam_mode {
+            if args.lsass || args.all {
+                #[cfg(any(
+                    feature = "vmware",
+                    feature = "vbox",
+                    feature = "qemu",
+                    feature = "hyperv"
+                ))]
+                run_associated_lsass_for_disk(input_path, &args)?;
+                #[cfg(not(any(
+                    feature = "vmware",
+                    feature = "vbox",
+                    feature = "qemu",
+                    feature = "hyperv"
+                )))]
+                anyhow::bail!("--lsass requires a memory snapshot backend feature");
+            }
             if let Some(cp) = &args.cp {
                 let mut disk = vmkatz::disk::open_disk(input_path)?;
                 return cli::disk::run_cp(&mut disk, &cp[0], &cp[1], args.partition);

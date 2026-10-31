@@ -43,7 +43,8 @@ fn read_bytes<'a>(bytes: &'a [u8], cur: &mut usize, len: usize) -> Result<&'a [u
 
 /// Read a u32 length-prefixed byte run.
 fn read_lp_bytes<'a>(bytes: &'a [u8], cur: &mut usize) -> Result<&'a [u8]> {
-    let len = read_u32(bytes, cur)? as usize;
+    let len = usize::try_from(read_u32(bytes, cur)?)
+        .map_err(|_| VmkatzError::Parse("CREDENTIAL length does not fit this platform".into()))?;
     read_bytes(bytes, cur, len)
 }
 
@@ -130,7 +131,8 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
     read_bytes(decrypted, &mut cur, 8)?; // LastWritten
     read_u32(decrypted, &mut cur)?; // Unknown1
     read_u32(decrypted, &mut cur)?; // Persist
-    let attr_count = read_u32(decrypted, &mut cur)? as usize;
+    let attr_count = usize::try_from(read_u32(decrypted, &mut cur)?)
+        .map_err(|_| VmkatzError::Parse("CREDENTIAL attribute count overflow".into()))?;
     read_u32(decrypted, &mut cur)?; // Unknown2
     read_u32(decrypted, &mut cur)?; // Unknown3
     let target = read_lp_utf16(decrypted, &mut cur)?;
@@ -383,7 +385,7 @@ mod tests {
 
     #[test]
     fn attributes_truncated_best_effort() {
-        let (full, _) = attrs_fixture();
+        let (mut full, _) = attrs_fixture();
         let base = build_fixture_attrs("t", b"p\0", "u", &[], 0).len();
         for n in base..full.len() {
             let e = parse_credential_blob(&full[..n]).unwrap();
@@ -392,8 +394,7 @@ mod tests {
             assert!(e.attributes.len() < 2);
         }
         // Huge declared count: bounded by data.
-        let mut b = full.clone();
-        b[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(parse_credential_blob(&b).unwrap().attributes.len(), 2);
+        full[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_credential_blob(&full).unwrap().attributes.len(), 2);
     }
 }

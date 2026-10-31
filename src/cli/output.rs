@@ -84,15 +84,7 @@ fn is_virtual_account(username: &str, domain: &str) -> bool {
 }
 
 /// Print `DiskSecrets` (SAM + LSA + cached creds) using the current output format.
-#[cfg(all(
-    feature = "sam",
-    any(
-        feature = "vmware",
-        feature = "vbox",
-        feature = "qemu",
-        feature = "hyperv"
-    )
-))]
+#[cfg(feature = "sam")]
 pub(crate) fn print_disk_secrets(secrets: &vmkatz::sam::DiskSecrets, args: &Args) {
     let c = get_colors(args);
 
@@ -124,7 +116,44 @@ pub(crate) fn print_disk_secrets(secrets: &vmkatz::sam::DiskSecrets, args: &Args
 }
 
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors) {
+fn ntds_domain<'a>(
+    entry: &'a vmkatz::ntds::AdHashEntry,
+    domain_override: Option<&'a str>,
+) -> Option<&'a str> {
+    domain_override
+        .filter(|d| !d.is_empty())
+        .or(entry.domain.as_deref())
+}
+
+#[cfg(feature = "ntds.dit")]
+fn ntds_username(entry: &vmkatz::ntds::AdHashEntry, domain_prefix: Option<&str>) -> String {
+    if let Some(domain) = ntds_domain(entry, domain_prefix) {
+        return format!("{domain}\\{}", entry.username);
+    }
+    entry.username.clone()
+}
+
+#[cfg(feature = "ntds.dit")]
+fn ntds_username_with_history(
+    entry: &vmkatz::ntds::AdHashEntry,
+    domain_prefix: Option<&str>,
+) -> String {
+    let base = ntds_username(entry, domain_prefix);
+    if entry.is_history {
+        return entry.history_index.map_or_else(
+            || format!("{base}_history"),
+            |idx| format!("{base}_history{idx}"),
+        );
+    }
+    base
+}
+
+#[cfg(feature = "ntds.dit")]
+pub(crate) fn print_ntds_text(
+    entries: &[vmkatz::ntds::AdHashEntry],
+    c: &Colors,
+    domain_prefix: Option<&str>,
+) {
     println!("\n{}[+] AD NTLM Hashes:{}", c.green, c.reset);
     for entry in entries {
         let hist = if entry.is_history {
@@ -140,7 +169,7 @@ pub(crate) fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors)
                 "  RID: {:<6} {}{:<24}{} {:<10} NT:{}",
                 entry.rid,
                 c.bold,
-                entry.username,
+                ntds_username(entry, domain_prefix),
                 c.reset,
                 hist,
                 fmt_hash(&entry.nt_hash, c),
@@ -150,7 +179,7 @@ pub(crate) fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors)
                 "  RID: {:<6} {}{:<24}{} {:<10} NT:{}  LM:{}",
                 entry.rid,
                 c.bold,
-                entry.username,
+                ntds_username(entry, domain_prefix),
                 c.reset,
                 hist,
                 fmt_hash(&entry.nt_hash, c),
@@ -161,16 +190,9 @@ pub(crate) fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors)
 }
 
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
+pub(crate) fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry], domain_prefix: Option<&str>) {
     for entry in entries {
-        let user: std::borrow::Cow<str> = if entry.is_history {
-            match entry.history_index {
-                Some(idx) => format!("{}_history{}", entry.username, idx).into(),
-                None => format!("{}_history", entry.username).into(),
-            }
-        } else {
-            (&*entry.username).into()
-        };
+        let user = ntds_username_with_history(entry, domain_prefix);
 
         println!(
             "{}:{}:{}:{}:::",
@@ -183,7 +205,7 @@ pub(crate) fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
+pub(crate) fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry], domain_override: Option<&str>) {
     println!("provider,username,domain,secret_type,secret,target");
     for entry in entries {
         let provider = if entry.is_history {
@@ -194,18 +216,20 @@ pub(crate) fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
         };
         if entry.nt_hash != ZERO_HASH_16 {
             println!(
-                "{},{},,nt_hash,{},{}",
+                "{},{},{},nt_hash,{},{}",
                 provider,
                 csv_escape(&entry.username),
+                csv_escape(ntds_domain(entry, domain_override).unwrap_or("")),
                 hex::encode(entry.nt_hash),
                 entry.rid
             );
         }
         if entry.lm_hash != ZERO_HASH_16 {
             println!(
-                "{},{},,lm_hash,{},{}",
+                "{},{},{},lm_hash,{},{}",
                 provider,
                 csv_escape(&entry.username),
+                csv_escape(ntds_domain(entry, domain_override).unwrap_or("")),
                 hex::encode(entry.lm_hash),
                 entry.rid
             );
@@ -214,20 +238,28 @@ pub(crate) fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn print_ntds_hashcat(entries: &[vmkatz::ntds::AdHashEntry]) {
+pub(crate) fn print_ntds_hashcat(
+    entries: &[vmkatz::ntds::AdHashEntry],
+    domain_prefix: Option<&str>,
+) {
     let mut seen = std::collections::HashSet::new();
     for entry in entries {
-        if entry.nt_hash != ZERO_HASH_16 && seen.insert((&entry.username, entry.nt_hash)) {
-            println!("{}:{}", entry.username, hex::encode(entry.nt_hash));
+        let username = ntds_username_with_history(entry, domain_prefix);
+        if entry.nt_hash != ZERO_HASH_16 && seen.insert((username.clone(), entry.nt_hash)) {
+            println!("{}:{}", username, hex::encode(entry.nt_hash));
         }
     }
 }
 
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn print_ntds_brief(entries: &[vmkatz::ntds::AdHashEntry]) {
+pub(crate) fn print_ntds_brief(entries: &[vmkatz::ntds::AdHashEntry], domain_prefix: Option<&str>) {
     for entry in entries {
-        if entry.nt_hash != ZERO_HASH_16 && !entry.is_history {
-            println!("{}: {}", entry.username, hex::encode(entry.nt_hash));
+        if entry.nt_hash != ZERO_HASH_16 {
+            println!(
+                "{}: {}",
+                ntds_username_with_history(entry, domain_prefix),
+                hex::encode(entry.nt_hash)
+            );
         }
     }
 }
@@ -680,15 +712,17 @@ pub(crate) fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
 
     // --ccache: write all tickets into a single ccache file
     if let Some(ccache_path) = &args.ccache {
-        let data = build_ccache(&all_tickets);
-        match std::fs::write(ccache_path, &data) {
-            Ok(()) => eprintln!(
-                "[+] Exported {} ticket(s) to {} ({} bytes)",
-                all_tickets.len(),
-                ccache_path,
-                data.len()
-            ),
-            Err(e) => eprintln!("[!] Failed to write {ccache_path}: {e}"),
+        match build_ccache(&all_tickets) {
+            Ok(data) => match std::fs::write(ccache_path, &data) {
+                Ok(()) => eprintln!(
+                    "[+] Exported {} ticket(s) to {} ({} bytes)",
+                    all_tickets.len(),
+                    ccache_path,
+                    data.len()
+                ),
+                Err(e) => eprintln!("[!] Failed to write {ccache_path}: {e}"),
+            },
+            Err(e) => eprintln!("[!] Failed to build ccache: {e}"),
         }
     }
 }
@@ -737,7 +771,9 @@ fn sanitize_filename(s: &str) -> String {
 
 /// Build a ccache (MIT Kerberos credential cache) file.
 /// Format: v4 (0x0504), one default principal, N credentials.
-fn build_ccache(tickets: &[(&vmkatz::lsass::types::KerberosTicket, &str, &str)]) -> Vec<u8> {
+fn build_ccache(
+    tickets: &[(&vmkatz::lsass::types::KerberosTicket, &str, &str)],
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
 
     // File format version: 0x0504 (v4)
@@ -751,10 +787,10 @@ fn build_ccache(tickets: &[(&vmkatz::lsass::types::KerberosTicket, &str, &str)])
     if let Some((ticket, _username, _domain)) = tickets.first() {
         let realm = &ticket.domain_name;
         let client = &ticket.client_name;
-        write_ccache_principal(&mut out, ticket.client_name_type as u32, realm, client);
+        write_ccache_principal(&mut out, ticket.client_name_type, realm, client)?;
     } else {
         // Empty principal
-        write_ccache_principal(&mut out, 1, "", &[]);
+        write_ccache_principal(&mut out, 1, "", &[])?;
     }
 
     // Credentials
@@ -762,69 +798,94 @@ fn build_ccache(tickets: &[(&vmkatz::lsass::types::KerberosTicket, &str, &str)])
         if ticket.ticket_blob.is_empty() {
             continue;
         }
-        write_ccache_credential(&mut out, ticket);
+        write_ccache_credential(&mut out, ticket)?;
     }
 
-    out
+    Ok(out)
 }
 
 /// Write a principal to ccache format.
 /// Format: `name_type` (u32), `num_components` (u32), realm (`counted_octet_string`),
 ///         components[num] (`counted_octet_string` each)
-fn write_ccache_principal(out: &mut Vec<u8>, name_type: u32, realm: &str, components: &[String]) {
+fn write_ccache_principal(
+    out: &mut Vec<u8>,
+    name_type: i16,
+    realm: &str,
+    components: &[String],
+) -> Result<(), String> {
+    let name_type = u32::try_from(name_type)
+        .map_err(|_| format!("Kerberos principal name type {name_type} is negative"))?;
     out.extend_from_slice(&name_type.to_be_bytes());
-    out.extend_from_slice(&(components.len() as u32).to_be_bytes());
+    write_ccache_len(out, components.len(), "principal component count")?;
     // Realm
-    write_ccache_string(out, realm);
+    write_ccache_string(out, realm)?;
     // Components
     for comp in components {
-        write_ccache_string(out, comp);
+        write_ccache_string(out, comp)?;
     }
+    Ok(())
 }
 
-fn write_ccache_string(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+fn write_ccache_len(out: &mut Vec<u8>, len: usize, field: &str) -> Result<(), String> {
+    let len = u32::try_from(len).map_err(|_| format!("{field} exceeds the ccache u32 limit"))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    Ok(())
+}
+
+fn write_ccache_string(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
+    write_ccache_len(out, s.len(), "principal string length")?;
     out.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 /// Write a single credential entry in ccache format.
-fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::KerberosTicket) {
+fn write_ccache_credential(
+    out: &mut Vec<u8>,
+    ticket: &vmkatz::lsass::types::KerberosTicket,
+) -> Result<(), String> {
     // Client principal
     let client_realm = &ticket.domain_name;
     write_ccache_principal(
         out,
-        ticket.client_name_type as u32,
+        ticket.client_name_type,
         client_realm,
         &ticket.client_name,
-    );
+    )?;
 
     // Server principal
     let server_realm = &ticket.target_domain_name;
     write_ccache_principal(
         out,
-        ticket.service_name_type as u32,
+        ticket.service_name_type,
         server_realm,
         &ticket.service_name,
-    );
+    )?;
 
     // Keyblock: keytype (u16), etype (u16 = 0 for ccache v4), keylength (u16), keyvalue
     // ccache v4 uses: enc_type (u16), key_length (u32), key_data
-    out.extend_from_slice(&(ticket.key_type as u16).to_be_bytes());
-    out.extend_from_slice(&(ticket.session_key.len() as u32).to_be_bytes());
+    let key_type = u16::try_from(ticket.key_type).map_err(|_| {
+        format!(
+            "Kerberos key type {} exceeds ccache u16 limit",
+            ticket.key_type
+        )
+    })?;
+    out.extend_from_slice(&key_type.to_be_bytes());
+    write_ccache_len(out, ticket.session_key.len(), "session key length")?;
     out.extend_from_slice(&ticket.session_key);
 
     // Convert Windows FILETIME (100-ns ticks since 1601-01-01) to Unix timestamp
     // 10_000_000 = ticks per second, 11_644_473_600 = seconds between 1601 and 1970 epochs
-    let to_unix = |ft: u64| -> u32 {
+    let to_unix = |ft: u64| -> Result<u32, String> {
         if ft == 0 {
-            return 0;
+            return Ok(0);
         }
-        ((ft / 10_000_000).saturating_sub(11_644_473_600)) as u32
+        let seconds = (ft / 10_000_000).saturating_sub(11_644_473_600);
+        u32::try_from(seconds).map_err(|_| "Kerberos ticket time exceeds ccache u32 range".into())
     };
-    out.extend_from_slice(&to_unix(ticket.start_time).to_be_bytes()); // authtime
-    out.extend_from_slice(&to_unix(ticket.start_time).to_be_bytes()); // starttime
-    out.extend_from_slice(&to_unix(ticket.end_time).to_be_bytes()); // endtime
-    out.extend_from_slice(&to_unix(ticket.renew_until).to_be_bytes()); // renew_till
+    out.extend_from_slice(&to_unix(ticket.start_time)?.to_be_bytes()); // authtime
+    out.extend_from_slice(&to_unix(ticket.start_time)?.to_be_bytes()); // starttime
+    out.extend_from_slice(&to_unix(ticket.end_time)?.to_be_bytes()); // endtime
+    out.extend_from_slice(&to_unix(ticket.renew_until)?.to_be_bytes()); // renew_till
 
     // is_skey: u8 (0)
     out.push(0);
@@ -840,11 +901,12 @@ fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::Ker
 
     // A ccache stores the complete ASN.1 Ticket, not just its encrypted cipher.
     let ticket_der = vmkatz::lsass::build_ticket_der(ticket);
-    out.extend_from_slice(&(ticket_der.len() as u32).to_be_bytes());
+    write_ccache_len(out, ticket_der.len(), "ticket DER length")?;
     out.extend_from_slice(&ticket_der);
 
     // Second ticket: length = 0
     out.extend_from_slice(&0u32.to_be_bytes());
+    Ok(())
 }
 
 /// Deduplicate credentials by (username, domain, `nt_hash`).
@@ -1743,9 +1805,7 @@ fn print_vault_text(report: &vmkatz::sam::CredmanReport, c: &super::args::Colors
     }
 }
 
-/// CSV: `profile,sid,target,username,password`, one row per decrypted entry.
-/// With `attributes`, a second `profile,sid,target,attr_keyword,attr_value_hex`
-/// table follows (separate header) with one row per enumerated attribute.
+/// Print a single rectangular CSV stream for all CredMan/Vault record types.
 #[cfg(feature = "sam")]
 pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes: bool) {
     print!("{}", credman_csv_string(report, attributes));
@@ -1753,71 +1813,86 @@ pub(crate) fn print_credman_csv(report: &vmkatz::sam::CredmanReport, attributes:
 
 #[cfg(feature = "sam")]
 fn credman_csv_string(report: &vmkatz::sam::CredmanReport, attributes: bool) -> String {
-    use std::fmt::Write as _;
     let mut o = String::new();
-    let _ = writeln!(o, "profile,sid,target,username,password");
+    let header = [
+        "record_type",
+        "profile",
+        "sid",
+        "target",
+        "username",
+        "password",
+        "attribute_keyword",
+        "attribute_value_hex",
+        "vault_guid",
+        "resource",
+        "identity",
+        "secret",
+        "file",
+        "reason",
+        "note",
+    ];
+    write_credman_csv_row(&mut o, &header);
     for e in &report.entries {
-        let _ = writeln!(
-            o,
-            "{},{},{},{},{}",
-            csv_escape(&e.profile),
-            csv_escape(&e.sid),
-            csv_escape(&e.entry.target),
-            csv_escape(&e.entry.username),
-            csv_escape(&e.entry.password),
-        );
+        let mut row = [""; 15];
+        row[0] = "credential";
+        row[1] = &e.profile;
+        row[2] = &e.sid;
+        row[3] = &e.entry.target;
+        row[4] = &e.entry.username;
+        row[5] = &e.entry.password;
+        write_credman_csv_row(&mut o, &row);
     }
     if attributes {
-        let _ = writeln!(o, "profile,sid,target,attr_keyword,attr_value_hex");
         for e in &report.entries {
             for a in &e.attributes {
-                let _ = writeln!(
-                    o,
-                    "{},{},{},{},{}",
-                    csv_escape(&e.profile),
-                    csv_escape(&e.sid),
-                    csv_escape(&e.entry.target),
-                    csv_escape(&a.keyword),
-                    a.value_hex,
-                );
+                let mut row = [""; 15];
+                row[0] = "credential_attribute";
+                row[1] = &e.profile;
+                row[2] = &e.sid;
+                row[3] = &e.entry.target;
+                row[6] = &a.keyword;
+                row[7] = &a.value_hex;
+                write_credman_csv_row(&mut o, &row);
             }
         }
     }
-    if !report.vault.is_empty() {
-        let _ = writeln!(o, "profile,sid,vault_guid,resource,identity,secret");
-        for v in &report.vault {
-            let _ = writeln!(
-                o,
-                "{},{},{},{},{},{}",
-                csv_escape(&v.profile),
-                csv_escape(&v.sid),
-                csv_escape(&v.vault_guid),
-                csv_escape(&v.cred.resource),
-                csv_escape(&v.cred.identity),
-                csv_escape(&v.cred.secret),
-            );
-        }
+    for v in &report.vault {
+        let mut row = [""; 15];
+        row[0] = "vault";
+        row[1] = &v.profile;
+        row[2] = &v.sid;
+        row[8] = &v.vault_guid;
+        row[9] = &v.cred.resource;
+        row[10] = &v.cred.identity;
+        row[11] = &v.cred.secret;
+        write_credman_csv_row(&mut o, &row);
     }
-    if !report.undecrypted.is_empty() {
-        let _ = writeln!(o, "profile,sid,file,reason");
-        for u in &report.undecrypted {
-            let _ = writeln!(
-                o,
-                "{},{},{},{}",
-                csv_escape(&u.profile),
-                csv_escape(&u.sid),
-                csv_escape(&u.file),
-                csv_escape(&u.reason),
-            );
-        }
+    for u in &report.undecrypted {
+        let mut row = [""; 15];
+        row[0] = "undecrypted";
+        row[1] = &u.profile;
+        row[2] = &u.sid;
+        row[12] = &u.file;
+        row[13] = &u.reason;
+        write_credman_csv_row(&mut o, &row);
     }
-    if !report.vault_notes.is_empty() {
-        let _ = writeln!(o, "vault_note");
-        for n in &report.vault_notes {
-            let _ = writeln!(o, "{}", csv_escape(n));
-        }
+    for n in &report.vault_notes {
+        let mut row = [""; 15];
+        row[0] = "note";
+        row[14] = n;
+        write_credman_csv_row(&mut o, &row);
     }
     o
+}
+
+#[cfg(feature = "sam")]
+fn write_credman_csv_row(out: &mut String, fields: &[&str]) {
+    use std::fmt::Write as _;
+    let row = fields
+        .iter()
+        .map(|field| csv_escape(field))
+        .collect::<Vec<_>>();
+    let _ = writeln!(out, "{}", row.join(","));
 }
 
 #[cfg(all(test, feature = "sam"))]
@@ -1835,7 +1910,62 @@ mod credman_csv_tests {
         });
         r.vault_notes.push("bob\\G: keys=2 vcrd=0/1".into());
         let out = credman_csv_string(&r, false);
-        assert!(out.contains("profile,sid,file,reason\nbob,S-1-5-21-1,\"C:\\x,y\",no key"));
-        assert!(out.contains("vault_note\nbob\\G: keys=2 vcrd=0/1"));
+        let mut lines = out.lines();
+        let header = lines.next().unwrap();
+        assert_eq!(csv_field_count(header), 15);
+        assert_eq!(lines.clone().count(), 2);
+        for line in lines {
+            assert_eq!(csv_field_count(line), 15, "{line}");
+        }
+        assert!(out.contains("undecrypted,bob,S-1-5-21-1,,,,,,,,,,\"C:\\x,y\",no key,"));
+        assert!(out.contains("note,,,,,,,,,,,,,,bob\\G: keys=2 vcrd=0/1"));
+    }
+
+    fn csv_field_count(line: &str) -> usize {
+        let mut fields = 1;
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        fields
+    }
+}
+
+#[cfg(all(test, feature = "ntds.dit"))]
+mod ntds_output_tests {
+    use super::*;
+
+    fn entry() -> vmkatz::ntds::AdHashEntry {
+        vmkatz::ntds::AdHashEntry {
+            username: "alice".into(),
+            domain: Some("corp.example".into()),
+            rid: 1104,
+            lm_hash: [0; 16],
+            nt_hash: [1; 16],
+            is_history: false,
+            history_index: None,
+        }
+    }
+
+    #[test]
+    fn domain_prefix_supports_auto_and_override() {
+        let e = entry();
+        assert_eq!(ntds_username(&e, None), "corp.example\\alice");
+        assert_eq!(ntds_username(&e, Some("CORP")), "CORP\\alice");
+        let mut history = e;
+        history.is_history = true;
+        history.history_index = Some(2);
+        assert_eq!(
+            ntds_username_with_history(&history, Some("CORP")),
+            "CORP\\alice_history2"
+        );
     }
 }

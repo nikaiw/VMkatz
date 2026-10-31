@@ -70,6 +70,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) ntds_history: bool,
 
+    /// Override the NTDS-derived username domain prefix (for example with a NetBIOS name)
+    #[cfg(feature = "ntds.dit")]
+    #[arg(long, value_name = "DOMAIN")]
+    pub(crate) ntds_domain_prefix: Option<String>,
+
     /// Disk image for pagefile.sys resolution (resolves paged-out memory from disk)
     #[cfg(feature = "sam")]
     #[arg(long, value_name = "DISK_IMAGE")]
@@ -124,8 +129,9 @@ pub(crate) struct Args {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
 
-    /// Show all logon sessions (disables deduplication and shows empty sessions).
-    /// On a disk/VMDK, also extract every secret type (SAM/LSA/DCC2 + NTDS + DPAPI).
+    /// Extract all supported secret categories from memory and disk inputs.
+    /// Keeps all logon sessions; on disks also scans SAM/LSA/DCC2, NTDS when present,
+    /// DPAPI, Credential Manager, Vault and browser data when built. Includes associated LSASS snapshots.
     #[arg(short, long, default_value_t = false)]
     pub(crate) all: bool,
 
@@ -215,6 +221,10 @@ pub(crate) struct Args {
     #[cfg(feature = "vmfs")]
     #[arg(long, value_name = "PATH")]
     pub(crate) vmdk: Option<String>,
+
+    /// Also extract LSASS secrets from memory snapshots associated with the selected VM/disk
+    #[arg(long, default_value_t = false)]
+    pub(crate) lsass: bool,
 
     /// List VMFS-6 devices and available flat VMDKs, then exit
     #[cfg(feature = "vmfs")]

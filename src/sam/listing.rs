@@ -23,9 +23,9 @@ pub enum ListOutcome {
 
 /// List `path` on the NTFS partition at `partition_offset`.
 ///
-/// A `DiskFormatError` from path navigation means the index is readable and the
-/// entry is absent (`PathNotFound`, no fallback). Any other failure, including
-/// NTFS bootstrap errors, falls back to the degraded MFT scan.
+/// A typed NTFS entry-not-found error means the index is readable and the path
+/// is absent (`PathNotFound`, no fallback). Other failures, including NTFS
+/// bootstrap errors, fall back to the degraded MFT scan.
 pub fn list_path<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -46,12 +46,12 @@ pub fn list_path<R: Read + Seek>(
     )
 }
 
-/// Decide how a navigation result is handled: `DiskFormatError` means the index
-/// works and the entry is absent (`PathNotFound`); any other error falls back.
+/// Decide how a navigation result is handled: a typed missing-entry error means
+/// the index works and the entry is absent; any other error falls back.
 fn classify_nav_error<T>(nav: Result<T>) -> std::result::Result<T, Result<ListOutcome>> {
     match nav {
         Ok(v) => Ok(v),
-        Err(VmkatzError::DiskFormatError(_)) => Err(Ok(ListOutcome::PathNotFound)),
+        Err(VmkatzError::NtfsEntryNotFound(_)) => Err(Ok(ListOutcome::PathNotFound)),
         Err(e) => Err(Err(e)),
     }
 }
@@ -114,7 +114,7 @@ mod tests {
         let mut r = volume();
         match list_path(&mut r, PART_OFF, "Users").unwrap() {
             ListOutcome::Listed { entries, degraded } => {
-                assert!(entries.is_empty());
+                assert_eq!(entries.len(), 0);
                 assert!(degraded);
             }
             other => panic!("unexpected {other:?}"),
@@ -122,8 +122,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_disk_format_error_is_path_not_found() {
-        let r = classify_nav_error::<()>(Err(VmkatzError::DiskFormatError("nf".into())));
+    fn classify_missing_entry_is_path_not_found() {
+        let r = classify_nav_error::<()>(Err(VmkatzError::NtfsEntryNotFound("Users".into())));
         assert!(matches!(r, Err(Ok(ListOutcome::PathNotFound))));
     }
 

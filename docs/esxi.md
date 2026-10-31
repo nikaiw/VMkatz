@@ -84,11 +84,19 @@ The output is designed as copy-pasteable command-line arguments. Filter to a spe
 # Single VM — extract NTDS.dit from a domain controller
 /tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --ntds
 
+# Also extract LSASS secrets from snapshots in the VM's datastore directory
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --lsass
+
+# Extract all supported secret categories from the VM's snapshots and disk
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --all
+
 # All VMs — auto-scan the entire datastore
 /tmp/vmkatz --vmfs-device /dev/disks/naa.xxx
 ```
 
 In auto-scan mode (no `--vmdk`), VMkatz discovers every flat VMDK on the device, checks each for NTFS partitions (skipping Linux/BSD VMs), and extracts credentials from all Windows VMs in a single pass. Non-Windows VMs are silently skipped.
+
+Add `--lsass` to also process VMware memory snapshots found beside the selected VMDK. The same option works with a standalone disk path when its VM folder contains the snapshots. Snapshots are associated by the VM directory; auto-scan processes each snapshot file once. VMFS-associated snapshots do not currently resolve paged-out credentials from a pagefile; standalone disk mode can use its pagefile when available.
 
 ### How it works
 

@@ -83,8 +83,10 @@ impl QemuElfLayer {
         }
 
         let e_phoff = u64_le(data, 32);
-        let e_phentsize = u16::from_le_bytes([data[54], data[55]]) as usize;
-        let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
+        let e_phentsize = usize::from(u16::from_le_bytes([data[54], data[55]]));
+        let e_phnum = usize::from(u16::from_le_bytes([data[56], data[57]]));
+        let e_phoff = usize::try_from(e_phoff)
+            .map_err(|_| VmkatzError::ElfError("ELF program header offset overflow".into()))?;
 
         if e_phentsize < ELF64_PHDR_SIZE {
             return Err(VmkatzError::ElfError(format!(
@@ -97,13 +99,25 @@ impl QemuElfLayer {
         let mut phys_end: u64 = 0;
 
         for i in 0..e_phnum {
-            let Some(off) = (e_phoff as usize).checked_add(i.saturating_mul(e_phentsize)) else {
-                break;
+            let Some(off) = i
+                .checked_mul(e_phentsize)
+                .and_then(|relative| e_phoff.checked_add(relative))
+            else {
+                return Err(VmkatzError::ElfError(
+                    "ELF program header table offset overflow".into(),
+                ));
             };
-            if off + ELF64_PHDR_SIZE > data.len() {
-                break;
+            let Some(end) = off.checked_add(ELF64_PHDR_SIZE) else {
+                return Err(VmkatzError::ElfError(
+                    "ELF program header range overflow".into(),
+                ));
+            };
+            if end > data.len() {
+                return Err(VmkatzError::ElfError(
+                    "ELF program header table extends beyond available headers".into(),
+                ));
             }
-            let ph = &data[off..off + ELF64_PHDR_SIZE];
+            let ph = &data[off..end];
 
             let p_type = u32_le(ph, 0);
             if p_type != PT_LOAD {
@@ -118,7 +132,17 @@ impl QemuElfLayer {
                 continue;
             }
 
-            let seg_end = p_paddr.saturating_add(p_filesz);
+            let seg_end = p_paddr.checked_add(p_filesz).ok_or_else(|| {
+                VmkatzError::ElfError("ELF physical segment range overflow".into())
+            })?;
+            let file_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or_else(|| VmkatzError::ElfError("ELF file segment range overflow".into()))?;
+            if file_end > mmap.len_u64() {
+                return Err(VmkatzError::ElfError(
+                    "ELF PT_LOAD segment extends beyond the file".into(),
+                ));
+            }
             if seg_end > phys_end {
                 phys_end = seg_end;
             }
@@ -140,7 +164,10 @@ impl QemuElfLayer {
         segments.sort_by_key(|s| s.gpa_start);
 
         // Align phys_end to page boundary
-        phys_end = (phys_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        phys_end = phys_end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or_else(|| VmkatzError::ElfError("ELF physical size overflow".into()))?
+            & !(PAGE_SIZE - 1);
 
         log::info!(
             "QEMU ELF: {} PT_LOAD segments, physical end: 0x{:x} ({} MB)",
@@ -168,7 +195,11 @@ impl QemuElfLayer {
             return None;
         }
         let seg = &self.segments[idx - 1];
-        if gpa < seg.gpa_start + seg.file_size {
+        if seg
+            .gpa_start
+            .checked_add(seg.file_size)
+            .is_some_and(|end| gpa < end)
+        {
             Some(seg)
         } else {
             None
@@ -178,7 +209,8 @@ impl QemuElfLayer {
 
 impl PhysicalMemory for QemuElfLayer {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<()> {
-        let len = buf.len() as u64;
+        let len = u64::try_from(buf.len())
+            .map_err(|_| VmkatzError::ElfError("Requested read length overflow".into()))?;
         if len == 0 {
             return Ok(());
         }
@@ -188,9 +220,11 @@ impl PhysicalMemory for QemuElfLayer {
             let offset_in_seg = phys_addr - seg.gpa_start;
             let avail = seg.file_size - offset_in_seg;
             if avail >= len {
-                let file_off = seg.file_offset + offset_in_seg;
-                let end = file_off + buf.len() as u64;
-                if end <= self.mmap.len() as u64 {
+                let file_off = seg.file_offset.checked_add(offset_in_seg);
+                let end = file_off.and_then(|off| off.checked_add(len));
+                if let (Some(file_off), Some(end)) = (file_off, end)
+                    && end <= self.mmap.len_u64()
+                {
                     self.mmap
                         .read_at(file_off, buf)
                         .map_err(|_| VmkatzError::UnmappablePhysical(phys_addr))?;
@@ -204,20 +238,29 @@ impl PhysicalMemory for QemuElfLayer {
         buf.fill(0);
         let mut pos = 0u64;
         while pos < len {
-            let cur_gpa = phys_addr + pos;
+            let cur_gpa = phys_addr
+                .checked_add(pos)
+                .ok_or(VmkatzError::UnmappablePhysical(phys_addr))?;
             if let Some(seg) = self.find_segment(cur_gpa) {
                 let offset_in_seg = cur_gpa - seg.gpa_start;
                 let avail = seg.file_size - offset_in_seg;
-                let to_copy = std::cmp::min(avail, len - pos) as usize;
-                let file_off = seg.file_offset + offset_in_seg;
-                let end = file_off + to_copy as u64;
-                if end <= self.mmap.len() as u64 {
-                    let dst_start = pos as usize;
+                let to_copy_u64 = std::cmp::min(avail, len - pos);
+                let to_copy = usize::try_from(to_copy_u64)
+                    .map_err(|_| VmkatzError::ElfError("Segment read length overflow".into()))?;
+                let file_off = seg.file_offset.checked_add(offset_in_seg);
+                let end = file_off.and_then(|off| off.checked_add(to_copy_u64));
+                if let (Some(file_off), Some(end)) = (file_off, end)
+                    && end <= self.mmap.len_u64()
+                {
+                    let dst_start = usize::try_from(pos)
+                        .map_err(|_| VmkatzError::ElfError("Buffer offset overflow".into()))?;
                     let _ = self
                         .mmap
                         .read_at(file_off, &mut buf[dst_start..dst_start + to_copy]);
                 }
-                pos += to_copy as u64;
+                pos = pos
+                    .checked_add(to_copy_u64)
+                    .ok_or(VmkatzError::UnmappablePhysical(cur_gpa))?;
             } else {
                 // Skip to next segment or end
                 let next_seg_start = self

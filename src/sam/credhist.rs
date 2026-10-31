@@ -60,7 +60,12 @@ fn take<'a>(b: &'a [u8], cur: &mut usize, n: usize) -> Result<&'a [u8]> {
 
 fn read_u32(b: &[u8], cur: &mut usize) -> Result<u32> {
     let s = take(b, cur, 4)?;
-    Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_usize(b: &[u8], cur: &mut usize, field: &str) -> Result<usize> {
+    usize::try_from(read_u32(b, cur)?)
+        .map_err(|_| err(&format!("credhist {field} does not fit this platform")))
 }
 
 /// One parsed (still encrypted) entry.
@@ -79,7 +84,14 @@ fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
     if file.len() < FOOTER_LEN {
         return Err(err("credhist too short"));
     }
-    let entries_len = u32::from_le_bytes(file[file.len() - 4..].try_into().unwrap()) as usize;
+    let footer_len = file.len() - 4;
+    let entries_len = usize::try_from(u32::from_le_bytes([
+        file[footer_len],
+        file[footer_len + 1],
+        file[footer_len + 2],
+        file[footer_len + 3],
+    ]))
+    .map_err(|_| err("credhist entries length does not fit this platform"))?;
     if entries_len > file.len() - FOOTER_LEN {
         return Err(err("credhist entries length out of range"));
     }
@@ -94,11 +106,13 @@ fn parse_entries(file: &[u8]) -> Result<Vec<Entry<'_>>> {
         read_u32(file, &mut cur)?; // revision
         let hash_alg = read_u32(file, &mut cur)?;
         let rounds = read_u32(file, &mut cur)?;
-        let sid_len = read_u32(file, &mut cur)? as usize;
+        let sid_len = read_usize(file, &mut cur, "SID length")?;
         let cipher_alg = read_u32(file, &mut cur)?;
-        let sha_len = read_u32(file, &mut cur)? as usize;
-        let nt_len = read_u32(file, &mut cur)? as usize;
-        let salt: [u8; 16] = take(file, &mut cur, 16)?.try_into().unwrap();
+        let sha_len = read_usize(file, &mut cur, "SHA length")?;
+        let nt_len = read_usize(file, &mut cur, "NT hash length")?;
+        let salt_bytes = take(file, &mut cur, 16)?;
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(salt_bytes);
         take(file, &mut cur, sid_len)?; // SID (binary); the caller already knows it
         if hash_alg != CALG_SHA_512 || cipher_alg != CALG_AES_256 {
             return Err(err("unsupported credhist algorithms"));

@@ -52,6 +52,37 @@ $ vmkatz --ntds dc-disk.qcow2
   ...
 ```
 
+Usernames are prefixed by default when the account SID matches a domain SID
+from the domain root and LDAP `crossRef` in `ntds.dit`. Accounts whose domain
+cannot be matched unambiguously remain unprefixed. Include password history with:
+
+```bash
+vmkatz --ntds --ntds-history dc-disk.qcow2
+```
+
+An explicit prefix (for example the NetBIOS name) overrides the NTDS mapping:
+
+```bash
+vmkatz --ntds --ntds-domain-prefix CORP dc-disk.qcow2
+```
+
+## Proxmox disk of a running VM
+
+On a Proxmox host, vmkatz accepts the VM's active LVM block device directly;
+the VM does not need to be stopped. The device is opened for reading, and
+vmkatz does not change the LV or block-device read/write state:
+
+```bash
+vmkatz --credman /dev/pve/vm-102-disk-0
+vmkatz --ntds --credman /dev/pve/vm-110-disk-1
+```
+
+The first command scans local SAM/LSA and Credential Manager data. The second
+also parses NTDS and supplies its account hashes to the DPAPI masterkey
+resolver. A running guest can update files during the scan, so the result is
+not an atomic point-in-time image; use a Proxmox snapshot when consistency is
+required.
+
 ## Pagefile resolution
 ```
 $ vmkatz --disk disk.vmdk snapshot.vmsn

@@ -84,7 +84,20 @@ impl<R: Read + Seek> Read for BitLockerReader<R> {
             let offset_in_sector = (current_pos % SECTOR_SIZE) as usize;
 
             // Read the full encrypted sector from the underlying reader
-            let disk_offset = self.partition_offset + sector_number * SECTOR_SIZE;
+            let disk_offset = self
+                .partition_offset
+                .checked_add(sector_number.checked_mul(SECTOR_SIZE).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "BitLocker sector offset overflow",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "BitLocker disk offset overflow",
+                    )
+                })?;
             self.inner.seek(SeekFrom::Start(disk_offset)).map_err(|e| {
                 io::Error::other(format!("BitLocker seek to sector {sector_number}: {e}"))
             })?;
@@ -117,7 +130,9 @@ impl<R: Read + Seek> Read for BitLockerReader<R> {
                 .copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + to_copy]);
 
             total_read += to_copy;
-            self.position += to_copy as u64;
+            self.position = self.position.checked_add(to_copy as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "BitLocker position overflow")
+            })?;
         }
 
         Ok(total_read)
@@ -134,19 +149,31 @@ impl<R: Read + Seek> Seek for BitLockerReader<R> {
                 self.position.checked_sub((-delta) as u64)
             }
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Seek position overflow"))?,
-            SeekFrom::End(_) => {
-                // We don't know the partition size easily, so pass through to inner.
-                // This is rarely used by NTFS parsers (they use SeekFrom::Start).
-                let abs = self.inner.seek(pos)?;
-                let relative = abs.saturating_sub(self.partition_offset);
-                self.position = relative;
-                return Ok(relative);
+            SeekFrom::End(delta) => {
+                let disk_end = self.inner.seek(SeekFrom::End(0))?;
+                let partition_end =
+                    disk_end.checked_sub(self.partition_offset).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Partition starts beyond disk end",
+                        )
+                    })?;
+                add_signed_offset(partition_end, delta)?
             }
         };
 
         self.position = new_position;
         Ok(new_position)
     }
+}
+
+fn add_signed_offset(base: u64, delta: i64) -> io::Result<u64> {
+    if delta >= 0 {
+        base.checked_add(delta as u64)
+    } else {
+        base.checked_sub(delta.unsigned_abs())
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Seek position overflow"))
 }
 
 /// Build the full AES-XTS key from a `BitLockerKey`.

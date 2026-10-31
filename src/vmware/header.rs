@@ -27,12 +27,12 @@ impl VmsnHeader {
                 "VMSN header too short",
             )));
         }
-        let magic = crate::utils::read_u32_le(data, 0).unwrap_or(0);
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if !VALID_MAGICS.contains(&magic) {
             return Err(VmkatzError::InvalidMagic(magic));
         }
-        let _reserved = crate::utils::read_u32_le(data, 4).unwrap_or(0);
-        let group_count = crate::utils::read_u32_le(data, 8).unwrap_or(0);
+        let _reserved = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let group_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         Ok(Self { magic, group_count })
     }
 }
@@ -46,8 +46,12 @@ impl VmsnGroup {
             .copied()
             .collect::<Vec<u8>>();
         let name = String::from_utf8_lossy(&name).to_string();
-        let offset = crate::utils::read_u64_le(data, 64).unwrap_or(0);
-        let size = crate::utils::read_u64_le(data, 72).unwrap_or(0);
+        let offset = u64::from_le_bytes([
+            data[64], data[65], data[66], data[67], data[68], data[69], data[70], data[71],
+        ]);
+        let size = u64::from_le_bytes([
+            data[72], data[73], data[74], data[75], data[76], data[77], data[78], data[79],
+        ]);
         Self { name, offset, size }
     }
 }
@@ -57,8 +61,11 @@ pub fn parse_vmsn(data: &[u8]) -> Result<(VmsnHeader, Vec<VmsnGroup>)> {
     let header = VmsnHeader::parse(data)?;
     // Cap allocation to prevent OOM from forged group_count
     let max_groups = (data.len() - HEADER_SIZE) / GROUP_SIZE;
-    let mut groups = Vec::with_capacity((header.group_count as usize).min(max_groups));
-    for i in 0..header.group_count as usize {
+    let group_count = usize::try_from(header.group_count)
+        .unwrap_or(usize::MAX)
+        .min(max_groups);
+    let mut groups = Vec::with_capacity(group_count);
+    for i in 0..group_count {
         let start = HEADER_SIZE + i * GROUP_SIZE;
         let end = start + GROUP_SIZE;
         if end > data.len() {

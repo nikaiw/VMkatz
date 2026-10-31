@@ -84,14 +84,23 @@ impl Minidump {
             return Err(VmkatzError::InvalidMagic(0));
         }
 
-        let signature = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
+        let signature = crate::utils::read_u32_le(&data, 0)
+            .ok_or_else(|| VmkatzError::DiskFormatError("Truncated minidump header".into()))?;
         if signature != MDMP_SIGNATURE {
             return Err(VmkatzError::InvalidMagic(signature));
         }
 
         // Header fields
-        let num_streams = crate::utils::read_u32_le(&data, 8).unwrap_or(0);
-        let stream_dir_rva = crate::utils::read_u32_le(&data, 12).unwrap_or(0) as usize;
+        let num_streams = usize::try_from(
+            crate::utils::read_u32_le(&data, 8)
+                .ok_or_else(|| VmkatzError::DiskFormatError("Truncated minidump header".into()))?,
+        )
+        .map_err(|_| VmkatzError::DiskFormatError("Minidump stream count overflow".into()))?;
+        let stream_dir_rva = usize::try_from(
+            crate::utils::read_u32_le(&data, 12)
+                .ok_or_else(|| VmkatzError::DiskFormatError("Truncated minidump header".into()))?,
+        )
+        .map_err(|_| VmkatzError::DiskFormatError("Minidump directory offset overflow".into()))?;
 
         let mut modules = Vec::new();
         let mut regions = Vec::new();
@@ -101,16 +110,35 @@ impl Minidump {
         let mut processor_arch = 9u16; // default AMD64
 
         // Parse stream directory
-        for i in 0..num_streams as usize {
-            let entry_off = stream_dir_rva + i * 12;
-            if entry_off + 12 > data.len() {
+        for i in 0..num_streams {
+            let Some(entry_off) = i
+                .checked_mul(12)
+                .and_then(|n| stream_dir_rva.checked_add(n))
+            else {
+                return Err(VmkatzError::DiskFormatError(
+                    "Minidump stream directory offset overflow".into(),
+                ));
+            };
+            let Some(entry_end) = entry_off.checked_add(12) else {
+                return Err(VmkatzError::DiskFormatError(
+                    "Minidump stream directory size overflow".into(),
+                ));
+            };
+            if entry_end > data.len() {
                 break;
             }
             let stream_type = u32_le_or0(&data, entry_off);
-            let stream_size = u32_le_or0(&data, entry_off + 4) as usize;
-            let stream_rva = u32_le_or0(&data, entry_off + 8) as usize;
+            let stream_size = usize::try_from(u32_le_or0(&data, entry_off + 4)).map_err(|_| {
+                VmkatzError::DiskFormatError("Minidump stream size overflow".into())
+            })?;
+            let stream_rva = usize::try_from(u32_le_or0(&data, entry_off + 8)).map_err(|_| {
+                VmkatzError::DiskFormatError("Minidump stream offset overflow".into())
+            })?;
 
-            if stream_rva + stream_size > data.len() {
+            if stream_rva
+                .checked_add(stream_size)
+                .is_none_or(|end| end > data.len())
+            {
                 log::warn!("Minidump stream {i} (type {stream_type}) extends past EOF, skipping");
                 continue;
             }
@@ -204,7 +232,12 @@ impl VirtualMemory for Minidump {
         let mut bytes_read = 0;
 
         while bytes_read < len {
-            let current_va = vaddr + bytes_read as u64;
+            let current_va =
+                vaddr
+                    .checked_add(u64::try_from(bytes_read).map_err(|_| {
+                        VmkatzError::PageFault(vaddr, "minidump-read-size-overflow")
+                    })?)
+                    .ok_or(VmkatzError::PageFault(vaddr, "minidump-address-overflow"))?;
             let (region, offset) = self
                 .find_region(current_va)
                 .ok_or(VmkatzError::PageFault(current_va, "minidump"))?;
@@ -212,16 +245,19 @@ impl VirtualMemory for Minidump {
             let Some(file_off) = region.file_offset.checked_add(offset) else {
                 return Err(VmkatzError::PageFault(current_va, "minidump-overflow"));
             };
-            let available = (region.size - offset) as usize;
-            let to_copy = (len - bytes_read).min(available);
-
-            let end = (file_off as usize).saturating_add(to_copy);
+            let file_off = usize::try_from(file_off)
+                .map_err(|_| VmkatzError::PageFault(current_va, "minidump-offset-overflow"))?;
+            let remaining = len - bytes_read;
+            let to_copy = usize::try_from(region.size - offset)
+                .map_or(remaining, |available| remaining.min(available));
+            let Some(end) = file_off.checked_add(to_copy) else {
+                return Err(VmkatzError::PageFault(current_va, "minidump-eof"));
+            };
             if end > self.data.len() {
                 return Err(VmkatzError::PageFault(current_va, "minidump-eof"));
             }
 
-            buf[bytes_read..bytes_read + to_copy]
-                .copy_from_slice(&self.data[file_off as usize..end]);
+            buf[bytes_read..bytes_read + to_copy].copy_from_slice(&self.data[file_off..end]);
             bytes_read += to_copy;
         }
 
@@ -234,7 +270,7 @@ impl VirtualMemory for Minidump {
 /// Parse MINIDUMP_MODULE_LIST (stream type 4).
 fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
     let mut modules = Vec::new();
-    if rva + 4 > data.len() {
+    if rva.checked_add(4).is_none_or(|end| end > data.len()) {
         return modules;
     }
 
@@ -250,7 +286,7 @@ fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
         let Some(off) = entries_start.checked_add(i.saturating_mul(108)) else {
             break;
         };
-        if off + 108 > data.len() {
+        if off.checked_add(108).is_none_or(|end| end > data.len()) {
             break;
         }
 
@@ -284,19 +320,26 @@ fn parse_module_list(data: &[u8], rva: usize) -> Vec<LoadedModule> {
 /// - NumberOfMemoryRanges: u64
 /// - BaseRva: u64 (file offset where the first memory region's data starts)
 /// - N * MINIDUMP_MEMORY_DESCRIPTOR64: (StartOfMemoryRange: u64, DataSize: u64)
-fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemRegion> {
+fn parse_memory64_list(data: &[u8], rva: usize, stream_size: usize) -> Vec<MemRegion> {
     let mut regions = Vec::new();
-    if rva + 16 > data.len() {
+    if rva.checked_add(16).is_none_or(|end| end > data.len()) || stream_size < 16 {
         return regions;
     }
 
-    let count = u64_le_or0(data, rva) as usize;
+    let Ok(count) = usize::try_from(u64_le_or0(data, rva)) else {
+        log::warn!("Memory64 region count does not fit this platform");
+        return regions;
+    };
     // Cap region count to prevent excessive iteration on malformed dumps
     if count > 1_000_000 {
         log::warn!("Memory64 region count {count} too large, capping");
         return regions;
     }
     let base_rva = u64_le_or0(data, rva + 8);
+    let Ok(data_len) = u64::try_from(data.len()) else {
+        log::warn!("Minidump length does not fit file offsets");
+        return regions;
+    };
 
     let descs_start = rva + 16;
     let mut current_file_offset = base_rva;
@@ -305,23 +348,30 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
         let Some(desc_off) = descs_start.checked_add(i.saturating_mul(16)) else {
             break;
         };
-        if desc_off + 16 > data.len() {
+        let Some(desc_end) = desc_off.checked_add(16) else {
+            break;
+        };
+        if desc_end > data.len()
+            || desc_end
+                .checked_sub(rva)
+                .is_none_or(|end| end > stream_size)
+        {
             break;
         }
 
         let start_va = u64_le_or0(data, desc_off);
         let size = u64_le_or0(data, desc_off + 8);
 
+        let next_file_offset = match current_file_offset.checked_add(size) {
+            Some(v) if v <= data_len => v,
+            None | Some(_) => break, // overflow or region extends past the dump
+        };
         regions.push(MemRegion {
             start_va,
             size,
             file_offset: current_file_offset,
         });
-
-        current_file_offset = match current_file_offset.checked_add(size) {
-            Some(v) => v,
-            None => break, // overflow — bail out
-        };
+        current_file_offset = next_file_offset;
     }
 
     regions
@@ -329,13 +379,20 @@ fn parse_memory64_list(data: &[u8], rva: usize, _stream_size: usize) -> Vec<MemR
 
 /// Read a MINIDUMP_STRING (Length: u32 in bytes, then UTF-16LE data).
 fn read_minidump_string(data: &[u8], rva: usize) -> String {
-    if rva + 4 > data.len() {
+    if rva.checked_add(4).is_none_or(|end| end > data.len()) {
         return String::new();
     }
-    let byte_len = u32_le_or0(data, rva) as usize;
-    let str_start = rva + 4;
-    if str_start + byte_len > data.len() || byte_len == 0 {
+    let Ok(byte_len) = usize::try_from(u32_le_or0(data, rva)) else {
+        return String::new();
+    };
+    let Some(str_start) = rva.checked_add(4) else {
+        return String::new();
+    };
+    let Some(str_end) = str_start.checked_add(byte_len) else {
+        return String::new();
+    };
+    if str_end > data.len() || byte_len == 0 {
         return String::new();
     }
-    crate::utils::utf16le_decode(&data[str_start..str_start + byte_len])
+    crate::utils::utf16le_decode(&data[str_start..str_end])
 }

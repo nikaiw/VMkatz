@@ -12,6 +12,16 @@ pub mod output;
 #[cfg(feature = "sam")]
 pub(crate) use args::is_block_dev;
 pub(crate) use args::{Args, RawFileType, detect_file_type};
+#[cfg(all(
+    feature = "sam",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
+pub(crate) use disk::run_associated_lsass_for_disk;
 #[cfg(feature = "ntds.dit")]
 pub(crate) use disk::run_raw_ntds;
 #[cfg(feature = "veeam")]

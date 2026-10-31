@@ -135,10 +135,15 @@ impl SecretTable {
                 user: self.dpapi_system_user,
             }];
         }
+        let sid_key = normalize_sid_key(sid);
         let name = profile.to_lowercase();
         let mut out: Vec<Secret<'_>> = Vec::new();
-        let pw_name = self.pw_by_name.get(&name).map_or(&[][..], Vec::as_slice);
-        for pw in self.pw_by_sid.get(sid).into_iter().chain(pw_name) {
+        let pw_name = self
+            .pw_by_name
+            .iter()
+            .filter(|(key, _)| secret_name_matches_profile(key, &name))
+            .flat_map(|(_, values)| values.iter());
+        for pw in self.pw_by_sid.get(&sid_key).into_iter().chain(pw_name) {
             if !out
                 .iter()
                 .any(|c| matches!(c, Secret::Password(p) if *p == pw.as_str()))
@@ -146,12 +151,16 @@ impl SecretTable {
                 out.push(Secret::Password(pw));
             }
         }
-        let nt_name = self.nt_by_name.get(&name).map_or(&[][..], Vec::as_slice);
+        let nt_name = self
+            .nt_by_name
+            .iter()
+            .filter(|(key, _)| secret_name_matches_profile(key, &name))
+            .flat_map(|(_, values)| values.iter());
         for h in self
             .domain_nt_by_sid
-            .get(sid)
+            .get(&sid_key)
             .into_iter()
-            .chain(self.local_nt_by_sid.get(sid))
+            .chain(self.local_nt_by_sid.get(&sid_key))
             .chain(nt_name)
         {
             if !out.iter().any(|c| matches!(c, Secret::Nt(x) if x == h)) {
@@ -175,6 +184,37 @@ impl SecretTable {
     }
 }
 
+fn normalize_sid_key(sid: &str) -> String {
+    sid.to_ascii_uppercase()
+}
+
+/// Match an unresolved secret identity to Windows profile directory names.
+/// Domain profiles commonly use `user.DOMAIN[.NNN]`; preserve an explicit
+/// `DOMAIN\\user` qualifier when supplied. An unqualified name remains a
+/// candidate for suffixed profile names because DPAPI's SID-bound integrity
+/// check still decides whether the secret belongs to that profile.
+fn secret_name_matches_profile(secret_name: &str, profile: &str) -> bool {
+    let normalized = secret_name.to_lowercase();
+    let (base, domain) = match normalized.rsplit_once('\\') {
+        Some((domain, user)) if !domain.is_empty() && !user.is_empty() => {
+            (format!("{user}.{domain}"), true)
+        }
+        _ => (normalized, false),
+    };
+    if profile == base {
+        return true;
+    }
+    let Some(suffix) = profile.strip_prefix(&base) else {
+        return false;
+    };
+    let Some(number) = suffix.strip_prefix('.') else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && (domain || number.len() == 3)
+}
+
 /// Strip the trailing RID from a user SID, yielding the account-domain SID.
 pub fn machine_sid_from_user_sid(user_sid: &str) -> Option<&str> {
     user_sid.rsplit_once('-').map(|(p, _)| p)
@@ -196,8 +236,10 @@ pub fn build_secret_table(
         for e in &disk_secrets.sam_entries {
             // An all-zero hash means no hash was recovered for the account.
             if e.nt_hash != [0u8; 16] {
-                t.local_nt_by_sid
-                    .insert(format!("{machine_sid}-{}", e.rid), e.nt_hash);
+                t.local_nt_by_sid.insert(
+                    normalize_sid_key(&format!("{machine_sid}-{}", e.rid)),
+                    e.nt_hash,
+                );
             }
         }
     }
@@ -213,10 +255,10 @@ pub fn build_secret_table(
         }
     }
     for (sid, h) in domain_nthashes {
-        t.domain_nt_by_sid.insert(sid.clone(), *h);
+        t.domain_nt_by_sid.insert(normalize_sid_key(sid), *h);
     }
     for (sid, pw) in passwords {
-        t.pw_by_sid.insert(sid.clone(), pw.clone());
+        t.pw_by_sid.insert(normalize_sid_key(sid), pw.clone());
     }
     t
 }
@@ -225,13 +267,19 @@ pub fn build_secret_table(
 /// return the inner DPAPI blob bytes.
 fn credential_file_blob(file: &[u8]) -> Result<&[u8]> {
     const HDR: usize = 12;
-    let size = file
+    let size_bytes = file
         .get(4..8)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
         .filter(|_| file.len() >= HDR)
         .ok_or_else(|| {
             crate::error::VmkatzError::Parse("CredentialFile header truncated".into())
         })?;
+    let size = usize::try_from(u32::from_le_bytes([
+        size_bytes[0],
+        size_bytes[1],
+        size_bytes[2],
+        size_bytes[3],
+    ]))
+    .map_err(|_| crate::error::VmkatzError::Parse("CredentialFile size overflow".into()))?;
     let end = HDR
         .checked_add(size)
         .filter(|&e| e <= file.len())
@@ -250,6 +298,10 @@ fn is_sid_dir_name(name: &str) -> bool {
         && name
             .get(..4)
             .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
+}
+
+const fn is_missing_directory(error: &crate::error::VmkatzError) -> bool {
+    matches!(error, crate::error::VmkatzError::NtfsEntryNotFound(_))
 }
 
 /// A directory holding masterkey files for `sid`.
@@ -331,9 +383,32 @@ fn filter_cap<T>(
 impl<R: Read + Seek> Walker<'_, '_, R> {
     /// List a directory (uncapped: callers filter first, then `filter_cap`);
     /// `None` if it does not exist.
-    fn list(&mut self, path: &str) -> Option<Vec<(String, bool)>> {
-        let dir = crate::fs::navigate_to_dir(self.ntfs, self.root, self.rd, path).ok()?;
-        crate::fs::list_directory(self.ntfs, &dir, self.rd).ok()
+    fn list(&mut self, path: &str) -> Result<Option<Vec<(String, bool)>>> {
+        let dir = match crate::fs::navigate_to_dir(self.ntfs, self.root, self.rd, path) {
+            Ok(dir) => dir,
+            Err(e) if is_missing_directory(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        crate::fs::list_directory(self.ntfs, &dir, self.rd).map(Some)
+    }
+
+    fn record_directory_error(
+        profile: &Profile,
+        path: &str,
+        error: impl std::fmt::Display,
+        report: &mut CredmanReport,
+    ) {
+        let sid = profile
+            .protect
+            .first()
+            .map(|p| p.sid.clone())
+            .unwrap_or_default();
+        report.undecrypted.push(Undecrypted {
+            profile: profile.name.clone(),
+            sid,
+            file: path.to_string(),
+            reason: format!("directory listing failed: {error}"),
+        });
     }
 
     /// Read a file by directory path + name, refusing oversized files.
@@ -356,7 +431,14 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     /// Masterkey folders under `<base>\AppData\Roaming\Microsoft\Protect`.
     fn user_protect_dirs(&mut self, base: &str, notes: &mut Vec<String>) -> Vec<ProtectDir> {
         let root = format!("{base}\\AppData\\Roaming\\Microsoft\\Protect");
-        let dirs = self.list(&root).unwrap_or_default();
+        let dirs = match self.list(&root) {
+            Ok(Some(dirs)) => dirs,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                notes.push(format!("{root}: directory listing failed: {e}"));
+                return Vec::new();
+            }
+        };
         filter_cap(
             dirs,
             |(n, is_dir)| *is_dir && is_sid_dir_name(n),
@@ -401,7 +483,14 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     fn profiles(&mut self, notes: &mut Vec<String>) -> Vec<Profile> {
         let mut out = vec![Self::system_profile()];
         for (parent, skip_builtin) in [("Users", true), ("Windows\\ServiceProfiles", false)] {
-            let all = self.list(parent).unwrap_or_default();
+            let all = match self.list(parent) {
+                Ok(Some(all)) => all,
+                Ok(None) => continue,
+                Err(e) => {
+                    notes.push(format!("{parent}: profile listing failed: {e}"));
+                    continue;
+                }
+            };
             let names = filter_cap(
                 all,
                 |(name, is_dir)| {
@@ -516,8 +605,13 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
 
     fn scan_profile(&mut self, prof: &Profile, report: &mut CredmanReport) {
         for dir in &prof.cred_dirs {
-            let Some(all) = self.list(dir) else {
-                continue;
+            let all = match self.list(dir) {
+                Ok(Some(all)) => all,
+                Ok(None) => continue,
+                Err(e) => {
+                    Self::record_directory_error(prof, dir, e, report);
+                    continue;
+                }
             };
             let files = filter_cap(
                 all,
@@ -549,8 +643,13 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
     /// Failures go to `undecrypted`; nothing here aborts the walk.
     fn scan_vaults(&mut self, prof: &Profile, report: &mut CredmanReport) {
         for root in &prof.vault_roots {
-            let Some(all) = self.list(root) else {
-                continue;
+            let all = match self.list(root) {
+                Ok(Some(all)) => all,
+                Ok(None) => continue,
+                Err(e) => {
+                    Self::record_directory_error(prof, root, e, report);
+                    continue;
+                }
             };
             let dirs = filter_cap(
                 all,
@@ -561,7 +660,14 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
             );
             for (guid, _) in dirs {
                 let dir = format!("{root}\\{guid}");
-                let all = self.list(&dir).unwrap_or_default();
+                let all = match self.list(&dir) {
+                    Ok(Some(all)) => all,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        Self::record_directory_error(prof, &dir, e, report);
+                        continue;
+                    }
+                };
                 let vcrds: Vec<String> = filter_cap(
                     all,
                     |(n, d)| !*d && n.to_lowercase().ends_with(".vcrd"),
@@ -720,10 +826,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
     partition: Option<u64>,
     secrets: &SecretTable,
 ) -> Result<CredmanReport> {
-    let parts = crate::fs::select_partition(
-        crate::fs::find_ntfs_partitions(reader).unwrap_or_default(),
-        partition,
-    )?;
+    let parts = crate::fs::select_partition(crate::fs::find_ntfs_partitions(reader)?, partition)?;
     let mut report = CredmanReport::default();
     for &off in &parts {
         if crate::fs::is_bitlocker_partition(reader, off) {
@@ -756,6 +859,7 @@ pub fn extract_credman_from_reader_scoped<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sam::dpapi_masterkey::fixture_mk_file;
     use crate::sam::{DiskSecrets, SamEntry};
 
     fn disk_secrets_fixture() -> DiskSecrets {
@@ -806,6 +910,49 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_domain_secret_matches_qualified_profile_name() {
+        let mut t = SecretTable::default();
+        let sid = "S-1-5-21-1-2-3-1101";
+        let hash = [0x42; 16];
+        t.nt_by_name.insert("lab\\alice".into(), vec![hash]);
+
+        let candidate = t.candidates(sid, "Alice.LAB");
+        assert!(matches!(candidate.as_slice(), [Secret::Nt(h)] if *h == hash));
+        let suffixed = t.candidates(sid, "Alice.LAB.001");
+        assert!(matches!(suffixed.as_slice(), [Secret::Nt(h)] if *h == hash));
+        assert!(t.candidates(sid, "Alice.OTHER").is_empty());
+
+        let mk = [0x5Au8; 64];
+        let file = fixture_mk_file(&prekey_from_hash(&hash, sid).unwrap(), &mk);
+        assert_eq!(unlock(&t, sid, "Alice.LAB.001", &file).unwrap(), mk);
+    }
+
+    #[test]
+    fn unqualified_secret_matches_only_numeric_profile_collision_suffix() {
+        let mut t = SecretTable::default();
+        t.pw_by_name.insert("alice".into(), vec!["P@ss".into()]);
+        assert_eq!(t.candidates("S-1-5-21-1-2-3-1101", "Alice.001").len(), 1);
+        assert!(t.candidates("S-1-5-21-1-2-3-1101", "Alice.LAB").is_empty());
+    }
+
+    #[test]
+    fn secret_sid_lookup_is_case_insensitive() {
+        let sid = "S-1-5-21-1-2-3-1101";
+        let lower_sid = sid.to_ascii_lowercase();
+        let t = build_secret_table(
+            &DiskSecrets::default(),
+            &[],
+            None,
+            &[(lower_sid.clone(), [0x42; 16])],
+            &[(lower_sid, "P@ss".into())],
+        );
+        let candidates = t.candidates(sid, "alice");
+        assert!(
+            matches!(candidates.as_slice(), [Secret::Password("P@ss"), Secret::Nt(h)] if *h == [0x42; 16])
+        );
+    }
+
+    #[test]
     fn sid_dir_name_filter_no_panic_on_multibyte() {
         assert!(is_sid_dir_name("S-1-5-21-1-2-3-1001"));
         assert!(is_sid_dir_name("s-1-5-18"));
@@ -813,6 +960,21 @@ mod tests {
         assert!(!is_sid_dir_name("a\u{e9}\u{e9}\u{e9}xyz"));
         assert!(!is_sid_dir_name("S-1\u{e9}-5"));
         assert!(!is_sid_dir_name("S-1-"));
+    }
+
+    #[test]
+    fn only_missing_ntfs_paths_are_treated_as_optional() {
+        assert!(is_missing_directory(
+            &crate::error::VmkatzError::NtfsEntryNotFound("Users".into())
+        ));
+        assert!(!is_missing_directory(
+            &crate::error::VmkatzError::DiskFormatError(
+                "Directory index error: checksum failure".into()
+            )
+        ));
+        assert!(!is_missing_directory(&crate::error::VmkatzError::Io(
+            std::io::Error::other("device error")
+        )));
     }
 
     #[test]
@@ -870,7 +1032,7 @@ mod tests {
         let mut quiet = Vec::new();
         let kept = filter_cap(items, |(_, d)| *d, 5, "dir", &mut quiet);
         assert_eq!(kept.len(), 5);
-        assert!(quiet.is_empty());
+        assert_eq!(quiet.len(), 0);
     }
 
     #[test]
@@ -980,7 +1142,7 @@ mod tests {
         let c = t.candidates(SYSTEM_SID, "SYSTEM");
         assert_eq!(c.len(), 1);
         assert!(c[0].is_system());
-        assert!(t.start_prekeys(SYSTEM_SID, "SYSTEM").is_empty());
+        assert_eq!(t.start_prekeys(SYSTEM_SID, "SYSTEM").len(), 0);
     }
 
     #[test]

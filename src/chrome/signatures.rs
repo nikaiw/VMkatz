@@ -63,6 +63,6 @@ mod tests {
 
     #[test]
     fn scan_no_match() {
-        assert!(scan(b"hello", &[Some(b'z')]).is_empty());
+        assert_eq!(scan(b"hello", &[Some(b'z')]).len(), 0);
     }
 }

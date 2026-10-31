@@ -31,6 +31,7 @@ const VMRS_MAGIC: u32 = 0x01282014;
 const HEADER_SIZE: usize = 46;
 const BACKUP_HEADER_OFFSET: u64 = 4096;
 const RAM_BLOCK_SIZE: usize = 0x100000; // 1 MB
+const MAX_KEY_TABLE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Cap on RAM blocks the scan may keep decompressed to warm the reassembly cache
 /// (≈ this many MiB). Bounds peak memory on large guests; the measured hive
@@ -41,6 +42,14 @@ const WARM_CACHE_BLOCKS: usize = 3072; // ~3 GiB
 /// is remapped above 4 GB. Applied only when total RAM exceeds the gap base.
 const MMIO_GAP_BASE: u64 = 0xF800_0000;
 const MMIO_GAP_END: u64 = 0x1_0000_0000;
+
+fn advance_address(address: u64, byte_count: usize) -> Result<u64> {
+    let byte_count =
+        u64::try_from(byte_count).map_err(|_| VmkatzError::UnmappablePhysical(address))?;
+    address
+        .checked_add(byte_count)
+        .ok_or(VmkatzError::UnmappablePhysical(address))
+}
 
 /// RamBlock reference sweep: scan chunk size and the overlap padding that keeps
 /// each entry (21-byte header + name + 12-byte reference) within one buffer.
@@ -147,30 +156,42 @@ impl BlockCache {
 
     /// Unlink node `k` from the LRU list (leaves it in `map`).
     fn detach(&mut self, k: u64) {
-        let (newer, older) = {
-            let n = &self.map[&k];
-            (n.newer, n.older)
+        let Some(n) = self.map.get(&k) else {
+            return;
         };
+        let (newer, older) = (n.newer, n.older);
         match newer {
-            Some(x) => self.map.get_mut(&x).unwrap().older = older,
+            Some(x) => {
+                if let Some(node) = self.map.get_mut(&x) {
+                    node.older = older;
+                }
+            }
             None => self.head = older,
         }
         match older {
-            Some(x) => self.map.get_mut(&x).unwrap().newer = newer,
+            Some(x) => {
+                if let Some(node) = self.map.get_mut(&x) {
+                    node.newer = newer;
+                }
+            }
             None => self.tail = newer,
         }
     }
 
     /// Link node `k` (already in `map`) at the head (most-recently used).
     fn push_front(&mut self, k: u64) {
+        if !self.map.contains_key(&k) {
+            return;
+        }
         let old_head = self.head;
-        {
-            let n = self.map.get_mut(&k).unwrap();
+        if let Some(n) = self.map.get_mut(&k) {
             n.newer = None;
             n.older = old_head;
         }
         if let Some(h) = old_head {
-            self.map.get_mut(&h).unwrap().newer = Some(k);
+            if let Some(node) = self.map.get_mut(&h) {
+                node.newer = Some(k);
+            }
         }
         self.head = Some(k);
         if self.tail.is_none() {
@@ -187,7 +208,7 @@ impl BlockCache {
             self.detach(k);
             self.push_front(k);
         }
-        Some(self.map.get(&k).unwrap().data.as_slice())
+        self.map.get(&k).map(|node| node.data.as_slice())
     }
 
     fn evict_to_limit(&mut self) {
@@ -273,7 +294,7 @@ impl VmrsLayer {
         layer.parse_data_region()?;
 
         // Determine RAM layout
-        layer.build_memory_layout();
+        layer.build_memory_layout()?;
 
         log::info!(
             "VMRS: {} RAM blocks, {} memory chunks, {:.0} MB physical",
@@ -433,10 +454,20 @@ impl VmrsLayer {
         let mut start = 0u64;
         while start < file_size {
             let lo = start.saturating_sub(SWEEP_PAD as u64);
-            let hi = (start + SWEEP_CHUNK as u64 + SWEEP_PAD as u64).min(file_size);
-            let buf = self.read_file_bytes(lo, (hi - lo) as usize)?;
-            let core_begin = (start - lo) as usize;
-            let core_end = ((start + SWEEP_CHUNK as u64).min(file_size) - lo) as usize;
+            let core_end_file = start + (file_size - start).min(SWEEP_CHUNK as u64);
+            let hi = core_end_file
+                .saturating_add(SWEEP_PAD as u64)
+                .min(file_size);
+            let read_len = usize::try_from(hi - lo).map_err(|_| {
+                VmkatzError::DiskFormatError("VMRS sweep window does not fit memory".into())
+            })?;
+            let buf = self.read_file_bytes(lo, read_len)?;
+            let core_begin = usize::try_from(start - lo).map_err(|_| {
+                VmkatzError::DiskFormatError("VMRS sweep offset does not fit memory".into())
+            })?;
+            let core_end = usize::try_from(core_end_file - lo).map_err(|_| {
+                VmkatzError::DiskFormatError("VMRS sweep end does not fit memory".into())
+            })?;
 
             for m in finder.find_iter(&buf) {
                 // Only own matches whose name starts in this chunk's core.
@@ -478,9 +509,11 @@ impl VmrsLayer {
                 let size = u32_le(&buf, ref_off);
                 let file_offset = u64_le(&buf, ref_off + 4);
                 if size == 0
-                    || size as usize > RAM_BLOCK_SIZE
+                    || size > RAM_BLOCK_SIZE as u32
                     || file_offset == 0
-                    || file_offset + u64::from(size) > file_size
+                    || file_offset
+                        .checked_add(u64::from(size))
+                        .is_none_or(|end| end > file_size)
                 {
                     continue;
                 }
@@ -489,7 +522,7 @@ impl VmrsLayer {
                     .or_insert((file_offset, size));
             }
 
-            start += SWEEP_CHUNK as u64;
+            start = core_end_file;
         }
 
         log::info!(
@@ -509,9 +542,22 @@ impl VmrsLayer {
     /// entries pass CRC, then collect every entry. The 32-bit per-entry CRC makes
     /// false positives negligible.
     fn scan_object_tables(&mut self) -> Result<()> {
-        let region =
-            self.read_file_bytes(self.header.data_offset, self.header.data_size as usize)?;
-        let n = region.len();
+        const MAX_ENTRIES: usize = 100_000;
+        const MAX_TABLE_SIZE: usize = 8 + MAX_ENTRIES * 18;
+        const SCAN_CHUNK: u64 = 32 * 1024 * 1024;
+
+        let mut file = self.inner.borrow_mut();
+        let file_size = crate::utils::file_size(&mut file.file)?;
+        let data_end = self
+            .header
+            .data_offset
+            .checked_add(self.header.data_size)
+            .filter(|&end| end <= file_size)
+            .ok_or_else(|| {
+                VmkatzError::DiskFormatError("VMRS data region extends beyond the file".into())
+            })?;
+        drop(file);
+
         let entry_crc_ok = |e: &[u8]| -> bool {
             let stored = u32_le(e, 1);
             if stored == 0 {
@@ -524,38 +570,85 @@ impl VmrsLayer {
         };
 
         let mut tables = 0usize;
-        let mut off = 0usize;
-        while off + 8 <= n {
-            let count = u32_le(&region, off + 4) as usize;
-            if count == 0 || count > 100_000 || off + 8 + count * 18 > n {
-                off += 1;
-                continue;
-            }
-            // Confirm this is a real table header: first up-to-8 entries must pass CRC.
-            let probe = count.min(8);
-            let base = off + 8;
-            let ok = (0..probe).all(|i| entry_crc_ok(&region[base + i * 18..base + (i + 1) * 18]));
-            if !ok {
-                off += 1;
-                continue;
-            }
-            for i in 0..count {
-                let e = &region[base + i * 18..base + (i + 1) * 18];
-                let entry = ObjectTableEntry {
-                    entry_type: e[0],
-                    crc32: u32_le(e, 1),
-                    file_offset: u64_le(e, 5),
-                    size: u32_le(e, 13),
-                    flags: e[17],
+        let mut core_start = self.header.data_offset;
+        let mut skip_until = core_start;
+        while core_start < data_end {
+            let core_end = core_start + (data_end - core_start).min(SCAN_CHUNK);
+            let window_end = core_end.saturating_add(MAX_TABLE_SIZE as u64).min(data_end);
+            let window_size = usize::try_from(window_end - core_start).map_err(|_| {
+                VmkatzError::DiskFormatError("VMRS scan window does not fit memory".into())
+            })?;
+            let region = self.read_file_bytes(core_start, window_size)?;
+            let core_len = usize::try_from(core_end - core_start).map_err(|_| {
+                VmkatzError::DiskFormatError("VMRS scan chunk does not fit memory".into())
+            })?;
+            let mut off = usize::try_from(skip_until.saturating_sub(core_start))
+                .unwrap_or(usize::MAX)
+                .min(core_len);
+
+            while off < core_len {
+                let Some(header_end) = off.checked_add(8) else {
+                    break;
                 };
-                // Skip empty slots: KeyTable reference indices count only populated
-                // entries (matches how the root ObjectTable is enumerated).
-                if entry.entry_type != 0 || entry.file_offset != 0 || entry.size != 0 {
-                    self.object_entries.push(entry);
+                if header_end > region.len() {
+                    break;
                 }
+                let count = usize::try_from(u32_le(&region, off + 4)).unwrap_or(usize::MAX);
+                let Some(table_size) = count.checked_mul(18).and_then(|size| size.checked_add(8))
+                else {
+                    off += 1;
+                    continue;
+                };
+                let Some(table_end) = off.checked_add(table_size) else {
+                    off += 1;
+                    continue;
+                };
+                if count == 0
+                    || count > MAX_ENTRIES
+                    || table_size > MAX_TABLE_SIZE
+                    || table_end > region.len()
+                {
+                    off += 1;
+                    continue;
+                }
+
+                // Confirm this is a real table header: first up-to-8 entries pass CRC.
+                let probe = count.min(8);
+                let base = off + 8;
+                let ok = (0..probe).all(|i| {
+                    let entry_start = base + i * 18;
+                    entry_crc_ok(&region[entry_start..entry_start + 18])
+                });
+                if !ok {
+                    off += 1;
+                    continue;
+                }
+
+                for i in 0..count {
+                    let entry_start = base + i * 18;
+                    let e = &region[entry_start..entry_start + 18];
+                    let entry = ObjectTableEntry {
+                        entry_type: e[0],
+                        crc32: u32_le(e, 1),
+                        file_offset: u64_le(e, 5),
+                        size: u32_le(e, 13),
+                        flags: e[17],
+                    };
+                    // Empty slots don't count when resolving KeyTable references.
+                    if entry.entry_type != 0 || entry.file_offset != 0 || entry.size != 0 {
+                        self.object_entries.push(entry);
+                    }
+                }
+                tables += 1;
+                let table_end_abs = u64::try_from(table_end).map_err(|_| {
+                    VmkatzError::DiskFormatError("VMRS ObjectTable size overflow".into())
+                })?;
+                skip_until = core_start.checked_add(table_end_abs).ok_or_else(|| {
+                    VmkatzError::DiskFormatError("VMRS ObjectTable offset overflow".into())
+                })?;
+                off = table_end;
             }
-            tables += 1;
-            off = base + count * 18;
+            core_start = core_end;
         }
 
         log::info!(
@@ -584,7 +677,9 @@ impl VmrsLayer {
         log::debug!("VMRS: ObjectTable at {offset:#x} with {entry_count} entries");
 
         // Read entries (18 bytes each)
-        let entries_size = entry_count * 18;
+        let entries_size = entry_count.checked_mul(18).ok_or_else(|| {
+            VmkatzError::DiskFormatError("VMRS ObjectTable entry size overflow".into())
+        })?;
         let mut entries_buf = vec![0u8; entries_size];
         inner.file.read_exact(&mut entries_buf)?;
 
@@ -654,7 +749,16 @@ impl VmrsLayer {
 
     /// Parse a single KeyTable and extract key-value mappings.
     fn parse_single_key_table(&mut self, entry: &ObjectTableEntry) -> Result<()> {
-        let data = self.read_file_bytes(entry.file_offset, entry.size as usize)?;
+        if entry.size > MAX_KEY_TABLE_SIZE {
+            return Err(VmkatzError::DiskFormatError(format!(
+                "VMRS KeyTable is too large: {} bytes",
+                entry.size
+            )));
+        }
+        let size = usize::try_from(entry.size).map_err(|_| {
+            VmkatzError::DiskFormatError("VMRS KeyTable size does not fit memory".into())
+        })?;
+        let data = self.read_file_bytes(entry.file_offset, size)?;
         if data.len() < 10 {
             return Ok(());
         }
@@ -797,8 +901,22 @@ impl VmrsLayer {
                 if child_obj_ref > 0 {
                     // Try to find and parse the child key table
                     if let Some(child_entry) = self.find_object_entry(child_obj_ref) {
-                        let child_data = self
-                            .read_file_bytes(child_entry.file_offset, child_entry.size as usize);
+                        let child_data = if child_entry.size <= MAX_KEY_TABLE_SIZE {
+                            usize::try_from(child_entry.size)
+                                .map_err(|_| {
+                                    VmkatzError::DiskFormatError(
+                                        "VMRS child KeyTable size does not fit memory".into(),
+                                    )
+                                })
+                                .and_then(|size| {
+                                    self.read_file_bytes(child_entry.file_offset, size)
+                                })
+                        } else {
+                            Err(VmkatzError::DiskFormatError(format!(
+                                "VMRS child KeyTable is too large: {} bytes",
+                                child_entry.size
+                            )))
+                        };
                         if let Ok(child_data) = child_data {
                             self.walk_key_entries(
                                 &child_data,
@@ -885,15 +1003,7 @@ impl VmrsLayer {
     }
 
     /// Build the memory layout from parsed keys.
-    fn build_memory_layout(&mut self) {
-        // Determine the key path prefix based on version
-        let prefix = if self.header.version > 0x500 {
-            "/savedstate/"
-        } else {
-            "" // Legacy format, prefix varies
-        };
-
-        let _ = prefix;
+    fn build_memory_layout(&mut self) -> Result<()> {
         // RamBlock<N> keys are sparse (gaps for never-touched RAM), so the guest's
         // physical extent is (max index + 1) * 1MB — NOT the key count. Using the
         // count truncates high memory (e.g. kernel pool above the count), which made
@@ -930,11 +1040,18 @@ impl VmrsLayer {
         // Physical extent spans block 0 .. max_block inclusive.
         let pages_per_block = (RAM_BLOCK_SIZE / 4096) as u64;
         if block_count > 0 {
-            let blocks_extent = max_block + 1;
-            let ram_size = blocks_extent * RAM_BLOCK_SIZE as u64;
+            let blocks_extent = max_block.checked_add(1).ok_or_else(|| {
+                VmkatzError::DiskFormatError("VMRS RamBlock index overflow".into())
+            })?;
+            let ram_size = blocks_extent
+                .checked_mul(RAM_BLOCK_SIZE as u64)
+                .ok_or_else(|| VmkatzError::DiskFormatError("VMRS RAM size overflow".into()))?;
+            let page_count = blocks_extent.checked_mul(pages_per_block).ok_or_else(|| {
+                VmkatzError::DiskFormatError("VMRS RAM page count overflow".into())
+            })?;
             self.memory_chunks.push(GpaMemoryChunk {
                 start_page_index: 0,
-                page_count: blocks_extent * pages_per_block,
+                page_count,
             });
 
             // RamBlock indices are contiguous RAM offsets, but a Hyper-V guest's
@@ -958,7 +1075,12 @@ impl VmrsLayer {
                 self.mmio_gap_base = MMIO_GAP_END - gap_size;
                 self.mmio_gap_size = gap_size;
                 // GPA span = 4 GB + (RAM remapped above 4 GB).
-                self.phys_size = MMIO_GAP_END + (ram_size - self.mmio_gap_base);
+                self.phys_size = ram_size
+                    .checked_sub(self.mmio_gap_base)
+                    .and_then(|above_gap| MMIO_GAP_END.checked_add(above_gap))
+                    .ok_or_else(|| {
+                        VmkatzError::DiskFormatError("VMRS physical address range overflow".into())
+                    })?;
             } else {
                 self.phys_size = ram_size;
             }
@@ -970,6 +1092,7 @@ impl VmrsLayer {
                 self.phys_size / (1024 * 1024)
             );
         }
+        Ok(())
     }
 
     /// Derive the low MMIO gap size from the guest's page tables, generation-agnostic.
@@ -1067,7 +1190,9 @@ impl VmrsLayer {
         if self.mmio_gap_size == 0 || gpa < self.mmio_gap_base {
             return Some(gpa);
         }
-        let gap_end = self.mmio_gap_base + self.mmio_gap_size;
+        let Some(gap_end) = self.mmio_gap_base.checked_add(self.mmio_gap_size) else {
+            return None;
+        };
         if gpa < gap_end {
             return None; // inside the MMIO gap
         }
@@ -1078,14 +1203,13 @@ impl VmrsLayer {
     /// as far as the file actually provides, so a bogus huge `size` from a header
     /// field can't force a giant eager allocation.
     fn read_file_bytes(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        let read_limit = u64::try_from(size).map_err(|_| {
+            VmkatzError::DiskFormatError("VMRS read size does not fit file offsets".into())
+        })?;
         let mut inner = self.inner.borrow_mut();
         inner.file.seek(SeekFrom::Start(offset))?;
         let mut buf = Vec::new();
-        inner
-            .file
-            .by_ref()
-            .take(size as u64)
-            .read_to_end(&mut buf)?;
+        inner.file.by_ref().take(read_limit).read_to_end(&mut buf)?;
         if buf.len() != size {
             return Err(VmkatzError::DiskFormatError(format!(
                 "VMRS read past end: wanted {size} bytes at {offset:#x}, got {}",
@@ -1122,7 +1246,7 @@ impl VmrsLayer {
                 .iter()
                 .filter(|e| {
                     e.size > 0
-                        && e.size as usize <= RAM_BLOCK_SIZE
+                        && e.size <= RAM_BLOCK_SIZE as u32
                         && e.file_offset > 0
                         && e.entry_type != 0
                         && e.entry_type != 2  // not a key table
@@ -1130,8 +1254,10 @@ impl VmrsLayer {
                 })
                 .collect();
 
-            if (block_index as usize) < ram_entries.len() {
-                let entry = ram_entries[block_index as usize];
+            if let Some(entry) = usize::try_from(block_index)
+                .ok()
+                .and_then(|index| ram_entries.get(index))
+            {
                 value_info = Some((entry.file_offset, entry.size));
             }
         }
@@ -1143,8 +1269,16 @@ impl VmrsLayer {
             ))
         })?;
 
-        let raw_data = self.read_file_bytes(file_offset, compressed_size as usize)?;
-        Ok(if compressed_size as usize == RAM_BLOCK_SIZE {
+        let compressed_size = usize::try_from(compressed_size).map_err(|_| {
+            VmkatzError::DiskFormatError("VMRS RAM block size does not fit memory".into())
+        })?;
+        if compressed_size > RAM_BLOCK_SIZE {
+            return Err(VmkatzError::DiskFormatError(format!(
+                "VMRS RAM block is too large: {compressed_size} bytes"
+            )));
+        }
+        let raw_data = self.read_file_bytes(file_offset, compressed_size)?;
+        Ok(if compressed_size == RAM_BLOCK_SIZE {
             raw_data
         } else {
             vm_compress_unpack(&raw_data)
@@ -1178,11 +1312,18 @@ impl PhysicalMemory for VmrsLayer {
             // is 1 MB-aligned, so a single block never straddles it.
             let Some(ram_offset) = self.gpa_to_ram_offset(addr) else {
                 // Inside the MMIO gap: no backing RAM.
-                let to_gap_end = (self.mmio_gap_base + self.mmio_gap_size).saturating_sub(addr);
-                let to_copy = remaining.len().min(to_gap_end.max(1) as usize);
+                let gap_end = self
+                    .mmio_gap_base
+                    .checked_add(self.mmio_gap_size)
+                    .ok_or(VmkatzError::UnmappablePhysical(addr))?;
+                let to_gap_end = gap_end.saturating_sub(addr).max(1);
+                let remaining_u64 = u64::try_from(remaining.len())
+                    .map_err(|_| VmkatzError::UnmappablePhysical(addr))?;
+                let to_copy = usize::try_from(to_gap_end.min(remaining_u64))
+                    .map_err(|_| VmkatzError::UnmappablePhysical(addr))?;
                 remaining[..to_copy].fill(0);
                 remaining = &mut remaining[to_copy..];
-                addr += to_copy as u64;
+                addr = advance_address(addr, to_copy)?;
                 continue;
             };
             let block_index = ram_offset / RAM_BLOCK_SIZE as u64;
@@ -1206,7 +1347,7 @@ impl PhysicalMemory for VmrsLayer {
                     }
                     drop(inner);
                     remaining = &mut remaining[to_copy..];
-                    addr += to_copy as u64;
+                    addr = advance_address(addr, to_copy)?;
                     continue;
                 }
             }
@@ -1236,7 +1377,7 @@ impl PhysicalMemory for VmrsLayer {
             }
 
             remaining = &mut remaining[to_copy..];
-            addr += to_copy as u64;
+            addr = advance_address(addr, to_copy)?;
         }
 
         Ok(())
@@ -1317,7 +1458,10 @@ impl PhysicalMemory for VmrsLayer {
         // ...and shrunk further when the host has less to spare than that, since
         // nothing here ever gives the retained blocks back for the rest of the run.
         let keep_budget = crate::utils::cache_budget_bytes().map_or(WARM_CACHE_BLOCKS, |b| {
-            WARM_CACHE_BLOCKS.min((b as usize / RAM_BLOCK_SIZE).max(256))
+            let blocks = usize::try_from(b)
+                .map_or(usize::MAX, |bytes| bytes / RAM_BLOCK_SIZE)
+                .max(256);
+            WARM_CACHE_BLOCKS.min(blocks)
         });
         let keep: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
         let nthreads = std::thread::available_parallelism()
@@ -1344,7 +1488,9 @@ impl PhysicalMemory for VmrsLayer {
                             vm_compress_unpack(&raw)
                         };
                         if f(gpa, &block) {
-                            let mut k = keep.lock().unwrap();
+                            let mut k = keep
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if k.len() < keep_budget {
                                 k.push((bi, block));
                             }
@@ -1357,7 +1503,9 @@ impl PhysicalMemory for VmrsLayer {
         // Warm the LRU with the retained hive blocks and raise the limit to hold
         // them (bounded by the retention budget) so they survive reassembly; the
         // LRU then evicts least-recently-used blocks first as it re-reads the rest.
-        let kept = keep.into_inner().unwrap();
+        let kept = keep
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut inner = self.inner.borrow_mut();
         let new_limit = inner.cache.limit.max(kept.len() + 64);
         inner.cache.set_limit(new_limit);
@@ -1450,7 +1598,10 @@ fn xpress_decompress(input: &[u8], out: &mut [u8]) -> usize {
                     }
                     match_length = u16::from_le_bytes([input[in_pos], input[in_pos + 1]]) as usize;
                     in_pos += 2;
-                    match_length = match_length.wrapping_sub(15 + 7);
+                    let Some(length) = match_length.checked_sub(15 + 7) else {
+                        break;
+                    };
+                    match_length = length;
                 }
                 match_length += 15;
             }
@@ -1545,10 +1696,21 @@ fn vm_compress_unpack(data: &[u8]) -> Vec<u8> {
                 let uncomp = u32_le(data, in_offset) as usize;
                 let comp = u32_le(data, in_offset + 4) as usize;
                 in_offset += 8;
-                if uncomp == 0 || comp > uncomp || in_offset + comp > data.len() {
+                let Some(input_end) = in_offset.checked_add(comp) else {
+                    break;
+                };
+                let Some(output_end) = out_offset.checked_add(uncomp) else {
+                    break;
+                };
+                if uncomp == 0
+                    || uncomp > 4096
+                    || output_end > RAM_BLOCK_SIZE
+                    || comp > uncomp
+                    || input_end > data.len()
+                {
                     break;
                 }
-                let end = (out_offset + uncomp).min(RAM_BLOCK_SIZE);
+                let end = output_end;
                 if comp == uncomp {
                     let n = end - out_offset;
                     output[out_offset..end].copy_from_slice(&data[in_offset..in_offset + n]);

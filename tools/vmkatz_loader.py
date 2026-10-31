@@ -310,6 +310,11 @@ def main():
 
     actual_entry, base = load_elf(libc, elf_data, entry, segments, is_pie, dyn_off, dyn_sz)
 
+    # The mapped PT_LOAD segments no longer depend on the Python bytes object.
+    # Release the complete ELF copy before handing the process to vmkatz; on
+    # memory-constrained ESXi hosts those few MiB matter during large NTDS runs.
+    del elf_data
+
     sys.stderr.write("[*] Loaded at 0x%x, entry=0x%x\n" % (base, actual_entry))
 
     auxv = [

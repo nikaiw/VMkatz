@@ -54,7 +54,7 @@ pub(super) fn read_hive_files<R: Read + Seek>(
                 // (a WinRE/OEM partition has no \Windows). The MFTMirr scan
                 // cannot find what the index does not list; report and let the
                 // caller move on to the next partition.
-                Err(e) if matches!(e, VmkatzError::DiskFormatError(_)) => {
+                Err(e) if matches!(e, VmkatzError::NtfsEntryNotFound(_)) => {
                     log::info!("Partition at 0x{partition_offset:x}: {e}");
                     Err(e)
                 }
@@ -123,7 +123,7 @@ pub(super) fn read_ntds_artifacts<R: Read + Seek>(
 
     match result {
         Ok(data) => Ok(data),
-        Err(e) if matches!(e, VmkatzError::DiskFormatError(_)) => {
+        Err(e) if matches!(e, VmkatzError::NtfsEntryNotFound(_)) => {
             log::info!("Partition at 0x{partition_offset:x}: {e}");
             Err(e)
         }

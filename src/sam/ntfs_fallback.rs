@@ -1252,10 +1252,10 @@ fn try_read_file_start<R: Read + Seek>(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
 
-    pub(crate) const PART_OFF: u64 = 0x1000;
+    pub const PART_OFF: u64 = 0x1000;
     const CLUSTER: u64 = 512;
 
     // MFT record numbers
@@ -1372,7 +1372,7 @@ pub(crate) mod tests {
     /// Build a synthetic NTFS volume. `ntds_parent`/`system_parent` set the
     /// parent MFT references of ntds.dit/SYSTEM (use record numbers beyond the
     /// MFT extent to make the parent chain unverifiable).
-    pub(crate) fn build_volume(
+    pub fn build_volume(
         ntds_parent: u64,
         system_parent: u64,
         hives: bool,

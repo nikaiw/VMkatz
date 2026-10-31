@@ -95,13 +95,19 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
         let (l, b, a) = scan_chunk(buf, gpa, &finder);
         let has_bins = !b.is_empty();
         if !l.is_empty() {
-            locs.lock().unwrap().extend(l);
+            locs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(l);
         }
         if has_bins {
-            bins.lock().unwrap().extend(b);
+            bins.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(b);
         }
         if !a.is_empty() {
-            lsa.lock().unwrap().extend(a);
+            lsa.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(a);
         }
         // Keep blocks that hold hive bins cached: reassembly re-reads exactly these.
         has_bins
@@ -114,7 +120,8 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
         let mut buf = vec![0u8; 1024 * 1024];
         let mut base = 0u64;
         while base < ps {
-            let n = ((ps - base) as usize).min(buf.len());
+            let n =
+                usize::try_from(ps - base).map_or(buf.len(), |remaining| remaining.min(buf.len()));
             if phys.read_phys(base, &mut buf[..n]).is_ok() {
                 collect(base, &buf[..n]);
             }
@@ -122,13 +129,25 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
             // only thing keeping a full-RAM carve from leaving the whole image
             // resident. (The par_scan path manages its own block cache.)
             phys.advise_scanned(base, n as u64);
-            base += buf.len() as u64;
+            let Ok(step) = u64::try_from(buf.len()) else {
+                break;
+            };
+            let Some(next_base) = base.checked_add(step) else {
+                break;
+            };
+            base = next_base;
         }
     }
 
-    let mut locs = locs.into_inner().unwrap();
-    let bins = bins.into_inner().unwrap();
-    let mut lsa = lsa.into_inner().unwrap();
+    let mut locs = locs
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bins = bins
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut lsa = lsa
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     lsa.truncate(256);
     locs.sort_by_key(|h| !h.sequence_ok); // clean copies first
     (locs, bins, lsa)
@@ -294,15 +313,21 @@ fn place_cell(
     let mut best: Option<(u64, Vec<u8>, u64)> = None; // (dist, cell bytes, run gpa)
     for run in ix.covering(off) {
         let poff = off - run.start_off;
-        let addr = run.start_gpa + poff;
+        let Some(addr) = run.start_gpa.checked_add(poff) else {
+            continue;
+        };
         let Ok(szb) = phys.read_phys_bytes(addr, 4) else {
             continue;
         };
-        let abs = u64::from(i32::from_le_bytes(szb.try_into().unwrap()).unsigned_abs());
-        if !(8..=0x10000).contains(&abs) || poff + abs > run.total {
+        let abs = u64::from(i32::from_le_bytes([szb[0], szb[1], szb[2], szb[3]]).unsigned_abs());
+        if !(8..=0x10000).contains(&abs) || poff.checked_add(abs).is_none_or(|end| end > run.total)
+        {
             continue;
         }
-        let Ok(cell) = phys.read_phys_bytes(addr, abs as usize) else {
+        let Ok(cell_len) = usize::try_from(abs) else {
+            continue;
+        };
+        let Ok(cell) = phys.read_phys_bytes(addr, cell_len) else {
             continue;
         };
         if !want.is_empty()
@@ -318,8 +343,15 @@ fn place_cell(
         }
     }
     let (_, cell, gpa) = best?;
-    let dst = (BASE_BLOCK + off) as usize;
-    if dst + cell.len() <= buf.len() {
+    let dst = usize::try_from(BASE_BLOCK).ok().and_then(|base| {
+        usize::try_from(off)
+            .ok()
+            .and_then(|offset| base.checked_add(offset))
+    })?;
+    if dst
+        .checked_add(cell.len())
+        .is_some_and(|end| end <= buf.len())
+    {
         buf[dst..dst + cell.len()].copy_from_slice(&cell);
     }
     Some((cell[4..].to_vec(), gpa))
@@ -338,15 +370,22 @@ fn place_nk(
     let mut best: Option<(u64, Vec<u8>, u64)> = None;
     for run in ix.covering(off) {
         let poff = off - run.start_off;
-        let addr = run.start_gpa + poff;
+        let Some(addr) = run.start_gpa.checked_add(poff) else {
+            continue;
+        };
         let Ok(szb) = phys.read_phys_bytes(addr, 4) else {
             continue;
         };
-        let abs = u64::from(i32::from_le_bytes(szb.try_into().unwrap()).unsigned_abs());
-        if !(0x50..=0x10000).contains(&abs) || poff + abs > run.total {
+        let abs = u64::from(i32::from_le_bytes([szb[0], szb[1], szb[2], szb[3]]).unsigned_abs());
+        if !(0x50..=0x10000).contains(&abs)
+            || poff.checked_add(abs).is_none_or(|end| end > run.total)
+        {
             continue;
         }
-        let Ok(cell) = phys.read_phys_bytes(addr, abs as usize) else {
+        let Ok(cell_len) = usize::try_from(abs) else {
+            continue;
+        };
+        let Ok(cell) = phys.read_phys_bytes(addr, cell_len) else {
             continue;
         };
         if &cell[4..6] != b"nk" || !nk_matches(&cell[4..], hk) {
@@ -358,8 +397,15 @@ fn place_nk(
         }
     }
     let (_, cell, gpa) = best?;
-    let dst = (BASE_BLOCK + off) as usize;
-    if dst + cell.len() <= buf.len() {
+    let dst = usize::try_from(BASE_BLOCK).ok().and_then(|base| {
+        usize::try_from(off)
+            .ok()
+            .and_then(|offset| base.checked_add(offset))
+    })?;
+    if dst
+        .checked_add(cell.len())
+        .is_some_and(|end| end <= buf.len())
+    {
         buf[dst..dst + cell.len()].copy_from_slice(&cell);
     }
     Some((cell[4..].to_vec(), gpa))
@@ -734,15 +780,22 @@ fn cell_candidates(phys: &impl PhysicalMemory, ix: &RunIndex, hive_off: u64) -> 
     let mut out = Vec::new();
     for run in ix.covering(hive_off) {
         let poff = hive_off - run.start_off;
-        let addr = run.start_gpa + poff;
+        let Some(addr) = run.start_gpa.checked_add(poff) else {
+            continue;
+        };
         let Ok(szb) = phys.read_phys_bytes(addr, 4) else {
             continue;
         };
-        let abs = u64::from(i32::from_le_bytes(szb.try_into().unwrap()).unsigned_abs());
-        if !(8..=0x10000).contains(&abs) || poff + abs > run.total {
+        let abs = u64::from(i32::from_le_bytes([szb[0], szb[1], szb[2], szb[3]]).unsigned_abs());
+        if !(8..=0x10000).contains(&abs) || poff.checked_add(abs).is_none_or(|end| end > run.total)
+        {
             continue;
         }
-        if let Ok(data) = phys.read_phys_bytes(addr + 4, (abs - 4) as usize) {
+        let (Some(data_addr), Ok(data_len)) = (addr.checked_add(4), usize::try_from(abs - 4))
+        else {
+            continue;
+        };
+        if let Ok(data) = phys.read_phys_bytes(data_addr, data_len) {
             out.push(data);
         }
         if out.len() >= 16 {
@@ -855,15 +908,22 @@ fn cells_with_gpa(phys: &impl PhysicalMemory, ix: &RunIndex, hive_off: u64) -> V
     let mut out = Vec::new();
     for run in ix.covering(hive_off) {
         let poff = hive_off - run.start_off;
-        let addr = run.start_gpa + poff;
+        let Some(addr) = run.start_gpa.checked_add(poff) else {
+            continue;
+        };
         let Ok(szb) = phys.read_phys_bytes(addr, 4) else {
             continue;
         };
-        let abs = u64::from(i32::from_le_bytes(szb.try_into().unwrap()).unsigned_abs());
-        if !(8..=0x10000).contains(&abs) || poff + abs > run.total {
+        let abs = u64::from(i32::from_le_bytes([szb[0], szb[1], szb[2], szb[3]]).unsigned_abs());
+        if !(8..=0x10000).contains(&abs) || poff.checked_add(abs).is_none_or(|end| end > run.total)
+        {
             continue;
         }
-        if let Ok(data) = phys.read_phys_bytes(addr + 4, (abs - 4) as usize) {
+        let (Some(data_addr), Ok(data_len)) = (addr.checked_add(4), usize::try_from(abs - 4))
+        else {
+            continue;
+        };
+        if let Ok(data) = phys.read_phys_bytes(data_addr, data_len) {
             out.push((data, addr));
         }
     }

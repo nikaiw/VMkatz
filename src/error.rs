@@ -38,6 +38,9 @@ pub enum VmkatzError {
     #[error("Disk format error: {0}")]
     DiskFormatError(String),
 
+    #[error("NTFS entry '{0}' not found")]
+    NtfsEntryNotFound(String),
+
     #[error("ELF error: {0}")]
     ElfError(String),
 

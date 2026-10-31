@@ -109,12 +109,18 @@ fn scan_hives<L: PhysicalMemory>(
     let mut buf = vec![0u8; 1024 * 1024];
     let mut base = 0u64;
     while base < ps {
-        let n = ((ps - base) as usize).min(buf.len());
+        let n = usize::try_from(ps - base).map_or(buf.len(), |remaining| remaining.min(buf.len()));
         if layer.read_phys(base, &mut buf[..n]).is_ok() {
             let mut i = 0;
             while i + 4 <= n {
                 if u32_le(&buf, i) == HHIVE_SIG {
-                    if let Some((name, img)) = materialize(layer, rv, base + i as u64) {
+                    let Some(hhive_phys) = u64::try_from(i)
+                        .ok()
+                        .and_then(|offset| base.checked_add(offset))
+                    else {
+                        continue;
+                    };
+                    if let Some((name, img)) = materialize(layer, rv, hhive_phys) {
                         // Keep the largest (most-complete) image seen per hive name.
                         if hives.get(&name).is_none_or(|e| img.len() > e.len()) {
                             hives.insert(name, img);
@@ -127,7 +133,13 @@ fn scan_hives<L: PhysicalMemory>(
         // Release the window just swept: on an mmap-backed layer this is the only
         // thing keeping a full-RAM scan from leaving the whole image resident.
         layer.advise_scanned(base, n as u64);
-        base += buf.len() as u64;
+        let Ok(step) = u64::try_from(buf.len()) else {
+            break;
+        };
+        let Some(next_base) = base.checked_add(step) else {
+            break;
+        };
+        base = next_base;
     }
     hives
 }
@@ -146,8 +158,8 @@ fn materialize<L: PhysicalMemory>(
         .step_by(8)
         .map(|o| u64_le(&hh, o))
         .filter(|&va| is_kernel_va(va))
-        .find_map(|va| rv(va, BASE_BLOCK).filter(|b| &b[0..4] == b"regf"))?;
-    let length = u32_le(&base_block, 0x28) as usize;
+        .find_map(|va| rv(va, BASE_BLOCK).filter(|b| b.get(..4) == Some(b"regf")))?;
+    let length = usize::try_from(u32_le(&base_block, 0x28)).ok()?;
     let name = crate::utils::utf16le_decode(&base_block[0x30..0x70]);
     let base = name
         .rsplit(['\\', '/'])
@@ -243,12 +255,17 @@ fn read_block(
     layout: &MapLayout,
     off: usize,
 ) -> Option<Vec<u8>> {
-    let dir = rv(layout.map_va + ((off >> 21) as u64) * 8, 8)?;
+    let dir_offset = u64::try_from(off >> 21).ok()?.checked_mul(8)?;
+    let dir_va = layout.map_va.checked_add(dir_offset)?;
+    let dir = rv(dir_va, 8)?;
     let table_va = u64_le(&dir, 0);
     if !is_kernel_va(table_va) {
         return None;
     }
-    let ent_va = table_va + (((off >> 12) & 0x1FF) as u64) * layout.stride;
+    let slot_offset = u64::try_from((off >> 12) & 0x1FF)
+        .ok()?
+        .checked_mul(layout.stride)?;
+    let ent_va = table_va.checked_add(slot_offset)?;
     let ent = rv(ent_va, 0x18)?;
     let block_va = match layout.scheme {
         // (PermanentBinAddress & ~0xF) + BlockOffset. The block VA is user-range in

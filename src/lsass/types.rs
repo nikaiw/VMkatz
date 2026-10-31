@@ -759,6 +759,6 @@ mod tests {
             ..Default::default()
         };
         fill_wellknown_luid(&mut cred3);
-        assert!(cred3.username.is_empty());
+        assert_eq!(cred3.username, "");
     }
 }

@@ -25,7 +25,7 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
     let mut pos: usize = 0;
 
     loop {
-        if pos + 2 > data.len() {
+        if pos.checked_add(2).is_none_or(|end| end > data.len()) {
             break;
         }
         let flags = data[pos];
@@ -35,19 +35,30 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
         }
         pos += 2;
 
-        if pos + name_len > data.len() {
+        if pos.checked_add(name_len).is_none_or(|end| end > data.len()) {
             break;
         }
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
         pos += name_len;
 
         let index_count = ((flags >> 6) & 3) as usize;
-        if pos + index_count * 4 > data.len() {
+        let Some(index_bytes) = index_count.checked_mul(4) else {
+            break;
+        };
+        if pos
+            .checked_add(index_bytes)
+            .is_none_or(|end| end > data.len())
+        {
             break; // Not enough data for all indices — stop parsing
         }
         let mut indices = Vec::with_capacity(index_count);
         for _ in 0..index_count {
-            indices.push(crate::utils::read_u32_le(data, pos).unwrap_or(0));
+            indices.push(u32::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            ]));
             pos += 4;
         }
 
@@ -56,14 +67,21 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
             if pos + 8 > data.len() {
                 break;
             }
-            let size = crate::utils::read_u64_le(data, pos).unwrap_or(0);
+            let Some(size) = crate::utils::read_u64_le(data, pos) else {
+                break;
+            };
             pos += 8;
             size
         } else {
             inline_len
         };
 
-        let data_offset = base_offset + pos as u64;
+        let Ok(pos_u64) = u64::try_from(pos) else {
+            break;
+        };
+        let Some(data_offset) = base_offset.checked_add(pos_u64) else {
+            break;
+        };
         tags.push(Tag {
             name,
             indices,
@@ -72,10 +90,14 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
         });
 
         // Guard against overflow: data_size must fit in remaining buffer
-        if data_size > (data.len() - pos) as u64 {
+        let remaining = data.len() - pos;
+        let Ok(data_size_usize) = usize::try_from(data_size) else {
+            break;
+        };
+        if data_size_usize > remaining {
             break;
         }
-        pos += data_size as usize;
+        pos += data_size_usize;
     }
 
     Ok(tags)

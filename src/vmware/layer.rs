@@ -6,6 +6,22 @@ use crate::memory::PhysicalMemory;
 use crate::vmware::header::{self, PAGE_SIZE};
 use crate::vmware::tags::{self, Tag};
 
+fn read_tag_u32(data: &[u8], tag: &Tag) -> Result<u32> {
+    let offset = usize::try_from(tag.data_offset).map_err(|_| {
+        VmkatzError::DiskFormatError(format!("VMware tag '{}' offset overflow", tag.name))
+    })?;
+    crate::utils::read_u32_le(data, offset).ok_or_else(|| {
+        VmkatzError::DiskFormatError(format!("VMware tag '{}' data is truncated", tag.name))
+    })
+}
+
+fn read_region_tag(data: &[u8], tags: &[Tag], name: &str, index: u32) -> Result<u64> {
+    tags::find_tag(tags, name, &[index])
+        .map(|tag| read_tag_u32(data, tag).map(u64::from))
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+}
+
 /// A memory region mapping guest physical pages to VMEM file offsets.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryRegion {
@@ -95,7 +111,9 @@ impl VmwareLayer {
                         Some(u64::from(u32::from_le_bytes(buf)))
                     })
                     .unwrap_or(0xFFF);
-                let offset = (tag.data_offset + align_mask) & !align_mask;
+                let offset = tag.data_offset.checked_add(align_mask).ok_or_else(|| {
+                    VmkatzError::DiskFormatError("Embedded VMware memory offset overflow".into())
+                })? & !align_mask;
                 log::info!("Embedded memory base offset: 0x{offset:x}");
                 offset
             } else {
@@ -108,9 +126,14 @@ impl VmwareLayer {
             // No region tags — create a single identity-mapped region
             let page_count = if embedded && base_offset > 0 {
                 // Embedded: available memory = file size - base_offset
-                (data.len() as u64 - base_offset) / PAGE_SIZE as u64
+                let available = data.len_u64().checked_sub(base_offset).ok_or_else(|| {
+                    VmkatzError::DiskFormatError(
+                        "Embedded VMware memory offset exceeds file size".into(),
+                    )
+                })?;
+                available / PAGE_SIZE as u64
             } else {
-                data.len() as u64 / PAGE_SIZE as u64
+                data.len_u64() / PAGE_SIZE as u64
             };
             log::info!("No memory regions in VMSN, using identity mapping ({page_count} pages)");
             vec![MemoryRegion {
@@ -123,13 +146,28 @@ impl VmwareLayer {
         };
 
         // Warn if VMEM file is truncated (e.g. partial download)
-        let expected_pages: u64 = regions
-            .iter()
-            .map(|r| r.vmem_page_num + r.page_count)
-            .max()
-            .unwrap_or(0);
-        let expected_size = expected_pages * PAGE_SIZE as u64 + base_offset;
-        let actual_size = data.len() as u64;
+        let expected_pages = regions.iter().try_fold(0u64, |max, region| {
+            region
+                .guest_page_num
+                .checked_add(region.page_count)
+                .ok_or_else(|| {
+                    VmkatzError::DiskFormatError("VMware guest region page range overflow".into())
+                })?;
+            region
+                .vmem_page_num
+                .checked_add(region.page_count)
+                .map(|end| max.max(end))
+                .ok_or_else(|| {
+                    VmkatzError::DiskFormatError("VMware memory region page range overflow".into())
+                })
+        })?;
+        let expected_size = expected_pages
+            .checked_mul(PAGE_SIZE as u64)
+            .and_then(|size| size.checked_add(base_offset))
+            .ok_or_else(|| {
+                VmkatzError::DiskFormatError("VMware expected memory size overflow".into())
+            })?;
+        let actual_size = data.len_u64();
         if actual_size < expected_size {
             log::warn!(
                 "VMEM file is truncated ({:.1} GB / {:.1} GB expected) — results may be incomplete",
@@ -180,14 +218,21 @@ impl VmwareLayer {
             memory_group.size
         );
 
-        let tag_start = memory_group.offset as usize;
-        let tag_end = tag_start.saturating_add(memory_group.size as usize);
-        if tag_start > vmsn_data.len() {
+        let tag_start = usize::try_from(memory_group.offset).map_err(|_| {
+            VmkatzError::GroupNotFound("memory group offset does not fit this platform")
+        })?;
+        let tag_size = usize::try_from(memory_group.size).map_err(|_| {
+            VmkatzError::GroupNotFound("memory group size does not fit this platform")
+        })?;
+        let tag_end = tag_start
+            .checked_add(tag_size)
+            .ok_or(VmkatzError::GroupNotFound("memory group range overflow"))?;
+        if tag_start > vmsn_data.len() || tag_end > vmsn_data.len() {
             return Err(VmkatzError::GroupNotFound(
-                "memory group offset beyond file",
+                "memory group range extends beyond file",
             ));
         }
-        let tag_data = &vmsn_data[tag_start..tag_end.min(vmsn_data.len())];
+        let tag_data = &vmsn_data[tag_start..tag_end];
         let all_tags = tags::parse_tags(tag_data, memory_group.offset)?;
 
         log::info!("Parsed {} tags", all_tags.len());
@@ -201,10 +246,10 @@ impl VmwareLayer {
             );
         }
 
-        let regions_count = tags::find_tag(&all_tags, "regionsCount", &[]).map_or(0, |t| {
-            let off = t.data_offset;
-            crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0)
-        });
+        let regions_count = tags::find_tag(&all_tags, "regionsCount", &[])
+            .map(|tag| read_tag_u32(&vmsn_data, tag))
+            .transpose()?
+            .unwrap_or(0);
 
         log::info!("Memory regions: {regions_count}");
 
@@ -214,20 +259,9 @@ impl VmwareLayer {
         let regions_count = regions_count.min(4096);
         let mut regions = Vec::with_capacity(regions_count as usize);
         for i in 0..regions_count {
-            let vmem_page = tags::find_tag(&all_tags, "regionPageNum", &[i]).map_or(0, |t| {
-                let off = t.data_offset;
-                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
-            });
-
-            let guest_page = tags::find_tag(&all_tags, "regionPPN", &[i]).map_or(0, |t| {
-                let off = t.data_offset;
-                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
-            });
-
-            let page_count = tags::find_tag(&all_tags, "regionSize", &[i]).map_or(0, |t| {
-                let off = t.data_offset;
-                u64::from(crate::utils::read_u32_le(&vmsn_data, off as usize).unwrap_or(0))
-            });
+            let vmem_page = read_region_tag(&vmsn_data, &all_tags, "regionPageNum", i)?;
+            let guest_page = read_region_tag(&vmsn_data, &all_tags, "regionPPN", i)?;
+            let page_count = read_region_tag(&vmsn_data, &all_tags, "regionSize", i)?;
 
             log::info!(
                 "  Region {}: guest_phys=0x{:x} vmem_file=0x{:x} pages=0x{:x} ({}MB)",
@@ -235,7 +269,7 @@ impl VmwareLayer {
                 guest_page,
                 vmem_page,
                 page_count,
-                (page_count * PAGE_SIZE as u64) / (1024 * 1024)
+                page_count.saturating_mul(PAGE_SIZE as u64) / (1024 * 1024)
             );
 
             regions.push(MemoryRegion {
@@ -256,15 +290,31 @@ impl VmwareLayer {
         let page_offset = phys_addr % PAGE_SIZE as u64;
 
         // Regions are sorted by guest_page_num; use binary search.
-        let idx = self
-            .regions
-            .partition_point(|r| r.guest_page_num + r.page_count <= page_num);
+        let idx = self.regions.partition_point(|r| {
+            r.guest_page_num
+                .checked_add(r.page_count)
+                .is_some_and(|end| end <= page_num)
+        });
         if let Some(region) = self.regions.get(idx) {
             if page_num >= region.guest_page_num
-                && page_num < region.guest_page_num + region.page_count
+                && region
+                    .guest_page_num
+                    .checked_add(region.page_count)
+                    .is_some_and(|end| page_num < end)
             {
-                let vmem_page = page_num - region.guest_page_num + region.vmem_page_num;
-                let offset = vmem_page * PAGE_SIZE as u64 + page_offset + self.base_offset;
+                let vmem_page = page_num
+                    .checked_sub(region.guest_page_num)
+                    .and_then(|relative| relative.checked_add(region.vmem_page_num))
+                    .ok_or_else(|| {
+                        VmkatzError::DiskFormatError("VMware page translation overflow".into())
+                    })?;
+                let offset = vmem_page
+                    .checked_mul(PAGE_SIZE as u64)
+                    .and_then(|bytes| bytes.checked_add(page_offset))
+                    .and_then(|bytes| bytes.checked_add(self.base_offset))
+                    .ok_or_else(|| {
+                        VmkatzError::DiskFormatError("VMware file offset overflow".into())
+                    })?;
                 return Ok(offset);
             }
         }
@@ -278,7 +328,11 @@ impl VmwareLayer {
     pub fn max_guest_phys(&self) -> u64 {
         self.regions
             .iter()
-            .map(|r| (r.guest_page_num + r.page_count) * PAGE_SIZE as u64)
+            .filter_map(|r| {
+                r.guest_page_num
+                    .checked_add(r.page_count)?
+                    .checked_mul(PAGE_SIZE as u64)
+            })
             .max()
             .unwrap_or(0)
     }

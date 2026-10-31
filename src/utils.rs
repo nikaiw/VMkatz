@@ -214,15 +214,25 @@ pub enum MappedFile {
 }
 
 impl MappedFile {
+    /// File size in bytes, including files larger than this host's address space.
+    pub fn len_u64(&self) -> u64 {
+        match self {
+            Self::Mmap(m) => m.len() as u64,
+            Self::Pread { size, .. } => *size,
+        }
+    }
+
+    /// Addressable file length as `usize`; saturates when a pread-backed file is
+    /// larger than this host's address space. Use [`Self::len_u64`] for offsets.
     pub fn len(&self) -> usize {
         match self {
             Self::Mmap(m) => m.len(),
-            Self::Pread { size, .. } => *size as usize,
+            Self::Pread { size, .. } => usize::try_from(*size).unwrap_or(usize::MAX),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len_u64() == 0
     }
 
     /// Read bytes at an offset into the provided buffer.
@@ -238,7 +248,7 @@ impl MappedFile {
                 format!(
                     "read_at: offset=0x{offset:x} len={} exceeds file size {}",
                     buf.len(),
-                    self.len()
+                    self.len_u64()
                 ),
             )
         };
@@ -254,13 +264,15 @@ impl MappedFile {
                 Ok(())
             }
             Self::Pread { file, size } => {
-                if offset
-                    .checked_add(buf.len() as u64)
-                    .is_none_or(|end| end > *size)
-                {
+                let buf_len = u64::try_from(buf.len()).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "buffer too large")
+                })?;
+                if offset.checked_add(buf_len).is_none_or(|end| end > *size) {
                     return Err(eof());
                 }
-                let f = file.lock().unwrap();
+                let f = file.lock().map_err(|_| {
+                    std::io::Error::other("positioned file reader lock was poisoned")
+                })?;
                 read_exact_at(&f, buf, offset)?;
                 Ok(())
             }
@@ -293,7 +305,7 @@ impl MappedFile {
         // share bytes with data still in use.
         const PAGE: u64 = 4096;
         let Self::Mmap(m) = self else { return };
-        let map_len = m.len() as u64;
+        let map_len = self.len_u64();
         if len == 0 || offset >= map_len {
             return;
         }
@@ -433,7 +445,7 @@ pub fn read_file_header(file: &std::fs::File, max_bytes: usize) -> std::io::Resu
     let mut f = file.try_clone()?;
     let size = f.seek(SeekFrom::End(0))?;
     f.seek(SeekFrom::Start(0))?;
-    let to_read = (size as usize).min(max_bytes);
+    let to_read = usize::try_from(size).map_or(max_bytes, |length| length.min(max_bytes));
     let mut buf = vec![0u8; to_read];
     f.read_exact(&mut buf)?;
     Ok(buf)
@@ -549,7 +561,13 @@ pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::
         use std::os::windows::fs::FileExt;
         let mut done = 0;
         while done < buf.len() {
-            match file.seek_read(&mut buf[done..], offset + done as u64) {
+            let offset_done = u64::try_from(done).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
+            })?;
+            let read_offset = offset.checked_add(offset_done).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
+            })?;
+            match file.seek_read(&mut buf[done..], read_offset) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,

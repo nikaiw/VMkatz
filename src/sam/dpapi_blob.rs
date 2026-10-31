@@ -59,11 +59,12 @@ fn take<'a>(bytes: &'a [u8], cur: &mut usize, len: usize) -> Result<&'a [u8]> {
 
 fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
     let s = take(bytes, cur, 4)?;
-    Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 fn read_len(bytes: &[u8], cur: &mut usize, cap: usize, label: &'static str) -> Result<usize> {
-    let v = read_u32(bytes, cur)? as usize;
+    let v = usize::try_from(read_u32(bytes, cur)?)
+        .map_err(|_| Error::Parse(format!("dpapi blob {label} length does not fit platform")))?;
     if v > cap {
         return Err(Error::Parse(format!(
             "dpapi blob {label} length {v} exceeds cap {cap}"
@@ -99,7 +100,9 @@ pub fn parse_blob(bytes: &[u8]) -> Result<DpapiBlob<'_>> {
     let _version = read_u32(bytes, &mut cur)?;
     let _provider = take(bytes, &mut cur, 16)?;
     let _mk_version = read_u32(bytes, &mut cur)?;
-    let mk_guid: [u8; 16] = take(bytes, &mut cur, 16)?.try_into().unwrap();
+    let guid_bytes = take(bytes, &mut cur, 16)?;
+    let mut mk_guid = [0u8; 16];
+    mk_guid.copy_from_slice(guid_bytes);
     let mk_guid_str = crate::utils::format_guid(&mk_guid);
     let flags = read_u32(bytes, &mut cur)?;
     let desc_len = read_len(bytes, &mut cur, MAX_DESC, "description")?;
@@ -460,7 +463,7 @@ mod tests {
         let mk: Vec<u8> = (0u8..64).collect();
         let raw = build_aes_blob(&mk, b"secret", &[]);
         let blob = parse_blob(&raw).unwrap();
-        let mut wrong = mk.clone();
+        let mut wrong = mk;
         wrong[0] ^= 1;
         assert!(is_integrity_err(&decrypt_blob(&blob, &wrong)));
     }

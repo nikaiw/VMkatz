@@ -998,7 +998,7 @@ fn run_with_system<L: PhysicalMemory>(
 
     #[cfg(feature = "chrome")]
     {
-        if args.chrome {
+        if args.chrome || args.all {
             // Collect cleartext DPAPI master keys from LSASS memory.
             let pairs: Vec<(String, Vec<u8>)> = credentials
                 .iter()

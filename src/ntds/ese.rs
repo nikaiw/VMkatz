@@ -82,6 +82,15 @@ const fn fixed_size_for_type(col_type: u32) -> usize {
 }
 
 impl<'a> EseDb<'a> {
+    fn catalog_column_layout(rec: &[u8], last_fixed_id: u16, space_usage: u32) -> (u16, u16) {
+        let offset = if last_fixed_id >= 9 && rec.len() >= 33 {
+            u16_le_or0(rec, 31)
+        } else {
+            0
+        };
+        (offset, u16::try_from(space_usage).unwrap_or(0))
+    }
+
     /// Open an ESE database from raw bytes.
     pub fn open(data: &'a [u8]) -> Result<Self> {
         // Validate ESE magic at offset 4
@@ -307,12 +316,22 @@ impl<'a> EseDb<'a> {
         F: FnMut(&'a [u8]),
     {
         let mut stack = vec![root_pgno];
-        let mut visited = std::collections::HashSet::new();
+        // A large production datatable can contain hundreds of thousands of
+        // pages.  HashSet<u32> grows in multi-megabyte jumps (an 8 MiB growth
+        // was enough to abort under the ESXi in-memory loader).  Page numbers
+        // are dense and bounded by the mapped database, so a bitset is both
+        // stricter against corrupt pointers and much smaller.
+        let page_count = self.data.len() / self.page_size;
+        let mut visited = vec![false; page_count];
 
         while let Some(pgno) = stack.pop() {
-            if pgno == 0 || !visited.insert(pgno) {
+            let Ok(page_index) = usize::try_from(pgno) else {
+                continue;
+            };
+            if pgno == 0 || page_index >= visited.len() || visited[page_index] {
                 continue;
             }
+            visited[page_index] = true;
 
             let Some(page) = self.page_data(pgno) else {
                 continue;
@@ -362,12 +381,17 @@ impl<'a> EseDb<'a> {
         F: FnMut(Vec<u8>, &'a [u8]),
     {
         let mut stack = vec![root_pgno];
-        let mut visited = std::collections::HashSet::new();
+        let page_count = self.data.len() / self.page_size;
+        let mut visited = vec![false; page_count];
 
         while let Some(pgno) = stack.pop() {
-            if pgno == 0 || !visited.insert(pgno) {
+            let Ok(page_index) = usize::try_from(pgno) else {
+                continue;
+            };
+            if pgno == 0 || page_index >= visited.len() || visited[page_index] {
                 continue;
             }
+            visited[page_index] = true;
 
             let Some(page) = self.page_data(pgno) else {
                 continue;
@@ -502,8 +526,14 @@ impl<'a> EseDb<'a> {
                 2 => {
                     // Column
                     let col_type = coltyp_or_pgno;
-                    let col_offset = (space_usage & 0xFFFF) as u16;
-                    let col_size = ((space_usage >> 16) & 0xFFFF) as u16;
+                    // Catalog fixed column 9 is RecordOffset (absolute within
+                    // the row, including its 4-byte record header). SpaceUsage
+                    // is the column width, not a packed offset/size pair. Using
+                    // its low word as the offset made every 4-byte fixed column
+                    // read rec[4..8], notably misreading sAMAccountType and
+                    // dropping password-less AD accounts.
+                    let (col_offset, col_size) =
+                        Self::catalog_column_layout(rec, last_fixed_id, space_usage);
 
                     let fsize = fixed_size_for_type(col_type);
                     let is_fixed = id <= 127 && fsize > 0;
@@ -639,27 +669,20 @@ impl<'a> EseDb<'a> {
         let columns = &tbl.columns;
         let lv_pgno = tbl.lv_pgno;
 
-        // Collect all leaf records from the data B+ tree
-        let mut records: Vec<&'a [u8]> = Vec::new();
-        self.traverse_btree(tbl.data_pgno, |data| {
-            records.push(data);
-        });
-
-        log::info!(
-            "ESE table '{}': {} leaf records, {} columns",
-            table,
-            records.len(),
-            columns.len()
-        );
-
         // Build column name -> index map
         let col_by_name: HashMap<&str, &EseColumn> =
             columns.iter().map(|c| (c.name.as_str(), c)).collect();
 
-        for rec_data in &records {
+        // Process records as the tree is walked.  Keeping every record slice in
+        // a Vec costs 16 bytes per row and forced an 8 MiB capacity allocation
+        // on a real 1.5 GiB NTDS.dit, after the whole database was already in
+        // memory.  Streaming also lets hash extraction start immediately.
+        let mut record_count = 0usize;
+        self.traverse_btree(tbl.data_pgno, |rec_data| {
             if rec_data.len() < 4 {
-                continue;
+                return;
             }
+            record_count += 1;
 
             let reader = |col_name: &str| -> Option<Vec<u8>> {
                 let col = col_by_name.get(col_name)?;
@@ -667,7 +690,14 @@ impl<'a> EseDb<'a> {
             };
 
             callback(&reader);
-        }
+        });
+
+        log::info!(
+            "ESE table '{}': {} leaf records, {} columns",
+            table,
+            record_count,
+            columns.len()
+        );
 
         Ok(())
     }
@@ -710,13 +740,8 @@ impl<'a> EseDb<'a> {
             return None; // Column not present in this record
         }
 
-        // Fixed columns are stored starting at offset 4 (after the 4-byte preamble)
-        // Each column's offset within the fixed data area is stored in col.offset,
-        // but that's the offset within the table definition, not the record.
-        // We need to compute the actual offset based on columns present.
-        //
-        // Actually, col.offset from the catalog is the fixed offset in the record
-        // (relative to byte 4, the start of fixed data).
+        // RecordOffset in the catalog is absolute within the record, including
+        // its four-byte data-definition header.
         let rec_offset = col.offset as usize;
         let size = col.size as usize;
 
@@ -977,4 +1002,38 @@ impl<'a> EseDb<'a> {
 
 fn ese_err(msg: &str) -> VmkatzError {
     VmkatzError::DecryptionError(format!("ESE: {msg}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_column_uses_record_offset_not_space_usage() {
+        let mut rec = vec![0u8; 40];
+        rec[31..33].copy_from_slice(&0x1234u16.to_le_bytes());
+        let (offset, size) = EseDb::catalog_column_layout(&rec, 12, 4);
+        assert_eq!(offset, 0x1234);
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn fixed_column_reads_absolute_record_offset() {
+        let mut rec = vec![0u8; 24];
+        rec[12..16].copy_from_slice(&0x3000_0001u32.to_le_bytes());
+        let col = EseColumn {
+            id: 5,
+            name: "sAMAccountType".into(),
+            col_type: JET_COLTYP_LONG,
+            offset: 12,
+            size: 4,
+            is_fixed: true,
+            is_variable: false,
+            is_tagged: false,
+        };
+        assert_eq!(
+            EseDb::read_fixed_column(&rec, &col, 5, 0),
+            Some(0x3000_0001u32.to_le_bytes().to_vec())
+        );
+    }
 }

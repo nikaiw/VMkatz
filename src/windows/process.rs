@@ -110,6 +110,12 @@ pub struct Process {
 /// reads when the VM is non-Windows or uses unknown offsets.
 /// Read chunk size for bulk physical memory scans (1 MB = 256 pages).
 const SCAN_CHUNK_SIZE: usize = 256 * 4096;
+const PRIORITY_TAIL_SIZE: u64 = 256 * 1024 * 1024;
+const SYSTEM_SCAN_PROGRESS_INTERVAL: u64 = 4 * 1024 * 1024 * 1024;
+
+fn bounded_scan_chunk_len(remaining: u64) -> usize {
+    usize::try_from(remaining).map_or(SCAN_CHUNK_SIZE, |n| n.min(SCAN_CHUNK_SIZE))
+}
 
 pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, EprocessOffsets)> {
     let pattern = b"System\0\0\0\0\0\0\0\0\0";
@@ -121,103 +127,130 @@ pub fn find_system_process_auto(phys: &impl PhysicalMemory) -> Result<(Process, 
     );
 
     let mut chunk_buf = vec![0u8; SCAN_CHUNK_SIZE];
-    let mut addr: u64 = 0;
+    // EPROCESS allocations often land near the top of guest physical memory.
+    // Probe the final 256 MiB first so common high-address layouts avoid a full
+    // linear scan; the remaining range is still scanned completely on a miss.
+    let chunk_size = SCAN_CHUNK_SIZE as u64;
+    let tail_start = (phys_size.saturating_sub(PRIORITY_TAIL_SIZE) / chunk_size) * chunk_size;
+    let scan_ranges = if tail_start > 0 {
+        vec![(tail_start, phys_size), (0, tail_start)]
+    } else {
+        vec![(0, phys_size)]
+    };
+    if tail_start > 0 {
+        log::info!("System discovery: probing the final 256 MiB first");
+    }
 
-    while addr < phys_size {
-        let read_len = SCAN_CHUNK_SIZE.min((phys_size - addr) as usize);
-        if phys.read_phys(addr, &mut chunk_buf[..read_len]).is_err() {
-            addr += read_len as u64;
-            continue;
-        }
+    let mut scanned_bytes = 0u64;
+    let mut next_progress = SYSTEM_SCAN_PROGRESS_INTERVAL;
+    for (range_start, range_end) in scan_ranges {
+        let mut addr = range_start;
+        while addr < range_end {
+            let remaining = range_end - addr;
+            let read_len = bounded_scan_chunk_len(remaining);
+            if phys.read_phys(addr, &mut chunk_buf[..read_len]).is_err() {
+                addr += read_len as u64;
+                scanned_bytes += read_len as u64;
+                continue;
+            }
 
-        // Scan each 4KB page within the chunk
-        for page_off in (0..read_len).step_by(4096) {
-            let page_end = (page_off + 4096).min(read_len);
-            let page = &chunk_buf[page_off..page_end];
+            // Scan each 4KB page within the chunk
+            for page_off in (0..read_len).step_by(4096) {
+                let page_end = (page_off + 4096).min(read_len);
+                let page = &chunk_buf[page_off..page_end];
 
-            let mut off = 0usize;
-            while off + pattern.len() <= page.len() {
-                if &page[off..off + pattern.len()] != pattern {
-                    off += 1;
-                    continue;
-                }
-
-                let match_phys = addr + page_off as u64 + off as u64;
-
-                // Try all offset sets at this match location
-                for offsets in ALL_EPROCESS_OFFSETS {
-                    if match_phys < offsets.image_file_name {
-                        continue;
-                    }
-                    let eprocess_phys = match_phys - offsets.image_file_name;
-
-                    let reader = EprocessReader::new(offsets);
-
-                    // Validate PID = 4
-                    let pid = match reader.read_pid(phys, eprocess_phys) {
-                        Ok(pid) if pid == 4 => pid,
-                        _ => continue,
-                    };
-
-                    // Validate DTB
-                    let Ok(dtb) = reader.read_dtb(phys, eprocess_phys) else {
-                        continue;
-                    };
-                    if !is_plausible_dtb(dtb, phys_size) {
+                // Searching byte-by-byte across a 32+ GiB snapshot made System
+                // discovery CPU-bound. `memchr_iter` uses optimized byte search to
+                // find the first character, then we verify the full name only at
+                // those rare positions.
+                for off in memchr::memchr_iter(pattern[0], page) {
+                    if page.get(off..off + pattern.len()) != Some(pattern) {
                         continue;
                     }
 
-                    // Validate Flink (bitness-aware)
-                    let Ok(flink) = reader.read_flink(phys, eprocess_phys) else {
-                        continue;
-                    };
-                    if !is_valid_kernel_flink(flink, offsets.bitness) {
-                        continue;
-                    }
+                    let match_phys = addr + page_off as u64 + off as u64;
 
-                    // Validate page table walk: translate the Flink VA to physical,
-                    // then verify the linked EPROCESS is readable with a valid PID.
-                    // This catches stale EPROCESS remnants where DTB points to
-                    // freed/corrupted page tables (common in QEMU savevm snapshots).
-                    let flink_valid = validate_flink_translation(phys, dtb, flink, offsets);
-                    if !flink_valid {
-                        log::debug!(
-                            "Rejecting System candidate at 0x{eprocess_phys:x}: Flink 0x{flink:x} translation produced invalid EPROCESS (DTB=0x{dtb:x})"
-                        );
-                        continue;
-                    }
+                    // Try all offset sets at this match location
+                    for offsets in ALL_EPROCESS_OFFSETS {
+                        if match_phys < offsets.image_file_name {
+                            continue;
+                        }
+                        let eprocess_phys = match_phys - offsets.image_file_name;
 
-                    let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
+                        let reader = EprocessReader::new(offsets);
 
-                    log::info!(
-                        "Found System process: eprocess_phys=0x{:x}, PID={}, DTB=0x{:x}, Flink=0x{:x}, bitness={:?}",
-                        eprocess_phys,
-                        pid,
-                        dtb,
-                        flink,
-                        offsets.bitness
-                    );
+                        // Validate PID = 4
+                        let pid = match reader.read_pid(phys, eprocess_phys) {
+                            Ok(pid) if pid == 4 => pid,
+                            _ => continue,
+                        };
 
-                    return Ok((
-                        Process {
-                            pid,
-                            name: "System".to_string(),
-                            dtb,
+                        // Validate DTB
+                        let Ok(dtb) = reader.read_dtb(phys, eprocess_phys) else {
+                            continue;
+                        };
+                        if !is_plausible_dtb(dtb, phys_size) {
+                            continue;
+                        }
+
+                        // Validate Flink (bitness-aware)
+                        let Ok(flink) = reader.read_flink(phys, eprocess_phys) else {
+                            continue;
+                        };
+                        if !is_valid_kernel_flink(flink, offsets.bitness) {
+                            continue;
+                        }
+
+                        // Validate page table walk: translate the Flink VA to physical,
+                        // then verify the linked EPROCESS is readable with a valid PID.
+                        // This catches stale EPROCESS remnants where DTB points to
+                        // freed/corrupted page tables (common in QEMU savevm snapshots).
+                        let flink_valid = validate_flink_translation(phys, dtb, flink, offsets);
+                        if !flink_valid {
+                            log::debug!(
+                                "Rejecting System candidate at 0x{eprocess_phys:x}: Flink 0x{flink:x} translation produced invalid EPROCESS (DTB=0x{dtb:x})"
+                            );
+                            continue;
+                        }
+
+                        let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
+
+                        log::info!(
+                            "Found System process: eprocess_phys=0x{:x}, PID={}, DTB=0x{:x}, Flink=0x{:x}, bitness={:?}",
                             eprocess_phys,
-                            peb_vaddr: peb,
-                        },
-                        *offsets,
-                    ));
-                }
+                            pid,
+                            dtb,
+                            flink,
+                            offsets.bitness
+                        );
 
-                off += 1;
+                        return Ok((
+                            Process {
+                                pid,
+                                name: "System".to_string(),
+                                dtb,
+                                eprocess_phys,
+                                peb_vaddr: peb,
+                            },
+                            *offsets,
+                        ));
+                    }
+                }
+            }
+
+            // Chunk consumed — release backing pages on mmap layers.
+            phys.advise_scanned(addr, read_len as u64);
+            addr += read_len as u64;
+            scanned_bytes += read_len as u64;
+            if scanned_bytes >= next_progress || scanned_bytes == phys_size {
+                log::info!(
+                    "System discovery scan: {:.1}/{:.1} GiB",
+                    scanned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    phys_size as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+                next_progress = scanned_bytes.saturating_add(SYSTEM_SCAN_PROGRESS_INTERVAL);
             }
         }
-
-        // Chunk consumed into chunk_buf — release its backing pages so RSS stays
-        // near one chunk instead of the whole image on mmap-backed layers.
-        phys.advise_scanned(addr, read_len as u64);
-        addr += read_len as u64;
     }
 
     Err(VmkatzError::SystemProcessNotFound)
@@ -257,8 +290,8 @@ pub fn find_system_process_ept<P: PhysicalMemory>(
     for region in ept.mapped_regions() {
         let mut region_off: u64 = 0;
         while region_off < region.size {
-            let remaining = (region.size - region_off) as usize;
-            let read_len = SCAN_CHUNK_SIZE.min(remaining);
+            let remaining = region.size - region_off;
+            let read_len = bounded_scan_chunk_len(remaining);
             let l1_addr = region.l1_base + region_off;
             let l2_addr = region.l2_base + region_off;
 

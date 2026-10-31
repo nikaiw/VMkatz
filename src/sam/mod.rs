@@ -152,6 +152,15 @@ pub fn extract_disk_secrets_with_bitlocker_scoped(
     extract_secrets_with_bitlocker(&mut disk, fvek_keys, partition_filter)
 }
 
+/// Reader-based BitLocker-aware SAM extraction, usable by VMFS-backed disks.
+pub fn extract_disk_secrets_from_reader_with_bitlocker<R: Read + Seek>(
+    reader: &mut R,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
+) -> Result<DiskSecrets> {
+    extract_secrets_with_bitlocker(reader, fvek_keys, partition_filter)
+}
+
 /// Extract NTDS artifacts from a disk, trying FVEK keys for BitLocker partitions.
 pub fn extract_ntds_artifacts_with_bitlocker(
     path: &Path,
@@ -170,16 +179,22 @@ pub fn extract_ntds_artifacts_with_bitlocker_scoped(
     extract_ntds_with_bitlocker(&mut disk, fvek_keys, partition_filter)
 }
 
+/// Reader-based BitLocker-aware NTDS extraction, usable by VMFS-backed disks.
+pub fn extract_ntds_artifacts_from_reader_with_bitlocker<R: Read + Seek>(
+    reader: &mut R,
+    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
+    partition_filter: Option<u64>,
+) -> Result<NtdsArtifacts> {
+    extract_ntds_with_bitlocker(reader, fvek_keys, partition_filter)
+}
+
 /// Core BitLocker-aware extraction for SAM/LSA secrets.
 fn extract_secrets_with_bitlocker<R: Read + Seek>(
     reader: &mut R,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(
-        find_ntfs_partitions(reader).unwrap_or_default(),
-        partition_filter,
-    )?;
+    let partitions = select_partition(find_ntfs_partitions(reader)?, partition_filter)?;
 
     for &partition_offset in &partitions {
         // Try unencrypted first
@@ -228,10 +243,7 @@ fn extract_ntds_with_bitlocker<R: Read + Seek>(
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
     partition_filter: Option<u64>,
 ) -> Result<NtdsArtifacts> {
-    let partitions = select_partition(
-        find_ntfs_partitions(reader).unwrap_or_default(),
-        partition_filter,
-    )?;
+    let partitions = select_partition(find_ntfs_partitions(reader)?, partition_filter)?;
 
     for &partition_offset in &partitions {
         if !is_bitlocker_partition(reader, partition_offset) {

@@ -83,9 +83,9 @@ pub fn find_entry<'n, R: Read + Seek>(
             return Ok(file);
         }
     }
-    Err(crate::error::VmkatzError::DiskFormatError(format!(
-        "NTFS entry '{name}' not found"
-    )))
+    Err(crate::error::VmkatzError::NtfsEntryNotFound(
+        name.to_string(),
+    ))
 }
 
 /// Read file data ($DATA attribute) into a `Vec<u8>`.
@@ -115,7 +115,12 @@ pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> 
             "NTFS attribute too large: {len} bytes"
         )));
     }
-    let mut buf = vec![0u8; len as usize];
+    let buffer_len = usize::try_from(len).map_err(|_| {
+        crate::error::VmkatzError::DecryptionError(format!(
+            "NTFS attribute length does not fit this platform: {len} bytes"
+        ))
+    })?;
+    let mut buf = vec![0u8; buffer_len];
     // Try exact read first; on error, use chunked resilient read
     match data_value.read_exact(reader, &mut buf) {
         Ok(()) => Ok(buf),
@@ -131,7 +136,12 @@ pub fn read_file_data<R: Read + Seek>(file: &ntfs::NtfsFile, reader: &mut R) -> 
                 let end = (offset + CHUNK).min(buf.len());
                 // Seek to the correct position before each chunk to avoid cursor desync
                 // after a failed read_exact (which leaves the cursor in an undefined state)
-                let _ = data_value.seek(reader, std::io::SeekFrom::Start(offset as u64));
+                let seek_offset = u64::try_from(offset).map_err(|_| {
+                    crate::error::VmkatzError::DecryptionError(
+                        "NTFS attribute offset does not fit a seek position".into(),
+                    )
+                })?;
+                let _ = data_value.seek(reader, std::io::SeekFrom::Start(seek_offset));
                 if data_value
                     .read_exact(reader, &mut buf[offset..end])
                     .is_err()

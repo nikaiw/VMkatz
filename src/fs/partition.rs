@@ -136,9 +136,11 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         ));
     }
 
-    let entry_lba = crate::utils::read_u64_le(&hdr, 0x48).unwrap_or(0);
-    let num_entries = crate::utils::read_u32_le(&hdr, 0x50).unwrap_or(0);
-    let entry_size = crate::utils::read_u32_le(&hdr, 0x54).unwrap_or(0);
+    let entry_lba = u64::from_le_bytes([
+        hdr[0x48], hdr[0x49], hdr[0x4A], hdr[0x4B], hdr[0x4C], hdr[0x4D], hdr[0x4E], hdr[0x4F],
+    ]);
+    let num_entries = u32::from_le_bytes([hdr[0x50], hdr[0x51], hdr[0x52], hdr[0x53]]);
+    let entry_size = u32::from_le_bytes([hdr[0x54], hdr[0x55], hdr[0x56], hdr[0x57]]);
 
     // Untrusted header: reject implausible values rather than looping/allocating.
     if !(128..=4096).contains(&entry_size) || num_entries > MAX_ENTRIES {
@@ -150,11 +152,22 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     log::debug!("GPT: entry_lba={entry_lba}, num_entries={num_entries}, entry_size={entry_size}");
 
     let mut partitions = Vec::new();
-    let entries_offset = entry_lba.saturating_mul(512);
-    let mut entry = vec![0u8; entry_size as usize];
+    let entries_offset = entry_lba.checked_mul(512).ok_or_else(|| {
+        VmkatzError::DecryptionError("GPT entry table offset overflow".to_string())
+    })?;
+    let entry_len = usize::try_from(entry_size).map_err(|_| {
+        VmkatzError::DecryptionError("GPT entry size does not fit this platform".to_string())
+    })?;
+    let mut entry = vec![0u8; entry_len];
 
     for i in 0..num_entries {
-        let entry_offset = entries_offset.saturating_add(u64::from(i) * u64::from(entry_size));
+        let Some(entry_offset) = u64::from(i)
+            .checked_mul(u64::from(entry_size))
+            .and_then(|relative| entries_offset.checked_add(relative))
+        else {
+            log::debug!("GPT entry {i}: table offset overflow");
+            continue;
+        };
         if reader.seek(SeekFrom::Start(entry_offset)).is_err()
             || reader.read_exact(&mut entry).is_err()
         {
@@ -168,7 +181,16 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
             continue;
         }
 
-        let first_lba = crate::utils::read_u64_le(&entry, 0x20).unwrap_or(0);
+        let first_lba = u64::from_le_bytes([
+            entry[0x20],
+            entry[0x21],
+            entry[0x22],
+            entry[0x23],
+            entry[0x24],
+            entry[0x25],
+            entry[0x26],
+            entry[0x27],
+        ]);
         if first_lba == 0 {
             continue;
         }

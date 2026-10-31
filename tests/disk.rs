@@ -317,7 +317,7 @@ fn test_cli_ls_lists_root() {
     }
     let mut disk = vmkatz::disk::open_disk(path).expect("open");
     let parts = vmkatz::fs::find_ntfs_partitions(&mut disk).expect("partitions");
-    assert!(!parts.is_empty());
+    assert_ne!(parts.len(), 0);
     let out = vmkatz::sam::list_path(&mut disk, parts[0], "").expect("list");
     assert!(matches!(out, vmkatz::sam::ListOutcome::Listed { .. }));
 }
