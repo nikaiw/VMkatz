@@ -38,6 +38,7 @@ check:
 
 .PHONY: clippy
 clippy:
+	cargo clippy --all-features -- -D warnings
 	cargo clippy -- -D warnings
 
 .PHONY: check-features
@@ -76,12 +77,19 @@ install: release
 	cp ./$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
 	@echo "[+] Installed: $(HOME)/.local/bin/$(BINARY_NAME)"
 
+# Mirrors the GitHub CI gates. Not reproducible locally (need mingw/wine) and
+# therefore excluded: the Windows-target clippy and the wine test run.
 .PHONY: ci
-ci: fmt-check clippy unit-test
+ci: fmt-check clippy check-features doc-check deny machete unit-test
+
+.PHONY: hooks
+hooks:
+	git config core.hooksPath .githooks
+	@echo "[+] pre-commit hook enabled (fmt + clippy). Bypass once: git commit --no-verify"
 
 .PHONY: unit-test
 unit-test:
-	cargo test
+	cargo test --all-features
 
 .PHONY: test-lsass
 test-lsass: release
@@ -112,7 +120,7 @@ help:
 	@echo "  make clean        Remove build artifacts"
 	@echo ""
 	@echo "Quality:"
-	@echo "  make ci           Run full CI pipeline (fmt + clippy + tests)"
+	@echo "  make ci           Run the GitHub CI gates (fmt, clippy, features, rustdoc, deny, machete, tests)"
 	@echo "  make check        Run cargo check"
 	@echo "  make clippy       Run clippy lints"
 	@echo "  make check-features  Check every feature in isolation (needs cargo-hack)"

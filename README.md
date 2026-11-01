@@ -166,6 +166,8 @@ cargo build --release --features chrome                            # Add chrome 
 cargo build --release --features veeam                             # Add Veeam backup support
 ```
 
+`make ci` runs the same gates as GitHub CI (fmt, clippy, feature matrix, rustdoc, cargo-deny, cargo-machete, tests); it needs `cargo install cargo-hack cargo-deny cargo-machete`. `make hooks` installs an opt-in pre-commit hook (fmt + clippy).
+
 ## Browser secrets (experimental)
 
 The optional `chrome` module extracts saved passwords, cookies, and autofill

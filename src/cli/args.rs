@@ -435,8 +435,7 @@ mod offset_tests {
     }
 }
 
-/// Parse `--dpapi-nthash` specs into `(USER, 16-byte NT hash)` pairs.
-/// Requires `USER:HEX`; malformed entries are skipped with a warning.
+/// Parse `--dpapi-password` specs into `(USER, password)` pairs; same `USER:VALUE` format.
 #[cfg(feature = "sam")]
 pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -455,6 +454,8 @@ pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
     out
 }
 
+/// Parse `--dpapi-nthash` specs into `(USER, 16-byte NT hash)` pairs.
+/// Requires `USER:HEX`; malformed entries are skipped with a warning.
 #[cfg(feature = "sam")]
 pub(crate) fn parse_dpapi_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
     let mut out: Vec<(String, [u8; 16])> = Vec::new();
