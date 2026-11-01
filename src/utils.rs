@@ -55,44 +55,36 @@ pub fn read_i32_le(data: &[u8], off: usize) -> Option<i32> {
 #[inline]
 #[must_use]
 pub fn u16_le(d: &[u8], off: usize) -> u16 {
-    {
-        let mut b = [0u8; 2];
-        b.copy_from_slice(&d[off..off + 2]);
-        u16::from_le_bytes(b)
-    }
+    let mut b = [0u8; 2];
+    b.copy_from_slice(&d[off..off + 2]);
+    u16::from_le_bytes(b)
 }
 
 /// Little-endian u32 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u32_le(d: &[u8], off: usize) -> u32 {
-    {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&d[off..off + 4]);
-        u32::from_le_bytes(b)
-    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&d[off..off + 4]);
+    u32::from_le_bytes(b)
 }
 
 /// Little-endian u64 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u64_le(d: &[u8], off: usize) -> u64 {
-    {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&d[off..off + 8]);
-        u64::from_le_bytes(b)
-    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[off..off + 8]);
+    u64::from_le_bytes(b)
 }
 
 /// Big-endian u32 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u32_be(d: &[u8], off: usize) -> u32 {
-    {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&d[off..off + 4]);
-        u32::from_be_bytes(b)
-    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&d[off..off + 4]);
+    u32::from_be_bytes(b)
 }
 
 /// Big-endian u64 at `off`. Panics if the slice is short, like indexing.
@@ -609,5 +601,19 @@ pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u64_be_round_trips() {
+        let v = 0x0102_0304_0506_0708_u64;
+        let mut d = vec![0xAA];
+        d.extend_from_slice(&v.to_be_bytes());
+        assert_eq!(u64_be(&d, 1), v);
+        assert_eq!(u64_be(&[0, 0, 0, 0, 0, 0, 1, 2], 0), 0x102);
     }
 }

@@ -13,6 +13,7 @@ pub mod cli;
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use clap::Parser;
 
 #[cfg(feature = "sam")]
@@ -67,7 +68,6 @@ fn main() -> anyhow::Result<()> {
     // EPT scan + process walk + credential extraction overflows 512KB when
     // processing multiple large VM snapshots sequentially.
     // Spawn on a thread with the standard Linux 8MB stack to avoid this.
-    use anyhow::Context as _;
     const STACK_SIZE: usize = 8 * 1024 * 1024;
     let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
     let handler = builder

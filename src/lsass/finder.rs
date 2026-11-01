@@ -2085,7 +2085,8 @@ fn scan_kerb_key_list(
     // Key entry anchored on the etype field: {etype:u32, keylen:u32, pad:u32==0,
     // keyptr:u64}. (The preceding u32 is 1 for RC4 but 0 for AES, so key on etype.)
     let mut off = 0;
-    while off + 0x10 <= buf.len() {
+    // rd64(off + 0xc) reads through off + 0x14, so that is the true extent.
+    while off + 0x14 <= buf.len() {
         let etype = rd32(off);
         let keylen = rd32(off + 4) as usize;
         if known_kerb_etype(etype) && matches!(keylen, 8 | 16 | 24 | 32) && rd32(off + 8) == 0 {
@@ -2400,4 +2401,35 @@ pub fn extract_credentials_from_minidump(
 
     status.print_summary();
     Ok(finalize_credentials(all_creds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct OneBuf(Vec<u8>);
+
+    impl VirtualMemory for OneBuf {
+        fn read_virt(&self, vaddr: u64, buf: &mut [u8]) -> Result<()> {
+            if vaddr != 0x2000_0000 || buf.len() > self.0.len() {
+                return Err(VmkatzError::DiskFormatError("unmapped".into()));
+            }
+            buf.copy_from_slice(&self.0[..buf.len()]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kerb_key_list_trigger_at_buffer_tail_does_not_panic() {
+        let mut data = vec![0u8; 0x400];
+        // etype 18 (AES256), keylen 16, zero pad at off 0x3F0 (last offset the old bound allowed): rd64(off+0xc)
+        // would run past the 0x400 buffer.
+        data[0x3F0..0x3F4].copy_from_slice(&18u32.to_le_bytes());
+        data[0x3F4..0x3F8].copy_from_slice(&16u32.to_le_bytes());
+        let vmem = OneBuf(data);
+        let mut keys = Vec::new();
+        let mut realm = String::new();
+        scan_kerb_key_list(&vmem, 0x2000_0000, &mut keys, &mut realm);
+        assert!(keys.is_empty());
+    }
 }
