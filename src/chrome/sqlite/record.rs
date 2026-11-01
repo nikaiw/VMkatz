@@ -1,4 +1,5 @@
 use crate::error::{Result, VmkatzError as Error};
+use crate::utils::{u32_be, u64_be};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -86,10 +87,7 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         }
         4 => {
             need(b, 4)?;
-            (
-                Value::Int(i64::from(i32::from_be_bytes(b[..4].try_into().unwrap()))),
-                4,
-            )
+            (Value::Int(i64::from(u32_be(b, 0) as i32)), 4)
         }
         5 => {
             need(b, 6)?;
@@ -106,17 +104,11 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         }
         6 => {
             need(b, 8)?;
-            (
-                Value::Int(i64::from_be_bytes(b[..8].try_into().unwrap())),
-                8,
-            )
+            (Value::Int(u64_be(b, 0) as i64), 8)
         }
         7 => {
             need(b, 8)?;
-            (
-                Value::Real(f64::from_be_bytes(b[..8].try_into().unwrap())),
-                8,
-            )
+            (Value::Real(f64::from_bits(u64_be(b, 0))), 8)
         }
         8 => (Value::Int(0), 0),
         9 => (Value::Int(1), 0),

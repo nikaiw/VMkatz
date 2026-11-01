@@ -55,28 +55,53 @@ pub fn read_i32_le(data: &[u8], off: usize) -> Option<i32> {
 #[inline]
 #[must_use]
 pub fn u16_le(d: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(d[off..off + 2].try_into().expect("2 bytes"))
+    {
+        let mut b = [0u8; 2];
+        b.copy_from_slice(&d[off..off + 2]);
+        u16::from_le_bytes(b)
+    }
 }
 
 /// Little-endian u32 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u32_le(d: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(d[off..off + 4].try_into().expect("4 bytes"))
+    {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&d[off..off + 4]);
+        u32::from_le_bytes(b)
+    }
 }
 
 /// Little-endian u64 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u64_le(d: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(d[off..off + 8].try_into().expect("8 bytes"))
+    {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&d[off..off + 8]);
+        u64::from_le_bytes(b)
+    }
 }
 
 /// Big-endian u32 at `off`. Panics if the slice is short, like indexing.
 #[inline]
 #[must_use]
 pub fn u32_be(d: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes(d[off..off + 4].try_into().expect("4 bytes"))
+    {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&d[off..off + 4]);
+        u32::from_be_bytes(b)
+    }
+}
+
+/// Big-endian u64 at `off`. Panics if the slice is short, like indexing.
+#[inline]
+#[must_use]
+pub fn u64_be(d: &[u8], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[off..off + 8]);
+    u64::from_be_bytes(b)
 }
 
 /// Little-endian u16 at `off`, 0 when the slice is short.
@@ -281,6 +306,10 @@ impl MappedFile {
 
     /// Get a byte slice (only works for mmap variant).
     /// Panics on Pread variant — callers that need slicing must use read_at instead.
+    #[expect(
+        clippy::panic,
+        reason = "programming-error guard: every caller checks is_pread() first; not reachable from file contents"
+    )]
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Mmap(m) => m,

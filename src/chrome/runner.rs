@@ -727,7 +727,10 @@ where
                     };
                     if let Some(clear) = decrypt_fn(sid, sub, bytes) {
                         log::info!("[chrome] decrypted {label} MK: SID={sid}{ctx} GUID={name}");
-                        found.lock().unwrap().push((name.to_lowercase(), clear));
+                        found
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((name.to_lowercase(), clear));
                     } else {
                         log::info!(
                             "[chrome] MK decrypt failed: ctx={label} SID={sid}{ctx} GUID={name}"
@@ -737,7 +740,10 @@ where
             });
         }
     });
-    for (guid, clear) in found.into_inner().unwrap() {
+    for (guid, clear) in found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         out.insert(guid, clear);
     }
 }

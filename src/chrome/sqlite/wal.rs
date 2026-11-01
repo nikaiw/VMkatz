@@ -38,7 +38,7 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
         )));
     }
 
-    let magic = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+    let magic = u32_be(bytes, 0);
     // 0x377F0682 = legacy/native-byte-order checksums, 0x377F0683 = big-endian
     // checksums. Both are valid WAL headers and the frame layout is identical.
     if magic != 0x377F_0682 && magic != 0x377F_0683 {
@@ -58,7 +58,7 @@ pub fn parse_wal(bytes: &[u8], page_size: usize) -> Result<HashMap<u32, Vec<u8>>
         .is_some_and(|e| e <= bytes.len())
     {
         let h = &bytes[cursor..cursor + 24];
-        let page_no = u32::from_be_bytes(h[..4].try_into().unwrap());
+        let page_no = u32_be(h, 0);
         let db_size = u32_be(h, 4);
         // page_no == 0 is reserved (used by some SQLite versions as a sentinel
         // for frames that have been overwritten). Discard rather than panic.

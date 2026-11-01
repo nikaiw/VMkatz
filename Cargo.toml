@@ -72,6 +72,15 @@ nursery  = { level = "deny", priority = -1 }
 too_many_lines        = "deny"
 cognitive_complexity  = "deny"
 
+# Crafted input must never panic: propagate or justify with #[expect].
+unwrap_used           = "deny"
+expect_used           = "deny"
+unwrap_in_result      = "deny"
+panic                 = "deny"
+unreachable           = "deny"
+todo                  = "deny"
+unimplemented         = "deny"
+
 # Deliberate for binary parsing: offset/size casts, format acronyms.
 cast_possible_truncation = "allow"
 cast_possible_wrap       = "allow"

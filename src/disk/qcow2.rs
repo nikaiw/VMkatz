@@ -240,7 +240,7 @@ impl QcowDisk {
 
         let table: Vec<u64> = raw
             .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .map(|c| crate::utils::u64_be(c, 0))
             .collect();
 
         let entry = table[l2_idx];

@@ -107,7 +107,13 @@ impl VmdkDisk {
         }
 
         // Determine total disk size from highest extent number
-        let max_num = numbered_extents.iter().map(|(n, _)| *n).max().unwrap();
+        let max_num = numbered_extents
+            .iter()
+            .map(|(n, _)| *n)
+            .max()
+            .ok_or_else(|| {
+                VmkatzError::DiskFormatError("No VMDK extent files found in directory".into())
+            })?;
 
         log::info!(
             "Found {} VMDK extent files (no descriptor), max extent number: s{:03}",
@@ -577,10 +583,7 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
     file.seek(SeekFrom::Start(gd_byte_off))?;
     let gd_raw = super::read_exact_alloc(&mut file, (gd_entries as u64).saturating_mul(4))?;
 
-    let gd: Vec<u32> = gd_raw
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let gd: Vec<u32> = gd_raw.chunks_exact(4).map(|c| u32_le(c, 0)).collect();
 
     Ok(VmdkExtent {
         file,

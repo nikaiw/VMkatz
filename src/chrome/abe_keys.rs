@@ -236,7 +236,8 @@ fn try_table_at(buf: &[u8]) -> Option<Vec<AbeKey>> {
             return None;
         }
         // Entropy gate on the 32 key bytes: distinct byte values >= 20.
-        let key: [u8; 32] = e[16..48].try_into().unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&e[16..48]);
         if distinct_bytes(&key) < 20 {
             return None;
         }

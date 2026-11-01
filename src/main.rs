@@ -67,12 +67,15 @@ fn main() -> anyhow::Result<()> {
     // EPT scan + process walk + credential extraction overflows 512KB when
     // processing multiple large VM snapshots sequentially.
     // Spawn on a thread with the standard Linux 8MB stack to avoid this.
+    use anyhow::Context as _;
     const STACK_SIZE: usize = 8 * 1024 * 1024;
     let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
     let handler = builder
         .spawn(vmkatz_main)
-        .expect("failed to spawn main thread");
-    handler.join().unwrap()
+        .context("failed to spawn main thread")?;
+    handler
+        .join()
+        .map_err(|_| anyhow::anyhow!("main thread panicked"))?
 }
 
 #[expect(
@@ -85,7 +88,7 @@ fn vmkatz_main() -> anyhow::Result<()> {
         Ok(args) => args,
         Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
             Args::parse_from(["vmkatz", "--help"]);
-            unreachable!()
+            std::process::exit(0)
         }
         Err(e) => e.exit(),
     };
@@ -94,7 +97,8 @@ fn vmkatz_main() -> anyhow::Result<()> {
         1 => log::LevelFilter::Info,
         _ => log::LevelFilter::Debug,
     };
-    log::set_logger(&SimpleLogger).unwrap();
+    // Only one logger is ever installed, so Err (already set) is ignorable.
+    let _ = log::set_logger(&SimpleLogger);
     log::set_max_level(log_level);
 
     eprintln!("[*] vmkatz v{}", env!("CARGO_PKG_VERSION"));
@@ -113,7 +117,7 @@ fn vmkatz_main() -> anyhow::Result<()> {
 
     if args.input_paths.is_empty() {
         Args::parse_from(["vmkatz", "--help"]);
-        unreachable!()
+        std::process::exit(0)
     }
 
     let input_path = Path::new(&args.input_paths[0]);

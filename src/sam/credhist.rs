@@ -150,8 +150,10 @@ fn decrypt_entry(e: &Entry<'_>, pre_key: &[u8]) -> Result<CredHistHashes> {
         return Err(err("credhist PBKDF2 rounds out of range"));
     }
     let derived = derive_key_sha512(pre_key, &e.salt, 48, e.rounds);
-    let key: [u8; 32] = derived[..32].try_into().unwrap();
-    let iv: [u8; 16] = derived[32..48].try_into().unwrap();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&derived[..32]);
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(&derived[32..48]);
     let mut buf = e.ciphertext.to_vec();
     Aes256CbcDec::new((&key).into(), (&iv).into())
         .decrypt_padded_mut::<NoPadding>(&mut buf)

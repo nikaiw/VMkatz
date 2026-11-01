@@ -347,8 +347,10 @@ fn decrypt_mk_section(mk: &MasterKeyDecryptInput, pre_key: &[u8]) -> Result<Vec<
             // the accumulated XOR (not the previous round's output). Standard
             // PBKDF2 from the `pbkdf2` crate produces a different (wrong) key.
             let derived = dpapi_derive_key_sha512(pre_key, &mk.salt, 48, mk.rounds);
-            let aes_key: [u8; 32] = derived[..32].try_into().unwrap();
-            let iv: [u8; 16] = derived[32..48].try_into().unwrap();
+            let mut aes_key = [0u8; 32];
+            aes_key.copy_from_slice(&derived[..32]);
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&derived[32..48]);
             if !mk.ciphertext.len().is_multiple_of(16) {
                 return Err(VmkatzError::DecryptionError(
                     "AES MK ciphertext not block-aligned".into(),
@@ -445,6 +447,10 @@ pub(crate) fn derive_key_sha512(
     dpapi_derive_key_sha512(passphrase, salt, keylen, count)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC accepts keys of any length; new_from_slice cannot fail"
+)]
 fn dpapi_derive_key_sha512(passphrase: &[u8], salt: &[u8], keylen: usize, count: u32) -> Vec<u8> {
     use hmac::Mac;
     let mut out: Vec<u8> = Vec::with_capacity(keylen);
@@ -469,6 +475,10 @@ fn dpapi_derive_key_sha512(passphrase: &[u8], salt: &[u8], keylen: usize, count:
     out
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC accepts keys of any length; new_from_slice cannot fail"
+)]
 fn dpapi_derive_key_sha1(passphrase: &[u8], salt: &[u8], keylen: usize, count: u32) -> Vec<u8> {
     use hmac::Mac;
     let mut out: Vec<u8> = Vec::with_capacity(keylen);

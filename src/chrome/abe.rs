@@ -210,7 +210,7 @@ fn parse_aes_encrypted_key_struct(blob: &[u8]) -> Result<(&[u8], &[u8], u8)> {
     if buf.len() < 4 {
         return Err(Error::Parse("ABE blob: missing header_len".into()));
     }
-    let header_len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+    let header_len = u32_le(buf, 0) as usize;
     if header_len < 1 || 4 + header_len + 4 > buf.len() {
         return Err(Error::Parse(format!(
             "ABE header_len {header_len} out of range"

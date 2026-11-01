@@ -2067,8 +2067,8 @@ fn scan_kerb_key_list(
     let Ok(buf) = vmem.read_virt_bytes(struct_ptr, 0x400) else {
         return;
     };
-    let rd32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-    let rd64 = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| crate::utils::u32_le(&buf, o);
+    let rd64 = |o: usize| crate::utils::u64_le(&buf, o);
     // Salt (@+0x10 len, @+0x18 ptr) → realm = salt without the "krbtgt" suffix.
     if realm.is_empty() {
         let salt_len = (rd32(0x10) & 0xffff) as usize;

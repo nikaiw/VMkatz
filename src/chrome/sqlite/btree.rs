@@ -180,7 +180,7 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
         let mut buf = Vec::with_capacity(cap);
         buf.extend_from_slice(&page[payload_off..local_end]);
 
-        let mut next = u32::from_be_bytes(page[local_end..next_ptr_end].try_into().unwrap());
+        let mut next = u32_be(page, local_end);
         let mut remaining = payload_size_us - local;
         // Cap the number of overflow hops to defend against cyclic chains.
         let max_hops = pager.header.page_count as usize + 1;
@@ -194,7 +194,7 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
             if op.len() < 4 {
                 return Err(Error::Parse("overflow page truncated".into()));
             }
-            let nxt = u32::from_be_bytes(op[..4].try_into().unwrap());
+            let nxt = u32_be(op, 0);
             let take = remaining.min(usable - 4);
             let end = 4usize
                 .checked_add(take)
