@@ -5,6 +5,9 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Weekly re-run so newly published advisories surface without a push.
+  schedule:
+    - cron: "0 6 * * 1"
 
 # A new push to the same ref cancels an in-flight run, so a stuck run (e.g. a
 # hung wine install) doesn't pile up or keep burning a runner.
@@ -87,3 +90,19 @@ jobs:
         run: >
           cargo test --all-features --target x86_64-pc-windows-gnu
           --test memory_limits --test positioned_read
+
+  deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@cargo-machete
+
+      - name: Unused dependencies
+        run: cargo machete

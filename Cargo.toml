@@ -59,6 +59,11 @@ lz4_flex = { version = "0.11", optional = true }
 zstd = { version = "0.13", optional = true }
 zeroize = { version = "1", features = ["derive"], optional = true }
 
+# False positive: the md-5 package's library is named `md5`, which machete
+# does not map back to the `md-5` dependency (used in sam/hashes.rs, veeam/reconstruct.rs).
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
+
 [lints.clippy]
 # pedantic + nursery at deny; lints that are just noise for a low-level
 # disk/memory forensic parser are allowed below (priority -1 lets these win).

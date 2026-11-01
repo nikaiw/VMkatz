@@ -49,6 +49,14 @@ check-features:
 doc-check:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --document-private-items
 
+.PHONY: deny
+deny:
+	cargo deny check
+
+.PHONY: machete
+machete:
+	cargo machete
+
 .PHONY: fmt
 fmt:
 	cargo fmt
@@ -109,6 +117,8 @@ help:
 	@echo "  make clippy       Run clippy lints"
 	@echo "  make check-features  Check every feature in isolation (needs cargo-hack)"
 	@echo "  make doc-check    Build rustdoc, warnings denied"
+	@echo "  make deny         Dependency policy: advisories, licences, bans, sources (needs cargo-deny)"
+	@echo "  make machete      Find unused dependencies (needs cargo-machete)"
 	@echo "  make fmt          Format code"
 	@echo "  make fmt-check    Check formatting"
 	@echo "  make unit-test    Run unit tests"
