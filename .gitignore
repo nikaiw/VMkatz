@@ -8,3 +8,6 @@ examples/
 dev/
 docs/plans/
 docs/superpowers/
+
+# Local-only test fixtures (real hives/images; never committed)
+tests/fixtures/
