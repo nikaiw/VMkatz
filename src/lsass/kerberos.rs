@@ -402,6 +402,11 @@ fn avl_table_is_valid(
 }
 
 /// Extract Kerberos credentials from kerberos.dll (unified x64/x86).
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "Kerberos ticket/credential AVL walk across x64/x86 layouts; split tracked"
+)]
 pub fn extract_kerberos_credentials(
     vmem: &dyn VirtualMemory,
     kerberos_base: u64,
@@ -1313,6 +1318,10 @@ pub fn extract_kerb_password(
 /// Used as fallback when the AVL tree walk fails or returns empty.
 /// Unlike the physical scan in finder.rs, this works on any VirtualMemory backend
 /// (minidumps, snapshots) and doesn't require known_users filter.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear VirtualMemory region scan for KIWI Kerberos primary credentials; split tracked"
+)]
 pub fn scan_vmem_for_kerberos_credentials(
     vmem: &dyn VirtualMemory,
     regions: &[(u64, u64)],

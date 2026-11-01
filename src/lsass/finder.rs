@@ -811,6 +811,11 @@ fn extract_all_credentials_x86<P: PhysicalMemory>(
 /// Find LSASS and extract all credentials.
 /// When a pagefile reader is provided, paged-out memory is resolved from disk.
 /// When a disk path is provided, demand-paged DLL sections are resolved from DLL files.
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "end-to-end LSASS credential extraction orchestrating every provider and fallback; split tracked"
+)]
 pub fn extract_all_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass: &Process,
@@ -1335,6 +1340,10 @@ fn recover_3des_iv_x64<P: PhysicalMemory>(
     found
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "physical-memory MSV primary-credential scan with session matching; split tracked"
+)]
 fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
@@ -1560,6 +1569,10 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
 /// The scan validates that +0x20..+0x30 does NOT look like another UNICODE_STRING
 /// (to distinguish from arrays of UNICODE_STRINGs in memory).
 /// Only credentials whose user/domain match already-known logon sessions are returned.
+#[expect(
+    clippy::too_many_lines,
+    reason = "physical-memory Kerberos primary-credential scan with UNICODE_STRING validation; split tracked"
+)]
 fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
@@ -2108,6 +2121,10 @@ fn find_module<'a>(modules: &'a [LoadedModule], name: &str) -> Option<&'a Loaded
 /// MSV list walk returns empty, falls back to scanning all memory regions
 /// for Primary credential structures (similar to the physical scan fallback
 /// in `extract_all_credentials`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "minidump MSV/Kerberos/WDigest/etc. extraction plus region-scan fallback in one pass; split tracked"
+)]
 pub fn extract_credentials_from_minidump(
     vmem: &dyn VirtualMemory,
     modules: &[LoadedModule],

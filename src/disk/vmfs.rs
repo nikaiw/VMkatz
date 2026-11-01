@@ -1174,6 +1174,10 @@ impl Vmfs6Volume {
     // ── Directory Parsing ────────────────────────────────────────────
 
     /// Read directory entries from a directory file descriptor.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single-pass VMFS5/VMFS6 directory block walk with per-version entry decoding; split tracked"
+    )]
     fn read_directory(&mut self, dir_fd: &FileDescriptor) -> Result<Vec<DirEntry>> {
         if !self.sb.is_vmfs6 {
             return self.read_directory_v5(dir_fd);

@@ -169,6 +169,10 @@ pub(crate) fn run_minidump(input_path: &Path, args: &Args) -> anyhow::Result<()>
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level LSASS command: input detection and layer dispatch for every backend; split tracked"
+)]
 pub(crate) fn run_lsass(
     input_path: &Path,
     args: &Args,
@@ -661,6 +665,10 @@ fn registry_carve_or_hint<L: PhysicalMemory>(layer: &L, args: &Args, why: &str) 
     feature = "qemu",
     feature = "hyperv"
 ))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-layer LSASS extraction flow with feature-gated steps inline; split tracked"
+)]
 fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     make_layer: F,
     args: &Args,
@@ -866,6 +874,10 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     feature = "hyperv"
 ))]
 #[cfg_attr(not(feature = "sam"), allow(unused_variables))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "SYSTEM-hive plus LSASS extraction flow per memory layer, feature-gated steps inline; split tracked"
+)]
 fn run_with_system<L: PhysicalMemory>(
     layer: &L,
     system: &vmkatz::windows::process::Process,

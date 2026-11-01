@@ -1050,6 +1050,10 @@ fn read_sid_at(vmem: &dyn VirtualMemory, addr: u64) -> String {
 
 /// Extract MSV1_0 credentials (NTLM hashes) from msv1_0.dll.
 /// `build_number` enables build-aware variant prioritization (0 = unknown).
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear MSV1_0 credential walk over every logon session; split tracked"
+)]
 pub fn extract_msv_credentials(
     vmem: &dyn VirtualMemory,
     msv_base: u64,
@@ -2269,6 +2273,10 @@ pub fn try_extract_primary_credential(
     extract_primary_credential(vmem, cred_ptr, keys, validated_variant, arch, None)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "MSV primary credential decrypt with variant probing; split tracked"
+)]
 fn extract_primary_credential(
     vmem: &dyn VirtualMemory,
     cred_ptr: u64,

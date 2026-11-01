@@ -75,6 +75,10 @@ fn main() -> anyhow::Result<()> {
     handler.join().unwrap()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "CLI argument dispatch across every input mode and output option; split tracked"
+)]
 fn vmkatz_main() -> anyhow::Result<()> {
     // Show full help (not just error) when no arguments provided
     let args = match Args::try_parse() {

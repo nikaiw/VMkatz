@@ -13,6 +13,11 @@ use crate::error::Result;
 /// 2. Try contiguous reads from regf headers and hbin roots
 /// 3. Fragmented assembly: collect scattered hbin blocks by offset_in_hive,
 ///    chain them to rebuild hives fragmented by NTFS
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "grain scan, contiguous read and fragmented hbin assembly of registry hives; split tracked"
+)]
 pub(super) fn scan_vmdk_grains_for_hives(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
 ) -> Result<(super::HiveFiles, Option<[u8; 16]>)> {

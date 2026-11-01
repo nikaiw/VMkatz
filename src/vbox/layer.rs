@@ -333,6 +333,10 @@ fn lzf_decompress(data: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
 
 impl VBoxLayer {
     /// Open a VirtualBox .sav file and extract all RAM pages.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "VirtualBox .sav unit parsing and RAM page extraction in one pass; split tracked"
+    )]
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = fs::File::open(path)?;
         let file_size = crate::utils::file_size(&mut file)?;

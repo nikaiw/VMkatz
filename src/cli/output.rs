@@ -913,6 +913,10 @@ fn write_ccache_credential(
 ///
 /// Sessions sharing the same identity and NT hash are merged into one entry,
 /// moving data from duplicates into the first occurrence to avoid cloning.
+#[expect(
+    clippy::too_many_lines,
+    reason = "credential dedup merging per-provider fields of duplicate sessions; split tracked"
+)]
 fn dedup_credentials(credentials: &[Credential]) -> Vec<Credential> {
     // Dedup key: (username_lower, domain_lower, nt_hash)
     type DedupKey = (String, String, [u8; 16]);
@@ -1125,6 +1129,10 @@ fn dedup_credentials(credentials: &[Credential]) -> Vec<Credential> {
     result
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "text renderer printing every credential provider section in sequence; split tracked"
+)]
 fn print_text(
     credentials: &[Credential],
     c: &Colors,
