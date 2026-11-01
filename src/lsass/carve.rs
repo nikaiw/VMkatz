@@ -84,9 +84,7 @@ pub fn carve_credentials<P: PhysicalMemory>(
     carve_level2(phys, lsass_dtb, &scan)
 }
 
-// ---------------------------------------------------------------------------
 // Combined single-pass scan (LSASS + crypto structures)
-// ---------------------------------------------------------------------------
 
 /// Single-pass scan of ALL physical pages, collecting:
 /// 1. LSASS EPROCESS candidates (from `lsass.exe\0` pattern)
@@ -314,9 +312,7 @@ fn validate_dtb<P: PhysicalMemory>(phys: &P, dtb: u64) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
 // Level 2: Raw physical page carving
-// ---------------------------------------------------------------------------
 
 /// Carve credentials from raw physical pages using pre-computed scan results.
 /// If `lsass_dtb` is provided (from Level 1), uses it for VA→PA translation
@@ -453,9 +449,7 @@ fn carve_level2<P: PhysicalMemory>(
     credentials
 }
 
-// ---------------------------------------------------------------------------
 // Session metadata carving (physical memory scan for LIST_63-like structures)
-// ---------------------------------------------------------------------------
 
 /// Session structure layout for physical memory scanning.
 /// Only variants with luid at 0x70 (the common case for Vista+ x64).

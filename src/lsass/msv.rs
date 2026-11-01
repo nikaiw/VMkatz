@@ -2746,9 +2746,7 @@ fn is_repeating_pattern(data: &[u8]) -> bool {
 /// Avoids external crate dependency.
 use crate::utils::sha1_digest;
 
-// ---------------------------------------------------------------------------
 // Pre-Vista MSV credential extraction (WinXP, Win2003)
-// ---------------------------------------------------------------------------
 
 /// Pre-Vista MSV1_0 list entry offsets (32-bit structures).
 struct PreVistaMsvOffsets {

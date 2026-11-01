@@ -1472,9 +1472,7 @@ fn decrypt_aes_cfb8(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-// ---------------------------------------------------------------------------
 // Pre-Vista crypto: DES-X-CBC + RC4 (WinXP, Win2003)
-// ---------------------------------------------------------------------------
 
 /// Pre-Vista crypto keys extracted from lsasrv.dll.
 /// Uses DES-X-CBC (8-byte aligned blobs) or RC4 (non-aligned blobs).

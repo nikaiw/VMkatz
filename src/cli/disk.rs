@@ -1659,9 +1659,7 @@ fn extract_ntds_from_reader<R: std::io::Read + std::io::Seek>(
     Ok(found_anything)
 }
 
-// ---------------------------------------------------------------------------
 // Raw file modes (no disk image / VM snapshot needed)
-// ---------------------------------------------------------------------------
 
 /// Extract AD hashes from raw NTDS.dit + SYSTEM hive files.
 #[cfg(feature = "ntds.dit")]

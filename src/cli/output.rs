@@ -11,9 +11,7 @@ fn should_show(providers: &[String], name: &str) -> bool {
     providers.is_empty() || providers.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
-// ---------------------------------------------------------------------------
 // Blank hash detection
-// ---------------------------------------------------------------------------
 
 /// NT hash of empty password (NTLM(""))
 const BLANK_NT_HEX: &str = "31d6cfe0d16ae931b73c59d7e0c089c0";
@@ -652,9 +650,7 @@ pub(crate) fn print_registry_creds(
     true
 }
 
-// ---------------------------------------------------------------------------
 // Kerberos ticket export (--kirbi, --ccache)
-// ---------------------------------------------------------------------------
 
 /// Export Kerberos tickets from credentials if --kirbi or --ccache is set.
 pub(crate) fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {

@@ -30,9 +30,7 @@ use crate::error::Result;
 use crate::memory::VirtualMemory;
 use crate::utils::u64_le;
 
-// ============================================================================
 // Locator signature
-// ============================================================================
 
 /// 152-byte structural signature of a `net::CookieMonster` instance's
 /// first members.
@@ -128,9 +126,7 @@ fn matches_signature(sig: &[u8; 152], window: &[u8]) -> bool {
     true
 }
 
-// ============================================================================
 // In-process C++ struct layouts (MSVC x64)
-// ============================================================================
 
 /// `std::string` short-string-optimization layout (MSVC x64): a 23-byte
 /// inline buffer with the length stored in byte 23.

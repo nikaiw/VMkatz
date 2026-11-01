@@ -463,9 +463,7 @@ impl super::DiskImage for VmdkDisk {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Internal helpers
-// ---------------------------------------------------------------------------
 
 fn parse_descriptor(text: &str) -> Result<Descriptor> {
     let mut parent_hint = None;

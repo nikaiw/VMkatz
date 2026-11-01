@@ -288,9 +288,7 @@ impl Args {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Terminal color support
-// ---------------------------------------------------------------------------
 
 /// ANSI color escape sequences (empty strings when disabled).
 pub(crate) struct Colors {
@@ -338,9 +336,7 @@ pub(crate) fn get_colors(args: &Args) -> &'static Colors {
     }
 }
 
-// ---------------------------------------------------------------------------
 // File type detection by magic bytes
-// ---------------------------------------------------------------------------
 
 /// File type detected from magic bytes at the start of the file.
 #[derive(Debug, Clone, Copy, PartialEq)]

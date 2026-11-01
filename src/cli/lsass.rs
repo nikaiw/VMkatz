@@ -1151,9 +1151,7 @@ fn find_process_by_name<'a>(
     exe_match
 }
 
-// ---------------------------------------------------------------------------
 // BitLocker FVEK extraction and export
-// ---------------------------------------------------------------------------
 
 /// Extract `BitLocker` FVEK keys from physical memory, display results, and
 /// optionally export as dislocker-compatible `.fvek` files.

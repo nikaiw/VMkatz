@@ -2111,9 +2111,7 @@ fn find_module<'a>(modules: &'a [LoadedModule], name: &str) -> Option<&'a Loaded
         .find(|m| m.base_name.eq_ignore_ascii_case(name))
 }
 
-// ---------------------------------------------------------------------------
 // Minidump credential extraction (no PhysicalMemory, only VirtualMemory)
-// ---------------------------------------------------------------------------
 
 /// Extract LSASS credentials from a parsed minidump.
 ///

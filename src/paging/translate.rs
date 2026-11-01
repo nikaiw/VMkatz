@@ -496,9 +496,7 @@ impl<P: PhysicalMemory> PageTableWalker<'_, P> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PAE (Physical Address Extension) page table walker for 32-bit Windows
-// ---------------------------------------------------------------------------
 
 /// 3-level PAE page table walker with TLB cache for 32-bit Windows kernels.
 ///
