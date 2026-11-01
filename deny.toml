@@ -1,5 +1,8 @@
 # cargo-deny policy (schema v2). Run: make deny
 
+[graph]
+all-features = true
+
 [advisories]
 version = 2
 yanked = "deny"

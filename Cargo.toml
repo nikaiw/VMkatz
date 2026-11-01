@@ -56,7 +56,7 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], opti
 blake3 = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
 lz4_flex = { version = "0.11", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 zeroize = { version = "1", features = ["derive"], optional = true }
 
 # False positive: the md-5 package's library is named `md5`, which machete

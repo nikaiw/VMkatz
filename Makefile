@@ -43,7 +43,7 @@ clippy:
 
 .PHONY: check-features
 check-features:
-	cargo hack check --each-feature --exclude-no-default-features --exclude-features carve,dump --no-dev-deps
+	cargo hack clippy --feature-powerset --depth 2 --at-least-one-of vmware,vbox,qemu,hyperv,sam --exclude-no-default-features --no-dev-deps -- -D warnings
 	cargo check --no-default-features --features vmware,carve,dump
 
 .PHONY: doc-check

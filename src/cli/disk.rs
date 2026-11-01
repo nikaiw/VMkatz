@@ -19,15 +19,7 @@ use super::args::Colors;
 use super::args::parse_chrome_nthashes;
 #[cfg(feature = "sam")]
 use super::args::{RawFileType, get_colors, parse_dpapi_nthashes, parse_dpapi_passwords};
-#[cfg(all(
-    feature = "sam",
-    any(
-        feature = "vmware",
-        feature = "vbox",
-        feature = "qemu",
-        feature = "hyperv"
-    )
-))]
+#[cfg(all(feature = "vmfs", feature = "vmware"))]
 use super::lsass::extract_bitlocker_keys_from_snapshot;
 #[cfg(any(
     feature = "vmware",
@@ -480,7 +472,7 @@ fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
     }
 }
 
-#[cfg(all(feature = "vmfs", feature = "chrome"))]
+#[cfg(all(feature = "vmfs", feature = "chrome", feature = "ntds.dit"))]
 fn vmfs_emit_chrome<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
     args: &Args,
@@ -749,7 +741,7 @@ pub(crate) fn run_associated_lsass_for_disk(input_path: &Path, args: &Args) -> a
 }
 
 #[cfg(all(feature = "vmfs", feature = "sam", not(feature = "vmware")))]
-fn vmfs_snapshot_bitlocker_keys(
+const fn vmfs_snapshot_bitlocker_keys(
     _disk: &mut (impl std::io::Read + std::io::Seek),
     _snapshots: &[std::path::PathBuf],
 ) -> Vec<vmkatz::lsass::bitlocker::BitLockerKey> {
@@ -757,7 +749,10 @@ fn vmfs_snapshot_bitlocker_keys(
 }
 
 #[cfg(all(feature = "vmfs", feature = "sam", not(feature = "vmware")))]
-fn vmfs_associated_snapshots(_device_path: &Path, _vmdk_path: &str) -> Vec<std::path::PathBuf> {
+const fn vmfs_associated_snapshots(
+    _device_path: &Path,
+    _vmdk_path: &str,
+) -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 

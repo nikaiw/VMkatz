@@ -2076,7 +2076,7 @@ fn scan_kerb_key_list(
         if (2..=256).contains(&salt_len) && salt_ptr > 0x10000 {
             if let Ok(sb) = vmem.read_virt_bytes(salt_ptr, salt_len) {
                 let salt = crate::utils::utf16le_decode(&sb);
-                if let Some(idx) = salt.to_lowercase().rfind("krbtgt") {
+                if let Some(idx) = salt.to_ascii_lowercase().rfind("krbtgt") {
                     *realm = salt[..idx].to_string();
                 }
             }
@@ -2430,6 +2430,46 @@ mod tests {
         let mut keys = Vec::new();
         let mut realm = String::new();
         scan_kerb_key_list(&vmem, 0x2000_0000, &mut keys, &mut realm);
+        assert!(keys.is_empty());
+    }
+
+    struct SaltMem {
+        list: Vec<u8>,
+        salt: Vec<u8>,
+    }
+
+    impl VirtualMemory for SaltMem {
+        fn read_virt(&self, vaddr: u64, buf: &mut [u8]) -> Result<()> {
+            let src = match vaddr {
+                0x2000_0000 => &self.list,
+                0x3000_0000 => &self.salt,
+                _ => return Err(VmkatzError::DiskFormatError("unmapped".into())),
+            };
+            if buf.len() > src.len() {
+                return Err(VmkatzError::DiskFormatError("unmapped".into()));
+            }
+            buf.copy_from_slice(&src[..buf.len()]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kerb_salt_with_length_changing_lowercase_does_not_panic() {
+        // 8 x U+0130 (2 bytes; lowercases to 3 bytes) + "krbtgt": the old
+        // to_lowercase().rfind() gave idx 24 on a 22-byte string and panicked.
+        let salt: Vec<u8> = "\u{130}\u{130}\u{130}\u{130}\u{130}\u{130}\u{130}\u{130}krbtgt"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(salt.len(), 28);
+        let mut list = vec![0u8; 0x400];
+        list[0x10..0x14].copy_from_slice(&28u32.to_le_bytes());
+        list[0x18..0x20].copy_from_slice(&0x3000_0000u64.to_le_bytes());
+        let vmem = SaltMem { list, salt };
+        let mut keys = Vec::new();
+        let mut realm = String::new();
+        scan_kerb_key_list(&vmem, 0x2000_0000, &mut keys, &mut realm);
+        assert_eq!(realm, "\u{130}".repeat(8));
         assert!(keys.is_empty());
     }
 }

@@ -12,7 +12,7 @@ on:
 # A new push to the same ref cancels an in-flight run, so a stuck run (e.g. a
 # hung wine install) doesn't pile up or keep burning a runner.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     # Bound the job: a hung step (e.g. apt stalling on a mirror/debconf prompt)
     # should fail fast and visibly, not run to the 6h default and look "blocked".
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +35,15 @@ jobs:
           # The -gnu target stands in for -msvc here (same cfg(windows) code paths)
           # because mingw can build the C deps on an ubuntu runner, msvc can't.
           targets: x86_64-pc-windows-gnu
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings
 
       - name: Install mingw + wine (Windows cross-check)
         run: |
@@ -57,18 +66,6 @@ jobs:
           echo "::error::wine install failed after 3 attempts"
           exit 1
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
-
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
-
-      - name: Feature matrix
-        run: make check-features
-
       - name: Clippy (Windows target)
         run: cargo clippy --all-features --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -90,6 +87,29 @@ jobs:
         run: >
           cargo test --all-features --target x86_64-pc-windows-gnu
           --test memory_limits --test positioned_read
+
+  # Feature powerset clippy (-D warnings) in its own job: ~60 combos, slow on a cold runner.
+  features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Feature matrix
+        run: make check-features
 
   deps:
     runs-on: ubuntu-latest
