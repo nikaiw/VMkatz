@@ -1138,8 +1138,9 @@ pub(super) fn run_ntds(
 
     let c = get_colors(args);
 
-    // `--all` also surfaces this disk's local SAM/LSA/DCC2 (the --ntds flow skips them).
-    let local_secrets = if args.all {
+    // Local SAM/LSA/DCC2 are computed for `--all` (printed) and `--credman` (DPAPI_SYSTEM and
+    // local-user keys for vault decryption; not printed unless `--all`).
+    let local_secrets = if args.credman || args.all {
         let result = if fvek_keys.is_empty() {
             vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition)
         } else {
@@ -1181,8 +1182,10 @@ pub(super) fn run_ntds(
         }
         Err(error) => return Err(error).context("NTDS artifact extraction failed"),
     };
-    if let Some(secrets) = &local_secrets {
-        print_disk_secrets(secrets, args);
+    if args.all {
+        if let Some(secrets) = &local_secrets {
+            print_disk_secrets(secrets, args);
+        }
     }
     let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
         .context("NTDS context validation failed")?;

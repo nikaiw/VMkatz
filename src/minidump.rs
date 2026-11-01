@@ -362,10 +362,22 @@ fn parse_memory64_list(data: &[u8], rva: usize, stream_size: usize) -> Vec<MemRe
         let start_va = u64_le_or0(data, desc_off);
         let size = u64_le_or0(data, desc_off + 8);
 
-        let next_file_offset = match current_file_offset.checked_add(size) {
-            Some(v) if v <= data_len => v,
-            None | Some(_) => break, // overflow or region extends past the dump
+        let Some(end_offset) = current_file_offset.checked_add(size) else {
+            break; // overflow
         };
+        if end_offset > data_len {
+            // Truncated dump: keep the bytes that are physically present, then stop.
+            let present = data_len.saturating_sub(current_file_offset);
+            if present > 0 {
+                regions.push(MemRegion {
+                    start_va,
+                    size: present,
+                    file_offset: current_file_offset,
+                });
+            }
+            break;
+        }
+        let next_file_offset = end_offset;
         regions.push(MemRegion {
             start_va,
             size,
@@ -395,4 +407,31 @@ fn read_minidump_string(data: &[u8], rva: usize) -> String {
         return String::new();
     }
     crate::utils::utf16le_decode(&data[str_start..str_end])
+}
+
+#[cfg(test)]
+mod memory64_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_memory64_region_keeps_present_prefix() {
+        // header(16) + 2 descriptors(32) = 48; data starts at base_rva = 48.
+        let mut d = vec![0u8; 48];
+        d[0..8].copy_from_slice(&2u64.to_le_bytes());
+        d[8..16].copy_from_slice(&48u64.to_le_bytes());
+        d[16..24].copy_from_slice(&0x1000u64.to_le_bytes());
+        d[24..32].copy_from_slice(&0x10u64.to_le_bytes());
+        d[32..40].copy_from_slice(&0x7000u64.to_le_bytes());
+        d[40..48].copy_from_slice(&0x1000u64.to_le_bytes()); // declares 0x1000
+        d.extend_from_slice(&[0xAA; 0x10]); // region 0 complete
+        d.extend_from_slice(&[0xBB; 0x20]); // only 0x20 of region 1 present
+        let regions = parse_memory64_list(&d, 0, 48);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start_va, 0x1000);
+        assert_eq!(regions[0].size, 0x10);
+        assert_eq!(regions[0].file_offset, 48);
+        assert_eq!(regions[1].start_va, 0x7000);
+        assert_eq!(regions[1].size, 0x20);
+        assert_eq!(regions[1].file_offset, 64);
+    }
 }

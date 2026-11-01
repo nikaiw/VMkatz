@@ -246,10 +246,16 @@ impl VmwareLayer {
             );
         }
 
-        let regions_count = tags::find_tag(&all_tags, "regionsCount", &[])
+        let regions_count = match tags::find_tag(&all_tags, "regionsCount", &[])
             .map(|tag| read_tag_u32(&vmsn_data, tag))
-            .transpose()?
-            .unwrap_or(0);
+            .transpose()
+        {
+            Ok(v) => v.unwrap_or(0),
+            Err(error) => {
+                log::warn!("regionsCount unreadable ({error}); treating as 0 regions");
+                0
+            }
+        };
 
         log::info!("Memory regions: {regions_count}");
 
@@ -259,9 +265,14 @@ impl VmwareLayer {
         let regions_count = regions_count.min(4096);
         let mut regions = Vec::with_capacity(regions_count as usize);
         for i in 0..regions_count {
-            let vmem_page = read_region_tag(&vmsn_data, &all_tags, "regionPageNum", i)?;
-            let guest_page = read_region_tag(&vmsn_data, &all_tags, "regionPPN", i)?;
-            let page_count = read_region_tag(&vmsn_data, &all_tags, "regionSize", i)?;
+            let (Ok(vmem_page), Ok(guest_page), Ok(page_count)) = (
+                read_region_tag(&vmsn_data, &all_tags, "regionPageNum", i),
+                read_region_tag(&vmsn_data, &all_tags, "regionPPN", i),
+                read_region_tag(&vmsn_data, &all_tags, "regionSize", i),
+            ) else {
+                log::warn!("Region {i}: truncated region tag, skipping");
+                continue;
+            };
 
             log::info!(
                 "  Region {}: guest_phys=0x{:x} vmem_file=0x{:x} pages=0x{:x} ({}MB)",
