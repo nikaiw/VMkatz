@@ -40,6 +40,11 @@ check:
 clippy:
 	cargo clippy -- -D warnings
 
+.PHONY: check-features
+check-features:
+	cargo hack check --each-feature --exclude-no-default-features --exclude-features carve,dump --no-dev-deps
+	cargo check --no-default-features --features vmware,carve,dump
+
 .PHONY: fmt
 fmt:
 	cargo fmt
@@ -98,6 +103,7 @@ help:
 	@echo "  make ci           Run full CI pipeline (fmt + clippy + tests)"
 	@echo "  make check        Run cargo check"
 	@echo "  make clippy       Run clippy lints"
+	@echo "  make check-features  Check every feature in isolation (needs cargo-hack)"
 	@echo "  make fmt          Format code"
 	@echo "  make fmt-check    Check formatting"
 	@echo "  make unit-test    Run unit tests"

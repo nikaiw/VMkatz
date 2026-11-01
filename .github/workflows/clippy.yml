@@ -60,6 +60,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features -- -D warnings
 
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Feature matrix
+        run: make check-features
+
       - name: Clippy (Windows target)
         run: cargo clippy --all-features --target x86_64-pc-windows-gnu -- -D warnings
 

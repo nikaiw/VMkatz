@@ -455,6 +455,7 @@ pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
     out
 }
 
+#[cfg(feature = "sam")]
 pub(crate) fn parse_dpapi_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
     let mut out: Vec<(String, [u8; 16])> = Vec::new();
     for spec in specs {
