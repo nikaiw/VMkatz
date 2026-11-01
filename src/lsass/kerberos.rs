@@ -2145,7 +2145,7 @@ fn build_encrypted_data_with_kvno(etype: u32, kvno: u32, cipher: &[u8]) -> Vec<u
 // ---- ASN.1 DER primitives ----
 
 /// Encode ASN.1 DER length directly into the output buffer (zero allocation).
-/// Called hundreds of times per ticket; avoids a Vec<u8> allocation each time.
+/// Called hundreds of times per ticket; avoids a `Vec<u8>` allocation each time.
 fn asn1_length_into(out: &mut Vec<u8>, len: usize) {
     if len < 0x80 {
         out.push(len as u8);

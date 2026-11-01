@@ -394,8 +394,8 @@ pub static DPAPI_MASTER_KEY_PATTERNS_X86: &[&[u8]] = &[
 
 /// Find a LIST_ENTRY global by scanning for MOV/LEA/PUSH with absolute addresses in x86 code.
 /// Check if an x86 instruction at `data[i]` uses a 4-byte absolute address operand.
-/// Matches: PUSH imm32 (0x68), MOV EAX,[abs32] (0xA1), MOV [abs32],EAX (0xA3),
-/// LEA/MOV reg,[abs32] (0x8D/0x8B with ModRM mod=00, rm=101).
+/// Matches: PUSH imm32 (0x68), MOV EAX,`[abs32]` (0xA1), MOV `[abs32]`,EAX (0xA3),
+/// LEA/MOV reg,`[abs32]` (0x8D/0x8B with ModRM mod=00, rm=101).
 #[inline]
 const fn is_x86_abs_address_insn(data: &[u8], i: usize) -> bool {
     match data[i] {

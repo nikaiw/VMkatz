@@ -551,7 +551,7 @@ const fn parse_pb_addr_v5(addr: u64) -> (u64, u64) {
     (cluster, resource)
 }
 
-/// Check TBZ bitmap for SFB/LFB (bits [14:7]).
+/// Check TBZ bitmap for SFB/LFB (bits `[14:7]`).
 const fn addr_tbz(addr: u64) -> u8 {
     ((addr >> 7) & 0xFF) as u8
 }

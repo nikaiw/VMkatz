@@ -587,7 +587,7 @@ pub fn enrich_sessions_from_lsasrv(
 }
 
 /// Fixed-capacity cycle detector for linked-list walks.
-/// Replaces HashSet<u64> to avoid heap allocation — the max iteration count is
+/// Replaces `HashSet<u64>` to avoid heap allocation — the max iteration count is
 /// bounded at 256, so a stack array is sufficient.
 struct CycleDetector {
     addrs: [u64; 256],

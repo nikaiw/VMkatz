@@ -1371,8 +1371,8 @@ pub fn decrypt_prefix_3des(
 /// AES-CFB-128 decryption (128-bit segments).
 ///
 /// LSA uses AES-CFB (not AES-CBC) for non-8-aligned credential blobs.
-/// CFB-128 decrypt: plaintext[i] = ciphertext[i] XOR AES_encrypt(feedback[i])
-/// where feedback[0] = IV, feedback[i>0] = ciphertext[i-1].
+/// CFB-128 decrypt: `plaintext[i]` = `ciphertext[i]` XOR AES_encrypt(`feedback[i]`)
+/// where `feedback[0]` = IV, `feedback[i>0]` = ciphertext[i-1].
 /// Handles any input length (no block alignment needed).
 fn decrypt_aes_cfb128(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     if data.is_empty() {

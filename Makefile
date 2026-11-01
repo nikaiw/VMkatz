@@ -45,6 +45,10 @@ check-features:
 	cargo hack check --each-feature --exclude-no-default-features --exclude-features carve,dump --no-dev-deps
 	cargo check --no-default-features --features vmware,carve,dump
 
+.PHONY: doc-check
+doc-check:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --document-private-items
+
 .PHONY: fmt
 fmt:
 	cargo fmt
@@ -104,6 +108,7 @@ help:
 	@echo "  make check        Run cargo check"
 	@echo "  make clippy       Run clippy lints"
 	@echo "  make check-features  Check every feature in isolation (needs cargo-hack)"
+	@echo "  make doc-check    Build rustdoc, warnings denied"
 	@echo "  make fmt          Format code"
 	@echo "  make fmt-check    Check formatting"
 	@echo "  make unit-test    Run unit tests"

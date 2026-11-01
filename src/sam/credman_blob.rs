@@ -155,7 +155,7 @@ pub fn parse_credential_blob(decrypted: &[u8]) -> Result<CredmanEntry> {
 /// Best-effort attribute parse: stops at the first malformed/truncated attribute,
 /// bounded by `count` and the remaining data.
 ///
-/// Per attribute: Flags u32, Keyword SIZED_WSTR, ValueSize u32, Value[ValueSize].
+/// Per attribute: Flags u32, Keyword SIZED_WSTR, ValueSize u32, `Value[ValueSize]`.
 fn parse_attributes(bytes: &[u8], cur: &mut usize, count: usize) -> Vec<CredAttribute> {
     let mut out = Vec::new();
     for _ in 0..count {

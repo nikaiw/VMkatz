@@ -238,7 +238,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
 ///
 /// Decrypted blob = LSA_SECRET_BLOB: Length(4) + Random(12) + Secret(Length).
 /// Secret = inner LSA_SECRET: Version(4) + KeyID(16) + Algo(4) + Flags(4) + EncryptedData.
-/// LSA key = EncryptedData[:32] = blob[44..76] (per impacket: parse Secret as LSA_SECRET).
+/// LSA key = `EncryptedData[:32]` = blob[44..76] (per impacket: parse Secret as LSA_SECRET).
 fn extract_lsa_key_modern(
     hive: &Hive,
     policy: &super::hive::Key,

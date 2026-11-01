@@ -72,6 +72,9 @@ jobs:
       - name: Tests
         run: cargo test --all-features
 
+      - name: Rustdoc
+        run: make doc-check
+
       # The platform-divergent code (positioned reads, drop-behind, host-memory
       # query) is where cfg(windows) can compile and still be wrong. Clippy only
       # proves it builds; these two run it.
