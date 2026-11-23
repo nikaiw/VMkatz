@@ -123,10 +123,8 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
         .checked_add(n2)
         .ok_or_else(|| Error::Parse("payload offset overflow".into()))?;
 
-    if payload_size < 0 {
-        return Err(Error::Parse("negative payload size".into()));
-    }
-    let payload_size_us = payload_size as usize;
+    let payload_size_us = usize::try_from(payload_size)
+        .map_err(|_| Error::Parse("payload size out of range".into()))?;
 
     // Reserved space at the end of each page (DbHeader stores it as 0 today;
     // hard-code 0 here, but compute defensively in case that changes).
@@ -183,8 +181,8 @@ fn decode_leaf_table_cell<F: FnMut(i64, Vec<Value>) -> Result<()>>(
         let mut next = u32_be(page, local_end);
         let mut remaining = payload_size_us - local;
         // Cap the number of overflow hops to defend against cyclic chains.
-        let max_hops = pager.header.page_count as usize + 1;
-        let mut hops: usize = 0;
+        let max_hops = u64::from(pager.header.page_count) + 1;
+        let mut hops = 0u64;
         while next != 0 && remaining > 0 {
             hops += 1;
             if hops > max_hops {

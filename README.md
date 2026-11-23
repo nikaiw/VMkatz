@@ -16,6 +16,7 @@ Single static binary, ~3 MB. Drop it on the ESXi host, the Proxmox node, or the 
 ## What It Extracts
 
 ### From memory snapshots (LSASS)
+
 All 9 SSP credential providers that mimikatz implements:
 
 | Provider | Data | Notes |
@@ -33,11 +34,13 @@ All 9 SSP credential providers that mimikatz implements:
 Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`).
 
 ### From virtual disks (offline)
+
 - **SAM hashes**: Local account NT/LM hashes with account status (disabled, blank password)
 - **LSA secrets**: Service account passwords, auto-logon credentials, machine account keys
 - **Cached domain credentials**: DCC2 hashes (last N domain logons)
 - **DPAPI master keys**: Hashcat-ready hashes (`$DPAPImk$` — modes 15300/15310/15900/15910)
 - **NTDS.dit**: Full Active Directory hash extraction from domain controller disks (native ESE parser)
+- **Credential Manager and Vault**: Offline extraction with `--credman` or `--all` (requires `credman`)
 - **BitLocker decryption**: Transparent disk decryption using FVEK extracted from memory
 
 ## Supported Inputs
@@ -66,6 +69,9 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 
 ## Quick Start
 
+These examples use the default build. Optional browser and Veeam commands are
+described below. Paths and passwords in examples are placeholders.
+
 ```bash
 # Extract LSASS credentials from a VMware snapshot
 ./vmkatz snapshot.vmsn
@@ -85,12 +91,15 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 # Extract from raw registry hives
 ./vmkatz SAM SYSTEM SECURITY
 
+# Extract from a raw NTDS database and its SYSTEM hive
+./vmkatz ntds.dit SYSTEM
+
 # Output as hashcat-ready hashes
 ./vmkatz --format hashcat snapshot.vmsn
 
 # Export Kerberos tickets
-./vmkatz --kirbi snapshot.vmsn        # .kirbi files
-./vmkatz --ccache snapshot.vmsn       # .ccache file
+./vmkatz --kirbi ./tickets snapshot.vmsn          # Destination directory
+./vmkatz --ccache ./tickets.ccache snapshot.vmsn  # Destination file
 
 # Export BitLocker FVEK for dislocker
 ./vmkatz --bitlocker-fvek /tmp/keys snapshot.vmsn
@@ -104,11 +113,170 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 # Extract from Hyper-V saved state
 ./vmkatz guest.vmrs
 
-# Extract from Veeam backup (build with --features veeam)
-./vmkatz backup.vbk
-./vmkatz --veeam-list backup.vbk               # List disk images
-./vmkatz --veeam-extract backup.vbk            # Extract raw disk
+# Extract all compiled secret categories, including associated memory snapshots
+./vmkatz --all disk.vmdk
 ```
+
+## Command-line options
+
+```text
+vmkatz [OPTIONS] [FILE]...
+```
+
+Use `./vmkatz --help` for the options available in your binary (`-h` gives a
+shorter summary). The tables below cover all features. Options for disabled
+features are rejected; see [Build Features](#build-features). A dash in the
+feature column means the option itself is always available; the input format
+still needs its backend. Browser flags are listed in the
+[browser section](#browser-secrets-experimental).
+
+Pass one snapshot, disk image, backup or VM directory, or one of the raw-file
+combinations `SAM SYSTEM [SECURITY]` and `ntds.dit SYSTEM`. To process several
+VMs, use directory or recursive mode. VMFS commands identify their source with
+`--vmfs-device` instead of a positional file.
+
+### General and memory options
+
+| Option | Purpose | Feature |
+| --- | --- | --- |
+| `-h`, `--help` | Show help | — |
+| `-V`, `--version` | Show version | — |
+| `-v`, `--verbose` | Increase logging; repeat as `-vv` for more detail | — |
+| `--format <FORMAT>` | `text` (default), `brief`, `ntlm`, `hashcat` or `csv` | — |
+| `--color <WHEN>` | `auto` (default), `always` or `never` | — |
+| `-a`, `--all` | Enable all compiled secret categories, retain all logon sessions and include snapshots associated with disk inputs | — |
+| `-r`, `--recurse` | Recursively discover VM files under a directory | — |
+| `--scan <TYPE>` | Limit directory discovery to `all` (default), `snapshot` or `disk` | — |
+| `--provider <LIST>` | Filter memory-credential output by comma-separated provider names | — |
+| `--list-processes` | List processes without credential extraction | — |
+| `--lsass` | Also process memory snapshots associated with the selected VM/disk | — |
+| `--disk <DISK_IMAGE>` | Supply a companion disk for paged-out memory and hybrid browser extraction | `disk` |
+| `--kirbi <DIR>` | Export recovered Kerberos tickets as individual `.kirbi` files | — |
+| `--ccache <FILE>` | Export recovered Kerberos tickets as one MIT Kerberos ccache file | — |
+| `--bitlocker-fvek <DIR>` | Export recovered memory FVEKs as dislocker-compatible `.fvek` files | — |
+| `--ept` | Attempt nested EPT scanning for VBS/Credential Guard VMs | — |
+| `--carve` | Enable fallback extraction from partial, truncated or raw memory | `carve` |
+| `--dump <PROCESS_NAME>` | Write a process minidump, e.g. `--dump lsass` | `dump` |
+| `-o`, `--output <FILE>` | Destination for `--dump`; default: `<process>.dmp` | `dump` |
+| `--build <NUMBER>` | Windows build number written into the minidump header; default: `19045` | `dump` |
+| `--no-mem-registry` | Disable both indexed and signature-based recovery of registry hives from memory | `sam` |
+| `--registry-carve` | Enable a physical-memory hive scan when indexed recovery fails; slow and potentially several GiB of RAM | `sam` |
+
+Provider names are `msv`, `wdigest`, `kerberos`, `tspkg`, `dpapi`, `ssp`,
+`livessp`, `credman` and `cloudap`. `--provider` filters memory-credential output;
+it does not restrict extraction or ticket exports. Use `--kirbi` or `--ccache`
+with an explicit destination to save tickets. Both export options can be combined.
+
+`--all` does not enable optional features at build time, ticket-file exports,
+password history or the opt-in carving/process-scan flags. Select those options
+explicitly when needed. `--no-mem-registry` takes precedence over
+`--registry-carve`.
+
+With `--all`, individual extraction failures can be reported on stderr while
+processing continues. A successful exit does not imply every category was recovered.
+For a local disk image, an open failure or failure of every disk extractor produces
+a nonzero exit status; missing NTDS alone does not fail a successful SAM/LSA extraction.
+
+### Disk and offline extraction options
+
+| Option | Purpose | Feature |
+| --- | --- | --- |
+| `--sam` | Force disk/SAM mode; recognized disk extensions already select disk mode | `sam` |
+| `--dpapi` | Scan disk DPAPI masterkey files; already included in normal disk processing when built | `disk` + `dpapi` |
+| `--ntds` | Extract AD hashes from `Windows/NTDS/ntds.dit` and the SYSTEM bootkey | `ntds.dit` |
+| `--ntds-history` | Include available password history during NTDS extraction | `ntds.dit` |
+| `--ntds-domain-prefix <DOMAIN>` | Override the domain prefix in NTDS output, e.g. `CORP` | `ntds.dit` |
+| `--credman` | Extract offline Credential Manager and Vault data | `credman` |
+| `--credman-attributes` | With `--credman` or `--all`, include encrypted attribute values as hex; entropy-bound attribute decryption is unsupported | `credman` |
+| `--dpapi-password <USER:PASSWORD>` | Supply a password for offline Credential Manager extraction; repeatable | `credman` |
+| `--dpapi-nthash <USER:HEX>` | Supply a 32-hex-digit NT hash for offline Credential Manager extraction; repeatable | `credman` |
+| `--ls <PATH>` | List a guest NTFS directory; use `'\'` for the root | `disk` |
+| `--cp <SRC> <DST>` | Stream one guest NTFS file to a new local destination | `disk` |
+| `--partition <OFFSET>` | Select an NTFS partition by byte offset, in decimal or `0x` hexadecimal | `disk` |
+
+Use `--dpapi-password` and `--dpapi-nthash` with `--credman` or `--all`.
+`USER` can be a SID, a SAM/profile name or `DOMAIN\name`. For local accounts,
+supply `--dpapi-password`; an NT hash alone is insufficient for the local
+masterkey derivation. Everything after the first colon is the password.
+Password options can be visible in the host's process list.
+
+```bash
+./vmkatz --credman --dpapi-password 'alice:example-password' disk.vmdk
+./vmkatz --ntds --ntds-history --ntds-domain-prefix CORP dc-disk.qcow2
+```
+
+#### Listing and copying NTFS files
+
+`--ls` consumes one guest path. `--cp` consumes two values: the guest source and
+the host destination. The disk image remains a positional argument:
+
+```bash
+./vmkatz --ls '\' disk.vmdk
+./vmkatz --ls '\Windows\System32\config' disk.vmdk
+./vmkatz --cp '\Windows\NTDS\ntds.dit' ./ntds.dit disk.vmdk
+./vmkatz --partition 0x100000 --ls '\' disk.vmdk
+```
+
+Without `--partition`, listing reports each detected NTFS partition, while
+copying uses the first partition containing the source file. A `path not found`
+message for one partition can therefore precede a successful listing on another.
+Use the byte offset shown in the listing to select a partition explicitly.
+The same selector scopes SAM/LSA, NTDS, DPAPI and Credential Manager extraction.
+
+These commands read disk images or block devices, and also work with an
+explicit VMFS `--vmdk` selection. They skip encrypted BitLocker volumes.
+`--cp` copies a single file and never overwrites an existing destination;
+`--output` is reserved for process dumps. Veeam catalogue extraction uses
+`--veeam-extract`, described below.
+
+See [large-file resource limits and recovery tradeoffs](docs/examples.md#large-disks-and-damaged-ntfs-volumes)
+for the bounded readers and scans. The opt-in `--registry-carve` memory scan
+has a separate, much higher memory cost.
+
+### VMFS options
+
+These options require the `vmfs` feature. Extraction also requires the relevant
+secret-extraction features.
+
+| Option | Purpose |
+| --- | --- |
+| `--vmfs-list` | List VMFS devices and available flat VMDKs, then exit |
+| `--vmfs-device <DEVICE>` | Read a VMFS raw SCSI device; also scopes `--vmfs-list` |
+| `--vmdk <PATH>` | Select a flat VMDK by its path within that datastore |
+
+```bash
+./vmkatz --vmfs-list
+./vmkatz --vmfs-device /dev/disks/naa.example --vmdk 'VM/VM-flat.vmdk' --ls '\'
+./vmkatz --vmfs-device /dev/disks/naa.example --vmdk 'VM/VM-flat.vmdk' --cp '\Windows\NTDS\ntds.dit' ./ntds.dit
+```
+
+See [VMFS discovery and ESXi deployment](docs/esxi.md) for device selection and
+associated-snapshot behavior.
+
+### Veeam options
+
+Build with `--features veeam`. Without a catalogue operation, VMkatz processes
+supported disk images inside the backup using the extraction features compiled
+into the binary.
+
+| Option | Purpose |
+| --- | --- |
+| `--veeam-password <PASSWORD>` | Open an encrypted backup with its password |
+| `--veeam-list` | List stored VMs/files in the backup catalogue, then exit |
+| `--veeam-extract <NAME>` | Reconstruct one stored file by exact catalogue name or stable path, then exit |
+| `--veeam-output <PATH>` | Destination for that file; default: its basename in the current directory. Existing files are never overwritten |
+
+```bash
+./vmkatz backup.vbk
+./vmkatz --veeam-list backup.vbk
+./vmkatz --veeam-extract 'CATALOGUE_NAME' --veeam-output ./recovered-disk.vmdk backup.vbk
+```
+
+Replace `CATALOGUE_NAME` with the selected file's exact catalogue name or stable
+path. Add `--veeam-password` for encrypted backups. `--veeam-extract` selects a
+stored catalogue file; `--cp` selects a guest NTFS path on a directly opened disk.
+Without a password, normal extraction from an encrypted backup emits its
+Hashcat target instead of opening the stored disk images.
 
 ## Output Formats
 
@@ -117,7 +285,7 @@ Plus: **BitLocker FVEK** extraction from memory (pool tag scan for `FVEc`/`Cngb`
 | `text` | `--format text` (default) | Full credential dump with session metadata |
 | `brief` | `--format brief` | Compact one-line-per-credential summary |
 | `ntlm` | `--format ntlm` | `DOMAIN\user:::hash:::` pwdump format |
-| `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), 2100 (DCC2), 15300/15900 (DPAPI) |
+| `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), 2100 (DCC2), 15300/15310/15900/15910 (DPAPI) |
 | `csv` | `--format csv` | Machine-readable, all fields |
 
 ## Deployment on ESXi
@@ -150,38 +318,78 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `vbox` | VirtualBox `.sav` saved-state support | Yes |
 | `qemu` | QEMU/KVM ELF core dumps + Proxmox savevm | Yes |
 | `hyperv` | Hyper-V `.vmrs`/`.bin`/`.raw` dump support | Yes |
-| `sam` | Disk extraction (SAM/LSA/DCC2) + disk format handlers | Yes |
+| `disk` | Disk formats, NTFS, listing/copy, pagefile and file-backed memory | Yes (via `sam`/`vmfs`) |
+| `sam` | Registry SAM/LSA/DCC2 extraction, including DPAPI_SYSTEM. Requires `disk` | Yes |
+| `dpapi` | DPAPI blobs, masterkeys and CREDHIST; NTFS adapter when `disk` is enabled | Yes |
+| `credman` | Offline Credential Manager and Vault. Requires `disk` + `dpapi` | Yes |
 | `ntds.dit` | NTDS.dit AD extraction. Requires `sam` | Yes |
 | `carve` | Degraded extraction from partial/truncated memory | Yes |
 | `dump` | Process memory dump as minidump | Yes |
-| `vmfs` | VMFS-5/6 raw parser for ESXi SCSI devices. Requires `sam` | Yes |
-| `chrome` | Browser secrets extraction (Chromium + Firefox). Requires `sam` | No |
-| `veeam` | Veeam VBK/VIB/VRB backup support. Requires `sam` | No |
+| `vmfs` | VMFS-5/6 raw parser for ESXi SCSI devices. Requires `disk` | Yes |
+| `chrome` | Browser secrets extraction (Chromium + Firefox). Requires `disk` + `dpapi` | No |
+| `veeam` | Veeam VBK/VIB/VRB backup support. Requires `disk` | No |
 
 ```bash
-cargo build --release                                              # Full build
+cargo build --release                                              # Default features
+cargo build --release --all-features                               # Include browser and Veeam modules
 cargo build --release --no-default-features --features vmware      # VMware only
-cargo build --release --no-default-features --features "sam ntds.dit"  # Disk only
+cargo build --release --no-default-features --features disk          # NTFS listing/copy, no secret extractors
+cargo build --release --no-default-features --features "sam ntds.dit"  # Registry/AD only, no offline DPAPI
+cargo build --release --no-default-features --features "disk dpapi"   # DPAPI masterkeys, no SAM
+cargo build --release --no-default-features --features credman       # Credential Manager/Vault, no SAM
 cargo build --release --features chrome                            # Add chrome module
 cargo build --release --features veeam                             # Add Veeam backup support
 ```
 
+The default build retains offline DPAPI and Credential Manager/Vault support. A
+`sam`-only build no longer scans DPAPI profile files. `credman` and `chrome` can
+run without SAM using supplied credentials; enabling `sam` additionally provides
+local hashes and LSA secrets. `ntds.dit` still depends on `sam` for SYSTEM/bootkey
+handling. VMFS and Veeam provide access to disks; extraction depends on the other
+features selected. `--ls`, `--cp`, `--disk` and `--partition` need only `disk`.
+Unsupported feature-specific CLI options are rejected.
+
+`dpapi` alone is also usable as a library (`cargo build --no-default-features
+--features dpapi --lib`); the CLI requires a disk or memory backend. Offline
+DPAPI APIs live under `vmkatz::dpapi::{blob, masterkey, credhist, disk}` and offline
+Credential Manager/Vault APIs under `vmkatz::credman`. LSASS memory providers
+remain independent of these offline features.
+
 `make ci` runs the same gates as GitHub CI (fmt, clippy, feature matrix, rustdoc, cargo-deny, cargo-machete, tests); it needs `cargo install cargo-hack cargo-deny cargo-machete`. `make hooks` installs an opt-in pre-commit hook (fmt + clippy).
+
+Clippy checks all targets, including integration tests. Unsafe blocks need a
+`SAFETY` explanation, discarded `Result` values must be handled or justified
+with a scoped `#[expect(..., reason = "...")]`, and `#[allow]` attributes need a
+reason. Upstream Veeam modules retain explicit lint exceptions; the native
+Veeam disk adapter follows the normal policy. Debug macros and `mem::forget`
+are denied. Test-only helpers may use `unwrap`/`expect` when marked `#[cfg(test)]`.
 
 ## Browser secrets (experimental)
 
 The optional `chrome` module extracts saved passwords, cookies, and autofill
 from Chromium-family browsers (Chrome, Edge, Brave, Vivaldi, Opera) via
-offline DPAPI decryption. Build with `--features chrome`, enable with `--chrome`.
+offline DPAPI decryption. Build with `--features chrome`, enable with `--chrome`
+or `--all`.
 
 Supports Chrome v10 (`os_crypt.encrypted_key`) and v20 App-Bound Encryption
 (Chrome ≥127). Works from disk, memory+disk (hybrid), or both combined.
+
+All the following options require `chrome`:
+
+| Option | Purpose |
+| --- | --- |
+| `--chrome` | Enable browser-secret extraction |
+| `--chrome-json` | Render browser findings as JSON; other extraction output keeps its selected format |
+| `--chrome-password <PASSWORD>` | Additional DPAPI password candidate; repeatable |
+| `--chrome-nthash <[SID:]HEX>` | Additional 32-hex-digit NT hash; bare hex tries all users, `SID:HEX` targets one user. Repeatable |
+| `--chrome-process-scan` | Also scan browser process memory heuristically; requires a memory input and may produce false positives |
 
 ```bash
 ./vmkatz --chrome disk.vmdk                              # Disk-only
 ./vmkatz --chrome --chrome-password vagrant disk.vmdk    # With extra password
 ./vmkatz --chrome --disk disk.vmdk snapshot.vmsn         # Hybrid mem+disk
 ./vmkatz --chrome --chrome-json disk.vmdk                # JSON output
+./vmkatz --chrome --chrome-process-scan snapshot.vmsn    # Opt-in process-memory scan
 ```
 
 For domain users (whose credentials aren't in the local SAM), use
@@ -192,6 +400,7 @@ hash to unlock their browser secrets.
 
 - [ESXi deployment, VIB bypass, VMFS raw access](docs/esxi.md)
 - [Example output](docs/examples.md)
+- [Large-file resource limits and recovery tradeoffs](docs/examples.md#large-disks-and-damaged-ntfs-volumes)
 - [Architecture and module layout](docs/architecture.md)
 - [Tested targets and known limitations](docs/tested-targets.md)
 

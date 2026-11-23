@@ -3,6 +3,7 @@
 use std::fs;
 use vmkatz::chrome::sqlite::Pager;
 
+#[cfg(test)]
 fn load() -> Vec<u8> {
     fs::read("tests/fixtures/chrome/sqlite/mini.sqlite").expect("fixture present")
 }
@@ -21,6 +22,39 @@ fn page1_accessible() {
     let pager = Pager::open(&bytes).unwrap();
     let p1 = pager.page(1).unwrap();
     assert_eq!(&p1[..16], b"SQLite format 3\x00");
+}
+
+#[test]
+fn large_page_numbers_do_not_wrap_to_the_first_page() {
+    let bytes = load();
+    let pager = Pager::open(&bytes).unwrap();
+    for page in [0, (1 << 20) + 1, u32::MAX] {
+        assert!(pager.page(page).is_err(), "page {page}");
+    }
+}
+
+#[test]
+fn root_page_numbers_are_checked_before_narrowing_to_u32() {
+    let mut bytes = vec![0u8; 512];
+    bytes[..16].copy_from_slice(b"SQLite format 3\0");
+    bytes[16..18].copy_from_slice(&512u16.to_be_bytes());
+    bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+    bytes[100] = 0x0D; // leaf table
+    bytes[103..105].copy_from_slice(&1u16.to_be_bytes());
+    bytes[108..110].copy_from_slice(&256u16.to_be_bytes());
+    // One sqlite_master row: ("table", "x", "x", rootpage: i64, NULL).
+    bytes[256..271].copy_from_slice(&[
+        21, 1, 6, 23, 15, 15, 6, 0, b't', b'a', b'b', b'l', b'e', b'x', b'x',
+    ]);
+    for root in [-1, 1i64 << 32, (1i64 << 32) + 1] {
+        bytes[271..279].copy_from_slice(&root.to_be_bytes());
+        let pager = Pager::open(&bytes).unwrap();
+        assert!(pager.root_of("x").is_err(), "root {root}");
+    }
+    bytes[271..279].copy_from_slice(&1i64.to_be_bytes());
+    let pager = Pager::open(&bytes).unwrap();
+    assert_eq!(pager.root_of("x").unwrap(), Some(1));
+    assert_eq!(pager.root_of("missing").unwrap(), None);
 }
 
 #[test]

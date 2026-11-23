@@ -1,29 +1,33 @@
 [[bin]]
 name = "extract_file"
 path = "tools/extract_file.rs"
-required-features = ["chrome"]
+required-features = ["disk"]
 
 [package]
 name = "vmkatz"
-version = "1.5.2"
+default-run = "vmkatz"
+version = "1.6.0-dev.1"
 edition = "2024"
 license = "MIT"
 
 [features]
-default = ["vmware", "vbox", "qemu", "hyperv", "sam", "ntds.dit", "carve", "dump", "vmfs"]
+default = ["vmware", "vbox", "qemu", "hyperv", "sam", "dpapi", "credman", "ntds.dit", "carve", "dump", "vmfs"]
 vmware = []
 vbox = []
 qemu = []
 hyperv = []
-sam = ["dep:md-5", "dep:md4", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
+disk = ["dep:ntfs"]
+sam = ["disk", "dep:md-5", "dep:sha2"]
+dpapi = ["dep:md4", "dep:sha2", "dep:pbkdf2", "dep:hmac", "dep:sha1"]
+credman = ["disk", "dpapi"]
 "ntds.dit" = ["sam"]
 carve = []
 dump = []
-vmfs = ["sam"]
-chrome = ["sam", "dep:aes-gcm", "dep:serde_json", "dep:serde", "dep:hmac", "dep:sha1"]
+vmfs = ["disk"]
+chrome = ["disk", "dpapi", "dep:aes-gcm", "dep:serde_json", "dep:serde", "dep:hmac", "dep:sha1"]
 # Veeam backup (VBK/VIB/VRB) support: native module (src/veeam/) ported from
 # vbktool. Off by default (pulls the parse/decompress deps); `--features veeam`.
-veeam = ["sam", "dep:blake3", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:zeroize", "dep:md-5", "dep:sha2", "dep:sha1", "dep:pbkdf2", "dep:hmac", "dep:serde", "dep:serde_json"]
+veeam = ["disk", "dep:blake3", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:zeroize", "dep:md-5", "dep:sha2", "dep:sha1", "dep:pbkdf2", "dep:hmac", "dep:serde", "dep:serde_json"]
 
 [profile.release]
 opt-level = "z"
@@ -34,7 +38,7 @@ panic = "abort"
 
 [dependencies]
 memmap2 = "0.9"
-ntfs = "0.4"
+ntfs = { version = "0.4", optional = true }
 md-5 = { version = "0.10", optional = true }
 md4 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
@@ -59,10 +63,18 @@ lz4_flex = { version = "0.11", optional = true }
 zstd = { version = "0.14", optional = true }
 zeroize = { version = "1", features = ["derive"], optional = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 # False positive: the md-5 package's library is named `md5`, which machete
-# does not map back to the `md-5` dependency (used in sam/hashes.rs, veeam/reconstruct.rs).
+# does not map back to the `md-5` dependency (used in sam/hashes.rs, veeam/upstream/reconstruct.rs).
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
+
+[lints.rust]
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unfulfilled_lint_expectations = "deny"
 
 [lints.clippy]
 # pedantic + nursery at deny; lints that are just noise for a low-level
@@ -85,6 +97,16 @@ panic                 = "deny"
 unreachable           = "deny"
 todo                  = "deny"
 unimplemented         = "deny"
+
+# Keep unsafe boundaries and deliberate error suppression reviewable.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+allow_attributes_without_reason = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok       = "deny"
+dbg_macro              = "deny"
+mem_forget             = "deny"
+verbose_file_reads     = "deny"
 
 # Deliberate for binary parsing: offset/size casts, format acronyms.
 cast_possible_truncation = "allow"

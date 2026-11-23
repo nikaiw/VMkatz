@@ -51,6 +51,8 @@ On ESXi, VMFS locks prevent reading flat VMDK files from running VMs via the mou
 
 VMkatz auto-discovers VMFS devices by scanning `/dev/disks/` for SCSI LUNs containing VMFS superblocks, then enumerates the VMFS directory tree to find all flat VMDKs and the VMs they belong to.
 
+Use the exact partition path reported by discovery, including its `:1` suffix when present; the whole-disk device is not interchangeable. An explicitly selected VMDK without an NTFS/BitLocker volume returns an error; datastore-wide scans skip these disks.
+
 ```bash
 # Discover all VMFS datastores, list their VMs, and print ready-to-run commands
 /tmp/vmkatz --vmfs-list
@@ -59,12 +61,12 @@ VMkatz auto-discovers VMFS devices by scanning `/dev/disks/` for SCSI LUNs conta
 Example output:
 ```
 [+] VMFS-6 devices:
-    /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc — RAID0_local
-    /dev/disks/naa.600508b4000adfe0d80b99cf3ce0c0c7 — NAS_datastore
+    /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc:1 — RAID0_local
+    /dev/disks/naa.600508b4000adfe0d80b99cf3ce0c0c7:1 — NAS_datastore
 
 [+] RAID0_local — 5 flat VMDKs:
---vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc --vmdk 'DC01/DC01-flat.vmdk'
---vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc --vmdk 'WEB01/WEB01-flat.vmdk'
+--vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc:1 --vmdk 'DC01/DC01-flat.vmdk'
+--vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc:1 --vmdk 'WEB01/WEB01-flat.vmdk'
 ...
 ```
 
@@ -72,26 +74,26 @@ The output is designed as copy-pasteable command-line arguments. Filter to a spe
 
 ```bash
 # List VMDKs on a specific device only
-/tmp/vmkatz --vmfs-list --vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc
+/tmp/vmkatz --vmfs-list --vmfs-device /dev/disks/naa.60003ff44dc75adcb3d1cbcd6d5049dc:1
 ```
 
 ### Extraction modes
 
 ```bash
 # Single VM — extract SAM/LSA/DCC2 from one flat VMDK
-/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk'
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx:1 --vmdk 'DC01/DC01-flat.vmdk'
 
 # Single VM — extract NTDS.dit from a domain controller
-/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --ntds
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx:1 --vmdk 'DC01/DC01-flat.vmdk' --ntds
 
 # Also extract LSASS secrets from snapshots in the VM's datastore directory
-/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --lsass
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx:1 --vmdk 'DC01/DC01-flat.vmdk' --lsass
 
 # Extract all supported secret categories from the VM's snapshots and disk
-/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx --vmdk 'DC01/DC01-flat.vmdk' --all
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx:1 --vmdk 'DC01/DC01-flat.vmdk' --all
 
 # All VMs — auto-scan the entire datastore
-/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx
+/tmp/vmkatz --vmfs-device /dev/disks/naa.xxx:1
 ```
 
 In auto-scan mode (no `--vmdk`), VMkatz discovers every flat VMDK on the device, checks each for NTFS partitions (skipping Linux/BSD VMs), and extracts credentials from all Windows VMs in a single pass. Non-Windows VMs are silently skipped.
@@ -103,7 +105,7 @@ Add `--lsass` to also process VMware memory snapshots found beside the selected 
 The parser resolves the full VMFS on-disk layout without any mounted filesystem:
 
 ```
-/dev/disks/naa.xxx
+/dev/disks/naa.xxx:1
   └─ LVM volume header (magic 0xC001D00D at offset 0x100000)
        └─ VMFS superblock (magic 0x2FABF15E at offset 0x200000)
             └─ SFD bootstrap → FDC resource (file descriptor cache)

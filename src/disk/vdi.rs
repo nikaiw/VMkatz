@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use super::table::{Encoding, Table, TableCache};
 use super::{read_u16_le_file, read_u32_le_file, read_u64_le_file};
 use crate::error::{Result, VmkatzError};
 
@@ -16,7 +17,8 @@ pub struct VdiDisk {
     file: File,
     disk_size: u64,
     block_size: u32,
-    bat: Vec<u32>,
+    bat: Table,
+    table_cache: TableCache,
     offset_data: u64,
     cursor: u64,
     parent: Option<Box<Self>>,
@@ -249,6 +251,11 @@ fn scan_dir_for_uuid(
 impl VdiDisk {
     /// Open a VDI disk image, recursively opening parent images for differencing disks.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_depth(path, 0)
+    }
+
+    fn open_with_depth(path: &Path, depth: u32) -> Result<Self> {
+        super::check_backing_depth(depth)?;
         let mut file = File::open(path)?;
         let header = parse_header(&mut file)?;
 
@@ -268,20 +275,19 @@ impl VdiDisk {
             header.image_uuid
         );
 
-        // Read BAT
-        file.seek(SeekFrom::Start(header.offset_blocks))?;
-        let mut bat =
-            Vec::with_capacity((header.blocks_total as usize).min(super::MAX_BAT_PREALLOC));
-        for _ in 0..header.blocks_total {
-            bat.push(read_u32_le_file(&mut file)?);
-        }
+        let bat = Table::open(
+            &mut file,
+            header.offset_blocks,
+            u64::from(header.blocks_total),
+            Encoding::Le32,
+        )?;
 
         // Open parent for differencing images
         let parent = if header.image_type == VDI_IMAGE_DIFF && !header.parent_uuid.is_zero() {
             log::debug!("VDI: diff image, parent UUID = {}", header.parent_uuid);
             let parent_path = find_parent_vdi(path, &header.parent_uuid)?;
             log::debug!("VDI: found parent at {}", parent_path.display());
-            Some(Box::new(Self::open(&parent_path)?))
+            Some(Box::new(Self::open_with_depth(&parent_path, depth + 1)?))
         } else {
             None
         };
@@ -291,6 +297,7 @@ impl VdiDisk {
             disk_size: header.disk_size,
             block_size: header.block_size,
             bat,
+            table_cache: TableCache::default(),
             offset_data: header.offset_data,
             cursor: 0,
             parent,
@@ -300,17 +307,20 @@ impl VdiDisk {
     /// Read from a specific block, returning bytes read.
     fn read_block(
         &mut self,
-        block_idx: usize,
+        block_idx: u64,
         offset_in_block: u32,
         buf: &mut [u8],
     ) -> std::io::Result<usize> {
-        let bat_entry = self.bat.get(block_idx).copied().unwrap_or(BAT_UNALLOCATED);
+        let bat_entry = self
+            .table_cache
+            .read(&mut self.file, self.bat, block_idx)?
+            .map_or(BAT_UNALLOCATED, |entry| entry as u32);
 
         if bat_entry == BAT_UNALLOCATED {
             if let Some(ref mut parent) = self.parent {
                 // Delegate to parent for differencing images
                 let virtual_offset =
-                    block_idx as u64 * u64::from(self.block_size) + u64::from(offset_in_block);
+                    block_idx * u64::from(self.block_size) + u64::from(offset_in_block);
                 parent.seek(SeekFrom::Start(virtual_offset))?;
                 return parent.read(buf);
             }
@@ -341,8 +351,7 @@ impl Read for VdiDisk {
             return Ok(0);
         }
 
-        let remaining = (self.disk_size - self.cursor) as usize;
-        let to_read = buf.len().min(remaining);
+        let to_read = crate::disk::read_len(self.disk_size - self.cursor, buf.len());
         if to_read == 0 {
             return Ok(0);
         }
@@ -350,7 +359,7 @@ impl Read for VdiDisk {
         let mut total = 0;
         while total < to_read {
             let pos = self.cursor;
-            let block_idx = (pos / u64::from(self.block_size)) as usize;
+            let block_idx = pos / u64::from(self.block_size);
             let offset_in_block = (pos % u64::from(self.block_size)) as u32;
             let avail_in_block = self.block_size - offset_in_block;
             let chunk = (to_read - total).min(avail_in_block as usize);
@@ -369,19 +378,9 @@ impl Read for VdiDisk {
 
 impl Seek for VdiDisk {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(offset) => offset as i64,
-            SeekFrom::End(offset) => self.disk_size as i64 + offset,
-            SeekFrom::Current(offset) => self.cursor as i64 + offset,
-        };
-        if new_pos < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-        self.cursor = new_pos as u64;
-        Ok(self.cursor)
+        let target = crate::disk::seek_position(self.cursor, self.disk_size, pos)?;
+        self.cursor = target;
+        Ok(target)
     }
 }
 

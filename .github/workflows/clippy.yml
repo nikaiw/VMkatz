@@ -43,7 +43,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Install mingw + wine (Windows cross-check)
         run: |
@@ -67,7 +67,7 @@ jobs:
           exit 1
 
       - name: Clippy (Windows target)
-        run: cargo clippy --all-features --target x86_64-pc-windows-gnu -- -D warnings
+        run: cargo clippy --all-features --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
       - name: Tests
         run: cargo test --all-features
@@ -88,7 +88,7 @@ jobs:
           cargo test --all-features --target x86_64-pc-windows-gnu
           --test memory_limits --test positioned_read
 
-  # Feature powerset clippy (-D warnings) in its own job: ~60 combos, slow on a cold runner.
+  # Feature powerset clippy (-D warnings) in its own job: isolated features and pairs, slow on a cold runner.
   features:
     runs-on: ubuntu-latest
     timeout-minutes: 15

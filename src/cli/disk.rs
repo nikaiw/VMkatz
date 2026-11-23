@@ -1,9 +1,15 @@
-//! Disk-image, raw-file, Veeam and VMFS pipelines (requires the `sam` feature).
+//! Local disk commands and shared extraction helpers for disk-backed readers.
 
 use std::path::Path;
 
+#[cfg(any(
+    feature = "ntds.dit",
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
 use anyhow::Context;
-
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
@@ -12,15 +18,10 @@ use anyhow::Context;
 ))]
 use vmkatz::lsass::finder::PagefileRef;
 
-use super::args::Args;
-#[cfg(feature = "veeam")]
+#[cfg(any(feature = "vmfs", feature = "veeam"))]
 use super::args::Colors;
-#[cfg(feature = "chrome")]
-use super::args::parse_chrome_nthashes;
-#[cfg(feature = "sam")]
-use super::args::{RawFileType, get_colors, parse_dpapi_nthashes, parse_dpapi_passwords};
-#[cfg(all(feature = "vmfs", feature = "vmware"))]
-use super::lsass::extract_bitlocker_keys_from_snapshot;
+use super::args::{Args, get_colors};
+use super::credentials::emit_disk_extras;
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
@@ -30,534 +31,127 @@ use super::lsass::extract_bitlocker_keys_from_snapshot;
 use super::lsass::run_lsass;
 #[cfg(feature = "sam")]
 use super::output::print_disk_secrets;
-#[cfg(feature = "sam")]
-use super::output::{
-    dedup_dpapi_hashes, print_cached_credentials, print_credman_csv, print_credman_text,
-    print_dcc2_csv, print_dcc2_hashcat, print_dpapi_masterkey_csv, print_dpapi_masterkey_hashcat,
-    print_dpapi_masterkey_text, print_lsa_csv, print_lsa_secrets, print_sam_brief, print_sam_csv,
-    print_sam_hashcat, print_sam_ntlm, print_sam_text,
-};
 #[cfg(feature = "ntds.dit")]
 use super::output::{
     print_ntds_brief, print_ntds_csv, print_ntds_hashcat, print_ntds_ntlm, print_ntds_text,
 };
 
-/// Format a byte count with binary units (B/KiB/MiB/GiB/TiB).
+mod files;
 #[cfg(feature = "sam")]
-fn human_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let units = ["KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64 / 1024.0;
-    let mut i = 0;
-    while v >= 1024.0 && i + 1 < units.len() {
-        v /= 1024.0;
-        i += 1;
-    }
-    format!("{v:.1} {}", units[i])
-}
+mod raw;
+#[cfg(feature = "veeam")]
+mod veeam;
+#[cfg(feature = "vmfs")]
+mod vmfs;
 
-/// One listing line: `<DIR>` marker or right-aligned size, then the name.
+pub(crate) use files::{run_cp, run_ls};
 #[cfg(feature = "sam")]
-fn format_entry(e: &vmkatz::fs::DirEntry) -> String {
-    match e.kind {
-        vmkatz::fs::EntryKind::Dir => format!("{:>10}  {}", "<DIR>", e.name),
-        vmkatz::fs::EntryKind::File { size } => format!("{:>10}  {}", human_size(size), e.name),
+pub(crate) use raw::run_raw_hives;
+#[cfg(feature = "ntds.dit")]
+pub(crate) use raw::run_raw_ntds;
+#[cfg(feature = "veeam")]
+pub(crate) use veeam::run_veeam;
+#[cfg(feature = "vmfs")]
+pub(crate) use vmfs::{run_vmfs, run_vmfs_list};
+
+pub(crate) fn run_disk(input_path: &Path, args: &Args) -> anyhow::Result<()> {
+    #[cfg(feature = "ntds.dit")]
+    if args.ntds || args.all {
+        return run_ntds(input_path, args, &[]);
     }
-}
-
-/// List `path` on each selected NTFS partition of `reader`.
-#[cfg(feature = "sam")]
-pub(crate) fn run_ls<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-    path: &str,
-    partition: Option<u64>,
-) -> anyhow::Result<()> {
-    use vmkatz::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};
-    use vmkatz::sam::{ListOutcome, list_path};
-
-    let offsets = select_partition(find_ntfs_partitions(reader)?, partition)?;
-    for off in offsets {
-        if is_bitlocker_partition(reader, off) {
-            println!("[partition @ {off:#x}, BitLocker] skipped: encrypted volume");
-            continue;
+    if !cfg!(any(feature = "sam", feature = "dpapi", feature = "chrome")) {
+        anyhow::bail!(
+            "No disk extraction feature enabled; use --ls or --cp, or build with sam, dpapi, credman or chrome"
+        );
+    }
+    #[cfg(feature = "sam")]
+    let secrets = match vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition) {
+        Ok(secrets) => {
+            print_disk_secrets(&secrets, args);
+            Some(secrets)
         }
-        let outcome = match list_path(reader, off, path) {
-            Ok(o) => o,
-            Err(e) => {
-                println!("[partition @ {off:#x}] listing failed: {e}");
-                continue;
-            }
-        };
-        match outcome {
-            ListOutcome::Listed { entries, degraded } => {
-                let note = if degraded { " (degraded: MFTMirr)" } else { "" };
-                println!("[partition @ {off:#x}, NTFS]{note}");
-                if entries.is_empty() {
-                    println!("(empty)");
-                }
-                for e in &entries {
-                    println!("{}", format_entry(e));
-                }
-            }
-            ListOutcome::PathNotFound => {
-                println!("[partition @ {off:#x}, NTFS]");
-                println!("path not found: {path}");
-            }
-            ListOutcome::PathUnresolvableDegraded => {
-                println!("[partition @ {off:#x}, NTFS] (degraded: MFTMirr)");
-                println!(
-                    "path cannot be resolved: NTFS index unusable and fallback scan could not locate it: {path}"
-                );
-            }
+        Err(e) if args.partition.is_some() => return Err(e.into()),
+        Err(e) => {
+            eprintln!("[!] SAM extraction failed: {e}");
+            None
         }
+    };
+    #[cfg(not(feature = "sam"))]
+    let secrets: Option<vmkatz::secrets::DiskSecrets> = None;
+    let mut disk = vmkatz::disk::open_disk(input_path)?;
+    // Validate explicit offsets before optional scanners (which return empty on failure).
+    if args.partition.is_some() {
+        vmkatz::fs::select_partition(vmkatz::fs::find_ntfs_partitions(&mut disk)?, args.partition)?;
+    }
+    let found = emit_disk_extras(&mut disk, args, get_colors(args), secrets.as_ref(), &[]);
+    if !found && secrets.is_none() {
+        anyhow::bail!("No secrets found by the enabled disk extractors");
     }
     Ok(())
 }
 
-/// Copy a single file out of the disk image's NTFS to a local destination.
-/// Mirrors the `extract_file` helper's `get`, over any Read+Seek disk (local or VMFS).
-pub(crate) fn run_cp<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-    src: &str,
-    dst: &str,
-    partition: Option<u64>,
-) -> anyhow::Result<()> {
-    use vmkatz::fs::{
-        PartitionReader, find_entry, find_ntfs_partitions, is_bitlocker_partition, navigate_to_dir,
-        read_file_data, select_partition,
-    };
-
-    let src_norm = src.replace('/', "\\");
-    let (parent, name) = src_norm.rsplit_once('\\').ok_or_else(|| {
-        anyhow::anyhow!("--cp SRC must be an absolute guest path, e.g. \\Windows\\NTDS\\ntds.dit")
-    })?;
-
-    let offsets = select_partition(find_ntfs_partitions(reader)?, partition)?;
-    for off in offsets {
-        if is_bitlocker_partition(reader, off) {
-            continue;
-        }
-        let mut pr = PartitionReader::new(reader, off);
-        let Ok(ntfs) = ntfs::Ntfs::new(&mut pr) else {
-            continue;
-        };
-        let Ok(root) = ntfs.root_directory(&mut pr) else {
-            continue;
-        };
-        let dir = match navigate_to_dir(&ntfs, &root, &mut pr, parent) {
-            Ok(d) => d,
-            Err(e) => {
-                log::info!("cp: navigate '{parent}' failed @ {off:#x}: {e}");
-                continue;
-            }
-        };
-        let file = match find_entry(&ntfs, &dir, &mut pr, name) {
-            Ok(f) => f,
-            Err(e) => {
-                log::info!("cp: '{name}' not found @ {off:#x}: {e}");
-                continue;
-            }
-        };
-        let data = read_file_data(&file, &mut pr)?;
-        std::fs::write(dst, &data).map_err(|e| anyhow::anyhow!("--cp: cannot write {dst}: {e}"))?;
-        eprintln!(
-            "[+] cp: wrote {} bytes from '{src}' (partition {off:#x}) to {dst}",
-            data.len()
-        );
-        return Ok(());
-    }
-    anyhow::bail!("--cp: '{src}' not found on any NTFS partition")
-}
-
-/// Quick check for MBR partition type 0x07 (NTFS/HPFS) in first sector.
-#[cfg(feature = "vmfs")]
-fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool {
-    use std::io::SeekFrom;
-    let pos = reader.stream_position().unwrap_or(0);
-    let mut mbr = [0u8; 512];
-    let ok = reader.seek(SeekFrom::Start(0)).is_ok() && reader.read_exact(&mut mbr).is_ok();
-    let _ = reader.seek(SeekFrom::Start(pos));
-    if !ok || mbr[510] != 0x55 || mbr[511] != 0xAA {
-        return false;
-    }
-    // Check 4 MBR partition entries at 0x1BE, each 16 bytes, type byte at offset 4
-    for i in 0..4 {
-        let ptype = mbr[0x1BE + i * 16 + 4];
-        if ptype == 0x07 || ptype == 0xEE {
-            // 0x07 = NTFS, 0xEE = GPT (may contain NTFS)
-            return true;
-        }
-    }
-    false
-}
-
-/// List available VMFS-6 devices and their flat VMDKs.
-#[cfg(feature = "vmfs")]
-pub(crate) fn run_vmfs_list(device_filter: Option<&str>) {
-    use vmkatz::disk::vmfs;
-
-    let devices = vmfs::list_vmfs6_devices();
-    if devices.is_empty() {
-        eprintln!("[!] No VMFS-6 devices found in /dev/disks/");
-        eprintln!("    (Are you running this on an ESXi host?)");
-        return;
-    }
-
-    eprintln!("[+] VMFS-6 devices:");
-    for dev in &devices {
-        let label = if dev.label.is_empty() {
-            "(unlabeled)".to_string()
-        } else {
-            dev.label.clone()
-        };
-        eprintln!("    {} — {}", dev.path.display(), label);
-    }
-
-    // If a specific device is given, or if there's only one, list its VMDKs
-    let targets: Vec<_> = if let Some(filter) = device_filter {
-        let filter_path = std::path::Path::new(filter);
-        devices.iter().filter(|d| d.path == filter_path).collect()
-    } else {
-        devices.iter().collect()
-    };
-
-    for dev in &targets {
-        let label = if dev.label.is_empty() {
-            dev.path.display().to_string()
-        } else {
-            dev.label.clone()
-        };
-        match vmfs::list_vmfs6_vmdks(&dev.path) {
-            Ok(vmdks) => {
-                eprintln!("\n[+] {} — {} flat VMDKs:", label, vmdks.len());
-                for (vm, vmdk) in &vmdks {
-                    println!(
-                        "--vmfs-device {} --vmdk '{}/{}'",
-                        dev.path.display(),
-                        vm,
-                        vmdk
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("[!] {}: {}", dev.path.display(), e);
-            }
-        }
-    }
-}
-
-/// Resolve `--dpapi-nthash` user specs (SID, SAM/profile name, or `DOMAIN\\name`) to SIDs.
-/// Supplied secrets split by how they can be matched: resolved to a SID, or
-/// (fallback) keyed by profile name for the walk to bind later.
-type ResolvedSecrets<T> = (Vec<(String, T)>, Vec<(String, T)>);
-
-fn resolve_secret_sids<T>(
-    specs: Vec<(String, T)>,
-    machine_sid: Option<&str>,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-    flag: &str,
-) -> ResolvedSecrets<T> {
-    let mut out = Vec::new();
-    let mut by_name = Vec::new();
-    for (user, val) in specs {
-        if user
-            .get(..4)
-            .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
-        {
-            out.push((user.to_ascii_uppercase(), val));
-            continue;
-        }
-        let (domain, bare) = match user.rsplit_once('\\') {
-            Some((d, n)) if !d.is_empty() && d != "." => (Some(d), n),
-            Some((_, n)) => (None, n),
-            None => (None, user.as_str()),
-        };
-        let sid = domain.map_or_else(
-            || local_or_profile_sid(bare, machine_sid, secrets, hashes),
-            |d| domain_profile_sid(d, bare, machine_sid, hashes),
-        );
-        if let Some(sid) = sid {
-            out.push((sid, val));
-        } else {
-            // No SID yet (typical for a domain user: no SAM entry and no
-            // masterkey hash to look one up from). Keep it keyed by profile
-            // name so the profile walk can bind it once the SID is known.
-            log::info!("{flag}: {user:?} not resolved to a SID; will match by profile name");
-            let key = domain.map_or_else(|| bare.to_string(), |d| format!("{d}\\{bare}"));
-            by_name.push((key, val));
-        }
-    }
-    (out, by_name)
-}
-
-/// SID for an unqualified (or `.\\`) account name: a profile of that name,
-/// else the local SAM account.
-fn local_or_profile_sid(
-    bare: &str,
-    machine_sid: Option<&str>,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-) -> Option<String> {
-    hashes
-        .iter()
-        .find(|h| h.username.eq_ignore_ascii_case(bare))
-        .map(|h| h.sid.clone())
-        .or_else(|| {
-            let m = machine_sid?;
-            secrets?
-                .sam_entries
-                .iter()
-                .find(|e| e.username.eq_ignore_ascii_case(bare))
-                .map(|e| format!("{m}-{}", e.rid))
-        })
-}
-
-/// SID for `DOMAIN\\name`: only a profile named `name` or `name.DOMAIN` whose
-/// SID is outside the machine's account domain. Never a local SAM SID (a
-/// local homonym would otherwise steal the domain secret); without a known
-/// machine SID local and domain profiles cannot be told apart, so `None`
-/// (the caller then binds by profile name).
-fn domain_profile_sid(
-    domain: &str,
-    bare: &str,
-    machine_sid: Option<&str>,
-    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-) -> Option<String> {
-    let m = machine_sid?;
-    let qualified = format!("{bare}.{domain}");
-    hashes
-        .iter()
-        .filter(|h| {
-            h.username.eq_ignore_ascii_case(bare) || h.username.eq_ignore_ascii_case(&qualified)
-        })
-        .find(|h| {
-            vmkatz::sam::machine_sid_from_user_sid(&h.sid)
-                .is_some_and(|p| !p.eq_ignore_ascii_case(m))
-        })
-        .map(|h| h.sid.clone())
-}
-
-/// Machine (account-domain) SID: read from the SAM `Domains\\Account\\V` value.
-/// Only if that is unavailable, inferred from a profile whose RID and name
-/// match a SAM account -- which can pick a domain SID (domain Administrator
-/// vs. local RID 500), hence the warning.
-fn find_machine_sid(
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-) -> Option<String> {
-    let secrets = secrets?;
-    if let Some(m) = &secrets.machine_sid {
-        return Some(m.clone());
-    }
-    let inferred = hashes.iter().find_map(|h| {
-        let (prefix, rid) = h.sid.rsplit_once('-')?;
-        let rid: u32 = rid.parse().ok()?;
-        secrets
-            .sam_entries
-            .iter()
-            .any(|e| e.rid == rid && e.username.eq_ignore_ascii_case(&h.username))
-            .then(|| prefix.to_string())
-    });
-    if let Some(m) = &inferred {
-        log::warn!("machine SID not found in SAM; inferred {m} from a profile (may be wrong)");
-    }
-    inferred
-}
-
-/// `--credman`: build the secret table from already-extracted SAM/LSA and sweep the disk.
-fn emit_credman<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
+#[cfg(feature = "ntds.dit")]
+pub(super) fn run_ntds(
+    input_path: &Path,
     args: &Args,
-    c: &super::args::Colors,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
-    ntds_by_name: &[(String, [u8; 16])],
-) -> bool {
-    let machine_sid = find_machine_sid(secrets, hashes);
-    let (domain, domain_by_name) = resolve_secret_sids(
-        parse_dpapi_nthashes(&args.dpapi_nthash),
-        machine_sid.as_deref(),
-        secrets,
-        hashes,
-        "--dpapi-nthash",
-    );
-    let (passwords, pw_by_name) = resolve_secret_sids(
-        parse_dpapi_passwords(&args.dpapi_password),
-        machine_sid.as_deref(),
-        secrets,
-        hashes,
-        "--dpapi-password",
-    );
-    let empty = vmkatz::sam::DiskSecrets::default();
-    let mut table = vmkatz::sam::build_secret_table(
-        secrets.unwrap_or(&empty),
-        secrets.map_or(&[][..], |s| &s.lsa_secrets),
-        machine_sid.as_deref(),
-        &domain,
-        &passwords,
-    );
-    // Domain accounts extracted from this disk's own NTDS.dit: their masterkeys
-    // are context 3 (PBKDF2 from the NT hash), so these open them with no flag.
-    // By-name slots hold every candidate: explicit first, then NTDS, so a stale
-    // explicit value cannot shadow the NTDS one (all are tried, in this order).
-    for (name, h) in domain_by_name {
-        table
-            .nt_by_name
-            .entry(name.to_lowercase())
-            .or_default()
-            .push(h);
-    }
-    for (name, h) in ntds_by_name {
-        table
-            .nt_by_name
-            .entry(name.to_lowercase())
-            .or_default()
-            .push(*h);
-    }
-    for (name, pw) in pw_by_name {
-        table
-            .pw_by_name
-            .entry(name.to_lowercase())
-            .or_default()
-            .push(pw);
-    }
-    match vmkatz::sam::extract_credman_from_reader_scoped(reader, args.partition, &table) {
-        Ok(report) => {
-            let found = !report.entries.is_empty()
-                || !report.vault.is_empty()
-                || !report.undecrypted.is_empty()
-                || !report.vault_notes.is_empty();
-            match args.format.as_str() {
-                "csv" => print_credman_csv(&report, args.credman_attributes),
-                "hashcat" => {}
-                _ => print_credman_text(&report, c, args.credman_attributes),
-            }
-            found
-        }
-        Err(e) => {
-            eprintln!("[!] Credential Manager extraction failed: {e}");
-            false
-        }
-    }
-}
-
-/// Print DPAPI master key hashes found on a VMFS-backed disk (same formats as `run_sam`).
-#[cfg(feature = "vmfs")]
-fn vmfs_emit_dpapi<R: std::io::Read + std::io::Seek>(
-    disk: &mut R,
-    args: &Args,
-    c: &super::args::Colors,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-    ntds_by_name: &[(String, [u8; 16])],
-) {
-    let hashes = vmkatz::sam::extract_dpapi_masterkeys_from_reader(disk, args.partition);
-    let all_hashes = if args.credman || args.all {
-        hashes.clone()
-    } else {
-        Vec::new()
-    };
-    let hashes = dedup_dpapi_hashes(hashes, args.all);
-    if !hashes.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&hashes),
-            _ => print_dpapi_masterkey_text(&hashes, c),
-        }
-    }
-    if args.credman || args.all {
-        let _ = emit_credman(disk, args, c, secrets, &all_hashes, ntds_by_name);
-    }
-}
-
-#[cfg(all(feature = "vmfs", feature = "chrome", feature = "ntds.dit"))]
-fn vmfs_emit_chrome<R: std::io::Read + std::io::Seek>(
-    disk: &mut R,
-    args: &Args,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-) {
-    if !(args.chrome || args.all) {
-        return;
-    }
-    let empty_secrets = vmkatz::sam::DiskSecrets::default();
-    let secrets = secrets.unwrap_or(&empty_secrets);
-    let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-    match vmkatz::chrome::runner::run_reader(disk, secrets, &args.chrome_password, &nt_hashes) {
-        Ok(summary) => {
-            let output = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-            if !output.trim().is_empty() {
-                println!("{output}");
-            }
-        }
-        Err(error) => log::warn!("chrome (vmfs) failed: {error}"),
-    }
-}
-
-/// NTDS extraction from a VMFS-backed disk; mirrors `run_ntds` (NTDS output, then DPAPI).
-#[cfg(all(feature = "vmfs", feature = "ntds.dit"))]
-fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
-    disk: &mut R,
-    args: &Args,
-    c: &super::args::Colors,
     fvek_keys: &[vmkatz::lsass::bitlocker::BitLockerKey],
 ) -> anyhow::Result<()> {
-    // `--all` also surfaces this disk's local SAM/LSA/DCC2 (the --ntds flow skips
-    // them). Extract once and reuse for the DPAPI/credman step below.
-    let secrets = if args.credman || args.all {
-        if fvek_keys.is_empty() {
-            vmkatz::sam::extract_secrets_from_reader_scoped(disk, args.partition).ok()
+    if args.verbose > 0 {
+        eprintln!("[*] NTDS extraction from: {}", input_path.display());
+    }
+
+    let c = get_colors(args);
+    let mut disk = vmkatz::disk::open_disk(input_path).context("Failed to open disk image")?;
+
+    // Reuse local secrets for CredMan; --all also prints them.
+    let local_secrets = if args.credman || args.all {
+        let result = if fvek_keys.is_empty() {
+            vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition)
         } else {
-            vmkatz::sam::extract_disk_secrets_from_reader_with_bitlocker(
-                disk,
+            vmkatz::sam::extract_disk_secrets_with_bitlocker_scoped(
+                input_path,
                 fvek_keys,
                 args.partition,
             )
-            .ok()
+        };
+        match result {
+            Ok(secrets) => Some(secrets),
+            Err(error) => {
+                eprintln!("[!] SAM/LSA extraction failed: {error}");
+                None
+            }
         }
     } else {
         None
     };
-    if args.all {
-        if let Some(s) = &secrets {
-            print_disk_secrets(s, args);
-        }
-    }
 
-    let artifacts_result = if fvek_keys.is_empty() {
-        vmkatz::sam::extract_ntds_artifacts_from_reader_scoped(disk, args.partition)
-    } else {
-        vmkatz::sam::extract_ntds_artifacts_from_reader_with_bitlocker(
-            disk,
-            fvek_keys,
-            args.partition,
-        )
-    };
-    let artifacts = match artifacts_result {
+    let result = read_ntds_stream(&mut disk, args, fvek_keys);
+    let artifacts = match result {
         Ok(artifacts) => artifacts,
         Err(error) if args.all => {
+            if let Some(secrets) = &local_secrets {
+                print_disk_secrets(secrets, args);
+            }
             eprintln!("[!] NTDS extraction skipped: {error}");
-            vmfs_emit_dpapi(disk, args, c, secrets.as_ref(), &[]);
-            #[cfg(feature = "chrome")]
-            vmfs_emit_chrome(disk, args, secrets.as_ref());
+            let found = emit_disk_extras(&mut disk, args, c, local_secrets.as_ref(), &[]);
+            if !found && local_secrets.is_none() {
+                return Err(error).context("No secrets found by the enabled disk extractors");
+            }
             return Ok(());
         }
         Err(error) => return Err(error).context("NTDS artifact extraction failed"),
     };
-    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
-        .context("NTDS context validation failed")?;
-    let hashes = vmkatz::ntds::extract_ad_hashes(
-        &artifacts.ntds_data,
-        &artifacts.system_data,
-        args.ntds_history,
-    )
-    .context("NTDS hash extraction failed")?;
+    if args.all {
+        if let Some(secrets) = &local_secrets {
+            print_disk_secrets(secrets, args);
+        }
+    }
+    let (ctx, hashes) = artifacts.output.context("NTDS hash extraction failed")?;
 
     eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
     eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
     eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
-    eprintln!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
+    eprintln!("  SYSTEM size      : {} bytes", artifacts.system_size);
     eprintln!("  Bootkey          : {}", hex::encode(ctx.boot_key));
     eprintln!("  Hashes extracted : {}", hashes.len());
 
@@ -569,143 +163,20 @@ fn vmfs_emit_ntds<R: std::io::Read + std::io::Seek>(
         _ => print_ntds_text(&hashes, c, args.ntds_domain_prefix.as_deref()),
     }
 
-    // `--credman` needs this disk's own NTDS hashes to open its domain users'
-    // masterkeys; SAM/LSA were already extracted above into `secrets`.
-    let ntds_by_name: Vec<(String, [u8; 16])> = if args.credman || args.all {
-        hashes
-            .iter()
-            .filter(|h| !h.is_history)
-            .map(|h| (h.username.clone(), h.nt_hash))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    vmfs_emit_dpapi(disk, args, c, secrets.as_ref(), &ntds_by_name);
-    #[cfg(feature = "chrome")]
-    vmfs_emit_chrome(disk, args, secrets.as_ref());
-    Ok(())
-}
-
-/// Find memory snapshots beside the VMFS VMDK selected by its VM folder.
-/// Prefer the mounted datastore whose label matches the raw VMFS device. If
-/// that mapping is unavailable, only use a unique matching VM directory.
-#[cfg(all(feature = "vmfs", feature = "sam", feature = "vmware"))]
-fn vmfs_associated_snapshots(device_path: &Path, vmdk_path: &str) -> Vec<std::path::PathBuf> {
-    use vmkatz::discover::discover_vm_files;
-    use vmkatz::disk::vmfs;
-
-    let relative = Path::new(vmdk_path);
-    let Some(vm_relative_dir) = relative.parent() else {
-        return Vec::new();
-    };
-    let Some(vmdk_name) = relative.file_name() else {
-        return Vec::new();
-    };
-
-    let datastore_label = vmfs::list_vmfs6_devices()
-        .into_iter()
-        .find(|device| device.path == device_path)
-        .map(|device| device.label);
-    let Ok(volumes) = std::fs::read_dir("/vmfs/volumes") else {
-        return Vec::new();
-    };
-
-    let mut matching_dirs = Vec::new();
-    for volume in volumes.flatten() {
-        if let Some(label) = datastore_label.as_deref() {
-            if volume.file_name().to_string_lossy() != label {
-                continue;
-            }
-        }
-        let vm_dir = volume.path().join(vm_relative_dir);
-        if vm_dir.join(vmdk_name).is_file() && vm_dir.is_dir() {
-            matching_dirs.push(vm_dir);
-        }
-    }
-
-    if matching_dirs.len() != 1 {
-        if !matching_dirs.is_empty() {
-            log::warn!(
-                "VMFS: {} mounted VM directories match {}; refusing ambiguous snapshot association",
-                matching_dirs.len(),
-                vmdk_path
-            );
-        }
-        return Vec::new();
-    }
-
-    let vm_dir = &matching_dirs[0];
-    let Ok(discovery) = discover_vm_files(vm_dir) else {
-        return Vec::new();
-    };
-    discovery.lsass_files
-}
-
-#[cfg(all(feature = "vmfs", feature = "sam", feature = "vmware"))]
-fn vmfs_snapshot_bitlocker_keys(
-    disk: &mut (impl std::io::Read + std::io::Seek),
-    snapshots: &[std::path::PathBuf],
-) -> Vec<vmkatz::lsass::bitlocker::BitLockerKey> {
-    // Snapshot scans are expensive (often tens of GiB). Do not scan guest RAM
-    // unless the corresponding disk actually has a BitLocker volume.
-    let Ok(partitions) = vmkatz::fs::find_ntfs_partitions(disk) else {
-        return Vec::new();
-    };
-    if !partitions
+    let ntds_by_name: Vec<_> = hashes
         .iter()
-        .any(|&offset| vmkatz::fs::is_bitlocker_partition(disk, offset))
-    {
-        return Vec::new();
-    }
+        .filter(|h| !h.is_history)
+        .map(|h| (h.username.clone(), h.nt_hash))
+        .collect();
+    emit_disk_extras(&mut disk, args, c, local_secrets.as_ref(), &ntds_by_name);
 
-    let mut snapshots = snapshots.to_vec();
-    snapshots.sort_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    });
-    snapshots.reverse();
-    for snapshot in snapshots {
-        let candidates = extract_bitlocker_keys_from_snapshot(&snapshot);
-        if !candidates.is_empty() {
-            log::info!(
-                "BitLocker: {} FVEK candidate(s) from associated snapshot {}",
-                candidates.len(),
-                snapshot.display()
-            );
-            return candidates;
-        }
-    }
-    Vec::new()
-}
-
-#[cfg(all(feature = "vmfs", feature = "vmware"))]
-fn vmfs_run_associated_lsass(snapshots: &[std::path::PathBuf], args: &Args) -> anyhow::Result<()> {
-    if snapshots.is_empty() {
-        anyhow::bail!("No memory snapshots were found beside the associated VMFS VMDK");
-    }
-    for snapshot in snapshots {
-        let name = snapshot.file_name().unwrap_or_default().to_string_lossy();
-        eprintln!("\n[*] LSASS snapshot: {name}");
-        if let Err(error) = run_lsass(snapshot, args, None, None) {
-            eprintln!("[!] {name}: {error:#}");
-        }
-    }
     Ok(())
-}
-
-#[cfg(all(feature = "vmfs", not(feature = "vmware")))]
-fn vmfs_run_associated_lsass(
-    _snapshots: &[std::path::PathBuf],
-    _args: &Args,
-) -> anyhow::Result<()> {
-    anyhow::bail!("VMFS-associated LSASS extraction requires the vmware feature")
 }
 
 /// Extract LSASS from memory snapshots located beside an explicitly selected
 /// standalone disk image. Directory mode already processes snapshots itself.
 #[cfg(all(
-    feature = "sam",
+    feature = "disk",
     any(
         feature = "vmware",
         feature = "vbox",
@@ -740,1210 +211,63 @@ pub(crate) fn run_associated_lsass_for_disk(input_path: &Path, args: &Args) -> a
     Ok(())
 }
 
-#[cfg(all(feature = "vmfs", feature = "sam", not(feature = "vmware")))]
-const fn vmfs_snapshot_bitlocker_keys(
-    _disk: &mut (impl std::io::Read + std::io::Seek),
-    _snapshots: &[std::path::PathBuf],
-) -> Vec<vmkatz::lsass::bitlocker::BitLockerKey> {
-    Vec::new()
-}
-
-#[cfg(all(feature = "vmfs", feature = "sam", not(feature = "vmware")))]
-const fn vmfs_associated_snapshots(
-    _device_path: &Path,
-    _vmdk_path: &str,
-) -> Vec<std::path::PathBuf> {
-    Vec::new()
-}
-
-#[cfg(feature = "vmfs")]
-pub(crate) fn run_vmfs(
-    device_path: &Path,
-    vmdk_path: Option<&str>,
-    args: &Args,
-) -> anyhow::Result<()> {
-    let colors = get_colors(args);
-    match vmdk_path {
-        Some(vmdk) => run_vmfs_single(device_path, vmdk, args, colors),
-        None => run_vmfs_scan(device_path, args, colors),
-    }
-}
-
-#[cfg(feature = "vmfs")]
-fn run_vmfs_single(
-    device_path: &Path,
-    vmdk: &str,
-    args: &Args,
-    c: &'static super::args::Colors,
-) -> anyhow::Result<()> {
-    use vmkatz::disk::DiskImage;
-    use vmkatz::disk::vmfs;
-
-    // Single VMDK mode
-    eprintln!(
-        "{}[*] VMFS-6: Opening {} from {}{}",
-        c.cyan,
-        vmdk,
-        device_path.display(),
-        c.reset
-    );
-    let mut disk = vmfs::open_vmfs6_vmdk(device_path, vmdk)
-        .map_err(|e| anyhow::anyhow!("VMFS open failed: {e}"))?;
-    let associated_snapshots = vmfs_associated_snapshots(device_path, vmdk);
-    if args.lsass || (args.all && !associated_snapshots.is_empty()) {
-        vmfs_run_associated_lsass(&associated_snapshots, args)?;
-    }
-    let bitlocker_keys = vmfs_snapshot_bitlocker_keys(&mut disk, &associated_snapshots);
-
-    eprintln!(
-        "{}[+] VMDK opened: {:.1} GB{}",
-        c.green,
-        disk.disk_size() as f64 / (1024.0 * 1024.0 * 1024.0),
-        c.reset
-    );
-
-    if let Some(cp) = &args.cp {
-        return run_cp(&mut disk, &cp[0], &cp[1], args.partition);
-    }
-
-    if let Some(ref ls_path) = args.ls {
-        return run_ls(&mut disk, ls_path, args.partition);
-    }
-
-    // NTDS replaces the plain SAM flow, as in the local-disk path.
-    // `--all` routes here too and additionally prints SAM/LSA/DCC2.
-    #[cfg(feature = "ntds.dit")]
-    if args.ntds || args.all {
-        return vmfs_emit_ntds(&mut disk, args, c, &bitlocker_keys);
-    }
-
-    // Extract secrets via the standard pipeline
-    let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
-    let extraction = if bitlocker_keys.is_empty() {
-        vmkatz::sam::extract_secrets_from_reader_scoped(&mut disk, args.partition)
-    } else {
-        vmkatz::sam::extract_disk_secrets_from_reader_with_bitlocker(
-            &mut disk,
-            &bitlocker_keys,
-            args.partition,
-        )
-    };
-    match extraction {
-        Ok(secrets) => {
-            print_disk_secrets(&secrets, args);
-            #[cfg(feature = "chrome")]
-            if args.chrome || args.all {
-                let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-                match vmkatz::chrome::runner::run_reader(
-                    &mut disk,
-                    &secrets,
-                    &args.chrome_password,
-                    &nt_hashes,
-                ) {
-                    Ok(summary) => {
-                        let out =
-                            vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                        if !out.trim().is_empty() {
-                            println!("{out}");
-                        }
-                    }
-                    Err(e) => log::warn!("chrome (vmfs) failed: {e}"),
-                }
-            }
-            disk_secrets = Some(secrets);
-        }
-        Err(e) if args.partition.is_some() => return Err(e.into()),
-        Err(e) => {
-            eprintln!("[!] Extraction failed for {vmdk}: {e}");
-        }
-    }
-
-    vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref(), &[]);
-    Ok(())
-}
-
-#[cfg(feature = "vmfs")]
-fn run_vmfs_scan(
-    device_path: &Path,
-    args: &Args,
-    c: &'static super::args::Colors,
-) -> anyhow::Result<()> {
-    use vmkatz::disk::vmfs;
-
-    // A --partition offset is specific to one disk's partition table and is
-    // meaningless across the many differently-laid-out VMDKs an auto-scan visits.
-    // Require --vmdk so the offset applies to a single, explicit disk.
-    if args.partition.is_some() {
-        anyhow::bail!(
-            "--partition requires --vmdk: a partition offset applies to one disk, not an \
-                 auto-scan of all VMDKs. Select a disk with --vmdk (see --vmfs-list)."
-        );
-    }
-    if args.cp.is_some() {
-        anyhow::bail!(
-            "--cp requires --vmdk: a file copy targets one disk, not an auto-scan of all \
-                 VMDKs. Select a disk with --vmdk (see --vmfs-list)."
-        );
-    }
-    // Auto-scan mode: list all VMs and extract from each
-    eprintln!(
-        "{}[*] VMFS-6: Scanning all VMs on {}{}",
-        c.cyan,
-        device_path.display(),
-        c.reset
-    );
-
-    let vmdks = vmfs::list_vmfs6_vmdks(device_path)
-        .map_err(|e| anyhow::anyhow!("VMFS scan failed: {e}"))?;
-
-    if vmdks.is_empty() {
-        anyhow::bail!("No flat VMDKs found on VMFS-6 datastore");
-    }
-
-    eprintln!("[+] Found {} flat VMDKs:", vmdks.len());
-    for (vm, vmdk) in &vmdks {
-        eprintln!("    {vm}/{vmdk}");
-    }
-
-    let mut processed_snapshots = std::collections::HashSet::new();
-    for (vm_name, vmdk_name) in &vmdks {
-        let vmdk_path = format!("{vm_name}/{vmdk_name}");
-        eprintln!("\n{}[*] Processing: {}{}", c.cyan, vmdk_path, c.reset);
-
-        match vmfs::open_vmfs6_vmdk(device_path, &vmdk_path) {
-            Ok(mut disk) => {
-                // Skip non-Windows disks before enumerating or parsing
-                // associated memory snapshots; VMFS auto-scan can contain
-                // many Linux VMs and snapshot images are expensive to read.
-                if !has_ntfs_partitions(&mut disk) {
-                    eprintln!(
-                        "[*] {vm_name}: no Windows-compatible partition layout detected; skipping this VM (common for Linux guests)"
-                    );
-                    continue;
-                }
-                let associated_snapshots = vmfs_associated_snapshots(device_path, &vmdk_path);
-                if args.lsass || args.all {
-                    let new_snapshots: Vec<_> = associated_snapshots
-                        .iter()
-                        .filter(|snapshot| processed_snapshots.insert((*snapshot).clone()))
-                        .cloned()
-                        .collect();
-                    if !new_snapshots.is_empty() {
-                        vmfs_run_associated_lsass(&new_snapshots, args)?;
-                    }
-                }
-                let bitlocker_keys = vmfs_snapshot_bitlocker_keys(&mut disk, &associated_snapshots);
-                if let Some(ref ls_path) = args.ls {
-                    println!("=== {vmdk_path} ===");
-                    if let Err(e) = run_ls(&mut disk, ls_path, args.partition) {
-                        eprintln!("[!] {vm_name}: {e}");
-                    }
-                    continue;
-                }
-                #[cfg(feature = "ntds.dit")]
-                if args.ntds || args.all {
-                    println!("=== {vmdk_path} ===");
-                    if let Err(e) = vmfs_emit_ntds(&mut disk, args, c, &bitlocker_keys) {
-                        eprintln!("[!] {vm_name}: {e:#}");
-                    }
-                    continue;
-                }
-                // Use NTFS-only extraction (no raw fallback scans) for batch mode
-                let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
-                let extraction = if bitlocker_keys.is_empty() {
-                    vmkatz::sam::extract_secrets_ntfs_only_scoped(&mut disk, args.partition)
-                } else {
-                    vmkatz::sam::extract_disk_secrets_from_reader_with_bitlocker(
-                        &mut disk,
-                        &bitlocker_keys,
-                        args.partition,
-                    )
-                };
-                match extraction {
-                    Ok(secrets) => {
-                        if !secrets.sam_entries.is_empty() {
-                            eprintln!(
-                                "{}[+] {} — {} SAM hashes:{}",
-                                c.green,
-                                vm_name,
-                                secrets.sam_entries.len(),
-                                c.reset
-                            );
-                        }
-                        if !secrets.sam_entries.is_empty()
-                            || !secrets.lsa_secrets.is_empty()
-                            || !secrets.cached_credentials.is_empty()
-                        {
-                            print_disk_secrets(&secrets, args);
-                        }
-                        disk_secrets = Some(secrets);
-                    }
-                    Err(e) => {
-                        eprintln!("[!] {vm_name}: {e}");
-                    }
-                }
-                vmfs_emit_dpapi(&mut disk, args, c, disk_secrets.as_ref(), &[]);
-            }
-            Err(e) => {
-                eprintln!("[!] Failed to open {vmdk_path}: {e}");
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "sam")]
-pub(crate) fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
-    #[cfg(feature = "ntds.dit")]
-    {
-        if args.ntds || args.all {
-            return run_ntds(input_path, args, &[]);
-        }
-    }
-
-    if args.verbose > 0 {
-        eprintln!("[*] SAM hash extraction from: {}", input_path.display());
-    }
-
-    let c = get_colors(args);
-    let mut found_anything = false;
-    let mut disk_secrets: Option<vmkatz::sam::DiskSecrets> = None;
-
-    // SAM/LSA extraction — non-fatal so DPAPI masterkey scan can still proceed
-    match vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition) {
-        Ok(secrets) => {
-            found_anything = true;
-            print_disk_secrets(&secrets, args);
-            disk_secrets = Some(secrets);
-        }
-        Err(e) if args.partition.is_some() => return Err(e.into()),
-        Err(e) => {
-            eprintln!("[!] SAM extraction failed: {e}");
-        }
-    }
-
-    // Extract DPAPI master key hashes from user profiles (independent of SAM)
-    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
-    let all_dpapi_hashes = if args.credman || args.all {
-        dpapi_hashes.clone()
-    } else {
-        Vec::new()
-    };
-    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
-    if !dpapi_hashes.is_empty() {
-        found_anything = true;
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
-            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
-        }
-    }
-
-    if args.credman || args.all {
-        match vmkatz::disk::open_disk(input_path) {
-            Ok(mut disk) => {
-                found_anything |= emit_credman(
-                    &mut disk,
-                    args,
-                    c,
-                    disk_secrets.as_ref(),
-                    &all_dpapi_hashes,
-                    &[],
-                );
-            }
-            Err(e) => eprintln!("[!] Credential Manager: cannot open disk: {e}"),
-        }
-    }
-
-    #[cfg(feature = "chrome")]
-    {
-        if args.chrome || args.all {
-            let chrome_nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-            match vmkatz::chrome::runner::run_disk_with_passwords(
-                input_path,
-                &args.chrome_password,
-                &chrome_nt_hashes,
-            ) {
-                Ok(summary) => {
-                    if !summary.profiles.is_empty() || !summary.findings.is_empty() {
-                        found_anything = true;
-                    }
-                    let out = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                    if !out.trim().is_empty() {
-                        println!("{out}");
-                    }
-                }
-                Err(e) => log::warn!("chrome extraction failed: {e}"),
-            }
-        }
-    }
-
-    if !found_anything {
-        anyhow::bail!("No SAM hashes or DPAPI master keys found on disk");
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "ntds.dit")]
-fn emit_all_disk_fallback(
-    input_path: &Path,
-    args: &Args,
-    c: &super::args::Colors,
-    secrets: Option<&vmkatz::sam::DiskSecrets>,
-) {
-    let raw_dpapi = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
-    let all_dpapi = raw_dpapi.clone();
-    let dpapi_hashes = dedup_dpapi_hashes(raw_dpapi, true);
-    if !dpapi_hashes.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
-            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
-        }
-    }
-
-    if let Ok(mut disk) = vmkatz::disk::open_disk(input_path) {
-        let _ = emit_credman(&mut disk, args, c, secrets, &all_dpapi, &[]);
-    }
-
-    #[cfg(feature = "chrome")]
-    if args.chrome || args.all {
-        let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-        match vmkatz::chrome::runner::run_disk_with_passwords(
-            input_path,
-            &args.chrome_password,
-            &nt_hashes,
-        ) {
-            Ok(summary) => {
-                let output = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                if !output.trim().is_empty() {
-                    println!("{output}");
-                }
-            }
-            Err(error) => log::warn!("chrome extraction failed: {error}"),
-        }
-    }
-}
-
-#[cfg(feature = "ntds.dit")]
-pub(super) fn run_ntds(
-    input_path: &Path,
-    args: &Args,
-    fvek_keys: &[vmkatz::lsass::bitlocker::BitLockerKey],
-) -> anyhow::Result<()> {
-    if args.verbose > 0 {
-        eprintln!("[*] NTDS extraction from: {}", input_path.display());
-    }
-
-    let c = get_colors(args);
-
-    // Local SAM/LSA/DCC2 are computed for `--all` (printed) and `--credman` (DPAPI_SYSTEM and
-    // local-user keys for vault decryption; not printed unless `--all`).
-    let local_secrets = if args.credman || args.all {
-        let result = if fvek_keys.is_empty() {
-            vmkatz::sam::extract_disk_secrets_scoped(input_path, args.partition)
-        } else {
-            vmkatz::sam::extract_disk_secrets_with_bitlocker_scoped(
-                input_path,
-                fvek_keys,
-                args.partition,
-            )
-        };
-        match result {
-            Ok(secrets) => Some(secrets),
-            Err(error) => {
-                eprintln!("[!] SAM/LSA extraction failed: {error}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let result = if fvek_keys.is_empty() {
-        vmkatz::sam::extract_ntds_artifacts_scoped(input_path, args.partition)
-    } else {
-        vmkatz::sam::extract_ntds_artifacts_with_bitlocker_scoped(
-            input_path,
-            fvek_keys,
-            args.partition,
-        )
-    };
-    let artifacts = match result {
-        Ok(artifacts) => artifacts,
-        Err(error) if args.all => {
-            if let Some(secrets) = &local_secrets {
-                print_disk_secrets(secrets, args);
-            }
-            eprintln!("[!] NTDS extraction skipped: {error}");
-            emit_all_disk_fallback(input_path, args, c, local_secrets.as_ref());
-            return Ok(());
-        }
-        Err(error) => return Err(error).context("NTDS artifact extraction failed"),
-    };
-    if args.all {
-        if let Some(secrets) = &local_secrets {
-            print_disk_secrets(secrets, args);
-        }
-    }
-    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
-        .context("NTDS context validation failed")?;
-    let hashes = vmkatz::ntds::extract_ad_hashes(
-        &artifacts.ntds_data,
-        &artifacts.system_data,
-        args.ntds_history,
-    )
-    .context("NTDS hash extraction failed")?;
-
-    eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
-    eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
-    eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
-    eprintln!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
-    eprintln!("  Bootkey          : {}", hex::encode(ctx.boot_key));
-    eprintln!("  Hashes extracted : {}", hashes.len());
-
-    match args.format.as_str() {
-        "csv" => print_ntds_csv(&hashes, args.ntds_domain_prefix.as_deref()),
-        "hashcat" => print_ntds_hashcat(&hashes, args.ntds_domain_prefix.as_deref()),
-        "ntlm" => print_ntds_ntlm(&hashes, args.ntds_domain_prefix.as_deref()),
-        "brief" => print_ntds_brief(&hashes, args.ntds_domain_prefix.as_deref()),
-        _ => print_ntds_text(&hashes, c, args.ntds_domain_prefix.as_deref()),
-    }
-
-    // Also extract DPAPI master key hashes from user profiles on the same disk
-    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys_scoped(input_path, args.partition);
-    let all_dpapi_hashes = if args.credman || args.all {
-        dpapi_hashes.clone()
-    } else {
-        Vec::new()
-    };
-    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
-    if !dpapi_hashes.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
-            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
-        }
-    }
-
-    // `--credman` alongside `--ntds`: this disk is a DC, so its own NTDS.dit
-    // supplies the NT hashes that open its domain users' masterkeys (context 3)
-    // without any flag. SAM/LSA are re-read here because run_ntds does not.
-    if args.credman || args.all {
-        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
-            .iter()
-            .filter(|h| !h.is_history)
-            .map(|h| (h.username.clone(), h.nt_hash))
-            .collect();
-        match vmkatz::disk::open_disk(input_path) {
-            Ok(mut disk) => {
-                let _ = emit_credman(
-                    &mut disk,
-                    args,
-                    c,
-                    local_secrets.as_ref(),
-                    &all_dpapi_hashes,
-                    &ntds_by_name,
-                );
-            }
-            Err(e) => eprintln!("[!] Credential Manager: cannot open disk: {e}"),
-        }
-    }
-
-    #[cfg(feature = "chrome")]
-    if args.chrome || args.all {
-        let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-        match vmkatz::chrome::runner::run_disk_with_passwords(
-            input_path,
-            &args.chrome_password,
-            &nt_hashes,
-        ) {
-            Ok(summary) => {
-                let output = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                if !output.trim().is_empty() {
-                    println!("{output}");
-                }
-            }
-            Err(error) => log::warn!("chrome extraction failed: {error}"),
-        }
-    }
-
-    Ok(())
-}
-
-/// Run the credential pipeline over every disk image in a Veeam backup.
-/// Images are read on demand — nothing is written to a temp file.
-#[cfg(feature = "veeam")]
-pub(crate) fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
-    use vmkatz::disk::DiskImage;
-
-    let password = args.veeam_password.as_deref();
-
-    // Inspection/extraction sub-modes (mirror vbktool's `list` / `extract`).
-    if args.veeam_list {
-        return run_veeam_list(input_path, password, args);
-    }
-    if let Some(name) = &args.veeam_extract {
-        return run_veeam_extract(
-            input_path,
-            name,
-            args.veeam_output.as_deref(),
-            password,
-            args,
-        );
-    }
-
-    // Encrypted with no password: can't reconstruct — emit the Hashcat
-    // target for cracking. With --veeam-password we fall through instead.
-    if password.is_none()
-        && vmkatz::veeam::inspect_encryption(input_path).is_ok_and(|e| e.encrypted)
-    {
-        return emit_veeam_hashcat(input_path);
-    }
-
-    let disks = vmkatz::veeam::list_disk_images(input_path, password)
-        .context("failed to enumerate Veeam disk images")?;
-    if disks.is_empty() {
-        // Encryption is handled above, so an empty list means the backup holds
-        // no Windows disk images (e.g. a Linux/agent backup or a wrong password).
-        anyhow::bail!(
-            "No supported Windows disk images found in Veeam backup {} (a Linux-only or agent-based backup may contain no Windows disks)",
-            input_path.display()
-        );
-    }
-
-    let c = get_colors(args);
-    eprintln!(
-        "[+] Veeam backup: {} disk image(s) in {}",
-        disks.len(),
-        input_path.display()
-    );
-
-    let mut found_anything = false;
-    for entry in &disks {
-        let size_note = entry
-            .size
-            .map(|s| format!(" ({})", veeam_human_size(s)))
-            .unwrap_or_default();
-        eprintln!(
-            "\n{}=== disk image: {}{}{}",
-            c.green, entry.name, size_note, c.reset
-        );
-
-        let mut disk = match vmkatz::veeam::VbkDisk::open(input_path, &entry.path, password) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[!] cannot open {}: {e}", entry.name);
-                continue;
-            }
-        };
-        log::info!("[veeam] {} = {} bytes", entry.name, disk.disk_size());
-
-        // --ntds targets a DC's disk: extract AD hashes from NTDS.dit instead of
-        // the local SAM/DPAPI pipeline.
-        #[cfg(feature = "ntds.dit")]
-        if args.ntds || args.all {
-            match extract_ntds_from_reader(&mut disk, args, c) {
-                Ok(found) => found_anything |= found,
-                Err(error) if args.all => {
-                    eprintln!("[!] NTDS extraction skipped on {}: {error}", entry.name);
-                    match extract_and_print_reader(&mut disk, args, c) {
-                        Ok(found) => found_anything |= found,
-                        Err(fallback_error) => {
-                            eprintln!("[!] extraction failed on {}: {fallback_error}", entry.name);
-                        }
-                    }
-                }
-                Err(error) => {
-                    eprintln!("[!] NTDS extraction failed on {}: {error}", entry.name);
-                }
-            }
-            continue;
-        }
-
-        match extract_and_print_reader(&mut disk, args, c) {
-            Ok(found) => found_anything |= found,
-            Err(e) => eprintln!("[!] extraction failed on {}: {e}", entry.name),
-        }
-    }
-
-    if !found_anything {
-        anyhow::bail!("No SAM hashes or DPAPI master keys found in Veeam backup");
-    }
-    Ok(())
-}
-
-/// Print the encrypted backup's wrapped keyset as a Hashcat target
-/// (`$vbk$*salt*iterations*verifier`, mode 31200) for offline cracking.
-#[cfg(feature = "veeam")]
-fn emit_veeam_hashcat(input_path: &Path) -> anyhow::Result<()> {
-    let hashes = vmkatz::veeam::hashcat_hashes(input_path).with_context(|| {
-        format!(
-            "{} is encrypted but no Hashcat target could be built",
-            input_path.display()
-        )
-    })?;
-    eprintln!(
-        "[+] Encrypted Veeam backup — {} Hashcat target(s), mode {}:",
-        hashes.len(),
-        vmkatz::veeam::HASHCAT_VEEAM_VBK_MODE
-    );
-    for h in &hashes {
-        println!("{h}");
-    }
-    eprintln!(
-        "[*] Crack with: hashcat -m {} <hash> <wordlist>, then re-run with --veeam-password",
-        vmkatz::veeam::HASHCAT_VEEAM_VBK_MODE
-    );
-    Ok(())
-}
-
-/// Human-readable byte size (binary units), matching vbktool's list output.
-#[cfg(feature = "veeam")]
-fn veeam_human_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} {}", UNITS[0])
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
-/// `--veeam-list`: print the backup catalogue (directories and stored files).
-#[cfg(feature = "veeam")]
-fn run_veeam_list(input_path: &Path, password: Option<&str>, args: &Args) -> anyhow::Result<()> {
-    use vmkatz::veeam::StoredItemKind;
-    let catalog = vmkatz::veeam::list_items_with_password(input_path, password)
-        .context("failed to read Veeam catalogue")?;
-    let c = get_colors(args);
-    let (mut files, mut dirs, mut total) = (0u64, 0u64, 0u64);
-    for item in &catalog.items {
-        match item.kind {
-            StoredItemKind::Directory => {
-                dirs += 1;
-                eprintln!("\n{}{}/{}", c.cyan, item.name, c.reset);
-            }
-            StoredItemKind::File => {
-                files += 1;
-                let sz = item.size.unwrap_or(0);
-                total += sz;
-                println!("  {:>11}  {}", veeam_human_size(sz), item.name);
-            }
-        }
-    }
-    eprintln!(
-        "\n{files} file(s) · {dirs} director(ies) · {} total",
-        veeam_human_size(total)
-    );
-    Ok(())
-}
-
-/// `--veeam-extract`: reconstruct one stored file to disk (never overwrites).
-#[cfg(feature = "veeam")]
-fn run_veeam_extract(
-    input_path: &Path,
-    name: &str,
-    output: Option<&str>,
-    password: Option<&str>,
-    args: &Args,
-) -> anyhow::Result<()> {
-    // Default destination: the item's basename (after any catalogue path) in cwd.
-    let default_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let dest = Path::new(output.unwrap_or(default_name));
-    let report =
-        vmkatz::veeam::extract_item_to_path_with_password(input_path, name, dest, password)
-            .with_context(|| format!("failed to extract {name:?}"))?;
-    let c = get_colors(args);
-    eprintln!(
-        "{}[+] Extracted {} → {}{}",
-        c.green,
-        report.name,
-        dest.display(),
-        c.reset
-    );
-    eprintln!(
-        "    {} · {} blocks ({} sparse, {} compressed)",
-        veeam_human_size(report.bytes_written),
-        report.block_count,
-        report.sparse_blocks,
-        report.compressed_blocks
-    );
-    Ok(())
-}
-
-/// Extract and print SAM/LSA/DCC2, DPAPI, and (with `--chrome`) Chrome
-/// secrets from one open disk reader — the reader-based twin of `run_sam`.
-#[cfg(feature = "veeam")]
+/// Run registry and optional disk extractors on an open reader.
+#[cfg(any(feature = "vmfs", feature = "veeam"))]
 fn extract_and_print_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     args: &Args,
     c: &Colors,
+    fvek_keys: &[vmkatz::lsass::bitlocker::BitLockerKey],
+    ntfs_only: bool,
 ) -> anyhow::Result<bool> {
-    use std::io::SeekFrom;
-    let mut found_anything = false;
-
-    reader.seek(SeekFrom::Start(0))?;
-    let secrets = match vmkatz::sam::extract_secrets_from_reader_scoped(reader, args.partition) {
-        Ok(secrets) => {
-            found_anything = true;
-            print_disk_secrets(&secrets, args);
-            secrets
-        }
-        Err(e) => {
-            eprintln!("[!] SAM extraction failed: {e}");
-            vmkatz::sam::DiskSecrets::default()
-        }
-    };
-
-    // Chrome — independent of SAM success, like run_sam. Recovered secrets seed
-    // keyring building; without them we still discover profiles and try
-    // --chrome-password candidates.
-    #[cfg(feature = "chrome")]
-    if args.chrome || args.all {
-        reader.seek(SeekFrom::Start(0))?;
-        let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-        match vmkatz::chrome::runner::run_reader(
-            reader,
-            &secrets,
-            &args.chrome_password,
-            &nt_hashes,
-        ) {
-            Ok(summary) => {
-                if !summary.profiles.is_empty() || !summary.findings.is_empty() {
-                    found_anything = true;
-                }
-                let out = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                if !out.trim().is_empty() {
-                    println!("{out}");
-                }
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    #[cfg(feature = "sam")]
+    let secrets = {
+        let result = if !fvek_keys.is_empty() {
+            vmkatz::sam::extract_disk_secrets_from_reader_with_bitlocker(
+                reader,
+                fvek_keys,
+                args.partition,
+            )
+        } else if ntfs_only {
+            vmkatz::sam::extract_secrets_ntfs_only_scoped(reader, args.partition)
+        } else {
+            vmkatz::sam::extract_secrets_from_reader_scoped(reader, args.partition)
+        };
+        match result {
+            Ok(secrets) => {
+                print_disk_secrets(&secrets, args);
+                Some(secrets)
             }
-            Err(e) => log::warn!("chrome extraction failed: {e}"),
+            Err(e) if args.partition.is_some() => return Err(e.into()),
+            Err(e) => {
+                eprintln!("[!] SAM extraction failed: {e}");
+                None
+            }
         }
-    }
-
-    // DPAPI master key hashes (independent of SAM).
-    reader.seek(SeekFrom::Start(0))?;
-    let raw_dpapi = vmkatz::sam::extract_dpapi_masterkeys_from_reader(reader, args.partition);
-    let all_dpapi = if args.credman || args.all {
-        raw_dpapi.clone()
-    } else {
-        Vec::new()
     };
-    let dpapi_hashes = dedup_dpapi_hashes(raw_dpapi, args.all);
-    if !dpapi_hashes.is_empty() {
-        found_anything = true;
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
-            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
-        }
-    }
-
-    if args.credman || args.all {
-        reader.seek(SeekFrom::Start(0))?;
-        found_anything |= emit_credman(reader, args, c, Some(&secrets), &all_dpapi, &[]);
-    }
-
-    Ok(found_anything)
-}
-
-/// Extract AD hashes from a DC disk's NTDS.dit via a reader — the reader-based
-/// twin of `run_ntds`. Returns whether any hashes were found.
-#[cfg(all(feature = "veeam", feature = "ntds.dit"))]
-fn extract_ntds_from_reader<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-    args: &Args,
-    c: &Colors,
-) -> anyhow::Result<bool> {
-    use std::io::SeekFrom;
-
-    let secrets = if args.credman || args.all {
-        reader.seek(SeekFrom::Start(0))?;
-        vmkatz::sam::extract_secrets_from_reader_scoped(reader, args.partition).ok()
-    } else {
+    #[cfg(not(feature = "sam"))]
+    let secrets: Option<vmkatz::secrets::DiskSecrets> = {
+        let _ = (fvek_keys, ntfs_only);
         None
     };
-    if args.all {
-        if let Some(s) = &secrets {
-            print_disk_secrets(s, args);
-        }
-    }
-
-    reader.seek(SeekFrom::Start(0))?;
-    let artifacts = vmkatz::sam::extract_ntds_artifacts_from_reader_scoped(reader, args.partition)
-        .context("NTDS artifact extraction failed")?;
-    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
-        .context("NTDS context validation failed")?;
-    let hashes = vmkatz::ntds::extract_ad_hashes(
-        &artifacts.ntds_data,
-        &artifacts.system_data,
-        args.ntds_history,
-    )
-    .context("NTDS hash extraction failed")?;
-
-    eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
-    eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
-    eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
-    eprintln!("  Hashes extracted : {}", hashes.len());
-
-    match args.format.as_str() {
-        "csv" => print_ntds_csv(&hashes, args.ntds_domain_prefix.as_deref()),
-        "hashcat" => print_ntds_hashcat(&hashes, args.ntds_domain_prefix.as_deref()),
-        "ntlm" => print_ntds_ntlm(&hashes, args.ntds_domain_prefix.as_deref()),
-        "brief" => print_ntds_brief(&hashes, args.ntds_domain_prefix.as_deref()),
-        _ => print_ntds_text(&hashes, c, args.ntds_domain_prefix.as_deref()),
-    }
-
-    // DPAPI master key hashes from the same disk, as run_ntds does.
-    reader.seek(SeekFrom::Start(0))?;
-    let raw_dpapi = vmkatz::sam::extract_dpapi_masterkeys_from_reader(reader, args.partition);
-    let all_dpapi = if args.credman || args.all {
-        raw_dpapi.clone()
-    } else {
-        Vec::new()
-    };
-    let dpapi_hashes = dedup_dpapi_hashes(raw_dpapi, args.all);
-    if !dpapi_hashes.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
-            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
-            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
-        }
-    }
-
-    let mut found_anything = !hashes.is_empty() || !dpapi_hashes.is_empty();
-
-    // `--credman` on the VMFS NTDS path, mirroring run_ntds: this disk is a DC,
-    // so its own NTDS.dit supplies the NT hashes that open its domain users'
-    // masterkeys with no extra flag.
-    if args.credman || args.all {
-        let ntds_by_name: Vec<(String, [u8; 16])> = hashes
-            .iter()
-            .filter(|h| !h.is_history)
-            .map(|h| (h.username.clone(), h.nt_hash))
-            .collect();
-        reader.seek(SeekFrom::Start(0))?;
-        found_anything |=
-            emit_credman(reader, args, c, secrets.as_ref(), &all_dpapi, &ntds_by_name);
-    }
-
-    #[cfg(feature = "chrome")]
-    if args.chrome || args.all {
-        reader.seek(SeekFrom::Start(0))?;
-        let empty_secrets = vmkatz::sam::DiskSecrets::default();
-        let disk_secrets = secrets.as_ref().unwrap_or(&empty_secrets);
-        let nt_hashes = parse_chrome_nthashes(&args.chrome_nthash);
-        match vmkatz::chrome::runner::run_reader(
-            reader,
-            disk_secrets,
-            &args.chrome_password,
-            &nt_hashes,
-        ) {
-            Ok(summary) => {
-                let output = vmkatz::chrome::runner::render_summary(&summary, args.chrome_json);
-                if !output.trim().is_empty() {
-                    println!("{output}");
-                }
-            }
-            Err(error) => log::warn!("chrome (Veeam) failed: {error}"),
-        }
-    }
-
-    Ok(found_anything)
+    let found = emit_disk_extras(reader, args, c, secrets.as_ref(), &[]);
+    Ok(found || secrets.is_some())
 }
 
-// Raw file modes (no disk image / VM snapshot needed)
-
-/// Extract AD hashes from raw NTDS.dit + SYSTEM hive files.
 #[cfg(feature = "ntds.dit")]
-pub(crate) fn run_raw_ntds(
-    ntds_path: &Path,
-    system_path: &Path,
-    args: &Args,
-) -> anyhow::Result<()> {
-    // Mapped, not read: a production NTDS.dit runs to tens of GB and the ESE
-    // parser only ever borrows `&[u8]`, so there is nothing to gain from a heap
-    // copy and an allocation abort to lose.
-    let ntds_data = vmkatz::utils::FileBytes::open(ntds_path)
-        .with_context(|| format!("Failed to read {}", ntds_path.display()))?;
-    let system_data = std::fs::read(system_path)
-        .with_context(|| format!("Failed to read {}", system_path.display()))?;
+type NtdsStreamOutput = vmkatz::sam::NtdsReadResult<
+    vmkatz::error::Result<(vmkatz::ntds::NtdsContext, Vec<vmkatz::ntds::AdHashEntry>)>,
+>;
 
-    let ctx = vmkatz::ntds::build_context(&ntds_data, &system_data)
-        .context("NTDS context validation failed")?;
-    let hashes = vmkatz::ntds::extract_ad_hashes(&ntds_data, &system_data, {
-        #[cfg(feature = "ntds.dit")]
-        {
-            args.ntds_history
-        }
-        #[cfg(not(feature = "ntds.dit"))]
-        {
-            false
-        }
+#[cfg(feature = "ntds.dit")]
+fn read_ntds_stream<R: std::io::Read + std::io::Seek>(
+    disk: &mut R,
+    args: &Args,
+    fvek_keys: &[vmkatz::lsass::bitlocker::BitLockerKey],
+) -> vmkatz::error::Result<NtdsStreamOutput> {
+    vmkatz::sam::with_ntds_bootkey(disk, args.partition, fvek_keys, |reader, boot_key| {
+        // Keep parser failures fatal even when --all skips absent disk artifacts.
+        vmkatz::ntds::extract_ad_hashes_with_bootkey(reader, *boot_key, args.ntds_history)
     })
-    .context("NTDS hash extraction failed")?;
-
-    let c = get_colors(args);
-
-    eprintln!("\n{}[+] NTDS (raw files):{}", c.green, c.reset);
-    eprintln!(
-        "  ntds.dit : {} ({} bytes)",
-        ntds_path.display(),
-        ctx.ntds_size
-    );
-    eprintln!(
-        "  SYSTEM   : {} ({} bytes)",
-        system_path.display(),
-        system_data.len()
-    );
-    eprintln!("  Bootkey  : {}", hex::encode(ctx.boot_key));
-    eprintln!("  Hashes   : {}", hashes.len());
-
-    match args.format.as_str() {
-        "csv" => print_ntds_csv(&hashes, args.ntds_domain_prefix.as_deref()),
-        "hashcat" => print_ntds_hashcat(&hashes, args.ntds_domain_prefix.as_deref()),
-        "ntlm" => print_ntds_ntlm(&hashes, args.ntds_domain_prefix.as_deref()),
-        "brief" => print_ntds_brief(&hashes, args.ntds_domain_prefix.as_deref()),
-        _ => print_ntds_text(&hashes, c, args.ntds_domain_prefix.as_deref()),
-    }
-
-    Ok(())
-}
-
-/// Extract SAM/LSA/DCC2 from raw registry hive files.
-/// Auto-detects which hive is SYSTEM (via bootkey extraction), SAM, and SECURITY.
-#[cfg(feature = "sam")]
-pub(crate) fn run_raw_hives(
-    hive_files: &[&(std::path::PathBuf, RawFileType)],
-    args: &Args,
-) -> anyhow::Result<()> {
-    // Read all hive files
-    let hives: Vec<(&Path, Vec<u8>)> = hive_files
-        .iter()
-        .map(|(p, _)| {
-            let data =
-                std::fs::read(p).with_context(|| format!("Failed to read {}", p.display()))?;
-            Ok((p.as_path(), data))
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    // Identify SYSTEM hive by trying bootkey extraction on each
-    let mut system_idx = None;
-    let mut bootkey = [0u8; 16];
-
-    for (i, (path, data)) in hives.iter().enumerate() {
-        if let Ok(key) = vmkatz::sam::bootkey::extract_bootkey(data) {
-            log::info!(
-                "SYSTEM hive: {} (bootkey: {})",
-                path.display(),
-                hex::encode(key)
-            );
-            system_idx = Some(i);
-            bootkey = key;
-            break;
-        }
-    }
-
-    let system_idx = system_idx.context(
-        "No SYSTEM hive found (could not extract bootkey from any of the provided files)",
-    )?;
-
-    let c = get_colors(args);
-    eprintln!("\n{}[+] Raw hives:{}", c.green, c.reset);
-    eprintln!(
-        "  SYSTEM  : {} (bootkey: {})",
-        hives[system_idx].0.display(),
-        hex::encode(bootkey)
-    );
-
-    let mut sam_entries = Vec::new();
-    let mut lsa_secrets = Vec::new();
-    let mut cached_creds = Vec::new();
-
-    // Try SAM and SECURITY extraction on the other hives
-    for (i, (path, data)) in hives.iter().enumerate() {
-        if i == system_idx {
-            continue;
-        }
-
-        // Try as SAM
-        if let Ok(entries) = vmkatz::sam::hashes::extract_hashes(data, &bootkey) {
-            if !entries.is_empty() {
-                eprintln!(
-                    "  SAM     : {} ({} accounts)",
-                    path.display(),
-                    entries.len()
-                );
-                sam_entries = entries;
-                continue;
-            }
-        }
-
-        // Try as SECURITY (LSA secrets + cached creds)
-        if let Ok(secrets) = vmkatz::sam::lsa::extract_lsa_secrets(data, &bootkey) {
-            if !secrets.is_empty() {
-                eprintln!("  SECURITY: {} ({} secrets)", path.display(), secrets.len());
-                lsa_secrets = secrets;
-
-                if let Some(nlkm) = lsa_secrets.iter().find(|s| s.name == "NL$KM") {
-                    if let Ok(creds) =
-                        vmkatz::sam::cache::extract_cached_credentials(data, &nlkm.raw_data)
-                    {
-                        cached_creds = creds;
-                    }
-                }
-            }
-        }
-    }
-
-    if sam_entries.is_empty() && lsa_secrets.is_empty() {
-        anyhow::bail!("Could not extract SAM hashes or LSA secrets from the provided hives");
-    }
-
-    if !sam_entries.is_empty() {
-        match args.format.as_str() {
-            "ntlm" => print_sam_ntlm(&sam_entries),
-            "csv" => print_sam_csv(&sam_entries),
-            "hashcat" => print_sam_hashcat(&sam_entries),
-            "brief" => print_sam_brief(&sam_entries),
-            _ => print_sam_text(&sam_entries, c),
-        }
-    }
-
-    if !lsa_secrets.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_lsa_csv(&lsa_secrets),
-            "hashcat" => {} // LSA secrets not applicable for hashcat
-            _ => print_lsa_secrets(&lsa_secrets, c),
-        }
-    }
-
-    if !cached_creds.is_empty() {
-        match args.format.as_str() {
-            "csv" => print_dcc2_csv(&cached_creds),
-            "hashcat" => print_dcc2_hashcat(&cached_creds),
-            _ => print_cached_credentials(&cached_creds, c),
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(test, feature = "sam"))]
-mod secret_sid_tests {
-    use super::resolve_secret_sids;
-    use vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash;
-    use vmkatz::sam::{DiskSecrets, SamEntry};
-
-    fn mk_hash(user: &str, sid: &str) -> DpapiMasterKeyHash {
-        DpapiMasterKeyHash {
-            username: user.into(),
-            sid: sid.into(),
-            guid: String::new(),
-            hash: String::new(),
-            mode: 15900,
-            modified: 0,
-        }
-    }
-
-    #[test]
-    fn resolve_secret_sids_keeps_domain_prefix() {
-        let machine = "S-1-5-21-1-2-3";
-        let ds = DiskSecrets {
-            sam_entries: vec![SamEntry {
-                rid: 500,
-                username: "Administrator".into(),
-                nt_hash: [7u8; 16],
-                lm_hash: [0u8; 16],
-                acb_flags: 0,
-            }],
-            ..Default::default()
-        };
-        let local_only = [mk_hash("Administrator", "S-1-5-21-1-2-3-500")];
-        // `LAB\Administrator` must not bind to the local MACHINE-500 SID.
-        let (sids, by_name) = resolve_secret_sids(
-            vec![("LAB\\Administrator".to_string(), 1u8)],
-            Some(machine),
-            Some(&ds),
-            &local_only,
-            "--dpapi-nthash",
-        );
-        assert!(sids.is_empty(), "bound to {sids:?}");
-        assert_eq!(by_name, vec![("LAB\\Administrator".to_string(), 1u8)]);
-        // With the domain profile present, it binds to the domain SID.
-        let both = [
-            mk_hash("Administrator", "S-1-5-21-1-2-3-500"),
-            mk_hash("Administrator.LAB", "S-1-5-21-9-9-9-500"),
-        ];
-        let (sids, _) = resolve_secret_sids(
-            vec![("LAB\\Administrator".to_string(), 1u8)],
-            Some(machine),
-            Some(&ds),
-            &both,
-            "--dpapi-nthash",
-        );
-        assert_eq!(sids, vec![("S-1-5-21-9-9-9-500".to_string(), 1u8)]);
-        // A bare name (or `.\name`) still resolves to the local SAM account.
-        let (sids, _) = resolve_secret_sids(
-            vec![(".\\Administrator".to_string(), 1u8)],
-            Some(machine),
-            Some(&ds),
-            &[],
-            "--dpapi-nthash",
-        );
-        assert_eq!(sids, vec![("S-1-5-21-1-2-3-500".to_string(), 1u8)]);
-        let (sids, _) = resolve_secret_sids(
-            vec![("s-1-5-21-9-9-9-500".to_string(), 2u8)],
-            Some(machine),
-            Some(&ds),
-            &[],
-            "--dpapi-nthash",
-        );
-        assert_eq!(sids, vec![("S-1-5-21-9-9-9-500".to_string(), 2u8)]);
-    }
-}
-
-#[cfg(all(test, feature = "sam"))]
-mod ls_tests {
-    use super::{format_entry, human_size};
-    use vmkatz::fs::{DirEntry, EntryKind};
-
-    #[test]
-    fn human_size_units() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(4096), "4.0 KiB");
-        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GiB");
-    }
-
-    #[test]
-    fn format_entry_dir_vs_file() {
-        let d = format_entry(&DirEntry {
-            name: "Windows".into(),
-            kind: EntryKind::Dir,
-        });
-        assert!(d.contains("<DIR>") && d.contains("Windows"));
-        let f = format_entry(&DirEntry {
-            name: "a.txt".into(),
-            kind: EntryKind::File { size: 4096 },
-        });
-        assert!(f.contains("4.0 KiB") && f.contains("a.txt") && !f.contains("<DIR>"));
-    }
-
-    #[test]
-    fn run_ls_lists_root_when_fixture_present() {
-        let p = std::path::Path::new("/tmp/test.qcow2");
-        if !p.exists() {
-            eprintln!("SKIP run_ls_lists_root_when_fixture_present: /tmp/test.qcow2 absent");
-            return;
-        }
-        let mut disk = vmkatz::disk::open_disk(p).unwrap();
-        super::run_ls(&mut disk, "", None).unwrap();
-    }
 }

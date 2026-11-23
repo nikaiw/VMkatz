@@ -1,4 +1,4 @@
-#![cfg(feature = "sam")]
+#![cfg(feature = "disk")]
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -28,6 +28,7 @@ fn test_open_qcow2() {
     assert_eq!(&ntfs_hdr[3..8], b"NTFS ");
 }
 
+#[cfg(feature = "sam")]
 #[test]
 fn test_qcow2_sam_extraction() {
     let path = Path::new("/tmp/test.qcow2");
@@ -186,7 +187,8 @@ fn test_qcow2_zero_flag_overrides_backing() {
         "unallocated cluster must read from backing file"
     );
 
-    std::fs::remove_dir_all(&dir).ok();
+    drop(disk);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // Self-contained VDI tests (512-byte blocks): a normal physical block, a
@@ -213,6 +215,24 @@ fn build_vdi(block_size: u32) -> Vec<u8> {
     p32(&mut img, 0x208, 0xFFFF_FFFF);
     img[0x400..0x600].fill(0xAB); // data block 0
     img
+}
+
+#[test]
+fn high_vdi_block_index_does_not_alias_block_zero() {
+    let path = std::env::temp_dir().join(format!("vmkatz_vdi_index_{}.vdi", std::process::id()));
+    let high_offset = (1u64 << 32) * 512;
+    let mut img = build_vdi(512);
+    img[0x170..0x178].copy_from_slice(&(high_offset + 512).to_le_bytes());
+    std::fs::write(&path, &img).unwrap();
+    let mut disk = VdiDisk::open(&path).unwrap();
+    let mut byte = [0];
+    disk.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0xAB]);
+    disk.seek(SeekFrom::Start(high_offset)).unwrap();
+    disk.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0]); // outside the BAT, not block 0 after truncation
+    drop(disk);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -248,7 +268,8 @@ fn test_vdi_zero_and_unallocated_blocks() {
         "unallocated block must read zeros"
     );
 
-    std::fs::remove_dir_all(&dir).ok();
+    drop(disk);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -261,12 +282,12 @@ fn test_vdi_zero_block_size_rejected() {
         VdiDisk::open(&path).is_err(),
         "zero block_size must be rejected, not divide-by-zero"
     );
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_list_path_healthy_root() {
-    use vmkatz::sam::{ListOutcome, list_path};
+    use vmkatz::fs::{ListOutcome, list_path};
     let path = Path::new("/tmp/test.qcow2");
     if !path.exists() {
         eprintln!("SKIP test_list_path_healthy_root: /tmp/test.qcow2 absent");
@@ -290,6 +311,7 @@ fn test_list_path_healthy_root() {
     );
 }
 
+#[cfg(feature = "sam")]
 #[test]
 fn test_qcow2_scoped_partition_extraction() {
     let path = Path::new("/tmp/test.qcow2");
@@ -318,10 +340,11 @@ fn test_cli_ls_lists_root() {
     let mut disk = vmkatz::disk::open_disk(path).expect("open");
     let parts = vmkatz::fs::find_ntfs_partitions(&mut disk).expect("partitions");
     assert_ne!(parts.len(), 0);
-    let out = vmkatz::sam::list_path(&mut disk, parts[0], "").expect("list");
-    assert!(matches!(out, vmkatz::sam::ListOutcome::Listed { .. }));
+    let out = vmkatz::fs::list_path(&mut disk, parts[0], "").expect("list");
+    assert!(matches!(out, vmkatz::fs::ListOutcome::Listed { .. }));
 }
 
+#[cfg(feature = "dpapi")]
 #[test]
 fn dpapi_from_reader_matches_path() {
     let path = Path::new("/tmp/test.qcow2");
@@ -329,11 +352,11 @@ fn dpapi_from_reader_matches_path() {
         eprintln!("SKIP dpapi_from_reader_matches_path: /tmp/test.qcow2 absent");
         return;
     }
-    let by_path = vmkatz::sam::extract_dpapi_masterkeys(path);
+    let by_path = vmkatz::dpapi::disk::extract_dpapi_masterkeys(path);
     let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");
-    let by_reader = vmkatz::sam::extract_dpapi_masterkeys_from_reader(&mut disk, None);
+    let by_reader = vmkatz::dpapi::disk::extract_dpapi_masterkeys_from_reader(&mut disk, None);
     assert_eq!(by_path.len(), by_reader.len());
-    let guids = |v: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]| {
+    let guids = |v: &[vmkatz::dpapi::masterkey::DpapiMasterKeyHash]| {
         let mut g: Vec<String> = v.iter().map(|h| h.guid.clone()).collect();
         g.sort();
         g
@@ -343,7 +366,8 @@ fn dpapi_from_reader_matches_path() {
     // Scoped to a real partition: must be a subset of the unscoped result.
     let parts = vmkatz::fs::find_ntfs_partitions(&mut disk).unwrap_or_default();
     if let Some(&off) = parts.first() {
-        let scoped = vmkatz::sam::extract_dpapi_masterkeys_from_reader(&mut disk, Some(off));
+        let scoped =
+            vmkatz::dpapi::disk::extract_dpapi_masterkeys_from_reader(&mut disk, Some(off));
         assert!(scoped.len() <= by_reader.len());
     }
 }

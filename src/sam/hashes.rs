@@ -17,22 +17,30 @@ type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 /// Extract all user hashes from SAM hive data using the given bootkey.
 pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<SamEntry>> {
-    let hive = Hive::new(sam_hive_data)?;
+    extract_hashes_from_hive(&Hive::new(sam_hive_data)?, bootkey)
+}
+
+/// Extract using a byte-backed or streamed hive.
+pub fn extract_hashes_from_hive(hive: &Hive<'_>, bootkey: &[u8; 16]) -> Result<Vec<SamEntry>> {
+    hive.finish(extract_hashes_inner(hive, bootkey))
+}
+
+fn extract_hashes_inner(hive: &Hive<'_>, bootkey: &[u8; 16]) -> Result<Vec<SamEntry>> {
     let root = hive.root_key()?;
 
     let account = root
-        .subkey(&hive, "SAM")?
-        .subkey(&hive, "Domains")?
-        .subkey(&hive, "Account")?;
+        .subkey(hive, "SAM")?
+        .subkey(hive, "Domains")?
+        .subkey(hive, "Account")?;
 
     // Step 1: Derive hashed bootkey from Account\F value
-    let f_value = account.value(&hive, "F")?;
+    let f_value = account.value(hive, "F")?;
     let hashed_bootkey = decrypt_hashed_bootkey(&f_value, bootkey)?;
     log::info!("Hashed bootkey: {}", hex::encode(hashed_bootkey));
 
     // Step 2: Enumerate users under Account\Users
-    let users_key = account.subkey(&hive, "Users")?;
-    let user_subkeys = users_key.subkeys(&hive)?;
+    let users_key = account.subkey(hive, "Users")?;
+    let user_subkeys = users_key.subkeys(hive)?;
 
     let mut entries = Vec::new();
 
@@ -49,7 +57,7 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
             continue;
         };
 
-        let v_data = match user_key.value(&hive, "V") {
+        let v_data = match user_key.value(hive, "V") {
             Ok(v) => v,
             Err(e) => {
                 log::debug!("RID {rid}: no V value: {e}");
@@ -59,7 +67,7 @@ pub fn extract_hashes(sam_hive_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<Sa
 
         // Read per-user F value for Account Control Bits (ACB flags at offset 0x38)
         let acb_flags = user_key
-            .value(&hive, "F")
+            .value(hive, "F")
             .ok()
             .filter(|f| f.len() >= 0x3C)
             .map_or(0, |f| {
@@ -392,17 +400,20 @@ pub(crate) fn decode_utf16le(data: &[u8]) -> String {
 /// Account-domain (machine) SID from the SAM hive: the trailing SID of the
 /// `SAM\Domains\Account` `V` value. `None` if absent or malformed.
 pub fn extract_machine_sid(sam_hive_data: &[u8]) -> Option<String> {
-    let hive = Hive::new(sam_hive_data).ok()?;
+    extract_machine_sid_from_hive(&Hive::new(sam_hive_data).ok()?)
+}
+
+pub fn extract_machine_sid_from_hive(hive: &Hive<'_>) -> Option<String> {
     let v = hive
         .root_key()
         .ok()?
-        .subkey(&hive, "SAM")
+        .subkey(hive, "SAM")
         .ok()?
-        .subkey(&hive, "Domains")
+        .subkey(hive, "Domains")
         .ok()?
-        .subkey(&hive, "Account")
+        .subkey(hive, "Account")
         .ok()?
-        .value(&hive, "V")
+        .value(hive, "V")
         .ok()?;
     account_domain_sid_from_v(&v)
 }

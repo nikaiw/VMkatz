@@ -55,11 +55,11 @@ impl QemuElfLayer {
 
         // For pread fallback: read the ELF header + program headers (first 1MB covers it)
         let header_buf: Vec<u8>;
-        let data: &[u8] = if mmap.is_pread() {
+        let data: &[u8] = if let Some(data) = mmap.as_bytes() {
+            data
+        } else {
             header_buf = crate::utils::read_file_header(&file, 1024 * 1024)?;
             &header_buf
-        } else {
-            mmap.as_bytes()
         };
         if data[0..4] != ELF_MAGIC {
             return Err(VmkatzError::InvalidMagic(u32::from_le_bytes([
@@ -254,9 +254,9 @@ impl PhysicalMemory for QemuElfLayer {
                 {
                     let dst_start = usize::try_from(pos)
                         .map_err(|_| VmkatzError::ElfError("Buffer offset overflow".into()))?;
-                    let _ = self
-                        .mmap
-                        .read_at(file_off, &mut buf[dst_start..dst_start + to_copy]);
+                    self.mmap
+                        .read_at(file_off, &mut buf[dst_start..dst_start + to_copy])
+                        .map_err(|_| VmkatzError::UnmappablePhysical(cur_gpa))?;
                 }
                 pos = pos
                     .checked_add(to_copy_u64)
@@ -294,5 +294,76 @@ impl PhysicalMemory for QemuElfLayer {
             let file_off = seg.file_offset + offset_in_seg;
             self.mmap.advise_dontneed(file_off, len.min(avail));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_cross_segment_boundaries_and_gaps() {
+        let mut bytes = vec![0xA5; 512];
+        bytes.extend_from_slice(&[0xC3; 512]);
+        let (path, mmap) = crate::qemu::pread_fixture("elf-spans", &bytes, bytes.len() as u64);
+        let layer = QemuElfLayer {
+            mmap,
+            segments: vec![
+                LoadSegment {
+                    file_offset: 0,
+                    gpa_start: 128,
+                    file_size: 512,
+                },
+                LoadSegment {
+                    file_offset: 512,
+                    gpa_start: 1024,
+                    file_size: 512,
+                },
+            ],
+            phys_end: 1536,
+        };
+        let mut expected = vec![0; 4096];
+        expected[128..640].fill(0xA5);
+        expected[1024..1536].fill(0xC3);
+        for start in (0..2048).step_by(17) {
+            for len in [0, 1, 17, 511, 1025] {
+                let mut buf = vec![0xFF; len];
+                layer.read_phys(start as u64, &mut buf).unwrap();
+                assert_eq!(
+                    buf,
+                    expected[start..start + len],
+                    "start={start}, len={len}"
+                );
+            }
+        }
+        drop(layer);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn spanning_read_propagates_backing_io_errors() {
+        let (path, mmap) = crate::qemu::truncated_pread_fixture("elf");
+        let layer = QemuElfLayer {
+            mmap,
+            segments: vec![LoadSegment {
+                file_offset: 0,
+                gpa_start: 0,
+                file_size: 8,
+            }],
+            phys_end: 16,
+        };
+        // Spanning the segment boundary selects the slow read path. The
+        // backing file supplies four bytes, then EOF: this must be an error.
+        let mut buf = [0; 16];
+        assert!(matches!(
+            layer.read_phys(0, &mut buf),
+            Err(VmkatzError::UnmappablePhysical(0))
+        ));
+        // Unmapped memory still follows the existing zero-fill policy.
+        let mut gap = [0xFF; 8];
+        layer.read_phys(8, &mut gap).unwrap();
+        assert_eq!(gap, [0; 8]);
+        drop(layer);
+        std::fs::remove_file(path).unwrap();
     }
 }

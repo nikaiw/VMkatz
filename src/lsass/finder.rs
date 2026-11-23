@@ -519,16 +519,16 @@ fn heal_rc4_from_nt(cred: &mut Credential) {
 
 /// Pagefile reference type: wraps Option<&PagefileReader> when sam feature is enabled,
 /// or () when not. Allows a unified function signature across feature configurations.
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub type PagefileRef<'a> = Option<&'a crate::paging::pagefile::PagefileReader>;
-#[cfg(not(feature = "sam"))]
+#[cfg(not(feature = "disk"))]
 pub type PagefileRef<'a> = ();
 
 /// Disk path reference type: wraps Option<&Path> when sam feature is enabled,
 /// or () when not. Allows a unified function signature across feature configurations.
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub type DiskPathRef<'a> = Option<&'a std::path::Path>;
-#[cfg(not(feature = "sam"))]
+#[cfg(not(feature = "disk"))]
 pub type DiskPathRef<'a> = ();
 
 /// Bitness-aware credential extraction: dispatches to x64, Win10 x86, or pre-Vista x86.
@@ -824,9 +824,9 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     disk_path: DiskPathRef<'_>,
 ) -> Result<Vec<Credential>> {
     // Create initial virtual memory reader for module enumeration
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     let lsass_vmem_init = ProcessMemory::with_resolvers(phys, lsass.dtb, pagefile, None);
-    #[cfg(not(feature = "sam"))]
+    #[cfg(not(feature = "disk"))]
     let lsass_vmem_init = {
         let _ = (pagefile, disk_path);
         ProcessMemory::new(phys, lsass.dtb)
@@ -848,7 +848,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     }
 
     // Build file-backed resolver from disk to serve demand-paged DLL sections
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     let filebacked = disk_path.and_then(|p| {
         match crate::paging::filebacked::FileBackedResolver::from_disk_and_modules(p, &modules) {
             Ok(fb) if fb.section_count() > 0 => {
@@ -872,9 +872,9 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     });
 
     // Create enhanced vmem with file-backed resolution for DLL sections
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     let lsass_vmem = ProcessMemory::with_resolvers(phys, lsass.dtb, pagefile, filebacked.as_ref());
-    #[cfg(not(feature = "sam"))]
+    #[cfg(not(feature = "disk"))]
     let lsass_vmem = lsass_vmem_init;
 
     let dlls = LsassDlls::from_modules(&modules);
@@ -1132,7 +1132,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     insert_dpapi_creds(&mut all_creds, dpapi_creds);
 
     status.print_summary();
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     if let Some(fb) = &filebacked {
         let resolved = fb.pages_resolved();
         if resolved > 0 {

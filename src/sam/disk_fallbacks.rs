@@ -2,6 +2,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::hive;
 use crate::error::Result;
+use crate::fs::recovery::{ScanBudget, check_raw_size};
 
 /// Read into `buf` with resilient I/O: on error, zero-fill the failing 4KB block
 /// and continue. This allows extraction from live/in-use block devices where
@@ -39,6 +40,8 @@ pub(super) const MIN_SAM_HIVE_SIZE: u64 = 16 * 1024;
 /// Used as fallback when NTFS MFT traversal fails (e.g., incomplete disk images).
 pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::HiveFiles> {
     let disk_size = reader.seek(SeekFrom::End(0))?;
+    check_raw_size(disk_size)?;
+    let budget = ScanBudget::new();
     reader.seek(SeekFrom::Start(0))?;
 
     log::info!(
@@ -55,6 +58,7 @@ pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::Hi
     let mut chunk = vec![0u8; SCAN_CHUNK];
 
     while offset < disk_size {
+        budget.check_time()?;
         if reader.seek(SeekFrom::Start(offset)).is_err() {
             // Seek failed (I/O error on live device) — skip this chunk
             offset += SCAN_CHUNK as u64;
@@ -73,6 +77,7 @@ pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::Hi
         // Scan this chunk at cluster boundaries for "regf" magic
         let mut pos = 0;
         while pos + 4 <= n {
+            budget.check_time()?;
             if &chunk[pos..pos + 4] == b"regf" {
                 let hive_offset = offset + pos as u64;
                 if let Some((name, data)) = try_read_hive(reader, hive_offset) {
@@ -100,8 +105,6 @@ pub(super) fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<super::Hi
                         ));
                     }
                 }
-                // Restore read position for continued scanning
-                let _ = reader.seek(SeekFrom::Start(offset + n as u64));
             }
             pos += CLUSTER_SIZE;
         }
@@ -174,6 +177,8 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
         }
     };
     let name = root.name().to_uppercase();
+    drop(root);
+    drop(hive);
     log::debug!("regf at 0x{offset:x}: root='{name}', size={total_size}");
 
     // Accept known hive names with minimum size validation to reject
@@ -201,6 +206,8 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
 /// contiguous hbin blocks from that position to reconstruct the hive.
 pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<super::HiveFiles> {
     let disk_size = reader.seek(SeekFrom::End(0))?;
+    check_raw_size(disk_size)?;
+    let budget = ScanBudget::new();
     reader.seek(SeekFrom::Start(0))?;
 
     log::info!(
@@ -217,6 +224,7 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
     let mut chunk = vec![0u8; SCAN_CHUNK];
 
     while offset < disk_size {
+        budget.check_time()?;
         if reader.seek(SeekFrom::Start(offset)).is_err() {
             offset += SCAN_CHUNK as u64;
             continue;
@@ -232,6 +240,7 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
 
         let mut pos = 0;
         while pos + 0x60 <= n {
+            budget.check_time()?;
             if &chunk[pos..pos + 4] == b"hbin" {
                 // hbin header: "hbin"(4) + offset_in_hive(4) + size(4) + ...
                 let hbin_hive_off = chunk
@@ -269,7 +278,6 @@ pub(super) fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<supe
                             ));
                         }
                     }
-                    let _ = reader.seek(SeekFrom::Start(offset + n as u64));
                 }
             }
             pos += CLUSTER_SIZE;

@@ -40,7 +40,7 @@ pub struct DiscoverySummary {
 /// decrypting user DPAPI masterkey files — the latter carry DOMAIN users' hashes.
 pub fn run_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
-    secrets: &crate::sam::DiskSecrets,
+    secrets: &crate::secrets::DiskSecrets,
     extra_passwords: &[String],
     extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<DiscoverySummary> {
@@ -156,7 +156,7 @@ where
 /// hybrid path so we open the disk once and share the handle.
 pub fn build_keyrings_from_reader<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
-    secrets: &crate::sam::DiskSecrets,
+    secrets: &crate::secrets::DiskSecrets,
     extra_passwords: &[String],
     extra_nt_hashes: &[(String, [u8; 16])],
 ) -> (HybridKeyring, HybridKeyring) {
@@ -280,6 +280,7 @@ fn discover_profiles_in_reader<R: std::io::Read + std::io::Seek>(
             };
             match discover_chromium(&mut tree) {
                 Ok(p) => p,
+                Err(e) if e.is_resource_limit() => return Err(e),
                 Err(e) => {
                     last_err = Some(format!("discover at 0x{part_offset:x}: {e}"));
                     continue;
@@ -434,7 +435,10 @@ pub fn build_keyrings_from_disk_with_passwords(
     extra_passwords: &[String],
     extra_nt_hashes: &[(String, [u8; 16])],
 ) -> Result<(HybridKeyring, HybridKeyring)> {
+    #[cfg(feature = "sam")]
     let secrets = crate::sam::extract_disk_secrets(disk_path)?;
+    #[cfg(not(feature = "sam"))]
+    let secrets = crate::secrets::DiskSecrets::default();
     let mut disk = crate::disk::open_disk(disk_path)?;
     Ok(build_keyrings_with_secrets(
         &mut disk,
@@ -450,7 +454,7 @@ pub fn build_keyrings_from_disk_with_passwords(
 /// Never errors; returns empty keyrings on any failure.
 fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     disk: &mut R,
-    secrets: &crate::sam::DiskSecrets,
+    secrets: &crate::secrets::DiskSecrets,
     extra_passwords: &[String],
     extra_nt_hashes: &[(String, [u8; 16])],
 ) -> (HybridKeyring, HybridKeyring) {
@@ -463,7 +467,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     //  - `Protect\S-1-5-18\<GUID>` (machine-context)  → user_key
     //  - `Protect\S-1-5-18\User\<GUID>` (user-context) → machine_key
     let dpapi_system = secrets.lsa_secrets.iter().find_map(|s| match &s.parsed {
-        crate::sam::lsa::LsaSecretType::DpapiSystem {
+        crate::secrets::LsaSecretType::DpapiSystem {
             user_key,
             machine_key,
         } => Some((*user_key, *machine_key)),
@@ -476,8 +480,8 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
     let mut password_candidates: Vec<String> = extra_passwords.to_vec();
     for s in &secrets.lsa_secrets {
         match &s.parsed {
-            crate::sam::lsa::LsaSecretType::DefaultPassword { password }
-            | crate::sam::lsa::LsaSecretType::ServicePassword { password, .. } => {
+            crate::secrets::LsaSecretType::DefaultPassword { password }
+            | crate::secrets::LsaSecretType::ServicePassword { password, .. } => {
                 password_candidates.push(password.clone());
             }
             _ => {}
@@ -532,7 +536,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                 } else {
                     machine_key
                 };
-                crate::sam::dpapi_masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
+                crate::dpapi::masterkey::decrypt_system_masterkey(file_bytes, pre_key).ok()
             };
             decrypt_collected(&sys_items, &sys_fn, &mut system_kr, "system");
         }
@@ -580,7 +584,7 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
             // so this is the only source that covers them.
             for (h_sid, nt_hash) in extra_nt_hashes {
                 if h_sid.is_empty() || h_sid == sid {
-                    if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
+                    if let Ok(k) = crate::dpapi::masterkey::decrypt_local_user_masterkey(
                         file_bytes, nt_hash, sid,
                     ) {
                         return Some(k);
@@ -594,17 +598,17 @@ fn build_keyrings_with_secrets<R: std::io::Read + std::io::Seek>(
                 .and_then(|r| r.parse::<u32>().ok())
                 .and_then(|rid| nt_hash_by_rid.get(&rid))
             {
-                if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey(
-                    file_bytes, nt_hash, sid,
-                ) {
+                if let Ok(k) =
+                    crate::dpapi::masterkey::decrypt_local_user_masterkey(file_bytes, nt_hash, sid)
+                {
                     return Some(k);
                 }
             }
             // Last resort: every plaintext password from LSA / `--chrome-password`.
             for pw in &password_candidates {
-                if let Ok(k) = crate::sam::dpapi_masterkey::decrypt_local_user_masterkey_pw(
-                    file_bytes, pw, sid,
-                ) {
+                if let Ok(k) =
+                    crate::dpapi::masterkey::decrypt_local_user_masterkey_pw(file_bytes, pw, sid)
+                {
                     return Some(k);
                 }
             }
@@ -764,6 +768,10 @@ fn is_mk_guid(name: &str) -> bool {
 }
 
 /// Render a discovery summary for stdout / JSON.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "formatting primitive and string values into String is infallible"
+)]
 pub fn render_summary(summary: &DiscoverySummary, json: bool) -> String {
     if json {
         let mut obj = serde_json::Map::new();

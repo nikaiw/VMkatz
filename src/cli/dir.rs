@@ -13,6 +13,8 @@ use anyhow::Context;
 use vmkatz::lsass::finder::PagefileRef;
 
 use super::args::Args;
+#[cfg(feature = "disk")]
+use super::disk::run_disk;
 #[cfg(all(
     feature = "ntds.dit",
     any(
@@ -23,8 +25,6 @@ use super::args::Args;
     )
 ))]
 use super::disk::run_ntds;
-#[cfg(feature = "sam")]
-use super::disk::run_sam;
 #[cfg(all(
     feature = "sam",
     any(
@@ -82,14 +82,12 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     let mut discovery =
         vmkatz::discover::discover_vm_files(dir).context("VM file discovery failed")?;
 
-    // Apply --scan filter
     match args.scan.as_str() {
         "snapshot" => discovery.disk_files.clear(),
         "disk" => discovery.lsass_files.clear(),
         _ => {} // "all"
     }
 
-    // Build typed file list for display
     if !discovery.lsass_files.is_empty() {
         for f in &discovery.lsass_files {
             let name = f.file_name().unwrap_or_default().to_string_lossy();
@@ -118,7 +116,7 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     ))]
     {
         // Try to open pagefile.sys from the first available disk image
-        #[cfg(feature = "sam")]
+        #[cfg(feature = "disk")]
         let pagefile_reader = if discovery.lsass_files.is_empty() {
             None
         } else {
@@ -140,18 +138,18 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
             })
         };
 
-        #[cfg(feature = "sam")]
+        #[cfg(feature = "disk")]
         let pagefile: PagefileRef<'_> = pagefile_reader.as_ref();
-        #[cfg(not(feature = "sam"))]
+        #[cfg(not(feature = "disk"))]
         let pagefile: PagefileRef<'_> = ();
 
         // Disk path for file-backed DLL resolution
-        #[cfg(feature = "sam")]
+        #[cfg(feature = "disk")]
         let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = discovery
             .disk_files
             .first()
             .map(std::path::PathBuf::as_path);
-        #[cfg(not(feature = "sam"))]
+        #[cfg(not(feature = "disk"))]
         let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = ();
 
         for file in &discovery.lsass_files {
@@ -163,8 +161,7 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         }
     }
 
-    // Extract BitLocker FVEK keys from memory snapshots for transparent disk decryption.
-    // This is done as a separate pass so we can pass keys to the SAM extraction phase.
+    // Recover FVEKs before disk extraction so SAM can read BitLocker volumes.
     #[cfg(all(
         feature = "sam",
         any(
@@ -187,16 +184,15 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
                 keys.extend(snapshot_keys);
             }
         }
-        // Deduplicate by FVEK content
         keys.sort_by(|a, b| a.fvek.cmp(&b.fvek));
         keys.dedup_by(|a, b| a.fvek == b.fvek && a.method == b.method);
         keys
     };
 
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     for file in &discovery.disk_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
-        eprintln!("\n[*] SAM: {name}");
+        eprintln!("\n[*] Disk: {name}");
         #[cfg(all(
             feature = "ntds.dit",
             any(
@@ -212,12 +208,14 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
             }
             continue;
         }
-        // Try BitLocker-aware extraction if we have FVEK keys from memory
-        #[cfg(any(
-            feature = "vmware",
-            feature = "vbox",
-            feature = "qemu",
-            feature = "hyperv"
+        #[cfg(all(
+            feature = "sam",
+            any(
+                feature = "vmware",
+                feature = "vbox",
+                feature = "qemu",
+                feature = "hyperv"
+            )
         ))]
         if !bitlocker_keys.is_empty() {
             match vmkatz::sam::extract_disk_secrets_with_bitlocker(file, &bitlocker_keys) {
@@ -230,15 +228,15 @@ pub(crate) fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
                 }
             }
         }
-        if let Err(e) = run_sam(file, args) {
+        if let Err(e) = run_disk(file, args) {
             eprintln!("[!] {name}: {e:#}");
         }
     }
 
-    #[cfg(not(feature = "sam"))]
+    #[cfg(not(feature = "disk"))]
     if !discovery.disk_files.is_empty() {
         eprintln!(
-            "[!] {} disk image(s) found but SAM support not compiled in (rebuild with --features sam)",
+            "[!] {} disk image(s) found but disk support not compiled in (rebuild with --features disk)",
             discovery.disk_files.len()
         );
     }

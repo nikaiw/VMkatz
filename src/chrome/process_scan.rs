@@ -160,9 +160,10 @@ fn harvest_process<P: PhysicalMemory>(
         if total_read >= MAX_BYTES_PER_PROCESS || instances.len() >= MAX_INSTANCES_PER_PROCESS {
             break;
         }
-        let take = (region.len as usize)
-            .min(MAX_BYTES_PER_REGION)
-            .min(MAX_BYTES_PER_PROCESS - total_read);
+        let take = region
+            .len
+            .min(MAX_BYTES_PER_REGION as u64)
+            .min((MAX_BYTES_PER_PROCESS - total_read) as u64) as usize;
         if take < COOKIE_MONSTER_SIG.len() {
             continue;
         }

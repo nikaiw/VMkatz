@@ -1,6 +1,9 @@
 use crate::utils::{u32_be, u32_le, u64_le};
+pub mod aes_xts;
+pub mod bitlocker_decrypt;
 pub mod qcow2;
 pub mod raw;
+mod table;
 pub mod vdi;
 pub mod vhd;
 pub mod vhdx;
@@ -14,37 +17,87 @@ use std::path::Path;
 
 use crate::error::Result;
 
+/// Prevent unbounded recursion when snapshot descriptors contain parent cycles.
+pub(crate) const fn check_backing_depth(depth: u32) -> Result<()> {
+    if depth > 64 {
+        return Err(crate::error::VmkatzError::DiskChainLimit);
+    }
+    Ok(())
+}
+
+/// Compute a logical seek without narrowing a u64 position to i64. Seeking past
+/// EOF is permitted; negative positions and arithmetic overflow are errors.
+pub(crate) fn seek_position(cursor: u64, end: u64, pos: SeekFrom) -> std::io::Result<u64> {
+    let target = match pos {
+        SeekFrom::Start(offset) => Some(offset),
+        SeekFrom::Current(delta) => cursor.checked_add_signed(delta),
+        SeekFrom::End(delta) => end.checked_add_signed(delta),
+    };
+    target.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seek to a negative or overflowing position",
+        )
+    })
+}
+
+/// Clamp in u64 before narrowing, so large disks also work on 32-bit hosts.
+pub(crate) fn read_len(remaining: u64, requested: usize) -> usize {
+    remaining.min(requested as u64) as usize
+}
+
 // Shared File I/O helpers for disk image parsers.
 // All disk formats need to read multi-byte integers from File handles.
 // Little-endian variants for VDI, VHDX, VMDK; big-endian for VHD, QCOW2.
 
-/// Read exactly `len` bytes into a fresh `Vec`, growing the buffer as bytes
-/// arrive rather than pre-allocating `len` up front.
-///
-/// Disk headers carry attacker-controlled length fields (backing-file name,
-/// parent-locator path, key/value sizes). A hostile image could set one to
-/// several GB and turn a plain `vec![0u8; len]; read_exact(..)` into a memory
-/// DoS. `take(len).read_to_end(..)` is bounded by the bytes actually present in
-/// the file, so a bogus length allocates only what the file can supply and then
-/// fails with `UnexpectedEof` — same error contract as `read_exact`.
-/// Upper bound on how many block-allocation-table entries to *pre-reserve*.
-///
-/// BAT entry counts come from untrusted headers. This caps only the up-front
-/// `with_capacity` hint; the read loop still grows the vector on demand, so a
-/// legitimately huge disk is unaffected while a bogus count can't force a giant
-/// allocation before a single entry is read.
-pub(crate) const MAX_BAT_PREALLOC: usize = 1 << 20; // 1,048,576 entries
-
+/// Parent paths and locator key/value fields must fit within 1 MiB each.
+/// Large allocation tables need bounded, on-demand readers instead.
 pub(crate) fn read_exact_alloc<R: Read>(r: &mut R, len: u64) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let n = r.take(len).read_to_end(&mut buf)?;
-    if n as u64 != len {
+    const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+    if len > MAX_METADATA_BYTES {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "short read: file ended before the declared length",
+            std::io::ErrorKind::InvalidData,
+            "disk metadata field exceeds 1 MiB",
         ));
     }
+    let len = usize::try_from(len).map_err(std::io::Error::other)?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+    buf.resize(len, 0);
+    r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::read_exact_alloc;
+    use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn oversized_metadata_is_refused_before_reading() {
+        for length in [1024 * 1024 + 1, u64::MAX] {
+            let mut input = Cursor::new([0; 16]);
+            assert_eq!(
+                read_exact_alloc(&mut input, length).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+            assert_eq!(input.position(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_metadata_reads_preserve_exact_length_and_eof() -> std::io::Result<()> {
+        let mut input = Cursor::new([0xAB; 512]);
+        assert_eq!(read_exact_alloc(&mut input, 512)?, [0xAB; 512]);
+        assert_eq!(input.position(), 512);
+        assert!(read_exact_alloc(&mut input, 0)?.is_empty());
+        assert_eq!(
+            read_exact_alloc(&mut input, 1).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        Ok(())
+    }
 }
 
 pub(crate) fn read_u16_le_file(f: &mut File) -> std::io::Result<u16> {

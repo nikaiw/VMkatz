@@ -1,28 +1,27 @@
 //! Veeam VBK/VIB/VRB backup access (read-only): parse the format, enumerate
 //! stored disk images, and reconstruct their bytes for the credential pipeline.
 //!
-//! Vendored from the `vbktool` project and kept close to upstream, so it is
-//! exempted from vmkatz's lint gate; only `disk` is vmkatz code.
-#![allow(
+//! Vendored modules retain their upstream lint exceptions. The native `disk`
+//! adapter and this module's public re-exports use the normal crate lint policy.
+
+// Only the imported implementation receives these exceptions. The native disk
+// adapter below remains subject to the crate's complete lint policy.
+#[allow(
     clippy::all,
     clippy::pedantic,
     clippy::nursery,
     dead_code,
     unexpected_cfgs,
-    rustdoc::private_intra_doc_links
+    rustdoc::private_intra_doc_links,
+    reason = "vbktool source kept close to upstream; native disk adapter is linted separately"
 )]
+mod upstream;
 
-pub mod block;
-pub mod catalog;
 pub mod disk;
-pub mod diskfs;
-pub mod encryption;
-pub mod error;
-pub mod format;
-pub mod metadata;
-pub mod properties;
-mod reader;
-pub mod reconstruct;
+use upstream::reader;
+pub use upstream::{
+    block, catalog, diskfs, encryption, error, format, metadata, properties, reconstruct,
+};
 
 pub use block::{
     BlockDigestEngine, BlockFlags, BlockReference, Compression, Digest, FileBlockMap,

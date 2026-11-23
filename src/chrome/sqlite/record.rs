@@ -38,17 +38,15 @@ pub fn read_varint(bytes: &[u8]) -> Result<(i64, usize)> {
 /// `payload` is the in-cell payload (overflow pages NOT spliced — caller handles overflow).
 pub fn decode_record(payload: &[u8]) -> Result<Vec<Value>> {
     let (hdr_size_signed, hdr_off) = read_varint(payload)?;
-    if hdr_size_signed < 0 {
-        return Err(Error::Parse("record header size negative".into()));
-    }
-    let hdr_size = hdr_size_signed as usize;
-    if hdr_size > payload.len() {
-        return Err(Error::Parse("record header > payload".into()));
+    let hdr_size = usize::try_from(hdr_size_signed)
+        .map_err(|_| Error::Parse("record header size out of range".into()))?;
+    if hdr_size < hdr_off || hdr_size > payload.len() {
+        return Err(Error::Parse("record header outside payload".into()));
     }
     let mut types: Vec<i64> = Vec::new();
     let mut cur = hdr_off;
     while cur < hdr_size {
-        let (t, n) = read_varint(&payload[cur..])?;
+        let (t, n) = read_varint(&payload[cur..hdr_size])?;
         types.push(t);
         cur += n;
     }
@@ -114,12 +112,14 @@ fn decode_value(serial_type: i64, b: &[u8]) -> Result<(Value, usize)> {
         9 => (Value::Int(1), 0),
         10 | 11 => return Err(Error::Parse("reserved serial type".into())),
         t if t >= 12 && t % 2 == 0 => {
-            let n = ((t - 12) / 2) as usize;
+            let n = usize::try_from((t - 12) / 2)
+                .map_err(|_| Error::Parse("blob size out of range".into()))?;
             need(b, n)?;
             (Value::Blob(b[..n].to_vec()), n)
         }
         t if t >= 13 && t % 2 == 1 => {
-            let n = ((t - 13) / 2) as usize;
+            let n = usize::try_from((t - 13) / 2)
+                .map_err(|_| Error::Parse("text size out of range".into()))?;
             need(b, n)?;
             (Value::Text(b[..n].to_vec()), n)
         }
@@ -164,6 +164,19 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_header_boundaries_and_oversized_values() {
+        assert!(decode_record(&[0]).is_err());
+        // The serial-type varint may not consume bytes from the record body.
+        assert!(decode_record(&[2, 0x80, 0]).is_err());
+        // These lengths used to wrap to zero on 32-bit hosts.
+        for serial_type in [12 + (1i64 << 33), 13 + (1i64 << 33)] {
+            assert!(decode_value(serial_type, &[]).is_err());
+        }
+        // Header length 2^32 + 5, encoded as a five-byte varint.
+        assert!(decode_record(&[0x90, 0x80, 0x80, 0x80, 0x05]).is_err());
+    }
 
     #[test]
     fn varint_one_byte() {

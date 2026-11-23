@@ -13,10 +13,17 @@
 use crate::error::{Result, VmkatzError};
 use crate::utils::{u16_le_or0, u32_le_or0};
 use std::collections::HashMap;
+use std::io::{Read, Seek};
 
-/// ESE database backed by a byte slice.
+mod source;
+#[cfg(test)]
+mod stream_tests;
+mod walk;
+use source::{Page, Source};
+
+/// ESE database backed by bytes or a seekable stream.
 pub struct EseDb<'a> {
-    data: &'a [u8],
+    data: Source<'a>,
     page_size: usize,
     /// Catalog: table_name -> EseTable
     tables: HashMap<String, EseTable>,
@@ -93,6 +100,18 @@ impl<'a> EseDb<'a> {
 
     /// Open an ESE database from raw bytes.
     pub fn open(data: &'a [u8]) -> Result<Self> {
+        Self::open_source(Source::Bytes(data))
+    }
+
+    /// Read pages on demand, without mapping or loading the complete database.
+    pub fn from_reader<R: Read + Seek + 'a>(reader: R) -> Result<Self> {
+        Self::open_source(Source::reader(reader)?)
+    }
+
+    fn open_source(source: Source<'a>) -> Result<Self> {
+        let data = source
+            .read(0, 4096)?
+            .ok_or_else(|| ese_err("Database too small"))?;
         // Validate ESE magic at offset 4
         if data.len() < 0x1000 {
             return Err(ese_err("Database too small"));
@@ -102,23 +121,23 @@ impl<'a> EseDb<'a> {
         }
 
         // Page size: offset 0xEC in the header (u32)
-        let page_size = u32_le_or0(data, 0xEC) as usize;
+        let page_size = u32_le_or0(&data, 0xEC) as usize;
         if page_size == 0 || !page_size.is_power_of_two() || !(4096..=32768).contains(&page_size) {
             // Fallback: try common page sizes
-            let ps = if data.len() >= 2 * 8192 { 8192 } else { 4096 };
+            let ps = if source.len() >= 2 * 8192 { 8192 } else { 4096 };
             log::info!("ESE: page_size field = {page_size}, using fallback {ps}");
-            return Ok(Self::init(data, ps));
+            return Self::init(source, ps);
         }
 
-        Ok(Self::init(data, page_size))
+        Self::init(source, page_size)
     }
 
-    fn init(data: &'a [u8], page_size: usize) -> Self {
+    fn init(data: Source<'a>, page_size: usize) -> Result<Self> {
         log::info!(
             "ESE: {} bytes, page_size={}, {} pages",
             data.len(),
             page_size,
-            data.len() / page_size
+            data.len() / page_size as u64
         );
 
         let mut db = EseDb {
@@ -128,24 +147,31 @@ impl<'a> EseDb<'a> {
         };
 
         // Parse catalog at page 4 (MSysObjects)
-        db.parse_catalog();
+        db.parse_catalog()?;
 
-        db
+        Ok(db)
     }
 
     /// Get page data by logical page number.
     ///
     /// ESE files start with 2 header pages (header + shadow copy).
     /// Logical page N is at file offset (N + 1) * page_size.
-    fn page_data(&self, pgno: u32) -> Option<&'a [u8]> {
+    fn page_data(&self, pgno: u32) -> Result<Option<Page<'a>>> {
         if pgno == 0 {
-            return None;
+            return Ok(None);
         }
-        let offset = (pgno as usize + 1) * self.page_size;
-        if offset + self.page_size > self.data.len() {
-            return None;
-        }
-        Some(&self.data[offset..offset + self.page_size])
+        self.data.read(
+            (u64::from(pgno) + 1) * self.page_size as u64,
+            self.page_size,
+        )
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.data.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.data.len() == 0
     }
 
     /// Read page header fields. Returns (page_flags, next_page).
@@ -220,12 +246,12 @@ impl<'a> EseDb<'a> {
 
     /// Get raw tag data. Tag offsets are relative to the data area (after header).
     /// Returns (tag_data, tag_flags).
-    fn tag_data_with_flags(
+    fn tag_data_with_flags<'p>(
         &self,
-        page: &'a [u8],
+        page: &'p [u8],
         tag_idx: usize,
         page_flags: u32,
-    ) -> Option<(&'a [u8], u8)> {
+    ) -> Option<(&'p [u8], u8)> {
         let (hdr_size, num_tags) = self.page_tags(page);
         if tag_idx >= num_tags {
             return None;
@@ -249,7 +275,7 @@ impl<'a> EseDb<'a> {
     }
 
     /// Get raw tag data (convenience wrapper).
-    fn tag_data(&self, page: &'a [u8], tag_idx: usize, page_flags: u32) -> Option<&'a [u8]> {
+    fn tag_data<'p>(&self, page: &'p [u8], tag_idx: usize, page_flags: u32) -> Option<&'p [u8]> {
         self.tag_data_with_flags(page, tag_idx, page_flags)
             .map(|(d, _)| d)
     }
@@ -311,32 +337,17 @@ impl<'a> EseDb<'a> {
 
     /// Traverse a B+ tree starting at the given root page, collecting all leaf records.
     /// Calls `callback` for each leaf record data (with key bytes stripped).
-    fn traverse_btree<F>(&self, root_pgno: u32, mut callback: F)
+    fn traverse_btree<F>(&self, root_pgno: u32, mut callback: F) -> Result<()>
     where
-        F: FnMut(&'a [u8]),
+        F: FnMut(&[u8]) -> Result<()>,
     {
-        let mut stack = vec![root_pgno];
-        // A large production datatable can contain hundreds of thousands of
-        // pages.  HashSet<u32> grows in multi-megabyte jumps (an 8 MiB growth
-        // was enough to abort under the ESXi in-memory loader).  Page numbers
-        // are dense and bounded by the mapped database, so a bitset is both
-        // stricter against corrupt pointers and much smaller.
-        let page_count = self.data.len() / self.page_size;
-        let mut visited = vec![false; page_count];
-
-        while let Some(pgno) = stack.pop() {
-            let Ok(page_index) = usize::try_from(pgno) else {
-                continue;
-            };
-            if pgno == 0 || page_index >= visited.len() || visited[page_index] {
-                continue;
-            }
-            visited[page_index] = true;
-
-            let Some(page) = self.page_data(pgno) else {
+        let mut walk = walk::Walk::new(root_pgno, self.data.len() / self.page_size as u64)?;
+        while let Some(pgno) = walk.pop() {
+            let Some(page) = self.page_data(pgno)? else {
                 continue;
             };
 
+            let page = page.as_ref();
             let (flags, _next_page) = Self::page_header(page);
             let (_hdr_size, num_tags) = self.page_tags(page);
 
@@ -353,7 +364,7 @@ impl<'a> EseDb<'a> {
                     if let Some((tag_data, tag_flags)) = self.tag_data_with_flags(page, i, flags) {
                         let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if !record.is_empty() {
-                            callback(record);
+                            callback(record)?;
                         }
                     }
                 }
@@ -366,37 +377,28 @@ impl<'a> EseDb<'a> {
                         let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
                             let child = u32_le_or0(record, 0);
-                            stack.push(child);
+                            walk.push(child)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Traverse a B+ tree, calling `callback` with (key, record_data) for each leaf record.
     /// Used for long value resolution where the key is needed.
-    fn traverse_btree_kv<F>(&self, root_pgno: u32, mut callback: F)
+    fn traverse_btree_kv<F>(&self, root_pgno: u32, mut callback: F) -> Result<()>
     where
-        F: FnMut(Vec<u8>, &'a [u8]),
+        F: FnMut(Vec<u8>, &[u8]) -> Result<()>,
     {
-        let mut stack = vec![root_pgno];
-        let page_count = self.data.len() / self.page_size;
-        let mut visited = vec![false; page_count];
-
-        while let Some(pgno) = stack.pop() {
-            let Ok(page_index) = usize::try_from(pgno) else {
-                continue;
-            };
-            if pgno == 0 || page_index >= visited.len() || visited[page_index] {
-                continue;
-            }
-            visited[page_index] = true;
-
-            let Some(page) = self.page_data(pgno) else {
+        let mut walk = walk::Walk::new(root_pgno, self.data.len() / self.page_size as u64)?;
+        while let Some(pgno) = walk.pop() {
+            let Some(page) = self.page_data(pgno)? else {
                 continue;
             };
 
+            let page = page.as_ref();
             let (flags, _) = Self::page_header(page);
             let (_, num_tags) = self.page_tags(page);
 
@@ -429,7 +431,7 @@ impl<'a> EseDb<'a> {
                         key.extend_from_slice(key_suffix);
 
                         if !record.is_empty() {
-                            callback(key, record);
+                            callback(key, record)?;
                         }
                     }
                 }
@@ -440,22 +442,37 @@ impl<'a> EseDb<'a> {
                         let record = Self::strip_leaf_key(tag_data, tag_flags);
                         if record.len() >= 4 {
                             let child = u32_le_or0(record, 0);
-                            stack.push(child);
+                            walk.push(child)?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Parse the catalog (MSysObjects, page 4) to discover tables and columns.
-    fn parse_catalog(&mut self) {
+    fn parse_catalog(&mut self) -> Result<()> {
         // The catalog is a B+ tree rooted at page 4
         let mut records: Vec<Vec<u8>> = Vec::new();
 
+        let mut bytes = 0usize;
         self.traverse_btree(4, |data| {
+            const LIMIT: usize = 16 * 1024 * 1024;
+            bytes += data.len();
+            if bytes > LIMIT || records.len() >= 65_536 {
+                return Err(VmkatzError::AllocTooLarge {
+                    what: "ESE catalog",
+                    requested: bytes.max(LIMIT + 1),
+                    limit: LIMIT,
+                });
+            }
+            records
+                .try_reserve(1)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
             records.push(data.to_vec());
-        });
+            Ok(())
+        })?;
 
         log::info!("ESE catalog: {} raw records", records.len());
 
@@ -588,6 +605,7 @@ impl<'a> EseDb<'a> {
         }
 
         log::info!("ESE: {} tables parsed", self.tables.len());
+        Ok(())
     }
 
     /// Extract name string from catalog record's variable columns.
@@ -680,17 +698,28 @@ impl<'a> EseDb<'a> {
         let mut record_count = 0usize;
         self.traverse_btree(tbl.data_pgno, |rec_data| {
             if rec_data.len() < 4 {
-                return;
+                return Ok(());
             }
             record_count += 1;
 
+            let error = std::cell::RefCell::new(None);
             let reader = |col_name: &str| -> Option<Vec<u8>> {
+                if error.borrow().is_some() {
+                    return None;
+                }
                 let col = col_by_name.get(col_name)?;
-                self.read_column_value(rec_data, columns, col, lv_pgno)
+                match self.read_column_value(rec_data, columns, col, lv_pgno) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        *error.borrow_mut() = Some(e);
+                        None
+                    }
+                }
             };
 
             callback(&reader);
-        });
+            error.into_inner().map_or(Ok(()), Err)
+        })?;
 
         log::info!(
             "ESE table '{}': {} leaf records, {} columns",
@@ -709,9 +738,9 @@ impl<'a> EseDb<'a> {
         _columns: &[EseColumn],
         col: &EseColumn,
         lv_pgno: u32,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         if rec.len() < 4 {
-            return None;
+            return Ok(None);
         }
 
         let last_fixed_id = u32::from(rec[0]);
@@ -719,13 +748,24 @@ impl<'a> EseDb<'a> {
         let var_data_off = u16_le_or0(rec, 2) as usize;
 
         if col.is_fixed {
-            Self::read_fixed_column(rec, col, last_fixed_id, var_data_off)
+            Ok(Self::read_fixed_column(
+                rec,
+                col,
+                last_fixed_id,
+                var_data_off,
+            ))
         } else if col.is_variable {
-            Self::read_variable_column(rec, col, last_var_id, var_data_off, lv_pgno)
+            Ok(Self::read_variable_column(
+                rec,
+                col,
+                last_var_id,
+                var_data_off,
+                lv_pgno,
+            ))
         } else if col.is_tagged {
             self.read_tagged_column(rec, col, var_data_off, last_var_id, lv_pgno)
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -825,7 +865,7 @@ impl<'a> EseDb<'a> {
         var_data_off: usize,
         last_var_id: u32,
         lv_pgno: u32,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         // Tagged columns come after variable columns
         let num_var = if last_var_id >= 128 {
             (last_var_id - 128 + 1) as usize
@@ -846,12 +886,12 @@ impl<'a> EseDb<'a> {
 
         let tagged_start = var_data_end;
         if tagged_start >= rec.len() {
-            return None;
+            return Ok(None);
         }
 
         let tagged_data = &rec[tagged_start..];
         if tagged_data.len() < 4 {
-            return None;
+            return Ok(None);
         }
 
         let small_pages = self.page_size <= 8192;
@@ -866,7 +906,7 @@ impl<'a> EseDb<'a> {
         };
 
         if dir_bytes == 0 || dir_bytes > tagged_data.len() || dir_bytes % 4 != 0 {
-            return None;
+            return Ok(None);
         }
 
         let num_entries = dir_bytes / 4;
@@ -888,7 +928,7 @@ impl<'a> EseDb<'a> {
 
             // Null check (small pages: bit 0x2000)
             if small_pages && offset_bits & 0x2000 != 0 {
-                return None;
+                return Ok(None);
             }
 
             // Per-entry extended info flag
@@ -919,7 +959,7 @@ impl<'a> EseDb<'a> {
             };
 
             if data_offset >= data_end || data_end > tagged_data.len() {
-                return None;
+                return Ok(None);
             }
 
             let mut data = &tagged_data[data_offset..data_end];
@@ -931,7 +971,7 @@ impl<'a> EseDb<'a> {
 
                 // Null check for large pages
                 if !small_pages && flags & 0x20 != 0 {
-                    return None;
+                    return Ok(None);
                 }
 
                 // Separated: data is a long value reference (LID)
@@ -941,12 +981,12 @@ impl<'a> EseDb<'a> {
             }
 
             if data.is_empty() {
-                return None;
+                return Ok(None);
             }
-            return Some(data.to_vec());
+            return Ok(Some(data.to_vec()));
         }
 
-        None
+        Ok(None)
     }
 
     /// Check if data is a long value reference and resolve it.
@@ -959,44 +999,44 @@ impl<'a> EseDb<'a> {
     }
 
     /// Resolve a long value from the LV tree.
-    fn resolve_long_value(&self, lv_pgno: u32, lv_key: &[u8]) -> Option<Vec<u8>> {
+    fn resolve_long_value(&self, lv_pgno: u32, lv_key: &[u8]) -> Result<Option<Vec<u8>>> {
         if lv_pgno == 0 || lv_key.len() < 4 {
-            return None;
+            return Ok(None);
         }
-
-        // LV reference from tagged column: LID stored as little-endian u32
-        let lid = u32::from_le_bytes(lv_key[..4].try_into().ok()?);
-
+        let lid = u32_le_or0(lv_key, 0);
         let mut chunks: Vec<(u32, Vec<u8>)> = Vec::new();
-
-        // LV B+ tree keys: LID(4 BE) + segment_offset(4 BE)
+        let mut bytes = 0usize;
         self.traverse_btree_kv(lv_pgno, |key, data| {
-            if let Some(rec_lid) = key
-                .get(..4)
-                .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                .map(u32::from_be_bytes)
-            {
-                if rec_lid == lid {
-                    let seg_offset = key
-                        .get(4..8)
-                        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                        .map_or(0, u32::from_be_bytes);
-                    chunks.push((seg_offset, data.to_vec()));
+            if key.len() >= 4 && crate::utils::u32_be_or0(&key, 0) == lid {
+                const LIMIT: usize = 16 * 1024 * 1024;
+                bytes += data.len();
+                if bytes > LIMIT || chunks.len() >= 65_536 {
+                    return Err(VmkatzError::AllocTooLarge {
+                        what: "ESE long value",
+                        requested: bytes.max(LIMIT + 1),
+                        limit: LIMIT,
+                    });
                 }
+                let offset = crate::utils::u32_be_or0(&key, 4);
+                chunks
+                    .try_reserve(1)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+                chunks.push((offset, data.to_vec()));
             }
-        });
-
+            Ok(())
+        })?;
         if chunks.is_empty() {
-            return None;
+            return Ok(None);
         }
-
         chunks.sort_by_key(|(off, _)| *off);
         let mut result = Vec::new();
+        result
+            .try_reserve_exact(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
         for (_, chunk) in chunks {
             result.extend_from_slice(&chunk);
         }
-
-        Some(result)
+        Ok(Some(result))
     }
 }
 
@@ -1007,6 +1047,20 @@ fn ese_err(msg: &str) -> VmkatzError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_data_does_not_wrap_large_page_numbers() {
+        let data = vec![0xA5; 3 * 4096];
+        let db = EseDb {
+            data: Source::Bytes(&data),
+            page_size: 4096,
+            tables: HashMap::new(),
+        };
+        assert_eq!(db.page_data(1).unwrap().as_deref(), Some(&data[8192..]));
+        for pgno in [0, 2, (1 << 20) - 1, u32::MAX] {
+            assert!(db.page_data(pgno).unwrap().is_none(), "page {pgno}");
+        }
+    }
 
     #[test]
     fn catalog_column_uses_record_offset_not_space_usage() {

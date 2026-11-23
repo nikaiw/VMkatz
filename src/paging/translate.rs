@@ -142,7 +142,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     /// entry becomes a pagefile PTE. This method resolves page table pages from
     /// the pagefile at each level, enabling full virtual address translation even
     /// when the page table hierarchy is partially swapped to disk.
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     pub fn translate_with_pagefile(
         &self,
         cr3: u64,
@@ -219,7 +219,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     }
 
     /// Continue page table walk from a resolved PDPT page (in-memory buffer).
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     fn walk_from_pdpt(
         &self,
         pdpt_page: &[u8; 4096],
@@ -267,7 +267,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     }
 
     /// Continue page table walk from a resolved PD page (in-memory buffer).
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     fn walk_from_pd(
         &self,
         pd_page: &[u8; 4096],
@@ -296,7 +296,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     }
 
     /// Continue page table walk from a resolved PT page (in-memory buffer).
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     fn walk_from_pt(
         pt_page: &[u8; 4096],
         vaddr: u64,
@@ -317,7 +317,7 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
     }
 
     /// Walk PT level from a physical base address (common helper).
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     fn walk_pt_level(
         &self,
         pt_base: u64,
@@ -716,9 +716,9 @@ pub struct ProcessMemory<'a, P: PhysicalMemory> {
     phys: &'a P,
     walker: PageTableWalker<'a, P>,
     dtb: u64,
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     pagefile: Option<&'a crate::paging::pagefile::PagefileReader>,
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     filebacked: Option<&'a crate::paging::filebacked::FileBackedResolver>,
 }
 
@@ -728,14 +728,14 @@ impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
             phys,
             walker: PageTableWalker::new(phys),
             dtb,
-            #[cfg(feature = "sam")]
+            #[cfg(feature = "disk")]
             pagefile: None,
-            #[cfg(feature = "sam")]
+            #[cfg(feature = "disk")]
             filebacked: None,
         }
     }
 
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     pub fn with_resolvers(
         phys: &'a P,
         dtb: u64,
@@ -762,14 +762,14 @@ impl<P: PhysicalMemory> VirtualMemory for ProcessMemory<'_, P> {
             let chunk = std::cmp::min(page_remaining, buf.len() - offset);
 
             // Use multi-level pagefile-aware translation when pagefile is available
-            #[cfg(feature = "sam")]
+            #[cfg(feature = "disk")]
             let translate_result = if let Some(pf) = self.pagefile {
                 self.walker
                     .translate_with_pagefile(self.dtb, current_vaddr, pf)
             } else {
                 self.walker.translate(self.dtb, current_vaddr)
             };
-            #[cfg(not(feature = "sam"))]
+            #[cfg(not(feature = "disk"))]
             let translate_result = self.walker.translate(self.dtb, current_vaddr);
 
             match translate_result {
@@ -782,7 +782,7 @@ impl<P: PhysicalMemory> VirtualMemory for ProcessMemory<'_, P> {
                         buf[offset..offset + chunk].fill(0);
                     }
                 }
-                #[cfg(feature = "sam")]
+                #[cfg(feature = "disk")]
                 Err(VmkatzError::PageFileFault(_vaddr, raw_pte)) => {
                     // Data page is in pagefile — resolve directly
                     if let Some(pf) = self.pagefile {
@@ -799,7 +799,7 @@ impl<P: PhysicalMemory> VirtualMemory for ProcessMemory<'_, P> {
                 }
                 Err(ref e) => {
                     // Try file-backed resolution for demand-paged DLL sections
-                    #[cfg(feature = "sam")]
+                    #[cfg(feature = "disk")]
                     if let Some(fb) = self.filebacked {
                         if let Some(page_data) = fb.resolve_page(current_vaddr) {
                             let page_off = (current_vaddr & 0xFFF) as usize;

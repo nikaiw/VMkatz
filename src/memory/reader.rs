@@ -19,7 +19,7 @@ fn alloc_buf(what: &'static str, len: usize) -> Result<Vec<u8>> {
             limit: MAX_READ_BYTES,
         });
     }
-    Ok(vec![0u8; len])
+    crate::utils::zeroed_buffer(len).map_err(VmkatzError::Io)
 }
 
 /// Read from guest physical address space.
@@ -70,8 +70,8 @@ pub trait PhysicalMemory {
     /// callback must be `Sync` and its work per region independent (order is not
     /// preserved), and returns `true` to ask the layer to keep that region cached
     /// (regions holding data a later pass will re-read). Returns `false` when the
-    /// implementation has no parallel path, so the caller falls back to a
-    /// sequential `read_phys` sweep.
+    /// implementation has no parallel path or the scan was incomplete. The caller
+    /// must discard partial results before falling back to a sequential sweep.
     ///
     /// This exists so formats whose reads decompress (Hyper-V VMRS) can spread the
     /// decompression across cores instead of doing it one block at a time on the

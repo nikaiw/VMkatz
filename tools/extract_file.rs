@@ -2,8 +2,8 @@
 // inside any vmkatz-supported disk image. For finding chrome's elevation_service.exe.
 //
 // Usage:
-//   cargo run --release --features chrome --bin extract_file <disk> ls <path>
-//   cargo run --release --features chrome --bin extract_file <disk> get <path> <out>
+//   cargo run --release --no-default-features --features disk --bin extract_file <disk> ls <path>
+//   cargo run --release --no-default-features --features disk --bin extract_file <disk> get <path> <out>
 
 use std::path::PathBuf;
 
@@ -16,6 +16,13 @@ fn main() -> anyhow::Result<()> {
     let disk_path = PathBuf::from(&args[1]);
     let cmd = &args[2];
     let path = &args[3];
+    if !matches!(cmd.as_str(), "ls" | "get") {
+        anyhow::bail!("unknown command {cmd:?}; expected ls or get");
+    }
+    let output = args.get(4);
+    if cmd == "get" && output.is_none() {
+        anyhow::bail!("get requires a destination: extract_file <disk> get <path> <out>");
+    }
 
     let mut disk = vmkatz::disk::open_disk(&disk_path)?;
     let partitions = vmkatz::fs::find_ntfs_partitions(&mut disk).unwrap_or_default();
@@ -52,10 +59,10 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
-            let data = vmkatz::fs::read_file_data(&file, &mut part_reader)?;
-            let out = &args[4];
-            std::fs::write(out, &data)?;
-            eprintln!("wrote {} bytes to {}", data.len(), out);
+            let out = output.ok_or_else(|| anyhow::anyhow!("get requires a destination"))?;
+            let copied =
+                vmkatz::fs::copy_file_to_path(&file, &mut part_reader, std::path::Path::new(out))?;
+            eprintln!("wrote {copied} bytes to {out}");
             return Ok(());
         }
         let dir = match vmkatz::fs::navigate_to_dir(&ntfs, &root, &mut part_reader, path) {

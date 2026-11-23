@@ -38,8 +38,14 @@ pub enum VmkatzError {
     #[error("Disk format error: {0}")]
     DiskFormatError(String),
 
+    #[error("Disk parent chain exceeds 64 levels (possible cycle)")]
+    DiskChainLimit,
+
     #[error("NTFS entry '{0}' not found")]
     NtfsEntryNotFound(String),
+
+    #[error("Recovery stopped: {0}")]
+    RecoveryLimit(&'static str),
 
     #[error("ELF error: {0}")]
     ElfError(String),
@@ -56,3 +62,11 @@ pub enum VmkatzError {
 }
 
 pub type Result<T> = std::result::Result<T, VmkatzError>;
+
+impl VmkatzError {
+    /// Resource refusals must not trigger more scans or allocation retries.
+    pub fn is_resource_limit(&self) -> bool {
+        matches!(self, Self::AllocTooLarge { .. } | Self::RecoveryLimit(_))
+            || matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::OutOfMemory)
+    }
+}

@@ -1,37 +1,20 @@
-//! CLI binary modules; re-exports what `main` dispatches to.
+//! Command-line entry points and their supporting modules.
 //!
-//! `args`: argument parsing, colours, input classification. `output`: output
-//! formats and export helpers. `lsass`: memory-snapshot pipeline. `dir`:
-//! VM-directory pipelines. `disk` (`sam` only): disk-image, raw-file, Veeam
-//! and VMFS pipelines.
+//! `dispatch` selects the input pipeline. `args` parses options and classifies
+//! raw files; `dir`, `disk`, and `lsass` execute the selected pipeline. Shared
+//! formatting lives in `output`, with optional disk consumers in `credentials`.
 
 pub mod args;
+#[cfg(feature = "disk")]
+mod credentials;
+#[cfg(feature = "credman")]
+mod credman;
 pub mod dir;
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub mod disk;
+mod dispatch;
 pub mod lsass;
 pub mod output;
 
-#[cfg(feature = "sam")]
-pub(crate) use args::is_block_dev;
-pub(crate) use args::{Args, RawFileType, detect_file_type};
-pub(crate) use dir::{run_directory, run_recursive};
-#[cfg(all(
-    feature = "sam",
-    any(
-        feature = "vmware",
-        feature = "vbox",
-        feature = "qemu",
-        feature = "hyperv"
-    )
-))]
-pub(crate) use disk::run_associated_lsass_for_disk;
-#[cfg(feature = "ntds.dit")]
-pub(crate) use disk::run_raw_ntds;
-#[cfg(feature = "veeam")]
-pub(crate) use disk::run_veeam;
-#[cfg(feature = "sam")]
-pub(crate) use disk::{run_raw_hives, run_sam};
-#[cfg(feature = "vmfs")]
-pub(crate) use disk::{run_vmfs, run_vmfs_list};
-pub(crate) use lsass::{run_lsass, run_minidump};
+pub(crate) use args::Args;
+pub(crate) use dispatch::run;

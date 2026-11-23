@@ -40,10 +40,11 @@ use clap::Parser;
         vmkatz --credman disk.vmdk                   Decrypt Windows Credential Manager (offline)\n  \
         vmkatz --credman --credman-attributes disk.vmdk   Also enumerate credential attributes (encrypted values; offline decryption unsupported)\n  \
         vmkatz --credman --dpapi-password vmkz:P@ss disk.vmdk   Supply a local user's password (needed to open their masterkey)\n  \
-        vmkatz --ls disk.vmdk                       List root of each NTFS partition\n  \
-        vmkatz --ls='\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
+        vmkatz --ls '\\' disk.vmdk                 List root of each NTFS partition\n  \
+        vmkatz --ls '\\Windows\\System32\\config' disk.vmdk   List a directory (read-only)\n  \
+        vmkatz --cp '\\Windows\\NTDS\\ntds.dit' ./ntds.dit disk.vmdk   Copy a file out of NTFS\n  \
         vmkatz --partition 0x100000 disk.vmdk       Restrict to one partition (byte offset)\n  \
-        vmkatz --vmfs-device /dev/sdb --vmdk 'DC01/DC01-flat.vmdk' --ls   List from VMFS\n  \
+        vmkatz --vmfs-device /dev/sdb --vmdk 'DC01/DC01-flat.vmdk' --ls '\\'   List root from VMFS\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
 )]
 pub(crate) struct Args {
@@ -56,9 +57,16 @@ pub(crate) struct Args {
     pub(crate) list_processes: bool,
 
     /// Force SAM hash extraction mode (auto-detected for .vdi/.vmdk/.qcow2/.vhdx/.vhd)
-    #[cfg(feature = "sam")]
-    #[arg(long, default_value_t = false)]
+    #[cfg_attr(feature = "sam", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "sam"), arg(skip))]
+    #[cfg(feature = "disk")]
     pub(crate) sam: bool,
+
+    /// Scan DPAPI master keys from a disk image (also enabled by default when built)
+    #[cfg_attr(all(feature = "dpapi", feature = "disk"), arg(long))]
+    #[cfg_attr(not(all(feature = "dpapi", feature = "disk")), arg(skip))]
+    #[cfg(feature = "disk")]
+    pub(crate) dpapi: bool,
 
     /// Try NTDS.dit extraction workflow (Windows/NTDS/ntds.dit + SYSTEM bootkey)
     #[cfg(feature = "ntds.dit")]
@@ -76,17 +84,17 @@ pub(crate) struct Args {
     pub(crate) ntds_domain_prefix: Option<String>,
 
     /// Disk image for pagefile.sys resolution (resolves paged-out memory from disk)
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     #[arg(long, value_name = "DISK_IMAGE")]
     pub(crate) disk: Option<String>,
 
-    /// List a directory on the NTFS partition(s) of a disk image (default: root)
-    #[cfg(feature = "sam")]
-    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    /// List a directory on the NTFS partition(s) of a disk image (use '\\' for root)
+    #[cfg(feature = "disk")]
+    #[arg(long, value_name = "PATH")]
     pub(crate) ls: Option<String>,
 
     /// Restrict --ls and extraction to the NTFS partition at this byte offset (decimal or 0x hex)
-    #[cfg(feature = "sam")]
+    #[cfg(feature = "disk")]
     #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
     pub(crate) partition: Option<u64>,
 
@@ -136,7 +144,9 @@ pub(crate) struct Args {
     pub(crate) all: bool,
 
     /// Copy a file out of the disk image's NTFS to a local path, e.g.
-    /// --cp '\Windows\NTDS\ntds.dit' ./ntds.dit (disk images and VMFS --vmdk; honours --partition)
+    /// --cp '\Windows\NTDS\ntds.dit' ./ntds.dit (disk images and VMFS --vmdk; honours --partition).
+    /// Streams to a new destination; existing files are never overwritten.
+    #[cfg(feature = "disk")]
     #[arg(long, num_args = 2, value_names = ["SRC", "DST"])]
     pub(crate) cp: Option<Vec<String>>,
 
@@ -157,42 +167,57 @@ pub(crate) struct Args {
     pub(crate) provider: Vec<String>,
 
     /// Carve credentials from partial/truncated/raw memory files
-    #[cfg(feature = "carve")]
-    #[arg(long, default_value_t = false)]
+    #[cfg(any(
+        feature = "carve",
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    ))]
+    #[cfg_attr(feature = "carve", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "carve"), arg(skip))]
     pub(crate) carve: bool,
 
     /// Extract browser secrets (Chromium + Firefox). Requires --features chrome at build time.
+    #[cfg(feature = "chrome")]
     #[arg(long, default_value_t = false)]
     pub(crate) chrome: bool,
 
     /// Emit chrome findings as JSON instead of pretty text.
+    #[cfg(feature = "chrome")]
     #[arg(long, default_value_t = false)]
     pub(crate) chrome_json: bool,
 
     /// Extra password candidate to try when decrypting user DPAPI masterkey
     /// files (repeatable). Useful when the password isn't in LSA — e.g. you
     /// got it from cracking, pivoting, or just know it's a vuln-lab default.
+    #[cfg(feature = "chrome")]
     #[arg(long, value_name = "PASSWORD")]
     pub(crate) chrome_password: Vec<String>,
 
     /// NT hash for DPAPI masterkey decrypt (repeatable). Bare hex tries all
     /// users; `SID:HEX` targets one. For domain users not in the local SAM.
+    #[cfg(feature = "chrome")]
     #[arg(long, value_name = "[SID:]HEX")]
     pub(crate) chrome_nthash: Vec<String>,
 
     /// Extract Credential Manager entries from disk images by decrypting
-    /// on-disk DPAPI masterkeys with SAM/LSA secrets.
-    #[arg(long, default_value_t = false)]
+    /// on-disk DPAPI masterkeys with supplied credentials and optional SAM/LSA secrets.
+    #[cfg_attr(feature = "credman", arg(long, default_value_t = false))]
+    #[cfg_attr(not(feature = "credman"), arg(skip))]
+    #[cfg(feature = "disk")]
     pub(crate) credman: bool,
 
     /// With `--credman`: enumerate CREDENTIAL attributes and show each
     /// attribute's encrypted value as hex (offline decryption of entropy-bound
     /// WindowsLive/SSO blobs is not supported).
+    #[cfg(feature = "credman")]
     #[arg(long, default_value_t = false)]
     pub(crate) credman_attributes: bool,
 
     /// `USER:HEX` NT hash for `--credman` (repeatable). USER is a SID, a
     /// SAM/profile name, or `DOMAIN\\name`. For domain users not in the local SAM.
+    #[cfg(feature = "credman")]
     #[arg(long, value_name = "USER:HEX")]
     pub(crate) dpapi_nthash: Vec<String>,
 
@@ -200,6 +225,7 @@ pub(crate) struct Args {
     /// SID, a SAM/profile name, or `DOMAIN\\name`. Required for LOCAL accounts:
     /// their masterkey derives from the password, not the NT hash. Everything
     /// after the first `:` is the password. Note: visible in the process list.
+    #[cfg(feature = "credman")]
     #[arg(long, value_name = "USER:PASSWORD")]
     pub(crate) dpapi_password: Vec<String>,
 
@@ -209,6 +235,7 @@ pub(crate) struct Args {
     /// flag is best used when the disk path is unavailable or when you want
     /// in-flight values that haven't been persisted yet (e.g. Edge's recent
     /// memory-resident password disclosures).
+    #[cfg(feature = "chrome")]
     #[arg(long, default_value_t = false)]
     pub(crate) chrome_process_scan: bool,
 
@@ -268,23 +295,15 @@ pub(crate) struct Args {
 }
 
 impl Args {
-    /// Whether carve mode is enabled (always false when feature is disabled).
-    #[cfg(any(
-        feature = "vmware",
-        feature = "vbox",
-        feature = "qemu",
-        feature = "hyperv"
-    ))]
-    #[cfg_attr(not(feature = "carve"), expect(clippy::unused_self))]
-    pub(crate) const fn carve(&self) -> bool {
-        #[cfg(feature = "carve")]
-        {
-            self.carve
+    /// Options that require a disk input. Chrome is excluded because it also
+    /// operates on memory snapshots; --disk supplies their optional pagefile.
+    #[cfg(feature = "disk")]
+    pub(crate) const fn requests_disk_mode(&self) -> bool {
+        #[cfg(feature = "ntds.dit")]
+        if self.ntds {
+            return true;
         }
-        #[cfg(not(feature = "carve"))]
-        {
-            false
-        }
+        self.sam || self.dpapi || self.credman || self.ls.is_some() || self.cp.is_some()
     }
 }
 
@@ -369,20 +388,16 @@ pub(crate) fn detect_file_type(path: &Path) -> RawFileType {
 }
 
 /// Check if a path is a block device (Linux /dev/...).
-#[cfg(feature = "sam")]
-// Windows: the unix branch is cfg'd out, leaving a trivially-const `false`.
-#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn))]
+#[cfg(all(feature = "disk", unix))]
 pub(crate) fn is_block_dev(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        std::fs::metadata(path).is_ok_and(|m| m.file_type().is_block_device())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path).is_ok_and(|m| m.file_type().is_block_device())
+}
+
+/// Block-device detection is only supported on Unix.
+#[cfg(all(feature = "disk", not(unix)))]
+pub(crate) const fn is_block_dev(_path: &Path) -> bool {
+    false
 }
 
 /// Parse `--chrome-nthash` specs into `(SID, 16-byte NT hash)` pairs.
@@ -409,7 +424,7 @@ pub(crate) fn parse_chrome_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])>
 }
 
 /// Parse a byte offset given as decimal or `0x`-prefixed hex.
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub(crate) fn parse_offset(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let r = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
@@ -419,7 +434,7 @@ pub(crate) fn parse_offset(s: &str) -> Result<u64, String> {
     r.map_err(|e| format!("invalid offset '{s}': {e}"))
 }
 
-#[cfg(all(test, feature = "sam"))]
+#[cfg(all(test, feature = "disk"))]
 mod offset_tests {
     use super::parse_offset;
 
@@ -432,7 +447,7 @@ mod offset_tests {
 }
 
 /// Parse `--dpapi-password` specs into `(USER, password)` pairs; same `USER:VALUE` format.
-#[cfg(feature = "sam")]
+#[cfg(feature = "credman")]
 pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for spec in specs {
@@ -452,7 +467,7 @@ pub(crate) fn parse_dpapi_passwords(specs: &[String]) -> Vec<(String, String)> {
 
 /// Parse `--dpapi-nthash` specs into `(USER, 16-byte NT hash)` pairs.
 /// Requires `USER:HEX`; malformed entries are skipped with a warning.
-#[cfg(feature = "sam")]
+#[cfg(feature = "credman")]
 pub(crate) fn parse_dpapi_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> {
     let mut out: Vec<(String, [u8; 16])> = Vec::new();
     for spec in specs {
@@ -473,7 +488,7 @@ pub(crate) fn parse_dpapi_nthashes(specs: &[String]) -> Vec<(String, [u8; 16])> 
     out
 }
 
-#[cfg(all(test, feature = "sam"))]
+#[cfg(all(test, feature = "credman"))]
 mod dpapi_nthash_tests {
     use super::parse_dpapi_nthashes;
 
@@ -483,5 +498,71 @@ mod dpapi_nthash_tests {
         assert_eq!(v[0].0, "LAB\\jdoe");
         assert_eq!(v[0].1[0], 0x00);
         assert_eq!(v[0].1[15], 0xff);
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::Args;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn unsupported_feature_flags_are_rejected() {
+        for (enabled, arguments) in [
+            (cfg!(feature = "carve"), vec!["--carve", "snapshot.raw"]),
+            (cfg!(feature = "disk"), vec!["--ls", "\\", "disk.vmdk"]),
+            (
+                cfg!(feature = "disk"),
+                vec!["--cp", "\\file", "out", "disk.vmdk"],
+            ),
+            (
+                cfg!(feature = "disk"),
+                vec!["--disk", "disk.vmdk", "snapshot.vmsn"],
+            ),
+            (
+                cfg!(feature = "disk"),
+                vec!["--partition", "0x100000", "disk.vmdk"],
+            ),
+            (cfg!(feature = "sam"), vec!["--sam", "disk.vmdk"]),
+            (
+                cfg!(all(feature = "disk", feature = "dpapi")),
+                vec!["--dpapi", "disk.vmdk"],
+            ),
+            (cfg!(feature = "credman"), vec!["--credman", "disk.vmdk"]),
+            (
+                cfg!(feature = "credman"),
+                vec!["--dpapi-password", "user:password", "disk.vmdk"],
+            ),
+            (
+                cfg!(feature = "credman"),
+                vec![
+                    "--dpapi-nthash",
+                    "user:00112233445566778899aabbccddeeff",
+                    "disk.vmdk",
+                ],
+            ),
+            (cfg!(feature = "chrome"), vec!["--chrome", "disk.vmdk"]),
+        ] {
+            let result =
+                Args::try_parse_from(std::iter::once("vmkatz").chain(arguments.iter().copied()));
+            assert_eq!(result.is_ok(), enabled, "{arguments:?}: {result:?}");
+            if let Err(error) = result {
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
+        }
+        Args::command().debug_assert();
+    }
+
+    #[cfg(feature = "disk")]
+    #[test]
+    fn ls_and_cp_consume_their_paths_and_leave_the_disk_positional() {
+        let ls = Args::try_parse_from(["vmkatz", "--ls", "\\Windows", "disk.vmdk"]).unwrap();
+        assert_eq!(ls.ls.as_deref(), Some("\\Windows"));
+        assert_eq!(ls.input_paths, ["disk.vmdk"]);
+        let cp = Args::try_parse_from(["vmkatz", "--cp", "\\Windows\\file", "out", "disk.vmdk"])
+            .unwrap();
+        assert_eq!(cp.cp.unwrap(), ["\\Windows\\file", "out"]);
+        assert_eq!(cp.input_paths, ["disk.vmdk"]);
+        assert!(Args::try_parse_from(["vmkatz", "--ls"]).is_err());
     }
 }

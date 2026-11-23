@@ -351,7 +351,7 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
 
     let mut addr: u64 = 0;
     while addr < l1_size {
-        let read_len = SCAN_CHUNK_SIZE.min((l1_size - addr) as usize);
+        let read_len = (l1_size - addr).min(SCAN_CHUNK_SIZE as u64) as usize;
         if l1.read_phys(addr, &mut chunk_buf[..read_len]).is_err() {
             // If full chunk fails, try page-by-page within this range
             addr += read_len as u64;
@@ -360,9 +360,11 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
         }
 
         // Score each 4KB page within the chunk
-        for page_off in (0..read_len).step_by(PAGE_SIZE as usize) {
-            let page = &chunk_buf[page_off..page_off + PAGE_SIZE as usize];
-            let page_addr = addr + page_off as u64;
+        for (page_index, page) in chunk_buf[..read_len]
+            .chunks_exact(PAGE_SIZE as usize)
+            .enumerate()
+        {
+            let page_addr = addr + page_index as u64 * PAGE_SIZE;
 
             if page.iter().all(|&b| b == 0) {
                 pages_since_last_candidate += 1;

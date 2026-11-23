@@ -8,34 +8,7 @@ use super::hashes::{aes128_cbc_decrypt, decode_utf16le};
 use super::hive::Hive;
 use crate::error::{Result, VmkatzError};
 
-/// A single domain cached credential entry.
-#[derive(Debug)]
-pub struct CachedCredential {
-    pub username: String,
-    pub domain: String,
-    pub dns_domain: String,
-    pub dcc2_hash: [u8; 16],
-    pub iteration_count: u32,
-}
-
-impl std::fmt::Display for CachedCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // hashcat mode 2100 format
-        write!(
-            f,
-            "  {}/{}:$DCC2${}#{}#{}",
-            if self.dns_domain.is_empty() {
-                &self.domain
-            } else {
-                &self.dns_domain
-            },
-            self.username,
-            self.iteration_count,
-            self.username.to_lowercase(),
-            hex::encode(self.dcc2_hash),
-        )
-    }
-}
+pub use crate::secrets::CachedCredential;
 
 /// Extract domain cached credentials from the SECURITY hive.
 ///
@@ -44,25 +17,38 @@ pub fn extract_cached_credentials(
     security_data: &[u8],
     nlkm_key: &[u8],
 ) -> Result<Vec<CachedCredential>> {
+    extract_cached_credentials_from_hive(&Hive::new(security_data)?, nlkm_key)
+}
+
+pub fn extract_cached_credentials_from_hive(
+    hive: &Hive<'_>,
+    nlkm_key: &[u8],
+) -> Result<Vec<CachedCredential>> {
+    hive.finish(extract_cached_credentials_inner(hive, nlkm_key))
+}
+
+fn extract_cached_credentials_inner(
+    hive: &Hive<'_>,
+    nlkm_key: &[u8],
+) -> Result<Vec<CachedCredential>> {
     if nlkm_key.len() < 32 {
         return Err(VmkatzError::DecryptionError(
             "NL$KM key too short (need at least 32 bytes)".to_string(),
         ));
     }
 
-    let hive = Hive::new(security_data)?;
     let root = hive.root_key()?;
 
     // Navigate to Cache key
-    let Ok(cache_key) = root.subkey(&hive, "Cache") else {
+    let Ok(cache_key) = root.subkey(hive, "Cache") else {
         log::info!("SECURITY\\Cache key not found, no cached credentials");
         return Ok(Vec::new());
     };
 
     // Read iteration count
-    let iteration_count = match cache_key.subkey(&hive, "NL$IterationCount") {
+    let iteration_count = match cache_key.subkey(hive, "NL$IterationCount") {
         Ok(iter_key) => {
-            match iter_key.value(&hive, "") {
+            match iter_key.value(hive, "") {
                 Ok(data) if data.len() >= 4 => {
                     let raw = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
                     if raw > 10240 {
@@ -76,7 +62,7 @@ pub fn extract_cached_credentials(
         }
         Err(_) => {
             // NL$IterationCount might be a value, not a subkey
-            match cache_key.value(&hive, "NL$IterationCount") {
+            match cache_key.value(hive, "NL$IterationCount") {
                 Ok(data) if data.len() >= 4 => {
                     let raw = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
                     if raw > 10240 {
@@ -103,7 +89,7 @@ pub fn extract_cached_credentials(
     for i in 1..=50 {
         let value_name = format!("NL${i}");
 
-        let Ok(data) = cache_key.value(&hive, &value_name) else {
+        let Ok(data) = cache_key.value(hive, &value_name) else {
             break;
         };
 

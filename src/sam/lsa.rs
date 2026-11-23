@@ -14,114 +14,30 @@ use super::hashes::{decode_utf16le, md5_hash, rc4};
 use super::hive::Hive;
 use crate::error::{Result, VmkatzError};
 
-/// A single LSA secret with its name, raw data, and parsed interpretation.
-#[derive(Debug)]
-pub struct LsaSecret {
-    pub name: String,
-    pub raw_data: Vec<u8>,
-    pub parsed: LsaSecretType,
-}
-
-/// Parsed LSA secret types.
-#[derive(Debug)]
-pub enum LsaSecretType {
-    /// DPAPI system keys (user + machine).
-    DpapiSystem {
-        user_key: [u8; 20],
-        machine_key: [u8; 20],
-    },
-    /// DPAPI domain backup key — preferred key GUID pointer.
-    DpapiBackupPreferred { guid: String },
-    /// DPAPI domain backup key — RSA private key (can decrypt any domain user's master key).
-    DpapiBackupKey {
-        guid: String,
-        version: u32,
-        key_data: Vec<u8>,
-        cert_data: Vec<u8>,
-        pvk: Vec<u8>,
-    },
-    /// Machine account password (hex-encoded raw bytes).
-    MachineAccount { password_hex: String },
-    /// Default logon password (plaintext UTF-16LE decoded).
-    DefaultPassword { password: String },
-    /// Cached domain key (NL$KM).
-    CachedDomainKey { key: Vec<u8> },
-    /// Service account password (_SC_* secrets).
-    ServicePassword { service: String, password: String },
-    /// Unrecognized secret, shown as raw hex.
-    Raw,
-}
-
-impl std::fmt::Display for LsaSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.parsed {
-            LsaSecretType::DpapiSystem {
-                user_key,
-                machine_key,
-            } => {
-                write!(
-                    f,
-                    "  DPAPI_SYSTEM\n    user_key:    {}\n    machine_key: {}",
-                    hex::encode(user_key),
-                    hex::encode(machine_key)
-                )
-            }
-            LsaSecretType::DpapiBackupPreferred { guid } => {
-                write!(f, "  BCKUPKEY_P (Preferred Backup Key)\n    GUID: {guid}")
-            }
-            LsaSecretType::DpapiBackupKey {
-                guid,
-                version,
-                key_data,
-                cert_data,
-                pvk,
-            } => {
-                write!(
-                    f,
-                    "  BCKUPKEY (Domain DPAPI Backup Key)\n    GUID    : {}\n    Version : {}\n    Key     : {} bytes\n    Cert    : {} bytes\n    PVK     : {} bytes",
-                    guid,
-                    version,
-                    key_data.len(),
-                    cert_data.len(),
-                    pvk.len()
-                )
-            }
-            LsaSecretType::MachineAccount { password_hex } => {
-                write!(f, "  $MACHINE.ACC\n    password: {password_hex}")
-            }
-            LsaSecretType::DefaultPassword { password } => {
-                write!(f, "  DefaultPassword\n    password: {password}")
-            }
-            LsaSecretType::CachedDomainKey { key } => {
-                write!(f, "  NL$KM\n    key: {}", hex::encode(key))
-            }
-            LsaSecretType::ServicePassword { service, password } => {
-                write!(f, "  _SC_{service}\n    password: {password}")
-            }
-            LsaSecretType::Raw => {
-                let hex_str = hex::encode(&self.raw_data);
-                let display = if hex_str.len() > 128 {
-                    format!("{}...", &hex_str[..128])
-                } else {
-                    hex_str
-                };
-                write!(f, "  {}\n    raw: {}", self.name, display)
-            }
-        }
-    }
-}
+pub use crate::secrets::{LsaSecret, LsaSecretType};
 
 /// Extract LSA secrets from SECURITY hive data using the bootkey.
 pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<Vec<LsaSecret>> {
-    let hive = Hive::new(security_data)?;
+    extract_lsa_secrets_from_hive(&Hive::new(security_data)?, bootkey)
+}
+
+/// Extract using a byte-backed or streamed hive.
+pub fn extract_lsa_secrets_from_hive(
+    hive: &Hive<'_>,
+    bootkey: &[u8; 16],
+) -> Result<Vec<LsaSecret>> {
+    hive.finish(extract_lsa_secrets_inner(hive, bootkey))
+}
+
+fn extract_lsa_secrets_inner(hive: &Hive<'_>, bootkey: &[u8; 16]) -> Result<Vec<LsaSecret>> {
     let root = hive.root_key()?;
 
     // Navigate to Policy key
-    let policy = root.subkey(&hive, "Policy")?;
+    let policy = root.subkey(hive, "Policy")?;
 
     // Check revision to determine modern vs legacy path
-    let revision = if let Ok(rev_key) = policy.subkey(&hive, "PolRevision") {
-        match rev_key.value(&hive, "") {
+    let revision = if let Ok(rev_key) = policy.subkey(hive, "PolRevision") {
+        match rev_key.value(hive, "") {
             Ok(data) if data.len() >= 4 => {
                 // Default (unnamed) value: first DWORD is minor, second is major
                 let val = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
@@ -153,37 +69,37 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
     // (PolSecretEncryptionKey). Some Windows versions (e.g. Server 2003 R2 SP2)
     // report a modern revision but still use the legacy encryption scheme.
     let (lsa_key, is_modern) = if is_modern {
-        match extract_lsa_key_modern(&hive, &policy, bootkey) {
+        match extract_lsa_key_modern(hive, &policy, bootkey) {
             Ok(key) => (key, true),
             Err(e) => {
                 log::debug!("Modern LSA key extraction failed ({e}), trying legacy fallback");
-                (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
+                (extract_lsa_key_legacy(hive, &policy, bootkey)?, false)
             }
         }
     } else {
-        (extract_lsa_key_legacy(&hive, &policy, bootkey)?, false)
+        (extract_lsa_key_legacy(hive, &policy, bootkey)?, false)
     };
     log::debug!("LSA key: {}", hex::encode(lsa_key));
 
     // Enumerate secrets
-    let Ok(secrets_key) = policy.subkey(&hive, "Secrets") else {
+    let Ok(secrets_key) = policy.subkey(hive, "Secrets") else {
         log::debug!("Policy\\Secrets key not found");
         return Ok(Vec::new());
     };
 
-    let secret_subkeys = secrets_key.subkeys(&hive)?;
+    let secret_subkeys = secrets_key.subkeys(hive)?;
     let mut secrets = Vec::new();
 
     for secret_key in &secret_subkeys {
         let secret_name = secret_key.name().to_string();
 
         // Read CurrVal subkey's default value
-        let Ok(curr_val) = secret_key.subkey(&hive, "CurrVal") else {
+        let Ok(curr_val) = secret_key.subkey(hive, "CurrVal") else {
             log::debug!("Secret '{secret_name}': no CurrVal subkey");
             continue;
         };
 
-        let Ok(encrypted) = curr_val.value(&hive, "") else {
+        let Ok(encrypted) = curr_val.value(hive, "") else {
             log::debug!("Secret '{secret_name}': no default value in CurrVal");
             continue;
         };

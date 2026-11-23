@@ -38,13 +38,19 @@ check:
 
 .PHONY: clippy
 clippy:
-	cargo clippy --all-features -- -D warnings
-	cargo clippy -- -D warnings
+	cargo clippy --all-features --all-targets -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 .PHONY: check-features
 check-features:
-	cargo hack clippy --feature-powerset --depth 2 --at-least-one-of vmware,vbox,qemu,hyperv,sam --exclude-no-default-features --no-dev-deps -- -D warnings
-	cargo check --no-default-features --features vmware,carve,dump
+	cargo hack clippy --feature-powerset --depth 2 --at-least-one-of vmware,vbox,qemu,hyperv,disk,sam,credman,ntds.dit,vmfs,chrome,veeam --exclude-no-default-features --no-dev-deps -- -D warnings
+	cargo clippy --no-default-features --lib --features dpapi -- -D warnings
+	cargo clippy --no-default-features --features vmware,carve,dump -- -D warnings
+	cargo clippy --no-default-features --features vmfs,ntds.dit,credman -- -D warnings
+	cargo clippy --no-default-features --features veeam,ntds.dit,credman -- -D warnings
+	cargo test --no-default-features --features vmware --bin vmkatz cli::args::feature_tests
+	cargo test --no-default-features --features disk --bin vmkatz cli::args::feature_tests
+	cargo test --no-default-features --features credman --bin vmkatz cli::args::feature_tests
 
 .PHONY: doc-check
 doc-check:
@@ -138,5 +144,5 @@ help:
 	@echo "  make test-folder  Test folder discovery (VMware)"
 	@echo ""
 	@echo "Release profile: strip=true, lto=true, codegen-units=1, panic=abort"
-	@echo "Default features: vmware,vbox,qemu,hyperv,sam,ntds.dit,carve,dump"
+	@echo "Default features: vmware,vbox,qemu,hyperv,sam,dpapi,credman,ntds.dit,carve,dump,vmfs"
 	@echo "Override: cargo build --release --no-default-features --features vmware,sam"

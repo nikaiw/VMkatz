@@ -6,6 +6,8 @@
 // is less than a dependency.
 #[cfg(windows)]
 #[link(name = "kernel32")]
+// SAFETY: these declarations use the Windows system ABI and SDK argument types;
+// MemoryStatusEx below has the required C layout.
 unsafe extern "system" {
     /// Unlocking a never-locked range still evicts it from the working set.
     fn VirtualUnlock(addr: *const core::ffi::c_void, size: usize) -> i32;
@@ -33,22 +35,30 @@ struct MemoryStatusEx {
 /// Bounds-checked alternatives to `data[off..off+N].try_into().unwrap()`.
 #[inline]
 pub fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(data.get(off..off + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        data.get(off..off.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 
 #[inline]
 pub fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        data.get(off..off.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 #[inline]
 pub fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        data.get(off..off.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 #[inline]
 pub fn read_i32_le(data: &[u8], off: usize) -> Option<i32> {
-    Some(i32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
+    Some(i32::from_le_bytes(
+        data.get(off..off.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
 /// Little-endian u16 at `off`. Panics if the slice is short, like indexing.
@@ -121,7 +131,8 @@ pub fn u64_le_or0(d: &[u8], off: usize) -> u64 {
 #[inline]
 #[must_use]
 pub fn u32_be_or0(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    off.checked_add(4)
+        .and_then(|end| d.get(off..end))
         .and_then(|s| s.try_into().ok())
         .map_or(0, u32::from_be_bytes)
 }
@@ -130,7 +141,8 @@ pub fn u32_be_or0(d: &[u8], off: usize) -> u32 {
 #[inline]
 #[must_use]
 pub fn u64_be_or0(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    off.checked_add(8)
+        .and_then(|end| d.get(off..end))
         .and_then(|s| s.try_into().ok())
         .map_or(0, u64::from_be_bytes)
 }
@@ -296,18 +308,12 @@ impl MappedFile {
         }
     }
 
-    /// Get a byte slice (only works for mmap variant).
-    /// Panics on Pread variant — callers that need slicing must use read_at instead.
-    #[expect(
-        clippy::panic,
-        reason = "programming-error guard: every caller checks is_pread() first; not reachable from file contents"
-    )]
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Borrow the mapped bytes, or return `None` for the pread fallback.
+    /// Use [`Self::read_at`] when both backing types must be supported.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Mmap(m) => m,
-            Self::Pread { .. } => {
-                panic!("as_bytes() not supported on pread fallback — use read_at()")
-            }
+            Self::Mmap(m) => Some(m),
+            Self::Pread { .. } => None,
         }
     }
 
@@ -345,8 +351,10 @@ impl MappedFile {
             // transparently re-faults them from the file with no data loss. (memmap2
             // gates this as `unchecked` because on a *dirty private* mapping it would
             // lose writes — not our case.)
-            unsafe {
-                let _ = m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, off, n);
+            let advised =
+                unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, off, n) };
+            if let Err(e) = advised {
+                log::trace!("could not release scanned mmap pages: {e}");
             }
         }
         #[cfg(windows)]
@@ -354,9 +362,11 @@ impl MappedFile {
             // Windows has no madvise; VirtualUnlock on a never-locked range
             // still drops those pages from the working set (reports
             // ERROR_NOT_LOCKED, ignored). Needed for the RSS bound to hold.
-            // SAFETY: `[off, off + n)` lies inside the mapping (clamped above).
+            // SAFETY: `off` lies inside the mapping (clamped above).
+            let addr = unsafe { m.as_ptr().add(off) }.cast();
+            // SAFETY: `[addr, addr + n)` is a valid range inside the mapping.
             unsafe {
-                let _ = VirtualUnlock(m.as_ptr().add(off).cast(), n);
+                let _ = VirtualUnlock(addr, n);
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -414,19 +424,22 @@ pub fn cache_budget_bytes() -> Option<u64> {
     available_memory_bytes().map(|avail| avail / 4)
 }
 
-impl std::ops::Deref for MappedFile {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        self.as_bytes()
-    }
+/// Allocate a zero-filled buffer, returning allocation failures to the caller.
+/// Callers must bound `len` before using this helper.
+pub(crate) fn zeroed_buffer(len: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
-/// Whole-file bytes with no heap copy of the file.
+/// Contiguous bytes for parsers that require a complete file slice.
 ///
-/// mmap, falling back to a plain read when the platform or filesystem refuses.
-/// An NTDS.dit from a real DC, or a complete memory dump, is routinely tens of
-/// GB — `fs::read` of one is an allocation abort, while a read-only mapping
-/// costs no commit charge and pages in only what gets touched.
+/// Uses mmap when available; otherwise buffers the entire file in RAM.
+/// This fallback is not memory-bounded. Seekable readers should use
+/// [`mmap_file`] and [`MappedFile::read_at`] instead.
 pub enum FileBytes {
     Mapped(memmap2::Mmap),
     Owned(Vec<u8>),
@@ -441,7 +454,9 @@ impl FileBytes {
         match unsafe { memmap2::Mmap::map(&file) } {
             Ok(m) => {
                 #[cfg(unix)]
-                let _ = m.advise(memmap2::Advice::Sequential);
+                if let Err(e) = m.advise(memmap2::Advice::Sequential) {
+                    log::trace!("could not advise sequential mmap access: {e}");
+                }
                 Ok(Self::Mapped(m))
             }
             Err(_) => Ok(Self::Owned(std::fs::read(path)?)),
@@ -490,7 +505,12 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
     // on a 32-bit host (armv7/i686 builds) — `size as usize` would silently
     // truncate and scan the wrong bytes, so fall through to pread instead.
     let mmap_result = match usize::try_from(size) {
-        Ok(len) => unsafe { memmap2::MmapOptions::new().len(len).map(file) },
+        Ok(len) => {
+            // SAFETY: read-only mapping with a length obtained from this file.
+            // The input image must remain unchanged for the mapping's lifetime;
+            // a concurrent truncation can fault, as with FileBytes::open.
+            unsafe { memmap2::MmapOptions::new().len(len).map(file) }
+        }
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "file larger than this host's address space",
@@ -504,7 +524,9 @@ pub fn mmap_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Resul
             // Combined with the explicit `advise_dontneed` calls the scan loops
             // make, this keeps resident memory near one scan window. Best-effort.
             #[cfg(unix)]
-            let _ = m.advise(memmap2::Advice::Sequential);
+            if let Err(e) = m.advise(memmap2::Advice::Sequential) {
+                log::trace!("could not advise sequential mmap access: {e}");
+            }
 
             // Guardrail: on a memory-constrained host (notably an ESXi userworld)
             // a large image can pressure the memory scheduler. We already bound RSS
@@ -607,6 +629,31 @@ pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_reads_reject_truncated_and_overflowing_offsets() {
+        let data = [0xA5; 8];
+        for off in [7, 8, 9, usize::MAX - 1, usize::MAX] {
+            assert_eq!(read_u16_le(&data, off), None);
+            assert_eq!(read_u32_le(&data, off), None);
+            assert_eq!(read_u64_le(&data, off), None);
+            assert_eq!(read_i32_le(&data, off), None);
+            assert_eq!(u16_le_or0(&data, off), 0);
+            assert_eq!(u32_le_or0(&data, off), 0);
+            assert_eq!(u64_le_or0(&data, off), 0);
+            assert_eq!(u32_be_or0(&data, off), 0);
+            assert_eq!(u64_be_or0(&data, off), 0);
+        }
+        assert_eq!(read_u16_le(&data, 6), Some(0xA5A5));
+        assert_eq!(read_u32_le(&data, 4), Some(0xA5A5_A5A5));
+        assert_eq!(read_u64_le(&data, 0), Some(0xA5A5_A5A5_A5A5_A5A5));
+        assert_eq!(read_i32_le(&[0xFF; 4], 0), Some(-1));
+        assert_eq!(u32_be_or0(&[1, 2, 3, 4], 0), 0x0102_0304);
+        assert_eq!(
+            u64_be_or0(&[1, 2, 3, 4, 5, 6, 7, 8], 0),
+            0x0102_0304_0506_0708
+        );
+    }
 
     #[test]
     fn u64_be_round_trips() {

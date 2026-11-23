@@ -199,7 +199,7 @@ pub fn read_optimized_string(vmem: &dyn VirtualMemory, addr: u64) -> Result<Stri
         // Cap at 8 KiB to bound a corrupt-pointer scenario.
         let str_ptr = u64_le(&buf, 0);
         let str_len_raw = vmem.read_virt_u64(addr + 16).unwrap_or(len as u64);
-        let str_len = (str_len_raw as usize).min(8192);
+        let str_len = str_len_raw.min(8192) as usize;
         if str_ptr == 0 || str_len == 0 {
             return Ok(String::new());
         }
@@ -357,7 +357,7 @@ pub fn walk_cookie_tree(
     if begin_node == 0 {
         return Ok(0);
     }
-    let cap = (size as usize).clamp(256, 100_000);
+    let cap = size.clamp(256, 100_000) as usize;
     let mut count = 0usize;
     let mut stack = vec![begin_node];
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();

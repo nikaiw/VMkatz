@@ -1,8 +1,31 @@
 # Architecture
 
+## Reading Guide
+
+Start at [main.rs](../src/main.rs), which calls `cli::run`, re-exported from
+[cli/dispatch.rs](../src/cli/dispatch.rs). The CLI selects workflows and formats
+results; the library modules implement disk/memory access and artifact processing.
+For example, `cli/disk/vmfs.rs` handles command options, while `disk/vmfs.rs` reads
+the datastore. Likewise, `cli/credman.rs`, `credman/` and `cli/output/credman.rs`
+handle orchestration, processing and formatting respectively.
+
+| Task | Start here | Follow into |
+|---|---|---|
+| Options and input routing | [cli/args.rs](../src/cli/args.rs), [cli/dispatch.rs](../src/cli/dispatch.rs) | The selected `cli/disk.rs`, `cli/lsass.rs` or `cli/dir.rs` handler |
+| NTFS listing or copy | [cli/disk/files.rs](../src/cli/disk/files.rs) | [fs/partition.rs](../src/fs/partition.rs), then [fs/listing.rs](../src/fs/listing.rs) for listing or [fs/ntfs.rs](../src/fs/ntfs.rs) for copying |
+| Memory snapshots | [cli/lsass.rs](../src/cli/lsass.rs) | [snapshot.rs](../src/cli/lsass/snapshot.rs) selects and opens the format; [pipeline.rs](../src/cli/lsass/pipeline.rs) coordinates discovery and processing |
+| VMFS datastore access | [cli/disk/vmfs.rs](../src/cli/disk/vmfs.rs) | [disk/vmfs.rs](../src/disk/vmfs.rs), with the volume's I/O methods kept together |
+| Degraded NTFS recovery | [fs/ntfs_fallback.rs](../src/fs/ntfs_fallback.rs) | [mft.rs](../src/fs/ntfs_fallback/mft.rs) for scans, [records.rs](../src/fs/ntfs_fallback/records.rs) for decoding, [data.rs](../src/fs/ntfs_fallback/data.rs) for file reads |
+| Output formatting | [cli/output.rs](../src/cli/output.rs) | The formatter for the result source in [cli/output/](../src/cli/output/); session text and deduplication have their own modules |
+
+For disk allocation caches, see [disk/table.rs](../src/disk/table.rs) and
+[disk/vmdk/directory.rs](../src/disk/vmdk/directory.rs). Automatic recovery budgets
+live in [fs/recovery.rs](../src/fs/recovery.rs); snapshot page-index limits live in
+[memory/page_index.rs](../src/memory/page_index.rs).
+
 ## How It Works
 
-1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, QEMU savevm page stream with MMIO gap remapping, Hyper-V identity map, Hyper-V VMRS key-value store with LZNT1 decompression) is abstracted behind a common `PhysicalMemory` trait.
+1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, QEMU savevm page stream with MMIO gap remapping, Hyper-V identity map, Hyper-V VMRS key-value store with XPRESS decompression) is abstracted behind a common `PhysicalMemory` trait.
 
 2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 18 known offset tables (WinXP SP3 through Win11 24H2, x86 PAE + x64).
 
@@ -16,14 +39,47 @@
 
 ## Module Layout
 
+This is a selective map of entry points and implementation boundaries. A parent
+such as `cli/output.rs` declares private modules from `cli/output/` and exposes
+their entry points; use the reading guide above to follow a specific operation.
+
 ```
 src/
-├── main.rs              CLI dispatch, format detection, output formatting
+├── main.rs              Argument parsing, logging and worker thread setup
+├── cli/
+│   ├── args.rs          Options, feature availability and raw-file classification
+│   ├── dispatch.rs      Input routing: VMFS, directory, raw files, disk or snapshot
+│   ├── dir.rs           Directory and recursive processing
+│   ├── disk.rs          Local disk commands and shared reader extraction
+│   ├── disk/
+│   │   ├── files.rs     NTFS listing and file copy commands
+│   │   ├── raw.rs       Standalone registry hive and NTDS commands
+│   │   ├── vmfs.rs      VMFS datastore commands and snapshot association
+│   │   └── veeam.rs     Backup listing, reconstruction and disk processing
+│   ├── lsass.rs         Snapshot and minidump command entry points
+│   ├── lsass/
+│   │   ├── snapshot.rs  Format detection, opening and layout diagnostics
+│   │   ├── pipeline.rs  System discovery, EPT/carve fallbacks and memory extraction
+│   │   ├── chrome.rs    Optional memory/disk browser workflow
+│   │   └── bitlocker.rs FVEK discovery and export
+│   ├── credentials.rs   Optional disk consumers: DPAPI, CredMan and browsers
+│   ├── credman.rs       Credential Manager command orchestration
+│   ├── output.rs        Output entry points and shared formatting helpers
+│   └── output/
+│       ├── sessions.rs  Session formats and extraction summaries
+│       ├── dedup.rs     Session grouping, normalization and provider merging
+│       ├── text.rs      Session headings and human-readable provider output
+│       ├── registry.rs  SAM, LSA and cached domain credential output
+│       ├── ntds.rs      AD account and password history output
+│       ├── dpapi.rs     Disk master key selection and output
+│       ├── credman.rs   Credential Manager and Vault output
+│       └── exports.rs   Kerberos, BitLocker and LSA backup key file exports
 ├── lib.rs               Crate root — feature-gated module declarations
 ├── error.rs             VmkatzError type
 ├── utils.rs             Endian helpers, hex, UTF-16LE decode, mmap helpers
 ├── memory/
-│   └── reader.rs        PhysicalMemory and VirtualMemory traits
+│   ├── reader.rs        PhysicalMemory and VirtualMemory traits
+│   └── page_index.rs    Bounded run-based snapshot page mappings
 ├── pe/                  PE header parser (exports, sections, data directories)
 ├── minidump.rs          MDMP parser — VirtualMemory trait over minidump regions
 ├── discover.rs          Directory/recursive auto-discovery of VM files
@@ -57,41 +113,112 @@ src/
 ├── vmware/              [feature: vmware] VMware .vmsn/.vmem/.vmss layer
 ├── vbox/                [feature: vbox] VirtualBox .sav layer
 ├── qemu/                [feature: qemu] QEMU ELF core dump + Proxmox savevm layer
+│   ├── savevm.rs        File opening, header validation and physical reads
+│   └── savevm/stream.rs RAM migration records and page-index construction
 ├── hyperv/              [feature: hyperv] Hyper-V .vmrs/.bin/.raw layer (native VMRS parser)
-├── sam/                 [feature: sam] SAM/LSA/DCC2 + DPAPI + disk format handlers
+│   ├── vmrs.rs          VMRS metadata, memory layout and physical reads
+│   └── vmrs/
+│       ├── metadata.rs  Bounded KeyTable traversal and RAM job enumeration
+│       ├── compression.rs XPRESS decoding and RAM block framing
+│       ├── scan.rs      Parallel RAM scan and sequential fallback signaling
+│       └── budget.rs    Shared worker/cache memory budget
+├── secrets.rs           Shared result records; no registry or DPAPI implementation
+├── dpapi/               [feature: dpapi] Blobs, masterkeys, CREDHIST; optional disk adapter
+├── credman/             [feature: credman] Offline Credentials/Vault consumers
+├── fs/                  [feature: disk] NTFS, partitions, listing and bounded MFT recovery
+│   ├── partition.rs    Partition discovery and selection
+│   ├── listing.rs      Healthy directory index lookup, then degraded MFT fallback
+│   ├── ntfs.rs         Partition reader, NTFS navigation, bounded reads and file copy
+│   ├── ntfs/stream.rs  Resilient read/seek adapter for registry recovery
+│   ├── ntfs_fallback.rs Degraded listing and file recovery entry points
+│   ├── ntfs_fallback/
+│   │   ├── records.rs  Boot parameters, data runs and FILE attributes
+│   │   ├── mft.rs      MFTMirr bootstrap, traversal and target-file search
+│   │   ├── data.rs     Bounded file reads and attribute-list extensions
+│   │   └── tests.rs    Synthetic volumes and recovery regressions
+│   └── recovery.rs     Shared scan, file-size and candidate limits
+├── sam/                 [feature: sam] Registry SAM/LSA/DCC2 extraction
 │   ├── mod.rs           Orchestration, disk extraction entry point
 │   ├── hive.rs          Windows registry hive parser (regf format)
 │   ├── bootkey.rs       Bootkey extraction from SYSTEM hive
 │   ├── hashes.rs        SAM hash decryption (AES-CBC, RC4, MD5, DES)
 │   ├── lsa.rs           LSA secrets decryption (DPAPI system keys, service passwords)
 │   ├── cache.rs         Cached domain credentials (DCC2)
-│   ├── dpapi_masterkey.rs  DPAPI master key file parser (hashcat 15300/15900)
-│   ├── aes_xts.rs       AES-XTS sector decryption (for BitLocker)
-│   ├── bitlocker_decrypt.rs  BitLocker transparent decrypting Read+Seek wrapper
-│   ├── partition.rs     MBR/GPT partition table parser
-│   ├── ntfs_reader.rs   NTFS file reader (SAM/SYSTEM/SECURITY discovery)
-│   ├── ntfs_fallback.rs NTFS fallback parser (no external crate)
+│   ├── ntfs_reader.rs   Streaming NTDS and registry reads, bounded recovery
 │   ├── disk_fallbacks.rs Fallback hive search for non-standard layouts
-│   └── vmdk_scan.rs     Sparse VMDK descriptor + extent parser
-├── disk/                Virtual disk format handlers
+│   └── vmdk_scan.rs     Bounded grain recovery: candidates, contiguous hives, fragments
+├── disk/                [feature: disk] Virtual disk formats + BitLocker sector reader
+│   ├── mod.rs          Format dispatch, DiskImage trait and shared I/O bounds
+│   ├── table.rs        Bounded on-demand allocation-table cache
 │   ├── vmdk.rs          VMware sparse/flat VMDK
+│   ├── vmdk/directory.rs Bounded grain-directory access and cache
 │   ├── vdi.rs           VirtualBox VDI (+ differencing chain)
 │   ├── qcow2.rs         QEMU QCOW2 (+ backing files)
 │   ├── vhd.rs           Hyper-V VHD (legacy)
 │   ├── vhdx.rs          Hyper-V VHDX
 │   ├── raw.rs           Raw/block device passthrough
-│   └── vmfs.rs          [feature: vmfs] VMFS-5/6 raw parser (LVM → SFD → FDC → FD → data)
+│   ├── bitlocker_decrypt.rs Transparent sector-decryption reader
+│   ├── vmfs.rs          [feature: vmfs] Public API and complete volume I/O workflow
+│   └── vmfs/
+│       ├── lvm.rs       Logical-to-physical extent mapping
+│       ├── metadata.rs  Superblock, resource metadata and file descriptors
+│       └── tests.rs     Directory, block mapping and descriptor-boundary regressions
+├── veeam/               [feature: veeam] Veeam backup access
+│   ├── disk.rs          Native adapter exposing backup images as disks
+│   └── upstream/        Imported vbktool implementation
 └── ntds/                [feature: ntds.dit] NTDS.dit ESE database parser
     ├── mod.rs           PEK decryption, hash extraction pipeline
     └── ese.rs           JET Blue database primitives (pages, B+ trees, columns)
 ```
+
+To follow a command, start at `cli::dispatch::run`. It checks VMFS options
+and directories first, then recognizes raw file combinations. For a single
+file, it selects the minidump, backup, disk or snapshot handler. Disk handlers
+process `--cp` before `--ls`, followed by extraction. `Args::requests_disk_mode`
+lists the options that force disk processing; `--chrome` also supports snapshots
+and therefore does not force that choice.
+
+`cli/disk.rs` keeps local-image processing and shared reader helpers. Its private
+submodules implement NTFS file operations, raw registry/NTDS input, VMFS and Veeam
+commands. Raw, VMFS and Veeam modules are gated by `sam`, `vmfs` and `veeam`;
+their entry points remain available through `cli::disk` re-exports.
+
+`cli/lsass.rs` is the parent module; `cli/lsass/` holds its private submodules.
+`snapshot` selects and opens the memory layer, then `pipeline` discovers System
+and runs the memory extraction stages. Chrome and BitLocker workflows have their
+own modules. These submodules require at least one backend; format selection and
+optional stages retain their individual feature gates.
+
+`cli/output.rs` exposes the output entry points and shared formatting helpers.
+Its private modules group formatters by data source and keep file exports separate.
+Registry, NTDS and CredMan output follow their respective features; disk master key
+output requires both `disk` and `dpapi`. LSA backup key export stays under `sam`,
+without requiring the `dpapi` feature.
+
+`disk/vmfs.rs` starts with the public API and flat-VMDK reader, followed by a single
+`Vmfs6Volume` implementation. Bootstrap, resource reads, block resolution and
+directory traversal stay together because they share the same volume state and
+call each other. LVM mapping and metadata decoding remain separate; the reader's
+unit tests are grouped in `vmfs/tests.rs`.
+
+`fs/ntfs_fallback.rs` keeps the degraded listing and recovery entry points.
+`records` decodes on-disk structures, `mft` handles bootstrap and both listing and
+target-file scans, and `data` reads file contents. Target-file search and `data`
+require `sam` or unit tests; disk-only listing remains available. Both search passes
+share one `ScanBudget`, with limits centralized in `fs/recovery.rs`.
+
+Veeam's imported implementation lives under `veeam/upstream/`, with its lint
+exceptions scoped to that module. The native `veeam/disk.rs` adapter uses the
+normal crate lint policy. Public Veeam module paths are preserved by re-exports
+in `veeam/mod.rs`.
 
 ## Chrome module (optional)
 
 Extracts browser secrets (passwords, cookies, autofill) from Chromium-family
 browsers (Chrome, Edge, Brave, Vivaldi, Opera) and Firefox. Gated by the
 `chrome` Cargo feature (not in the default set) and the `--chrome` runtime
-flag; depends on `sam` for NTFS and DPAPI primitives.
+flag; depends on `disk` and `dpapi`. SAM/LSA are optional secret sources; a build
+without `sam` can use explicit passwords/hashes or LSASS keys in hybrid mode.
 
 ```
 src/chrome/
@@ -99,7 +226,7 @@ src/chrome/
 ├── profile.rs        NTFS-walking profile + artifact discovery
 ├── disk.rs           per-profile SQLite decrypt + key derivation orchestrator
 ├── local_state.rs    parse Chrome/Edge "Local State" JSON for encrypted_key + ABE blob
-├── dpapi_decrypt.rs  DPAPI blob parser + AES-256-CBC / HMAC-SHA512 primitive
+├── dpapi_decrypt.rs  Compatibility re-export of dpapi::blob primitives
 ├── abe.rs            v20 App-Bound Encryption chain (two DPAPI layers + flag-keyed AES-GCM)
 ├── abe_keys.rs       auto-extract Chrome ABE static keys from elevation_service.exe
 ├── blob.rs           shared blob-shape helpers (v10 DPAPI prefix, v20 APPB header)
@@ -126,7 +253,7 @@ src/paging/regions.rs    page-walk top-down enumerator of mapped userland region
 
 The chain stitches three layers:
 
-- **DPAPI masterkey decryption** — for user MKs, `sam::dpapi_masterkey` runs
+- **DPAPI masterkey decryption** — for user MKs, `dpapi::masterkey` runs
   the Win10+ password-derived chain (PBKDF2-SHA512 with Microsoft's
   XOR-feedback variant) over every plaintext in LSA secrets plus the
   caller-supplied `--chrome-password` list. For SYSTEM-context MKs, both
@@ -189,5 +316,4 @@ the resulting CookieMonster. Until that signature work lands, the disk
 DPAPI chain remains the high-fidelity reference and the only
 structurally-reliable extractor.
 
-See [`docs/plans/2026-06-05-chrome-module-design.md`](plans/2026-06-05-chrome-module-design.md)
-for the full design spec.
+For the implemented browser workflows, start at [chrome/runner.rs](../src/chrome/runner.rs).

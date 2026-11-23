@@ -50,7 +50,7 @@ pub trait FileTree {
     fn list_dir(&mut self, path: &str) -> Result<Vec<String>>;
 
     /// Read a file by absolute path. Returns Ok(None) if the file does not exist.
-    /// Errors only for real I/O failures.
+    /// Errors include I/O failures and resource limits.
     fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>>;
 }
 
@@ -69,9 +69,7 @@ pub fn discover_chromium<T: FileTree>(tree: &mut T) -> Result<Vec<DiscoveredProf
             let Ok(profiles) = tree.list_dir(&root) else {
                 continue;
             };
-            let local_state = tree
-                .read_file(&format!(r"{root}\Local State"))
-                .unwrap_or(None);
+            let local_state = tree.read_file(&format!(r"{root}\Local State"))?;
             for prof in profiles {
                 if prof != "Default" && !prof.starts_with("Profile ") {
                     continue;
@@ -79,28 +77,19 @@ pub fn discover_chromium<T: FileTree>(tree: &mut T) -> Result<Vec<DiscoveredProf
                 let pdir = format!(r"{root}\{prof}");
                 let art = ProfileArtifacts {
                     local_state: local_state.clone(),
-                    login_data: tree
-                        .read_file(&format!(r"{pdir}\Login Data"))
-                        .unwrap_or(None),
-                    login_data_wal: tree
-                        .read_file(&format!(r"{pdir}\Login Data-wal"))
-                        .unwrap_or(None),
+                    login_data: tree.read_file(&format!(r"{pdir}\Login Data"))?,
+                    login_data_wal: tree.read_file(&format!(r"{pdir}\Login Data-wal"))?,
                     // Modern Chromium stores Cookies under <profile>\Network\
-                    cookies: tree
-                        .read_file(&format!(r"{pdir}\Network\Cookies"))
-                        .unwrap_or(None)
-                        .or_else(|| tree.read_file(&format!(r"{pdir}\Cookies")).unwrap_or(None)),
-                    cookies_wal: tree
-                        .read_file(&format!(r"{pdir}\Network\Cookies-wal"))
-                        .unwrap_or(None)
-                        .or_else(|| {
-                            tree.read_file(&format!(r"{pdir}\Cookies-wal"))
-                                .unwrap_or(None)
-                        }),
-                    web_data: tree.read_file(&format!(r"{pdir}\Web Data")).unwrap_or(None),
-                    web_data_wal: tree
-                        .read_file(&format!(r"{pdir}\Web Data-wal"))
-                        .unwrap_or(None),
+                    cookies: match tree.read_file(&format!(r"{pdir}\Network\Cookies"))? {
+                        Some(bytes) => Some(bytes),
+                        None => tree.read_file(&format!(r"{pdir}\Cookies"))?,
+                    },
+                    cookies_wal: match tree.read_file(&format!(r"{pdir}\Network\Cookies-wal"))? {
+                        Some(bytes) => Some(bytes),
+                        None => tree.read_file(&format!(r"{pdir}\Cookies-wal"))?,
+                    },
+                    web_data: tree.read_file(&format!(r"{pdir}\Web Data"))?,
+                    web_data_wal: tree.read_file(&format!(r"{pdir}\Web Data-wal"))?,
                 };
                 if art.login_data.is_none() && art.cookies.is_none() && art.web_data.is_none() {
                     continue;
@@ -126,7 +115,7 @@ use std::io::{Read, Seek};
 
 use crate::fs::{find_entry, list_directory, navigate_to_dir, read_file_data};
 
-/// FileTree backed by a live NTFS filesystem accessed via the existing sam helpers.
+/// FileTree backed by NTFS, with complete file reads limited to 128 MiB.
 ///
 /// We hold the parsed `Ntfs` and the mutable reader by reference; the root
 /// directory is re-resolved per call to keep lifetimes simple (NtfsFile borrows
@@ -171,6 +160,7 @@ impl<R: Read + Seek> FileTree for NtfsTree<'_, R> {
         };
         match read_file_data(&file, self.reader) {
             Ok(buf) => Ok(Some(buf)),
+            Err(error) if error.is_resource_limit() => Err(error),
             Err(_) => Ok(None),
         }
     }
@@ -219,5 +209,49 @@ mod tests {
         assert_eq!(found[0].profile.user, "alice");
         assert_eq!(found[0].profile.browser, Browser::Chrome);
         assert!(found[0].artifacts.login_data.is_some());
+    }
+
+    struct OversizedArtifact(&'static str);
+
+    impl FileTree for OversizedArtifact {
+        fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
+            Ok(match path {
+                "Users" => vec!["alice".into()],
+                r"Users\alice\AppData\Local\Google\Chrome\User Data" => vec!["Default".into()],
+                _ => Vec::new(),
+            })
+        }
+
+        fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            if path.ends_with(self.0) {
+                let limit = crate::fs::ntfs::MAX_BUFFERED_BYTES;
+                return Err(crate::error::VmkatzError::AllocTooLarge {
+                    what: "test browser artifact",
+                    requested: limit + 1,
+                    limit,
+                });
+            }
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn discovery_propagates_artifact_resource_limits() {
+        for path in [
+            r"User Data\Local State",
+            r"Default\Login Data",
+            r"Default\Login Data-wal",
+            r"Default\Network\Cookies",
+            r"Default\Network\Cookies-wal",
+            r"Default\Cookies",
+            r"Default\Cookies-wal",
+            r"Default\Web Data",
+            r"Default\Web Data-wal",
+        ] {
+            assert!(matches!(
+                discover_chromium(&mut OversizedArtifact(path)),
+                Err(crate::error::VmkatzError::AllocTooLarge { .. })
+            ));
+        }
     }
 }

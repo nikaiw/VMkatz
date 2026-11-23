@@ -193,11 +193,11 @@ impl VmwareLayer {
 
         // For mmap: use the mapping directly. For pread fallback: read the header
         // portion (first 8 MB covers all tag structures) for slice-based parsing.
-        let vmsn_data: std::borrow::Cow<[u8]> = if vmsn_mapped.is_pread() {
+        let vmsn_data: std::borrow::Cow<[u8]> = if let Some(data) = vmsn_mapped.as_bytes() {
+            std::borrow::Cow::Borrowed(data)
+        } else {
             let header_bytes = crate::utils::read_file_header(&vmsn_file, 8 * 1024 * 1024)?;
             std::borrow::Cow::Owned(header_bytes)
-        } else {
-            std::borrow::Cow::Borrowed(vmsn_mapped.as_bytes())
         };
 
         let (hdr, groups) = header::parse_vmsn(&vmsn_data)?;

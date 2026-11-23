@@ -57,8 +57,7 @@ struct MemRegion {
 impl Minidump {
     /// Open and parse a minidump file.
     pub fn open(path: &Path) -> Result<Self> {
-        // Mapped, not read: a complete memory dump is RAM-sized, and slurping one
-        // into a Vec is an allocation abort on any host with a sane pagefile.
+        // FileBytes uses mmap when possible; its fallback buffers the whole dump.
         let data = crate::utils::FileBytes::open(path).map_err(VmkatzError::Io)?;
         Self::parse_bytes(data)
     }

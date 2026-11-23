@@ -1,6 +1,6 @@
 use super::btree::walk_table;
 use super::page::Pager;
-use crate::error::Result;
+use crate::error::{Result, VmkatzError as Error};
 
 #[derive(Debug, Clone)]
 pub struct MasterEntry {
@@ -42,9 +42,13 @@ impl Pager<'_> {
     /// Look up a table by name and return its root page number, if any.
     pub fn root_of(&self, table: &str) -> Result<Option<u32>> {
         let tables = self.list_tables()?;
-        Ok(tables
+        tables
             .iter()
             .find(|t| t.name == table)
-            .map(|t| t.rootpage as u32))
+            .map(|t| {
+                u32::try_from(t.rootpage)
+                    .map_err(|_| Error::Parse("table root page out of range".into()))
+            })
+            .transpose()
     }
 }

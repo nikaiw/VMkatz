@@ -12,63 +12,13 @@ const PBOX: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7]
 /// Extract the 16-byte bootkey from SYSTEM hive data.
 pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
     let hive = Hive::new(system_hive_data)?;
-    let root = hive.root_key()?;
-
-    // Determine ControlSet numbers to try.
-    // Prefer Select\Current (canonical), fall back to trying 001/002/003 directly
-    // when Select is missing (e.g., incomplete hives from fragmented disks).
-    let cs_numbers = if let Ok(select) = root.subkey(&hive, "Select") {
-        match select.value_dword(&hive, "Current") {
-            Ok(current) => {
-                log::info!("Current ControlSet: {current}");
-                vec![current, 1, 2, 3]
-            }
-            Err(_) => vec![1, 2, 3],
+    let last_err = match hive.finish(extract_bootkey_tree(&hive)) {
+        Ok(key) => return Ok(key),
+        Err(error) if error.is_resource_limit() || matches!(error, VmkatzError::Io(_)) => {
+            return Err(error);
         }
-    } else {
-        log::info!("Select key not found, trying ControlSet001/002/003 directly");
-        vec![1, 2, 3]
+        Err(error) => Some(error),
     };
-
-    // Try each ControlSet until bootkey extraction succeeds
-    let mut last_err = None;
-    let mut seen = [false; 4]; // deduplicate cs_numbers (indices 1,2,3)
-    for cs_num in cs_numbers {
-        if cs_num == 0 || cs_num > 3 {
-            continue;
-        }
-        if seen[cs_num as usize] {
-            continue;
-        }
-        seen[cs_num as usize] = true;
-
-        let cs_name = format!("ControlSet{cs_num:03}");
-        let lsa = match root
-            .subkey(&hive, &cs_name)
-            .and_then(|cs| cs.subkey(&hive, "Control"))
-            .and_then(|ctrl| ctrl.subkey(&hive, "Lsa"))
-        {
-            Ok(lsa) => lsa,
-            Err(e) => {
-                log::debug!("ControlSet{cs_num:03}: LSA path not found: {e}");
-                last_err = Some(e);
-                continue;
-            }
-        };
-
-        match extract_bootkey_from_lsa(&hive, &lsa) {
-            Ok(bootkey) => {
-                if cs_num != 1 || seen[1] {
-                    log::info!("Bootkey extracted from ControlSet{cs_num:03}");
-                }
-                return Ok(bootkey);
-            }
-            Err(e) => {
-                log::debug!("ControlSet{cs_num:03}: bootkey extraction failed: {e}");
-                last_err = Some(e);
-            }
-        }
-    }
 
     // Fallback: brute-force scan all NK cells in the hive for JD/Skew1/GBG/Data.
     // On fragmented disks the tree navigation path (root→ControlSet→Control→Lsa)
@@ -97,6 +47,88 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
             VmkatzError::DecryptionError("No accessible ControlSet found in SYSTEM hive".into())
         }))
     }
+}
+
+pub fn extract_bootkey_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<[u8; 16]> {
+    let hive = Hive::from_reader(reader)?;
+    extract_bootkey_from_hive(&hive)
+}
+
+pub fn extract_bootkey_from_hive(hive: &Hive<'_>) -> Result<[u8; 16]> {
+    match hive.finish(extract_bootkey_tree(hive)) {
+        Ok(key) => Ok(key),
+        Err(error) if error.is_resource_limit() || matches!(error, VmkatzError::Io(_)) => {
+            Err(error)
+        }
+        Err(error) => hive.finish(stream_scan::recover(hive).and_then(|key| key.ok_or(error))),
+    }
+}
+
+mod stream_scan;
+
+fn extract_bootkey_tree(hive: &Hive<'_>) -> Result<[u8; 16]> {
+    let root = hive.root_key()?;
+
+    // Determine ControlSet numbers to try.
+    // Prefer Select\Current (canonical), fall back to trying 001/002/003 directly
+    // when Select is missing (e.g., incomplete hives from fragmented disks).
+    let cs_numbers = if let Ok(select) = root.subkey(hive, "Select") {
+        match select.value_dword(hive, "Current") {
+            Ok(current) => {
+                log::info!("Current ControlSet: {current}");
+                vec![current, 1, 2, 3]
+            }
+            Err(_) => vec![1, 2, 3],
+        }
+    } else {
+        log::info!("Select key not found, trying ControlSet001/002/003 directly");
+        vec![1, 2, 3]
+    };
+
+    // Try each ControlSet until bootkey extraction succeeds
+    let mut last_err = None;
+    let mut seen = [false; 4]; // deduplicate cs_numbers (indices 1,2,3)
+    for cs_num in cs_numbers {
+        if cs_num == 0 || cs_num > 3 {
+            continue;
+        }
+        if seen[cs_num as usize] {
+            continue;
+        }
+        seen[cs_num as usize] = true;
+
+        let cs_name = format!("ControlSet{cs_num:03}");
+        let lsa = match root
+            .subkey(hive, &cs_name)
+            .and_then(|cs| cs.subkey(hive, "Control"))
+            .and_then(|ctrl| ctrl.subkey(hive, "Lsa"))
+        {
+            Ok(lsa) => lsa,
+            Err(e) => {
+                log::debug!("ControlSet{cs_num:03}: LSA path not found: {e}");
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        match extract_bootkey_from_lsa(hive, &lsa) {
+            Ok(bootkey) => {
+                if cs_num != 1 || seen[1] {
+                    log::info!("Bootkey extracted from ControlSet{cs_num:03}");
+                }
+                return Ok(bootkey);
+            }
+            Err(e) => {
+                log::debug!("ControlSet{cs_num:03}: bootkey extraction failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| VmkatzError::DecryptionError("No accessible ControlSet found".into())))
 }
 
 /// Extract bootkey from a resolved LSA key.

@@ -2,30 +2,37 @@
 
 ## Unreleased
 
-### Fixes
-- **Large NTDS databases on ESXi** — ESE rows are processed as they are traversed instead of retaining one slice per row, avoiding the 8 MiB vector growth that aborted extraction on a reported 1.5 GiB `ntds.dit`. Page-cycle tracking now uses a compact, database-bounded bitmap, and the Python ESXi loader releases its ELF input buffer before transferring control.
-- **Veeam credential parity** — `--credman` now runs against disks inside Veeam backups, `--all` includes NTDS there as it does for local and VMFS disks, and `--partition` is honoured by the SAM, NTDS, DPAPI and credman reader paths.
-- **Complete NTDS account enumeration** — fixed-column offsets now come from the ESE catalog's `RecordOffset` field instead of the unrelated `SpaceUsage` field. This fixes `sAMAccountType` reads and preserves disabled, password-less, machine and trust accounts that were previously omitted. Verbose logs now report row and rejection counts.
-- **NTDS hash status** — only treat an absent password column as an empty-password hash; a hash decryption error no longer looks like a blank password.
-- **Certain NTDS domain labels and RIDs** — retain `dnsRoot` when checking `crossRef` uniqueness, compare exact binary domain SIDs, and decode SIDs' little-endian RIDs directly, so ambiguous crossRefs or endian heuristics cannot mislabel an account.
-- **NTDS history handling** — pair NT and LM history hashes within each account (avoiding cross-account matches on duplicate usernames), and include history entries in `--ntds-history --format brief` with distinct `_historyN` usernames.
-- **CredMan secret matching** — unresolved `DOMAIN\user` secrets now match Windows profile directories named `user.DOMAIN` (including numeric collision suffixes), and SID-keyed secrets are matched without case sensitivity.
-- **Vault record validation** — reject malformed `.vcrd` attribute-map sizes and offsets before attempting to decrypt their attributes.
-- **CredMan CSV output** — emit credentials, attributes, Vault records, notes and undecrypted items under one consistent header with a record type per row, so the output stays a valid rectangular CSV.
-- **CredMan scan diagnostics** — treat genuinely absent optional directories as normal, but report NTFS errors while listing profile, Protect, Credentials or Vault directories instead of silently skipping their contents.
-- **Typed NTFS missing-entry errors** — distinguish an absent directory entry from disk-format failures without parsing human-readable error strings.
-- **Checked dump and export offsets** — reject overflowing VMSN/VMware ranges and ccache fields instead of truncating offsets, principal lengths, key types or ticket times. Pread-backed files now retain their full `u64` length on 32-bit hosts.
-- **Bounded VMRS parsing and layout** — scan ObjectTables in overlapping windows instead of allocating the complete declared data region, cap individual KeyTables at 64 MiB, reject overflowing RAM extents and malformed variable-page sizes, and recover gracefully from poisoned internal cache locks.
+## v1.6.0-dev.1 — 2026-11-23
 
-### New Features
-- **NTDS domain prefix and history output** — usernames are prefixed by default when the account SID matches a domain SID recovered from the `ntds.dit` domain root and its LDAP `crossRef` NetBIOS name. UPN suffixes are not treated as proof of account domain; ambiguous or unmatched accounts stay unprefixed. `--ntds-domain-prefix DOMAIN` supplies an explicit override. CSV output populates its domain column. `--ntds-history` remains opt-in.
-- **`--credman`** — offline Windows Credential Manager extraction. Decrypts the on-disk `Credentials` store (including saved RDP/TERMSRV credentials) from a disk image by recovering DPAPI masterkeys: local users via their SAM NT hash, SYSTEM via `DPAPI_SYSTEM` (no extra input), and domain users via `--dpapi-nthash USER:HASH` (repeatable). Prints target, login and password.
-- **`--credman` now runs alongside `--ntds`** — previously `--ntds` short-circuited and credman was silently skipped. On a domain controller's disk the NT hashes from its own `NTDS.dit` are fed straight into the masterkey resolver, so domain users' Credential Manager entries and vaults decrypt with no extra flag (their masterkeys are context 3, derived from the NT hash). Wired on both the local-disk and VMFS NTDS paths (the VMFS one also previously handed credman no SAM/LSA secrets at all, so even SYSTEM entries failed). A supplied `--dpapi-nthash`/`--dpapi-password` still takes precedence. The vault csv table also gained the `sid` column
-- **CREDHIST chain** — a masterkey that predates the current password is now opened by walking `CREDHIST` for the previous password's SHA-1/NTLM hashes and retrying with each. Tried automatically as a last resort once the supplied credential fails, so no new flag. Chain crypto validated against a real Windows 10 `CREDHIST` with known ground truth
-- **`--dpapi-password USER:PASSWORD`** — supply a cleartext password so `--credman` can open a LOCAL account's DPAPI masterkey. Local (context-1) user masterkeys derive from the password, so an NT hash alone cannot open them; this is what unlocks a local user's saved RDP/Windows credentials and Vault
-- **`--credman` SYSTEM Protect fallback** — credman entries whose masterkey is not found in the user's Protect store (e.g. service profiles) are retried against the SYSTEM Protect store
-- **`--credman-attributes`** — enumerates CREDENTIAL attributes (keyword + encrypted value as hex); offline decryption of entropy-bound WindowsLive/SSO attribute blobs is not supported; adds an attribute table to `--format csv`
-- **`--credman` Vault store** — recovers the Windows Vault: decrypts `Policy.vpol` to the vault AES keys, then decodes each `*.vcrd` record (per-attribute AES, optional IV) into resource / identity / secret, printed in a `[+] Vault` section (and an extra csv table). Validated end-to-end against a real Windows 10 web-credential vault
+### Highlights
+
+- **Large disks** — read VMDK, VDI, VHD/VHDX and QCOW2 allocation tables on demand with bounded caches.
+- **Registry and NTDS** — stream SAM/SYSTEM/SECURITY and NTDS instead of loading whole files. Preserve ESXi fallbacks for hosts without usable mmap.
+- **Snapshots** — bound VirtualBox `.sav`, QEMU savevm and Hyper-V VMRS indexes, metadata and decompression caches.
+- **Offline features** — separate `disk`, `sam`, `dpapi` and `credman`; default builds retain existing capabilities.
+- **Credential Manager** — add `--credman` for Credentials/Vault, CREDHIST recovery, `--dpapi-password` and `--credman-attributes`. Support combined NTDS extraction and SYSTEM Protect fallback; entropy-bound attributes remain unsupported.
+- **NTDS output** — verified domain prefixes, `--ntds-domain-prefix` overrides and opt-in `--ntds-history` output.
+
+### Fixes
+
+- Correct QEMU final RAM updates and VMRS retry handling; preserve snapshot mappings when index limits are reached.
+- Validate offsets, lengths and snapshot chains before reading or allocating. Linux disks no longer trigger Windows recovery; automatic raw/grain recovery is disabled above 1 GiB.
+- Stream NTFS copies, refuse existing destinations and remove incomplete outputs. Distinguish missing paths from filesystem errors.
+- Correct NTDS account enumeration, RID/domain matching, hash-error reporting and per-account history pairing.
+- Fix CredMan profile matching, Vault validation, CSV formatting and scan diagnostics.
+- Propagate disk `--all` failures and align Veeam support for CredMan, NTDS and partition selection.
+- Report browser size-limit failures and reject oversized Veeam NTFS reads instead of silently skipping or truncating files.
+- Decode dense VMFS-5 sub-block addresses correctly; report failure when an explicitly selected VMDK has no NTFS/BitLocker volume.
+
+### Compatibility
+
+- DPAPI/CredMan APIs move out of `sam`; SAM-only builds no longer include them. `MappedFile::as_bytes()` returns `Option<&[u8]>`, and its `Deref` implementation is removed.
+- Remove `extract_ntds_artifacts*`, `with_ntds_artifacts` and `NtdsArtifacts`; use `with_ntds_bootkey` to stream NTDS/SYSTEM. `NtdsReadResult::system_size` is now `u64`. Generic buffered NTFS reads retain their 128 MiB limit; see [recovery limits](docs/examples.md#large-disks-and-damaged-ntfs-volumes).
+- Remove unused `open_all_vmfs6_vmdks`; enumerate with `list_vmfs6_vmdks` and open one disk at a time with `open_vmfs6_vmdk`.
+
+### Maintenance
+
+- Clarify CLI/reader organization and the architecture guide; strengthen Clippy, feature-matrix and regression checks. Publish `-dev` tags as prereleases.
 
 ## v1.5.2
 

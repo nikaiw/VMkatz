@@ -83,8 +83,9 @@ fn reader_looks_like_disk(reader: &LogicalFileReader) -> bool {
 /// chunk instead, or a byte-by-byte NTFS walk decompresses a block per byte.
 const CACHE_CHUNK: u64 = 64 * 1024;
 
-/// A Veeam-stored disk image as a flat, sector-addressable disk. Owns its
-/// [`LogicalFileReader`]; reads are reconstructed (decompressed/decrypted) on
+/// A Veeam-stored disk image as a flat, sector-addressable disk.
+///
+/// Owns its [`LogicalFileReader`]; reads are reconstructed (decompressed/decrypted) on
 /// demand, with a one-chunk cache so small local reads don't re-decompress.
 pub struct VbkDisk {
     reader: LogicalFileReader,
@@ -145,21 +146,10 @@ impl Read for VbkDisk {
 }
 
 impl Seek for VbkDisk {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        // Match File semantics: seeking past the end is allowed; reads there yield 0.
-        let new = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.len as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
-        };
-        if new < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start",
-            ));
-        }
-        self.pos = new as u64;
-        Ok(self.pos)
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = crate::disk::seek_position(self.pos, self.len, pos)?;
+        self.pos = target;
+        Ok(target)
     }
 }
 

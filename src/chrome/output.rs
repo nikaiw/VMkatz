@@ -15,6 +15,10 @@ pub fn render(findings: &ChromeFindings, fmt: Format) -> String {
     }
 }
 
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "formatting primitive and string values into String is infallible"
+)]
 fn render_pretty(f: &ChromeFindings) -> String {
     use std::collections::BTreeMap;
     type Key = (String, String, String); // (user, profile_name, browser)

@@ -1,15 +1,10 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use super::table::{Encoding, Table, TableCache};
 use super::{read_u32_be_file, read_u64_be_file};
 use crate::error::{Result, VmkatzError};
-
-/// Maximum number of L2 tables kept in cache.
-/// Each cached table holds `cluster_size / 8` entries of 8 bytes each,
-/// so with a 64 KB cluster size this is 64 * 8 KB = 512 KB of cache.
-const L2_CACHE_MAX_TABLES: usize = 64;
 
 /// QCOW2 magic: "QFI\xFB" as big-endian u32.
 const QCOW2_MAGIC: u32 = 0x514649FB;
@@ -25,25 +20,18 @@ const COMPRESSED_FLAG: u64 = 1 << 62;
 /// over the parent. Reserved (always 0) in v2, so the check is safe there too.
 const ZERO_FLAG: u64 = 1;
 
-/// Max backing-file chain depth. Real chains are a handful deep; the cap turns a
-/// circular chain (which would recurse forever and crash) into a clean error.
-const MAX_BACKING_DEPTH: u32 = 64;
-
 /// QCOW2 (QEMU Copy-On-Write v2/v3) disk image reader with backing file chain.
 pub struct QcowDisk {
     file: File,
     cluster_bits: u32,
     cluster_size: u64,
     l2_bits: u32,
-    /// Number of u64 entries in one L2 table (= cluster_size / 8).
-    l2_entries: usize,
-    l1_table: Vec<u64>,
+    l1_table: Table,
     disk_size: u64,
     cursor: u64,
     parent: Option<Box<Self>>,
-    /// Cache of L2 tables keyed by their on-disk byte offset.
-    /// Each value is the full L2 table decoded as big-endian u64 entries.
-    l2_cache: HashMap<u64, Vec<u64>>,
+    file_len: u64,
+    table_cache: TableCache,
 }
 
 struct QcowHeader {
@@ -114,11 +102,8 @@ impl QcowDisk {
     /// Backing-file chain depth is bounded so a circular chain errors instead of
     /// recursing until the stack overflows.
     fn open_with_depth(path: &Path, depth: u32) -> Result<Self> {
-        if depth > MAX_BACKING_DEPTH {
-            return Err(VmkatzError::Parse(format!(
-                "QCOW2 backing chain exceeds {MAX_BACKING_DEPTH} levels (circular chain?)"
-            )));
-        }
+        super::check_backing_depth(depth)?;
+
         let mut file = File::open(path)?;
         let header = parse_header(&mut file)?;
 
@@ -136,13 +121,13 @@ impl QcowDisk {
             header.l1_size,
         );
 
-        // Read L1 table (big-endian u64 entries)
-        file.seek(SeekFrom::Start(header.l1_table_offset))?;
-        // Cap pre-allocation; actual entries are read one-by-one from file
-        let mut l1_table = Vec::with_capacity((header.l1_size as usize).min(1 << 20));
-        for _ in 0..header.l1_size {
-            l1_table.push(read_u64_be_file(&mut file)?);
-        }
+        let file_len = file.seek(SeekFrom::End(0))?;
+        let l1_table = Table::new(
+            header.l1_table_offset,
+            u64::from(header.l1_size),
+            Encoding::Be64,
+            file_len,
+        )?;
 
         // Open backing file if present
         let parent = if header.backing_file_offset != 0 && header.backing_file_size > 0 {
@@ -157,35 +142,34 @@ impl QcowDisk {
             None
         };
 
-        let l2_entries = (cluster_size / 8) as usize;
-
         Ok(Self {
             file,
             cluster_bits,
             cluster_size,
             l2_bits,
-            l2_entries,
             l1_table,
             disk_size: header.disk_size,
             cursor: 0,
             parent,
-            l2_cache: HashMap::new(),
+            file_len,
+            table_cache: TableCache::default(),
         })
     }
 
     /// Read data at a given virtual offset within a single cluster boundary.
     /// Returns bytes read.
     fn read_cluster(&mut self, virtual_offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        let l1_idx = (virtual_offset >> (self.l2_bits + self.cluster_bits)) as usize;
-        let l2_idx = ((virtual_offset >> self.cluster_bits) & ((1 << self.l2_bits) - 1)) as usize;
+        let l1_idx = virtual_offset >> (self.l2_bits + self.cluster_bits);
+        let l2_idx = (virtual_offset >> self.cluster_bits) & ((1 << self.l2_bits) - 1);
         let cluster_off = virtual_offset & (self.cluster_size - 1);
 
         // Check L1 bounds
-        if l1_idx >= self.l1_table.len() {
+        let Some(l1_entry) = self
+            .table_cache
+            .read(&mut self.file, self.l1_table, l1_idx)?
+        else {
             return self.read_from_parent_or_zero(virtual_offset, buf);
-        }
-
-        let l1_entry = self.l1_table[l1_idx];
+        };
         let l2_table_offset = l1_entry & OFFSET_MASK;
 
         if l2_table_offset == 0 {
@@ -193,8 +177,21 @@ impl QcowDisk {
             return self.read_from_parent_or_zero(virtual_offset, buf);
         }
 
-        // Look up the L2 entry, using the cache to avoid per-cluster seeks.
-        let l2_entry = self.cached_l2_lookup(l2_table_offset, l2_idx)?;
+        let l2_table = Table::new(
+            l2_table_offset,
+            self.cluster_size / 8,
+            Encoding::Be64,
+            self.file_len,
+        )?;
+        let l2_entry = self
+            .table_cache
+            .read(&mut self.file, l2_table, l2_idx)?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "QCOW2 L2 index out of bounds",
+                )
+            })?;
 
         if l2_entry & COMPRESSED_FLAG != 0 {
             return Err(std::io::Error::new(
@@ -223,39 +220,6 @@ impl QcowDisk {
         self.file.read(buf)
     }
 
-    /// Look up a single L2 entry, reading and caching the entire L2 table on miss.
-    /// `l2_table_offset` is the on-disk byte offset of the L2 table.
-    /// `l2_idx` is the index within that table.
-    fn cached_l2_lookup(&mut self, l2_table_offset: u64, l2_idx: usize) -> std::io::Result<u64> {
-        // Fast path: table already cached.
-        if let Some(table) = self.l2_cache.get(&l2_table_offset) {
-            return Ok(table[l2_idx]);
-        }
-
-        // Cache miss: read the full L2 table (one cluster worth of u64 entries).
-        let l2_entries = self.l2_entries;
-        let mut raw = vec![0u8; l2_entries * 8];
-        self.file.seek(SeekFrom::Start(l2_table_offset))?;
-        self.file.read_exact(&mut raw)?;
-
-        let table: Vec<u64> = raw
-            .chunks_exact(8)
-            .map(|c| crate::utils::u64_be(c, 0))
-            .collect();
-
-        let entry = table[l2_idx];
-
-        // Evict the entire cache when it reaches the size limit.
-        // This is simple and effective: the working set will quickly re-populate.
-        if self.l2_cache.len() >= L2_CACHE_MAX_TABLES {
-            self.l2_cache.clear();
-        }
-
-        self.l2_cache.insert(l2_table_offset, table);
-
-        Ok(entry)
-    }
-
     /// Read from parent backing file, or return zeros if no parent.
     fn read_from_parent_or_zero(
         &mut self,
@@ -278,8 +242,7 @@ impl Read for QcowDisk {
             return Ok(0);
         }
 
-        let remaining = (self.disk_size - self.cursor) as usize;
-        let to_read = buf.len().min(remaining);
+        let to_read = crate::disk::read_len(self.disk_size - self.cursor, buf.len());
         if to_read == 0 {
             return Ok(0);
         }
@@ -305,19 +268,9 @@ impl Read for QcowDisk {
 
 impl Seek for QcowDisk {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(offset) => offset as i64,
-            SeekFrom::End(offset) => self.disk_size as i64 + offset,
-            SeekFrom::Current(offset) => self.cursor as i64 + offset,
-        };
-        if new_pos < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-        self.cursor = new_pos as u64;
-        Ok(self.cursor)
+        let target = crate::disk::seek_position(self.cursor, self.disk_size, pos)?;
+        self.cursor = target;
+        Ok(target)
     }
 }
 

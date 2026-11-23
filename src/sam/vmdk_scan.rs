@@ -1,76 +1,140 @@
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 use super::disk_fallbacks::{CLUSTER_SIZE, MAX_HIVE_SIZE, MIN_SYSTEM_HIVE_SIZE};
 use super::{bootkey, hive};
-use crate::error::Result;
+use crate::disk::DiskImage;
+use crate::disk::vmdk::VmdkDisk;
+use crate::error::{Result, VmkatzError};
+use crate::fs::recovery::{MAX_CANDIDATES, MAX_FILE_BYTES, ScanBudget, check_raw_size};
 
-/// Scan all physically allocated VMDK grains for registry hive signatures.
-///
-/// Three-phase approach:
-/// 1. Fast grain scan to collect candidate positions (regf headers, ALL hbin blocks)
-/// 2. Try contiguous reads from regf headers and hbin roots
-/// 3. Fragmented assembly: collect scattered hbin blocks by offset_in_hive,
-///    chain them to rebuild hives fragmented by NTFS
-#[expect(
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    reason = "grain scan, contiguous read and fragmented hbin assembly of registry hives; split tracked"
-)]
+#[cfg(test)]
+mod tests;
+
+/// Scan allocated VMDK grains with one budget shared by all recovery phases.
+/// Prefer complete registry files, then contiguous hbins, then fragments.
 pub(super) fn scan_vmdk_grains_for_hives(
-    vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    vmdk: &mut VmdkDisk,
 ) -> Result<(super::HiveFiles, Option<[u8; 16]>)> {
+    check_raw_size(vmdk.disk_size())?;
+    let budget = &ScanBudget::new();
     log::info!("Starting VMDK grain-direct scan for registry hives");
+    let candidates = collect_candidates(vmdk, budget)?;
+    let mut hives = RecoveredHives::default();
 
-    let mut grains_scanned = 0u64;
+    read_regf_hives(vmdk, budget, &candidates, &mut hives)?;
+    budget.check_time()?;
+    if hives.has_required() {
+        return hives.finish(&candidates, None);
+    }
 
-    // Phase 1: Collect candidates from grain data
-    let mut regf_candidates: Vec<(u64, u64)> = Vec::new(); // (virtual_offset, bins_size)
-    let mut hbin_root_candidates: Vec<(u64, String)> = Vec::new(); // (virtual_offset, name)
-    // ALL hbin blocks: (virtual_offset, offset_in_hive, block_size)
-    let mut all_hbin_blocks: Vec<(u64, u32, u32)> = Vec::new();
+    read_contiguous_hives(vmdk, budget, &candidates, &mut hives)?;
+    // Keep a small SYSTEM hive as fallback while trying fragmented recovery.
+    let mut small_system_fallback: Option<Vec<u8>> = None;
+    if let Some(sys) = hives.system.as_ref() {
+        if (sys.len() as u64) < MIN_SYSTEM_HIVE_SIZE {
+            log::info!(
+                "SYSTEM hive only {} bytes (< {} minimum), will try fragmented assembly",
+                sys.len(),
+                MIN_SYSTEM_HIVE_SIZE,
+            );
+            small_system_fallback = hives.system.take();
+        }
+    }
 
-    vmdk.scan_all_grains(|virtual_byte, grain_data| {
-        grains_scanned += 1;
+    budget.check_time()?;
+    if hives.has_required() {
+        return hives.finish(&candidates, None);
+    }
 
+    read_fragmented_hives(vmdk, budget, &candidates, &mut hives)?;
+    if hives.system.is_none() {
+        if let Some(small) = small_system_fallback {
+            log::info!(
+                "Using small SYSTEM hive fallback ({} bytes) from Phase 2b",
+                small.len(),
+            );
+            hives.system = Some(small);
+        }
+    }
+
+    // Gaps in SYSTEM may require recovering bootkey cells from separate hbins.
+    if candidates
+        .hbins
+        .iter()
+        .map(|&(_, _, size)| u64::from(size))
+        .sum::<u64>()
+        > MAX_FILE_BYTES
+    {
+        return Err(VmkatzError::RecoveryLimit(
+            "scattered hive blocks exceed 64 MiB",
+        ));
+    }
+    let scattered_bootkey = try_scattered_bootkey(vmdk, budget, &candidates.hbins);
+
+    budget.check_time()?;
+    hives.finish(&candidates, scattered_bootkey)
+}
+
+/// Candidate positions in scan order; no hive data is retained during collection.
+#[derive(Default)]
+struct HiveCandidates {
+    regf: Vec<(u64, u64)>,       // (virtual offset, bins size)
+    roots: Vec<(u64, String)>,   // (virtual offset, hive name)
+    hbins: Vec<(u64, u32, u32)>, // (virtual offset, offset in hive, block size)
+}
+
+impl HiveCandidates {
+    fn scan_grain(&mut self, virtual_byte: u64, grain_data: &[u8]) -> Result<()> {
         let mut pos = 0;
         while pos + CLUSTER_SIZE <= grain_data.len() {
+            if self.regf.len() + self.roots.len() + self.hbins.len() >= MAX_CANDIDATES {
+                return Err(VmkatzError::RecoveryLimit(
+                    "VMDK scan exceeds 65536 candidates",
+                ));
+            }
             let chunk = &grain_data[pos..];
 
-            // Check for "regf" signature
             if pos + 0x2C <= grain_data.len() && chunk[0..4] == *b"regf" {
-                let bins_size = u64::from(chunk.get(0x28..0x2C)
-                    .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                    .map_or(0, u32::from_le_bytes));
+                let bins_size = u64::from(
+                    chunk
+                        .get(0x28..0x2C)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                        .map_or(0, u32::from_le_bytes),
+                );
                 if bins_size > 0 && bins_size <= MAX_HIVE_SIZE {
-                    regf_candidates.push((virtual_byte + pos as u64, bins_size));
+                    self.regf.push((virtual_byte + pos as u64, bins_size));
                 }
             }
 
-            // Check for "hbin" signature (ANY hbin block, not just offset=0)
+            // Keep non-root hbins too, for fragmented recovery.
             if pos + 0x20 <= grain_data.len() && chunk[0..4] == *b"hbin" {
-                let hbin_hive_off = chunk.get(4..8)
+                let hbin_hive_off = chunk
+                    .get(4..8)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
                     .map_or(u32::MAX, u32::from_le_bytes);
-                let hbin_size = chunk.get(8..12)
+                let hbin_size = chunk
+                    .get(8..12)
                     .and_then(|s| <[u8; 4]>::try_from(s).ok())
                     .map_or(0, u32::from_le_bytes);
                 if (0x1000..=0x100000).contains(&hbin_size)
                     && u64::from(hbin_hive_off) < MAX_HIVE_SIZE
                     && hbin_hive_off % 0x1000 == 0
                 {
-                    all_hbin_blocks.push((virtual_byte + pos as u64, hbin_hive_off, hbin_size));
+                    self.hbins
+                        .push((virtual_byte + pos as u64, hbin_hive_off, hbin_size));
 
-                    // For offset=0 blocks, parse root NK cell to identify hive
+                    // The first hbin's root NK cell identifies the hive.
                     if hbin_hive_off == 0 {
                         let cell_off = 0x20;
                         if cell_off + 0x60 < chunk.len()
                             && &chunk[cell_off + 4..cell_off + 6] == b"nk"
                         {
-                            let name_len = chunk.get(cell_off + 0x4C..cell_off + 0x4E)
+                            let name_len = chunk
+                                .get(cell_off + 0x4C..cell_off + 0x4E)
                                 .and_then(|s| <[u8; 2]>::try_from(s).ok())
-                                .map_or(0, u16::from_le_bytes) as usize;
+                                .map_or(0, u16::from_le_bytes)
+                                as usize;
                             if name_len > 0 && cell_off + 0x50 + name_len <= chunk.len() {
                                 let name = String::from_utf8_lossy(
                                     &chunk[cell_off + 0x50..cell_off + 0x50 + name_len],
@@ -80,7 +144,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
                                     log::info!(
                                         "Grain scan: found {name} hbin(0) at virt 0x{virtual_byte:x}+0x{pos:x}",
                                     );
-                                    hbin_root_candidates.push((virtual_byte + pos as u64, name));
+                                    self.roots.push((virtual_byte + pos as u64, name));
                                 }
                             }
                         }
@@ -90,25 +154,95 @@ pub(super) fn scan_vmdk_grains_for_hives(
 
             pos += CLUSTER_SIZE;
         }
-        true // always scan all grains
-    })?;
+        Ok(())
+    }
+}
 
+#[derive(Default)]
+struct RecoveredHives {
+    sam: Option<Vec<u8>>,
+    system: Option<Vec<u8>>,
+    security: Option<Vec<u8>>,
+}
+
+impl RecoveredHives {
+    const fn has_required(&self) -> bool {
+        self.sam.is_some() && self.system.is_some()
+    }
+
+    /// Recovery phases only fill missing hives; earlier results keep priority.
+    fn missing_slot(&mut self, name: &str) -> Option<&mut Option<Vec<u8>>> {
+        match name {
+            "SAM" if self.sam.is_none() => Some(&mut self.sam),
+            "SYSTEM" if self.system.is_none() => Some(&mut self.system),
+            "SECURITY" if self.security.is_none() => Some(&mut self.security),
+            _ => None,
+        }
+    }
+
+    fn finish(
+        self,
+        candidates: &HiveCandidates,
+        bootkey: Option<[u8; 16]>,
+    ) -> Result<(super::HiveFiles, Option<[u8; 16]>)> {
+        let missing = match (self.sam, self.system) {
+            (Some(sam), Some(system)) => return Ok(((sam, system, self.security), bootkey)),
+            (None, None) => " SAM not found, SYSTEM not found",
+            (None, Some(_)) => " SAM not found",
+            (Some(_), None) => " SYSTEM not found",
+        };
+        let detail = if candidates.regf.is_empty() && candidates.roots.is_empty() {
+            format!("VMDK grain scan:{missing}")
+        } else {
+            format!(
+                "VMDK grain scan:{missing} ({} regf, {} hbin roots, {} total hbins scanned)",
+                candidates.regf.len(),
+                candidates.roots.len(),
+                candidates.hbins.len(),
+            )
+        };
+        Err(VmkatzError::DecryptionError(detail))
+    }
+}
+
+fn collect_candidates(vmdk: &mut VmdkDisk, budget: &ScanBudget) -> Result<HiveCandidates> {
+    let mut candidates = HiveCandidates::default();
+    let mut grains_scanned = 0u64;
+    let mut limit = None;
+    vmdk.scan_all_grains(|virtual_byte, grain_data| {
+        if let Err(e) = budget.check_time() {
+            limit = Some(e);
+            return false;
+        }
+        grains_scanned += 1;
+        if let Err(e) = candidates.scan_grain(virtual_byte, grain_data) {
+            limit = Some(e);
+            return false;
+        }
+        true
+    })?;
+    if let Some(e) = limit {
+        return Err(e);
+    }
     log::info!(
         "Grain scan complete: {} grains, {} regf candidates, {} hbin roots, {} total hbin blocks",
         grains_scanned,
-        regf_candidates.len(),
-        hbin_root_candidates.len(),
-        all_hbin_blocks.len(),
+        candidates.regf.len(),
+        candidates.roots.len(),
+        candidates.hbins.len(),
     );
+    Ok(candidates)
+}
 
-    // Phase 2: Try to read full hive data using VmdkDisk seek/read
-
-    let mut sam_data: Option<Vec<u8>> = None;
-    let mut system_data: Option<Vec<u8>> = None;
-    let mut security_data: Option<Vec<u8>> = None;
-
-    // 2a: Try regf candidates — read total_size bytes contiguously
-    for &(virt_off, bins_size) in &regf_candidates {
+/// Read complete hives from registry file headers.
+fn read_regf_hives(
+    vmdk: &mut VmdkDisk,
+    budget: &ScanBudget,
+    candidates: &HiveCandidates,
+    hives: &mut RecoveredHives,
+) -> Result<()> {
+    for &(virt_off, bins_size) in &candidates.regf {
+        budget.check_time()?;
         let total_size = (0x1000 + bins_size) as usize;
         if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
             continue;
@@ -124,37 +258,35 @@ pub(super) fn scan_vmdk_grains_for_hives(
             Ok(r) => r.name().to_uppercase(),
             Err(_) => continue,
         };
-        let target = match name.as_str() {
-            "SAM" if sam_data.is_none() => &mut sam_data,
-            "SYSTEM" if system_data.is_none() && total_size as u64 >= MIN_SYSTEM_HIVE_SIZE => {
-                &mut system_data
-            }
-            "SECURITY" if security_data.is_none() => &mut security_data,
-            _ => continue,
+        if name == "SYSTEM" && (total_size as u64) < MIN_SYSTEM_HIVE_SIZE {
+            continue;
+        }
+        let Some(target) = hives.missing_slot(&name) else {
+            continue;
         };
         log::info!("Grain scan: read {name} hive at virt 0x{virt_off:x} ({total_size} bytes)");
+        drop(h);
         *target = Some(data);
 
-        if sam_data.is_some() && system_data.is_some() {
+        if hives.sam.is_some() && hives.system.is_some() {
             break;
         }
     }
 
-    match (sam_data, system_data) {
-        (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
-        (s, sys) => {
-            sam_data = s;
-            system_data = sys;
-        }
-    }
+    Ok(())
+}
 
-    // 2b: Try hbin root candidates — read contiguous hbin blocks
-    for (hbin_virt, name) in &hbin_root_candidates {
-        let target = match name.as_str() {
-            "SAM" if sam_data.is_none() => &mut sam_data,
-            "SYSTEM" if system_data.is_none() => &mut system_data,
-            "SECURITY" if security_data.is_none() => &mut security_data,
-            _ => continue,
+/// Read consecutive hbin blocks starting at each root.
+fn read_contiguous_hives(
+    vmdk: &mut VmdkDisk,
+    budget: &ScanBudget,
+    candidates: &HiveCandidates,
+    hives: &mut RecoveredHives,
+) -> Result<()> {
+    for (hbin_virt, name) in &candidates.roots {
+        budget.check_time()?;
+        let Some(target) = hives.missing_slot(name) else {
+            continue;
         };
 
         let mut hbin_data = Vec::new();
@@ -199,7 +331,9 @@ pub(super) fn scan_vmdk_grains_for_hives(
             read_offset += block_size as u64;
         }
 
-        if let Some(hive_data) = build_hive_from_hbins(vmdk, name, &hbin_data, &regf_candidates) {
+        if let Some(hive_data) =
+            build_hive_from_hbins(vmdk, budget, name, &hbin_data, &candidates.regf)
+        {
             log::info!(
                 "Grain scan: valid {} hive from contiguous hbin at virt 0x{:x} ({} bytes)",
                 name,
@@ -210,64 +344,45 @@ pub(super) fn scan_vmdk_grains_for_hives(
         }
     }
 
-    // If SYSTEM hive is too small, save it as fallback but allow Phase 2c to try
-    // assembling a more complete hive from scattered hbin blocks.
-    let mut small_system_fallback: Option<Vec<u8>> = None;
-    if let Some(sys) = system_data.as_ref() {
-        if (sys.len() as u64) < MIN_SYSTEM_HIVE_SIZE {
-            log::info!(
-                "SYSTEM hive only {} bytes (< {} minimum), will try fragmented assembly",
-                sys.len(),
-                MIN_SYSTEM_HIVE_SIZE,
-            );
-            small_system_fallback = system_data.take();
-        }
-    }
+    Ok(())
+}
 
-    match (sam_data, system_data) {
-        (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
-        (s, sys) => {
-            sam_data = s;
-            system_data = sys;
-        }
-    }
-
-    // Phase 2c: Fragmented hive assembly
-    // Collect all hbin blocks scattered across the disk, group by offset_in_hive,
-    // and try to chain them into complete hives.
-    if !hbin_root_candidates.is_empty()
-        && (sam_data.is_none() || system_data.is_none() || security_data.is_none())
+/// Assemble missing hives from the indexed fragments.
+fn read_fragmented_hives(
+    vmdk: &mut VmdkDisk,
+    budget: &ScanBudget,
+    candidates: &HiveCandidates,
+    hives: &mut RecoveredHives,
+) -> Result<()> {
+    if !candidates.roots.is_empty()
+        && (hives.sam.is_none() || hives.system.is_none() || hives.security.is_none())
     {
         log::info!(
             "Attempting fragmented hive assembly from {} hbin blocks",
-            all_hbin_blocks.len()
+            candidates.hbins.len()
         );
 
         // Build lookup: offset_in_hive → list of (virtual_offset, block_size)
         let mut hbin_by_offset: HashMap<u32, Vec<(u64, u32)>> = HashMap::new();
-        for &(virt_off, off_in_hive, blk_size) in &all_hbin_blocks {
+        for &(virt_off, off_in_hive, blk_size) in &candidates.hbins {
             hbin_by_offset
                 .entry(off_in_hive)
                 .or_default()
                 .push((virt_off, blk_size));
         }
 
-        // Find the target bins_size for each hive from regf candidates
-        let regf_info = find_regf_for_hives(vmdk, &regf_candidates);
+        let regf_info = find_regf_for_hives(vmdk, budget, &candidates.regf);
 
-        for (hbin_virt, name) in &hbin_root_candidates {
-            let target = match name.as_str() {
-                "SAM" if sam_data.is_none() => &mut sam_data,
-                "SYSTEM" if system_data.is_none() => &mut system_data,
-                "SECURITY" if security_data.is_none() => &mut security_data,
-                _ => continue,
+        for (hbin_virt, name) in &candidates.roots {
+            budget.check_time()?;
+            let Some(target) = hives.missing_slot(name) else {
+                continue;
             };
 
             let bins_size = if let Some(&(_, bs)) = regf_info.get(name.as_str()) {
                 bs as u32
             } else {
-                // No matching regf header. Use conservative default size.
-                // Greedy assembly will fill gaps with zeros.
+                // Without a header, use a fixed size; greedy assembly zero-fills gaps.
                 let default = match name.as_str() {
                     "SYSTEM" => 0x800000u32, // 8MB
                     _ => 0x10000u32,         // 64KB for SAM/SECURITY
@@ -278,10 +393,8 @@ pub(super) fn scan_vmdk_grains_for_hives(
                 default
             };
 
-            // Read the root hbin block
-            let root_blocks = match hbin_by_offset.get(&0) {
-                Some(v) => v.clone(),
-                None => continue,
+            let Some(root_blocks) = hbin_by_offset.get(&0) else {
+                continue;
             };
             let root_entry = root_blocks.iter().find(|&&(vo, _)| vo == *hbin_virt);
             let root_block_size = match root_entry {
@@ -289,9 +402,9 @@ pub(super) fn scan_vmdk_grains_for_hives(
                 None => 0x1000, // default
             };
 
-            // Assemble: chain hbin blocks by offset_in_hive
             let assembled = assemble_fragmented_hive(
                 vmdk,
+                budget,
                 &hbin_by_offset,
                 name,
                 bins_size,
@@ -301,7 +414,7 @@ pub(super) fn scan_vmdk_grains_for_hives(
 
             if let Some(hbin_data) = assembled {
                 if let Some(hive_data) =
-                    build_hive_from_hbins(vmdk, name, &hbin_data, &regf_candidates)
+                    build_hive_from_hbins(vmdk, budget, name, &hbin_data, &candidates.regf)
                 {
                     log::info!(
                         "Grain scan: valid {} hive assembled from fragmented hbin blocks ({} bytes)",
@@ -314,59 +427,14 @@ pub(super) fn scan_vmdk_grains_for_hives(
         }
     }
 
-    // Restore small SYSTEM fallback if Phase 2c didn't find a better one
-    if system_data.is_none() {
-        if let Some(small) = small_system_fallback {
-            log::info!(
-                "Using small SYSTEM hive fallback ({} bytes) from Phase 2b",
-                small.len(),
-            );
-            system_data = Some(small);
-        }
-    }
-
-    // Phase 3: Try scattered block bootkey extraction as fallback.
-    // When the SYSTEM hive has gaps (fragmented assembly), regular bootkey
-    // extraction may fail. Scanning individual hbin blocks can find bootkey
-    // NK cells that survived in available grains.
-    let scattered_bootkey = try_scattered_bootkey(vmdk, &all_hbin_blocks);
-
-    let has_sam = sam_data.is_some();
-    let has_system = system_data.is_some();
-    if let (Some(sam), Some(system)) = (sam_data, system_data) {
-        Ok(((sam, system, security_data), scattered_bootkey))
-    } else {
-        let mut detail = "VMDK grain scan:".to_string();
-        if !has_sam {
-            detail.push_str(" SAM not found");
-        }
-        if !has_system {
-            if !has_sam {
-                detail.push(',');
-            }
-            detail.push_str(" SYSTEM not found");
-        }
-        if !regf_candidates.is_empty() || !hbin_root_candidates.is_empty() {
-            let _ = write!(
-                detail,
-                " ({} regf, {} hbin roots, {} total hbins scanned)",
-                regf_candidates.len(),
-                hbin_root_candidates.len(),
-                all_hbin_blocks.len(),
-            );
-        }
-        Err(crate::error::VmkatzError::DecryptionError(detail))
-    }
+    Ok(())
 }
 
-/// Read all hbin blocks from VMDK and scan for bootkey NK cells.
-///
-/// This is a last-resort fallback: when the assembled SYSTEM hive has gaps
-/// (missing extents), tree navigation and the per-hive NK scan both fail.
-/// Here we read every physically present hbin block and search for
-/// JD/Skew1/GBG/Data NK cells with valid hex class names.
+/// Recover bootkey cells from separate hbins when SYSTEM has gaps.
+/// Look for JD/Skew1/GBG/Data NK cells with valid hex class names.
 fn try_scattered_bootkey(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     all_hbin_blocks: &[(u64, u32, u32)],
 ) -> Option<[u8; 16]> {
     if all_hbin_blocks.is_empty() {
@@ -380,7 +448,7 @@ fn try_scattered_bootkey(
 
     let mut blocks: Vec<(u32, Vec<u8>)> = Vec::new();
     for &(virt_off, off_in_hive, blk_size) in all_hbin_blocks {
-        // Limit block reads to reasonable sizes
+        budget.check_time().ok()?;
         if blk_size > 0x100000 {
             continue;
         }
@@ -405,11 +473,15 @@ fn try_scattered_bootkey(
 /// Returns name → (virtual_offset, bins_size).
 fn find_regf_for_hives(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     regf_candidates: &[(u64, u64)],
 ) -> HashMap<&'static str, (u64, u64)> {
     let mut result: HashMap<&'static str, (u64, u64)> = HashMap::new();
 
     for &(roff, rbins) in regf_candidates {
+        if budget.check_time().is_err() {
+            return result;
+        }
         if vmdk.seek(SeekFrom::Start(roff + 0x30)).is_err() {
             continue;
         }
@@ -431,7 +503,7 @@ fn find_regf_for_hives(
             continue;
         };
 
-        // Prefer the regf with the largest bins_size (most recent/complete)
+        // Prefer the largest candidate as a completeness heuristic.
         log::info!(
             "Matched regf at 0x{:x} as {} (bins_size=0x{:x}, path={})",
             roff,
@@ -446,19 +518,16 @@ fn find_regf_for_hives(
     result
 }
 
-/// Assemble a fragmented hive by chaining hbin blocks from the global collection.
-///
-/// For small hives (SAM, SECURITY ≤ 256KB), tries all candidates at each offset
-/// with backtracking. For large hives (SYSTEM), uses greedy first-match.
+/// Assemble hbins with backtracking for hives up to 256 KiB, then greedy fallback.
 fn assemble_fragmented_hive(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     hbin_by_offset: &HashMap<u32, Vec<(u64, u32)>>,
     name: &str,
     bins_size: u32,
     root_virt: u64,
     root_block_size: u32,
 ) -> Option<Vec<u8>> {
-    // Read the root hbin block first
     if vmdk.seek(SeekFrom::Start(root_virt)).is_err() {
         return None;
     }
@@ -467,72 +536,63 @@ fn assemble_fragmented_hive(
         return None;
     }
 
-    // For small hives, try backtracking search first, fall back to greedy.
-    // For large hives, go straight to greedy.
     let max_backtrack_size = 256 * 1024u32; // 256KB
     if bins_size <= max_backtrack_size {
         if let Some(result) =
-            assemble_with_backtracking(vmdk, hbin_by_offset, name, bins_size, &root_data)
+            assemble_with_backtracking(vmdk, budget, hbin_by_offset, name, bins_size, &root_data)
         {
             return Some(result);
         }
         log::info!("Fragmented {name}: backtracking failed, trying greedy fallback");
     }
-    assemble_greedy(vmdk, hbin_by_offset, name, bins_size, root_data)
+    assemble_greedy(vmdk, budget, hbin_by_offset, name, bins_size, root_data)
 }
 
-/// Backtracking assembly for small hives (SAM, SECURITY).
-///
-/// Sorts candidates at each offset by proximity to the root hbin block
-/// (NTFS fragments tend to be nearby), then uses depth-first search with
-/// incremental validation: after placing each block, checks if the partial
-/// hive can parse successfully.
+/// Search candidate chains nearest-first and validate each complete assembly.
 fn assemble_with_backtracking(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     hbin_by_offset: &HashMap<u32, Vec<(u64, u32)>>,
     name: &str,
     bins_size: u32,
     root_data: &[u8],
 ) -> Option<Vec<u8>> {
     let root_virt = {
-        // Find root block virtual address from the hbin_by_offset map
         let root_cands = hbin_by_offset.get(&0)?;
-        // Use the first candidate at offset 0 (the one matching our root_data)
+        // Approximate locality using the first root candidate.
         root_cands.first()?.0
     };
 
-    // Sort candidates at each offset by proximity to root_virt.
-    // Closer blocks are more likely to belong to the same file (NTFS locality).
+    // Nearby NTFS fragments are more likely to belong to the same hive.
     let mut sorted_by_offset: HashMap<u32, Vec<(u64, u32)>> = HashMap::new();
     for (&off, cands) in hbin_by_offset {
+        budget.check_time().ok()?;
         if off == 0 || off >= bins_size {
             continue;
         }
         let mut sorted = cands.clone();
         sorted.sort_by_key(|&(virt, _)| virt.abs_diff(root_virt));
-        // Limit to closest candidates to keep search manageable
+        // Bound branching at each hive offset.
         sorted.truncate(10);
         sorted_by_offset.insert(off, sorted);
     }
 
-    // Depth-first search with proximity-sorted candidates.
     // choices[i] = (offset_in_hive, candidate_index, block_data)
     let mut choices: Vec<(u32, usize, Vec<u8>)> = Vec::new();
     let mut current_offset = root_data.len() as u32;
     let mut validations = 0u32;
     let max_validations = 2000u32;
-    // Track first structurally valid assembly as fallback when strict validation
-    // never passes (e.g., delta disks where subkeys are in base disk)
+    // Delta disks may lack subkeys: keep the first structurally valid fallback.
     let mut first_structural: Option<Vec<u8>> = None;
 
     'outer: loop {
+        budget.check_time().ok()?;
         if validations > max_validations {
             log::info!("Fragmented {name}: exceeded {max_validations} validations, giving up");
             break;
         }
 
         if current_offset >= bins_size {
-            // Full chain — assemble and validate
             validations += 1;
             let assembled = assemble_from_choices(root_data, &choices);
             if validate_hive_content(name, &assembled) {
@@ -545,22 +605,32 @@ fn assemble_with_backtracking(
                 );
                 return Some(assembled);
             }
-            // Save first structurally valid assembly as fallback
             if first_structural.is_none() && validate_hive_structure(name, &assembled) {
                 first_structural = Some(assembled);
             }
             // Backtrack: try next candidate at the deepest level
-            if !do_backtrack(vmdk, &mut choices, &mut current_offset, &sorted_by_offset) {
+            if !do_backtrack(
+                vmdk,
+                budget,
+                &mut choices,
+                &mut current_offset,
+                &sorted_by_offset,
+            ) {
                 break;
             }
             continue;
         }
 
-        // Find candidates at current_offset
         let candidates = match sorted_by_offset.get(&current_offset) {
             Some(v) if !v.is_empty() => v,
             _ => {
-                if !do_backtrack(vmdk, &mut choices, &mut current_offset, &sorted_by_offset) {
+                if !do_backtrack(
+                    vmdk,
+                    budget,
+                    &mut choices,
+                    &mut current_offset,
+                    &sorted_by_offset,
+                ) {
                     log::info!("Fragmented {name}: no candidates at offset 0x{current_offset:x}");
                     break;
                 }
@@ -568,9 +638,9 @@ fn assemble_with_backtracking(
             }
         };
 
-        // Try candidates starting from index 0 (proximity-sorted, closest first)
         for (ci, &(virt_off, blk_size)) in candidates.iter().enumerate() {
-            if let Some(block) = read_hbin_at(vmdk, virt_off, blk_size, current_offset) {
+            budget.check_time().ok()?;
+            if let Some(block) = read_hbin_at(vmdk, budget, virt_off, blk_size, current_offset) {
                 choices.push((current_offset, ci, block));
                 current_offset += blk_size;
                 continue 'outer;
@@ -578,12 +648,17 @@ fn assemble_with_backtracking(
         }
 
         // All candidates unreadable — backtrack
-        if !do_backtrack(vmdk, &mut choices, &mut current_offset, &sorted_by_offset) {
+        if !do_backtrack(
+            vmdk,
+            budget,
+            &mut choices,
+            &mut current_offset,
+            &sorted_by_offset,
+        ) {
             break;
         }
     }
 
-    // If strict validation never passed, use first structurally valid assembly
     if let Some(data) = first_structural {
         log::info!(
             "Fragmented {}: using structurally valid assembly ({} bytes, subkey check failed)",
@@ -600,10 +675,12 @@ fn assemble_with_backtracking(
 /// Read and validate an hbin block from virtual disk.
 fn read_hbin_at(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     virt_off: u64,
     blk_size: u32,
     expected_offset: u32,
 ) -> Option<Vec<u8>> {
+    budget.check_time().ok()?;
     if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
         return None;
     }
@@ -632,25 +709,30 @@ fn assemble_from_choices(root_data: &[u8], choices: &[(u32, usize, Vec<u8>)]) ->
     assembled
 }
 
-/// Backtrack: pop last choice, try next candidates at that offset (reading block data).
-/// If all candidates at that offset exhausted, pop further.
+/// Backtrack until an alternative readable block is found.
 fn do_backtrack(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     choices: &mut Vec<(u32, usize, Vec<u8>)>,
     current_offset: &mut u32,
     sorted_by_offset: &HashMap<u32, Vec<(u64, u32)>>,
 ) -> bool {
     while let Some((off, ci, _)) = choices.pop() {
+        if budget.check_time().is_err() {
+            return false;
+        }
         if let Some(candidates) = sorted_by_offset.get(&off) {
             for (next_ci, &(virt_off, blk_size)) in candidates.iter().enumerate().skip(ci + 1) {
-                if let Some(block) = read_hbin_at(vmdk, virt_off, blk_size, off) {
+                if budget.check_time().is_err() {
+                    return false;
+                }
+                if let Some(block) = read_hbin_at(vmdk, budget, virt_off, blk_size, off) {
                     choices.push((off, next_ci, block));
                     *current_offset = off + blk_size;
                     return true;
                 }
             }
         }
-        // All candidates exhausted at this offset — backtrack further
     }
     false
 }
@@ -659,6 +741,7 @@ fn do_backtrack(
 /// For each needed offset, reads the first available candidate.
 fn assemble_greedy(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     hbin_by_offset: &HashMap<u32, Vec<(u64, u32)>>,
     name: &str,
     bins_size: u32,
@@ -670,11 +753,13 @@ fn assemble_greedy(
     let mut blocks_missing = 0u32;
 
     while next_offset < bins_size {
+        budget.check_time().ok()?;
         let candidates = hbin_by_offset.get(&next_offset);
         let mut found = false;
 
         if let Some(cands) = candidates {
             for &(virt_off, blk_size) in cands {
+                budget.check_time().ok()?;
                 if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
                     continue;
                 }
@@ -698,8 +783,7 @@ fn assemble_greedy(
         }
 
         if !found {
-            // Fill gap with zeros (this offset's data is in a missing extent)
-            // Use 0x1000 as default block size for gaps
+            // Preserve offsets across missing extents with a zero-filled 4 KiB gap.
             let gap_size = 0x1000u32;
             let zeros = vec![0u8; gap_size as usize];
             assembled.extend_from_slice(&zeros);
@@ -759,9 +843,7 @@ fn validate_hive_content(name: &str, hbin_data: &[u8]) -> bool {
     }
 }
 
-/// Relaxed validation: only checks root key name matches the expected hive.
-/// Used as fallback when strict validation fails (e.g., delta disks where
-/// subkeys exist only in volatile storage or in the base disk).
+/// Accept a matching root name when missing subkeys prevent strict validation.
 fn validate_hive_structure(name: &str, hbin_data: &[u8]) -> bool {
     let hive_data = build_temp_hive(hbin_data);
     let Ok(h) = hive::Hive::new(&hive_data) else {
@@ -775,6 +857,7 @@ fn validate_hive_structure(name: &str, hbin_data: &[u8]) -> bool {
 /// Finds the best matching regf header and validates the result.
 fn build_hive_from_hbins(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    budget: &ScanBudget,
     name: &str,
     hbin_data: &[u8],
     regf_candidates: &[(u64, u64)],
@@ -783,9 +866,9 @@ fn build_hive_from_hbins(
         return None;
     }
 
-    // Find matching regf header by path
     let mut best_regf: Option<(u64, u64)> = None;
     for &(roff, rbins) in regf_candidates {
+        budget.check_time().ok()?;
         if vmdk.seek(SeekFrom::Start(roff + 0x30)).is_err() {
             continue;
         }
@@ -813,7 +896,6 @@ fn build_hive_from_hbins(
         hbin_data.len() as u32
     };
 
-    // Build regf header
     let mut regf_hdr = vec![0u8; 0x1000];
     regf_hdr[0..4].copy_from_slice(b"regf");
     regf_hdr[0x24..0x28].copy_from_slice(&0x20u32.to_le_bytes());
@@ -833,13 +915,11 @@ fn build_hive_from_hbins(
         hive_data.extend_from_slice(&hbin_data[..actual_bins as usize]);
     } else {
         hive_data.extend_from_slice(hbin_data);
-        // Pad if we have less data than bins_size
         if (hbin_data.len() as u32) < bins_size {
             hive_data.resize(0x1000 + bins_size as usize, 0);
         }
     }
 
-    // Validate: try strict first (expected subkeys), fall back to structural (root name only)
     let Ok(h) = hive::Hive::new(&hive_data) else {
         return None;
     };
@@ -863,7 +943,8 @@ fn build_hive_from_hbins(
             "build_hive_from_hbins: {name} root key found but expected subkeys missing (delta disk?)",
         );
     }
-    // Accept if root name matches — the extraction pipeline will report
-    // specific errors if needed data is missing
+    drop(root);
+    drop(h);
+    // Extraction reports missing data after this structural check.
     Some(hive_data)
 }

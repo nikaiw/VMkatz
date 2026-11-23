@@ -63,6 +63,11 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
         ));
     }
 
+    // Raw NTFS / BitLocker volume images have no partition table.
+    if &mbr[3..11] == b"NTFS    " || &mbr[3..11] == BITLOCKER_OEM_ID {
+        return Ok(vec![0]);
+    }
+
     let mut partitions = Vec::new();
     let mut protective = false;
 
@@ -83,7 +88,8 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
             protective = true;
         }
         // NTFS partition type is 0x07
-        if part_type == 0x07 && lba_start > 0 {
+        if part_type == 0x07 && lba_start > 0 && is_windows_vbr(reader, u64::from(lba_start) * 512)
+        {
             partitions.push(u64::from(lba_start) * 512);
         }
     }
@@ -111,16 +117,16 @@ pub fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
     Ok(partitions)
 }
 
-/// Check for an NTFS volume boot record (OEM id "NTFS    " at +3).
-fn is_ntfs_vbr<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
+/// Check for NTFS or BitLocker using the volume boot record OEM identifier.
+fn is_windows_vbr<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
     let mut vbr = [0u8; 512];
     reader.seek(SeekFrom::Start(offset)).is_ok()
         && reader.read_exact(&mut vbr).is_ok()
-        && &vbr[3..11] == b"NTFS    "
+        && (&vbr[3..11] == b"NTFS    " || &vbr[3..11] == BITLOCKER_OEM_ID)
 }
 
-/// Parse GPT partition table and find NTFS partitions. A valid NTFS VBR is required
-/// for every accepted offset (the partition type GUID is not used for acceptance).
+/// Parse GPT partition table and find Windows volumes. An NTFS
+/// or BitLocker VBR is required (the type GUID alone is insufficient).
 fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     const MAX_ENTRIES: u32 = 256;
 
@@ -200,7 +206,7 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
 
         // The Basic Data GUID also covers FAT/exFAT volumes, so a valid NTFS VBR
         // is required for every accepted offset.
-        if is_ntfs_vbr(reader, offset) && !partitions.contains(&offset) {
+        if is_windows_vbr(reader, offset) && !partitions.contains(&offset) {
             log::debug!("GPT partition {i}: NTFS candidate at LBA {first_lba}");
             partitions.push(offset);
         }
@@ -325,6 +331,7 @@ mod tests {
         let mut d = vec![0u8; 512 * 4];
         d[0x1BE + 4] = 0x07;
         d[0x1BE + 8] = 2;
+        d[1027..1035].copy_from_slice(b"NTFS    ");
         d[510] = 0x55;
         d[511] = 0xAA;
         let mut c = std::io::Cursor::new(d);

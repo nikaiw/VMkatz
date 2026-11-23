@@ -1,11 +1,16 @@
 #[cfg(feature = "chrome")]
 pub mod chrome;
+#[cfg(feature = "credman")]
+pub mod credman;
 pub mod discover;
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub mod disk;
+#[cfg(feature = "dpapi")]
+pub mod dpapi;
 #[cfg(feature = "dump")]
 pub mod dump;
 pub mod error;
+#[cfg(feature = "disk")]
 pub mod fs;
 #[cfg(feature = "hyperv")]
 pub mod hyperv;
@@ -20,6 +25,8 @@ pub mod pe;
 pub mod qemu;
 #[cfg(feature = "sam")]
 pub mod sam;
+#[cfg(feature = "disk")]
+pub mod secrets;
 pub mod utils;
 #[cfg(feature = "vbox")]
 pub mod vbox;

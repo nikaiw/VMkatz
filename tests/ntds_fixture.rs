@@ -34,6 +34,35 @@ fn ntds_fixture_rids_and_hashes_are_sane() {
     let hashes = vmkatz::ntds::extract_ad_hashes(&ntds_data, &system_data, false)
         .expect("extract_ad_hashes on the fixture");
 
+    let (context, streamed) = vmkatz::ntds::extract_ad_hashes_from_reader(
+        std::fs::File::open(&dit).expect("open NTDS stream"),
+        &system_data,
+        false,
+    )
+    .expect("streamed extraction");
+    assert_eq!(context.ntds_size, ntds_data.len() as u64);
+    let streamed_bootkey = vmkatz::sam::bootkey::extract_bootkey_from_reader(
+        std::fs::File::open(&system).expect("open SYSTEM stream"),
+    )
+    .expect("streamed SYSTEM bootkey");
+    assert!(
+        streamed_bootkey == context.boot_key,
+        "streamed SYSTEM bootkey differs"
+    );
+    assert!(
+        hashes.len() == streamed.len()
+            && hashes.iter().zip(&streamed).all(|(a, b)| {
+                a.username == b.username
+                    && a.domain == b.domain
+                    && a.rid == b.rid
+                    && a.lm_hash == b.lm_hash
+                    && a.nt_hash == b.nt_hash
+                    && a.is_history == b.is_history
+                    && a.history_index == b.history_index
+            }),
+        "streamed NTDS output differs from slice-backed parsing"
+    );
+
     assert!(
         hashes.len() >= 30,
         "expected a populated DC datatable, got {} entries",

@@ -17,7 +17,7 @@ type DomainSidMap = HashMap<Vec<u8>, String>;
 /// High-level NTDS context extracted from disk artifacts.
 #[derive(Debug, Clone)]
 pub struct NtdsContext {
-    pub ntds_size: usize,
+    pub ntds_size: u64,
     pub boot_key: [u8; 16],
 }
 
@@ -73,7 +73,7 @@ pub fn build_context(ntds_data: &[u8], system_data: &[u8]) -> Result<NtdsContext
 
     let boot_key = crate::sam::bootkey::extract_bootkey(system_data)?;
     Ok(NtdsContext {
-        ntds_size: ntds_data.len(),
+        ntds_size: ntds_data.len() as u64,
         boot_key,
     })
 }
@@ -95,6 +95,39 @@ pub fn extract_ad_hashes(
     let ctx = build_context(ntds_data, system_data)?;
     let db = EseDb::open(ntds_data)?;
 
+    extract_from_database(&db, &ctx, include_history)
+}
+
+/// Extract from a seekable database without a complete NTDS buffer or mmap.
+pub fn extract_ad_hashes_from_reader<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    system_data: &[u8],
+    include_history: bool,
+) -> Result<(NtdsContext, Vec<AdHashEntry>)> {
+    let boot_key = crate::sam::bootkey::extract_bootkey(system_data)?;
+    extract_ad_hashes_with_bootkey(reader, boot_key, include_history)
+}
+
+/// Extract from a seekable NTDS using an already extracted SYSTEM bootkey.
+pub fn extract_ad_hashes_with_bootkey<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    boot_key: [u8; 16],
+    include_history: bool,
+) -> Result<(NtdsContext, Vec<AdHashEntry>)> {
+    let db = EseDb::from_reader(reader)?;
+    let ctx = NtdsContext {
+        ntds_size: db.len(),
+        boot_key,
+    };
+    let hashes = extract_from_database(&db, &ctx, include_history)?;
+    Ok((ctx, hashes))
+}
+
+fn extract_from_database(
+    db: &EseDb<'_>,
+    ctx: &NtdsContext,
+    include_history: bool,
+) -> Result<Vec<AdHashEntry>> {
     // Log available tables for debugging
     let tables = db.table_names();
     log::info!("NTDS tables: {tables:?}");
@@ -116,7 +149,7 @@ pub fn extract_ad_hashes(
     //   ATTk589984 = lmPwdHistory
 
     // First pass: extract PEK (Password Encryption Key)
-    let (pek, domain_by_sid) = extract_pek_and_domain(&db, &ctx.boot_key)?;
+    let (pek, domain_by_sid) = extract_pek_and_domain(db, &ctx.boot_key)?;
     log::info!("PEK decrypted: {} bytes", pek.len());
     log::info!("NTDS domain SID mappings: {}", domain_by_sid.len());
 

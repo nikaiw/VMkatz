@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 use crate::error::{Result, VmkatzError};
 use crate::utils::{u32_le, u64_le};
 
+mod directory;
+use directory::{DirectoryCache, GrainDirectory};
+
 const VMDK_MAGIC: u32 = 0x564D444B; // "KDMV" LE
 const SECTOR_SIZE: u64 = 512;
+const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 
 /// VMware twoGbMaxExtentSparse VMDK reader with snapshot chain support.
 pub struct VmdkDisk {
@@ -14,6 +18,7 @@ pub struct VmdkDisk {
     disk_size: u64,
     cursor: u64,
     parent: Option<Box<Self>>,
+    gd_cache: DirectoryCache,
     /// Set once a read past an extent's data was zero-filled (truncated image or
     /// I/O error); used to warn a single time instead of silently masking it.
     read_masked: bool,
@@ -26,7 +31,7 @@ struct VmdkExtent {
     // Sparse-only (unused when is_flat=true)
     grain_size: u64,
     num_gtes_per_gt: u32,
-    gd: Vec<u32>,
+    gd: GrainDirectory,
     // Flat-specific: byte offset in the file where disk data starts
     flat_offset: u64,
     is_flat: bool,
@@ -47,13 +52,28 @@ struct DescriptorExtent {
 
 impl VmdkDisk {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_depth(path, 0)
+    }
+
+    fn open_with_depth(path: &Path, depth: u32) -> Result<Self> {
+        super::check_backing_depth(depth)?;
         // Detect whether this is a text descriptor or a binary extent file
         if is_binary_extent(path) {
             return Self::open_from_directory(path);
         }
 
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let desc_text = std::fs::read_to_string(path).map_err(VmkatzError::Io)?;
+        // A flat image reaching this parser must not be read as a multi-TB
+        // text descriptor during recovery. Bound the read itself (TOCTOU-safe).
+        let mut desc_text = String::new();
+        File::open(path)?
+            .take(MAX_DESCRIPTOR_BYTES + 1)
+            .read_to_string(&mut desc_text)?;
+        if desc_text.len() as u64 > MAX_DESCRIPTOR_BYTES {
+            return Err(VmkatzError::DiskFormatError(
+                "VMDK descriptor exceeds 1 MiB".into(),
+            ));
+        }
         let desc = parse_descriptor(&desc_text)?;
 
         let mut extents = Vec::new();
@@ -66,16 +86,18 @@ impl VmdkDisk {
             } else {
                 open_extent(&extent_path, start_sector, de.sectors)?
             };
-            start_sector += ext.capacity;
+            start_sector = start_sector
+                .checked_add(ext.capacity)
+                .ok_or_else(|| VmkatzError::DiskFormatError("VMDK capacity overflow".into()))?;
             extents.push(ext);
         }
 
-        let disk_size = start_sector * SECTOR_SIZE;
+        let disk_size = sector_bytes(start_sector)?;
 
         // Recursively open parent if snapshot
         let parent = if let Some(ref hint) = desc.parent_hint {
             let parent_path = resolve_parent_path(base_dir, hint);
-            Some(Box::new(Self::open(&parent_path)?))
+            Some(Box::new(Self::open_with_depth(&parent_path, depth + 1)?))
         } else {
             None
         };
@@ -85,6 +107,7 @@ impl VmdkDisk {
             disk_size,
             cursor: 0,
             parent,
+            gd_cache: DirectoryCache::default(),
             read_masked: false,
         })
     }
@@ -128,7 +151,13 @@ impl VmdkDisk {
             // Each extent's start_sector = (num - 1) * capacity
             let mut ext = open_extent(path, 0, 0)?;
             capacity_per_extent = ext.capacity;
-            ext.start_sector = (u64::from(*num) - 1) * ext.capacity;
+            ext.start_sector = u64::from(*num)
+                .checked_sub(1)
+                .and_then(|n| n.checked_mul(ext.capacity))
+                .ok_or_else(|| {
+                    VmkatzError::DiskFormatError("Invalid VMDK extent number or capacity".into())
+                })?;
+            sector_bytes(ext.start_sector)?;
             log::info!(
                 "  Extent s{:03}: {} (start_sector={}, capacity={}MB)",
                 num,
@@ -139,7 +168,10 @@ impl VmdkDisk {
             extents.push(ext);
         }
 
-        let disk_size = u64::from(max_num) * capacity_per_extent * SECTOR_SIZE;
+        let disk_size = u64::from(max_num)
+            .checked_mul(capacity_per_extent)
+            .ok_or_else(|| VmkatzError::DiskFormatError("VMDK capacity overflow".into()))
+            .and_then(sector_bytes)?;
         log::info!(
             "Total virtual disk: {}MB ({} of {} extents present, {:.0}% coverage)",
             disk_size / (1024 * 1024),
@@ -153,6 +185,7 @@ impl VmdkDisk {
             disk_size,
             cursor: 0,
             parent: None,
+            gd_cache: DirectoryCache::default(),
             read_masked: false,
         })
     }
@@ -165,8 +198,7 @@ impl VmdkDisk {
             return Ok(0);
         }
 
-        let avail = (self.disk_size - offset) as usize;
-        let to_read = buf.len().min(avail);
+        let to_read = super::read_len(self.disk_size - offset, buf.len());
         if to_read == 0 {
             return Ok(0);
         }
@@ -197,8 +229,7 @@ impl VmdkDisk {
                     } else {
                         self.disk_size
                     };
-                    let gap_remain = (gap_end_byte - pos) as usize;
-                    let chunk = gap_remain.min(to_read - filled);
+                    let chunk = super::read_len(gap_end_byte - pos, to_read - filled);
                     buf[filled..filled + chunk].fill(0);
                     filled += chunk;
                     continue;
@@ -210,8 +241,7 @@ impl VmdkDisk {
                 } else {
                     self.extents[0].start_sector * SECTOR_SIZE
                 };
-                let gap_remain = (gap_end_byte - pos) as usize;
-                let chunk = gap_remain.min(to_read - filled);
+                let chunk = super::read_len(gap_end_byte - pos, to_read - filled);
                 buf[filled..filled + chunk].fill(0);
                 filled += chunk;
                 continue;
@@ -222,7 +252,7 @@ impl VmdkDisk {
             // Flat extent: direct read at file_offset + local_sector * 512 + sector_off
             if ext.is_flat {
                 let remain_in_ext = (ext.capacity - local_sector) * SECTOR_SIZE - sector_off;
-                let chunk = (remain_in_ext as usize).min(to_read - filled);
+                let chunk = super::read_len(remain_in_ext, to_read - filled);
                 let data_off = ext.flat_offset + local_sector * SECTOR_SIZE + sector_off;
                 let read_ok = ext.file.seek(SeekFrom::Start(data_off)).is_ok()
                     && ext
@@ -241,8 +271,8 @@ impl VmdkDisk {
             }
 
             let grain_index = local_sector / ext.grain_size;
-            let gt_index = (grain_index / u64::from(ext.num_gtes_per_gt)) as usize;
-            let gte_index = (grain_index % u64::from(ext.num_gtes_per_gt)) as usize;
+            let gt_index = grain_index / u64::from(ext.num_gtes_per_gt);
+            let gte_index = grain_index % u64::from(ext.num_gtes_per_gt);
 
             // How many bytes remain in this grain from current offset
             let grain_offset = (local_sector % ext.grain_size) * SECTOR_SIZE + sector_off;
@@ -250,24 +280,22 @@ impl VmdkDisk {
             let remain_in_grain = (grain_bytes - grain_offset) as usize;
             let chunk = remain_in_grain.min(to_read - filled);
 
-            let grain_sector = if gt_index < ext.gd.len() {
-                let gt_sector = ext.gd[gt_index];
-                if gt_sector == 0 {
-                    0u32
-                } else {
-                    // Read GTE from grain table
-                    let gt_byte_off = u64::from(gt_sector) * SECTOR_SIZE + gte_index as u64 * 4;
-                    let mut gte_buf = [0u8; 4];
-                    let ok = ext.file.seek(SeekFrom::Start(gt_byte_off)).is_ok()
-                        && ext.file.read_exact(&mut gte_buf).is_ok();
-                    if ok {
-                        u32::from_le_bytes(gte_buf)
-                    } else {
-                        0u32 // Truncated file: treat as unallocated
-                    }
-                }
-            } else {
+            let gt_sector =
+                self.gd_cache
+                    .read_entry(&mut ext.file, ext.gd, candidate_idx - 1, gt_index)?;
+            let grain_sector = if gt_sector == 0 {
                 0u32
+            } else {
+                // Read GTE from grain table
+                let gt_byte_off = u64::from(gt_sector) * SECTOR_SIZE + gte_index * 4;
+                let mut gte_buf = [0u8; 4];
+                let ok = ext.file.seek(SeekFrom::Start(gt_byte_off)).is_ok()
+                    && ext.file.read_exact(&mut gte_buf).is_ok();
+                if ok {
+                    u32::from_le_bytes(gte_buf)
+                } else {
+                    0u32 // Truncated file: treat as unallocated
+                }
             };
 
             if grain_sector != 0 {
@@ -369,11 +397,14 @@ impl VmdkDisk {
 
             let grain_bytes = self.extents[ext_idx].grain_size * SECTOR_SIZE;
             let num_gtes = self.extents[ext_idx].num_gtes_per_gt;
-            let gd_len = self.extents[ext_idx].gd.len();
+            let gd_len = self.extents[ext_idx].gd.entries;
             let start_sector = self.extents[ext_idx].start_sector;
 
             for gd_idx in 0..gd_len {
-                let gt_sector = self.extents[ext_idx].gd[gd_idx];
+                let ext = &mut self.extents[ext_idx];
+                let gt_sector = self
+                    .gd_cache
+                    .read_entry(&mut ext.file, ext.gd, ext_idx, gd_idx)?;
                 if gt_sector == 0 {
                     continue;
                 }
@@ -413,7 +444,7 @@ impl VmdkDisk {
                     }
 
                     // Virtual byte offset = (start_sector + local_grain_index * grain_size) * SECTOR_SIZE
-                    let local_grain = gd_idx as u64 * u64::from(num_gtes) + gte_idx as u64;
+                    let local_grain = gd_idx * u64::from(num_gtes) + gte_idx as u64;
                     let virtual_byte = (start_sector
                         + local_grain * self.extents[ext_idx].grain_size)
                         * SECTOR_SIZE;
@@ -441,19 +472,9 @@ impl Read for VmdkDisk {
 
 impl Seek for VmdkDisk {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p as i64,
-            SeekFrom::Current(p) => self.cursor as i64 + p,
-            SeekFrom::End(p) => self.disk_size as i64 + p,
-        };
-        if new_pos < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-        self.cursor = new_pos as u64;
-        Ok(self.cursor)
+        let target = crate::disk::seek_position(self.cursor, self.disk_size, pos)?;
+        self.cursor = target;
+        Ok(target)
     }
 }
 
@@ -572,16 +593,12 @@ fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Resul
             format!("Invalid VMDK header: grain_size={grain_size}, numGTEsPerGT={num_gtes_per_gt}"),
         )));
     }
+    sector_bytes(capacity)?;
     let total_grains = capacity.div_ceil(grain_size);
-    let gd_entries = total_grains.div_ceil(u64::from(num_gtes_per_gt)) as usize;
+    let gd_entries = total_grains.div_ceil(u64::from(num_gtes_per_gt));
 
-    // Read the entire grain directory. gd_entries derives from the untrusted
-    // capacity, so size the read against the file rather than pre-allocating.
-    let gd_byte_off = gd_offset_sectors * SECTOR_SIZE;
-    file.seek(SeekFrom::Start(gd_byte_off))?;
-    let gd_raw = super::read_exact_alloc(&mut file, (gd_entries as u64).saturating_mul(4))?;
-
-    let gd: Vec<u32> = gd_raw.chunks_exact(4).map(|c| u32_le(c, 0)).collect();
+    let gd_byte_off = sector_bytes(gd_offset_sectors)?;
+    let gd = GrainDirectory::open(&mut file, gd_byte_off, gd_entries)?;
 
     Ok(VmdkExtent {
         file,
@@ -603,6 +620,11 @@ fn open_flat_extent(
     declared_sectors: u64,
     offset_sectors: u64,
 ) -> Result<VmdkExtent> {
+    let extent_bytes = sector_bytes(declared_sectors)?;
+    let flat_offset = sector_bytes(offset_sectors)?;
+    flat_offset
+        .checked_add(extent_bytes)
+        .ok_or_else(|| VmkatzError::DiskFormatError("VMDK flat extent range overflow".into()))?;
     let file = File::open(path).map_err(VmkatzError::Io)?;
     Ok(VmdkExtent {
         file,
@@ -610,9 +632,15 @@ fn open_flat_extent(
         capacity: declared_sectors,
         grain_size: 0,
         num_gtes_per_gt: 0,
-        gd: Vec::new(),
-        flat_offset: offset_sectors * SECTOR_SIZE,
+        gd: GrainDirectory::default(),
+        flat_offset,
         is_flat: true,
+    })
+}
+
+fn sector_bytes(sectors: u64) -> Result<u64> {
+    sectors.checked_mul(SECTOR_SIZE).ok_or_else(|| {
+        VmkatzError::DiskFormatError("VMDK sector offset or capacity overflow".into())
     })
 }
 

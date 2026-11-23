@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use super::table::{Encoding, Table, TableCache};
 use super::{read_u32_le_file, read_u64_le_file};
 use crate::error::{Result, VmkatzError};
 
@@ -59,7 +60,8 @@ pub struct VhdxDisk {
     block_size: u32,
     logical_sector_size: u32,
     chunk_ratio: u64,
-    bat: Vec<u64>,
+    bat: Table,
+    table_cache: TableCache,
     cursor: u64,
     parent: Option<Box<Self>>,
 }
@@ -393,6 +395,11 @@ fn resolve_parent_path(child_path: &Path, parent_ref: &str) -> PathBuf {
 impl VhdxDisk {
     /// Open a VHDX disk image, recursively opening parent for differencing disks.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_depth(path, 0)
+    }
+
+    fn open_with_depth(path: &Path, depth: u32) -> Result<Self> {
+        super::check_backing_depth(depth)?;
         let mut file = File::open(path)?;
 
         // 1. Validate file identifier
@@ -457,19 +464,16 @@ impl VhdxDisk {
         let max_entries_in_region = u64::from(regions.bat_length) / 8;
         let bat_entries_to_read = total_bat_entries.min(max_entries_in_region);
 
-        // 6. Read BAT
-        file.seek(SeekFrom::Start(regions.bat_offset))?;
-        let mut bat =
-            Vec::with_capacity((bat_entries_to_read as usize).min(super::MAX_BAT_PREALLOC));
-        for _ in 0..bat_entries_to_read {
-            bat.push(read_u64_le_file(&mut file)?);
-        }
+        // 6. Validate the BAT range; entries are read on demand.
+        let bat = Table::open(
+            &mut file,
+            regions.bat_offset,
+            bat_entries_to_read,
+            Encoding::Le64,
+        )?;
 
         log::debug!(
-            "VHDX: {} data blocks, chunk_ratio={}, {} BAT entries loaded",
-            data_blocks_count,
-            chunk_ratio,
-            bat.len(),
+            "VHDX: {data_blocks_count} data blocks, chunk_ratio={chunk_ratio}, {bat_entries_to_read} BAT entries"
         );
 
         // 7. Open parent for differencing disks. A differencing disk only stores
@@ -481,7 +485,7 @@ impl VhdxDisk {
                     let parent_path = resolve_parent_path(path, &parent_ref);
                     log::info!("VHDX: differencing disk, parent: {}", parent_path.display());
                     if parent_path.exists() {
-                        Some(Box::new(Self::open(&parent_path)?))
+                        Some(Box::new(Self::open_with_depth(&parent_path, depth + 1)?))
                     } else {
                         return Err(VmkatzError::DiskFormatError(format!(
                             "VHDX differencing disk requires its parent, not found: {}",
@@ -511,6 +515,7 @@ impl VhdxDisk {
             logical_sector_size: metadata.logical_sector_size,
             chunk_ratio,
             bat,
+            table_cache: TableCache::default(),
             cursor: 0,
             parent,
         })
@@ -525,11 +530,10 @@ impl VhdxDisk {
     ) -> std::io::Result<usize> {
         // Compute BAT index (payload entries are interleaved with sector bitmap entries)
         let bat_index = block_index + (block_index / self.chunk_ratio);
-        let entry = if (bat_index as usize) < self.bat.len() {
-            self.bat[bat_index as usize]
-        } else {
-            0 // treat out-of-range as NOT_PRESENT
-        };
+        let entry = self
+            .table_cache
+            .read(&mut self.file, self.bat, bat_index)?
+            .unwrap_or(0); // treat out-of-range as NOT_PRESENT
 
         let state = (entry & 0x7) as u8;
         let file_offset = entry & 0xFFFF_FFFF_FFF0_0000;
@@ -579,11 +583,10 @@ impl VhdxDisk {
         let chunk_index = block_index / self.chunk_ratio;
         let sb_bat_index = chunk_index * (self.chunk_ratio + 1) + self.chunk_ratio;
 
-        let sb_entry = if (sb_bat_index as usize) < self.bat.len() {
-            self.bat[sb_bat_index as usize]
-        } else {
-            0
-        };
+        let sb_entry = self
+            .table_cache
+            .read(&mut self.file, self.bat, sb_bat_index)?
+            .unwrap_or(0);
 
         let sb_state = (sb_entry & 0x7) as u8;
         let sb_file_offset = sb_entry & 0xFFFF_FFFF_FFF0_0000;
@@ -653,8 +656,7 @@ impl Read for VhdxDisk {
             return Ok(0);
         }
 
-        let remaining = (self.disk_size - self.cursor) as usize;
-        let to_read = buf.len().min(remaining);
+        let to_read = crate::disk::read_len(self.disk_size - self.cursor, buf.len());
         if to_read == 0 {
             return Ok(0);
         }
@@ -683,19 +685,9 @@ impl Read for VhdxDisk {
 
 impl Seek for VhdxDisk {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = match pos {
-            SeekFrom::Start(offset) => offset as i64,
-            SeekFrom::End(offset) => self.disk_size as i64 + offset,
-            SeekFrom::Current(offset) => self.cursor as i64 + offset,
-        };
-        if new_pos < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "seek to negative position",
-            ));
-        }
-        self.cursor = new_pos as u64;
-        Ok(self.cursor)
+        let target = crate::disk::seek_position(self.cursor, self.disk_size, pos)?;
+        self.cursor = target;
+        Ok(target)
     }
 }
 

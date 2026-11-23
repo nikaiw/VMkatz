@@ -1,8 +1,8 @@
 pub mod entry;
 pub mod ept;
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub mod filebacked;
-#[cfg(feature = "sam")]
+#[cfg(feature = "disk")]
 pub mod pagefile;
 #[cfg(feature = "chrome")]
 pub mod regions;

@@ -15,6 +15,10 @@ use crate::windows::peb::LoadedModule;
 
 /// IMAGE_SCN_MEM_WRITE — skip writable sections (in-memory content differs from disk).
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
+const MAX_SECTION_BYTES: usize = 128 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests;
 
 /// Pre-read DLL section mapped to a virtual address range.
 struct BackedSection {
@@ -41,6 +45,7 @@ impl FileBackedResolver {
             match Self::try_load_from_partition(&mut disk, partition_offset, modules, &mut sections)
             {
                 Ok(()) => break,
+                Err(e) if e.is_resource_limit() => return Err(e),
                 Err(e) => {
                     log::debug!("File-backed: partition 0x{partition_offset:x}: {e}");
                 }
@@ -83,7 +88,12 @@ impl FileBackedResolver {
             }
 
             match crate::fs::find_entry(&ntfs, &sys32, &mut part_reader, dll_name) {
-                Ok(file) => match Self::read_pe_sections(&file, &mut part_reader, module.base) {
+                Ok(file) => match Self::read_pe_sections(
+                    &file,
+                    &mut part_reader,
+                    module.base,
+                    MAX_SECTION_BYTES - sections.iter().map(|s| s.data.len()).sum::<usize>(),
+                ) {
                     Ok(secs) => {
                         let bytes: usize = secs.iter().map(|s| s.data.len()).sum();
                         log::debug!(
@@ -96,6 +106,7 @@ impl FileBackedResolver {
                         loaded_count += 1;
                         sections.extend(secs);
                     }
+                    Err(e) if e.is_resource_limit() => return Err(e),
                     Err(e) => {
                         log::debug!("File-backed: {dll_name} PE parse: {e}");
                     }
@@ -115,85 +126,85 @@ impl FileBackedResolver {
         }
     }
 
-    /// Read PE file from NTFS and extract non-writable section data.
+    /// Read only PE headers and retained sections, sharing a budget across DLLs.
     fn read_pe_sections<R: Read + Seek>(
         file: &ntfs::NtfsFile,
         reader: &mut R,
         module_base: u64,
+        budget: usize,
     ) -> Result<Vec<BackedSection>> {
-        let pe_data = crate::fs::read_file_data(file, reader)?;
-        Self::parse_pe_sections(&pe_data, module_base)
+        crate::fs::with_file_data(file, reader, |stream, len| {
+            let mut stream = crate::fs::ntfs::ResilientReader::new(stream, len);
+            Self::read_sections(&mut stream, len, module_base, budget)
+        })
     }
 
-    /// Parse PE headers, return non-writable sections mapped to module_base.
-    fn parse_pe_sections(pe_data: &[u8], module_base: u64) -> Result<Vec<BackedSection>> {
-        if pe_data.len() < 0x40 {
-            return Err(VmkatzError::DecryptionError("PE too small".to_string()));
+    fn read_sections<R: Read + Seek>(
+        reader: &mut R,
+        len: u64,
+        module_base: u64,
+        mut budget: usize,
+    ) -> Result<Vec<BackedSection>> {
+        use std::io::SeekFrom;
+        let mut dos = [0; 64];
+        reader.seek(SeekFrom::Start(0))?;
+        reader.read_exact(&mut dos)?;
+        if u16_le(&dos, 0) != 0x5A4D {
+            return Err(VmkatzError::DecryptionError("Not a PE (no MZ)".into()));
         }
-
-        // DOS header
-        if u16::from_le_bytes([pe_data[0], pe_data[1]]) != 0x5A4D {
-            return Err(VmkatzError::DecryptionError("Not a PE (no MZ)".to_string()));
+        let pe_offset = u64::from(u32_le(&dos, 0x3C));
+        if pe_offset + 24 > len {
+            return Err(VmkatzError::DecryptionError("Invalid e_lfanew".into()));
         }
-        let e_lfanew = u32_le(pe_data, 0x3C) as usize;
-        if e_lfanew + 24 > pe_data.len() {
-            return Err(VmkatzError::DecryptionError("Invalid e_lfanew".to_string()));
+        let mut header = [0; 24];
+        reader.seek(SeekFrom::Start(pe_offset))?;
+        reader.read_exact(&mut header)?;
+        if u32_le(&header, 0) != 0x0000_4550 {
+            return Err(VmkatzError::DecryptionError("Invalid PE signature".into()));
         }
-
-        // PE signature
-        if u32_le(pe_data, e_lfanew) != 0x0000_4550 {
-            return Err(VmkatzError::DecryptionError(
-                "Invalid PE signature".to_string(),
-            ));
-        }
-
-        // COFF header
-        let num_sections = u16_le(pe_data, e_lfanew + 6) as usize;
-        let opt_hdr_size = u16_le(pe_data, e_lfanew + 20) as usize;
-
-        let section_table = e_lfanew + 24 + opt_hdr_size;
+        let count = u64::from(u16_le(&header, 6));
+        let section_table = pe_offset + 24 + u64::from(u16_le(&header, 20));
         let mut sections = Vec::new();
-
-        for i in 0..num_sections {
-            let off = section_table + i * 40;
-            if off + 40 > pe_data.len() {
+        for i in 0..count {
+            let offset = section_table + i * 40;
+            if offset + 40 > len {
                 break;
             }
-
-            let virt_size = u32_le(pe_data, off + 8) as usize;
-            let virt_addr = u64::from(u32_le(pe_data, off + 12));
-            let raw_size = u32_le(pe_data, off + 16) as usize;
-            let raw_offset = u32_le(pe_data, off + 20) as usize;
-            let characteristics = u32_le(pe_data, off + 36);
-
-            // Skip writable sections (in-memory content modified by process)
-            if characteristics & SCN_MEM_WRITE != 0 {
+            let mut section = [0; 40];
+            reader.seek(SeekFrom::Start(offset))?;
+            reader.read_exact(&mut section)?;
+            if u32_le(&section, 36) & SCN_MEM_WRITE != 0 {
                 continue;
             }
-            if raw_size == 0 || raw_offset == 0 || virt_size == 0 {
+            let virt_size = u64::from(u32_le(&section, 8));
+            let raw_size = u64::from(u32_le(&section, 16));
+            let raw_offset = u64::from(u32_le(&section, 20));
+            if virt_size == 0 || raw_size == 0 || raw_offset == 0 || raw_offset + raw_size > len {
                 continue;
             }
-            // VirtualSize is only file-bounded via raw_size; cap the padded
-            // allocation at 256 MiB so a crafted PE section can't request ~4 GB.
-            if virt_size > 256 * 1024 * 1024 {
-                continue;
+            let padded = (virt_size + 0xFFF) & !0xFFF;
+            if padded > budget as u64 {
+                return Err(VmkatzError::AllocTooLarge {
+                    what: "file-backed DLL sections",
+                    requested: usize::try_from(padded).unwrap_or(usize::MAX),
+                    limit: budget,
+                });
             }
-            if raw_offset.saturating_add(raw_size) > pe_data.len() {
-                continue;
-            }
-
-            // Copy raw data, page-aligned to VirtualSize
-            let copy_size = std::cmp::min(raw_size, virt_size);
-            let padded_size = (virt_size + 0xFFF) & !0xFFF;
-            let mut data = vec![0u8; padded_size];
-            data[..copy_size].copy_from_slice(&pe_data[raw_offset..raw_offset + copy_size]);
-
-            sections.push(BackedSection {
-                va_start: module_base + virt_addr,
-                data,
-            });
+            let va_start = module_base
+                .checked_add(u64::from(u32_le(&section, 12)))
+                .filter(|start| start.checked_add(padded).is_some())
+                .ok_or_else(|| {
+                    VmkatzError::DecryptionError("PE section address overflow".into())
+                })?;
+            let mut data = crate::utils::zeroed_buffer(padded as usize)?;
+            reader.seek(SeekFrom::Start(raw_offset))?;
+            reader.read_exact(&mut data[..raw_size.min(virt_size) as usize])?;
+            budget -= data.len();
+            sections
+                .try_reserve(1)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+            sections.push(BackedSection { va_start, data });
         }
-
         Ok(sections)
     }
 

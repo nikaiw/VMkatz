@@ -1,32 +1,24 @@
 pub mod bootkey;
 pub mod cache;
 pub mod cm_hive;
-mod credhist;
-mod credman_blob;
-mod credman_disk;
 mod disk_fallbacks;
 pub mod hashes;
 pub mod hive;
-pub mod listing;
+pub use crate::fs::listing;
 pub mod lsa;
 pub mod mem_hive;
-mod ntfs_fallback;
+use crate::fs::recovery;
+mod ntds_stream;
 mod ntfs_reader;
-mod vault;
+mod security;
+pub use ntds_stream::{NtdsReadResult, with_ntds_bootkey};
+use security::process_security_hive;
+
 mod vmdk_scan;
 
-pub use credman_blob::{CredAttribute, CredmanEntry, parse_credential_blob};
-pub use credman_disk::{
-    AttrInfo, CredmanReport, ProfileCred, Secret, SecretTable, Undecrypted, build_secret_table,
-    extract_credman_from_reader_scoped, machine_sid_from_user_sid,
-};
 pub use listing::{ListOutcome, list_path};
-pub use vault::{VaultKeys, parse_vault_keys, parse_vpol};
 
-pub mod aes_xts;
-pub mod bitlocker_decrypt;
-pub mod dpapi_blob;
-pub mod dpapi_masterkey;
+pub use crate::disk::{aes_xts, bitlocker_decrypt};
 
 use crate::fs::{find_ntfs_partitions, is_bitlocker_partition, select_partition};
 use std::io::{Read, Seek};
@@ -37,97 +29,7 @@ use crate::error::Result;
 /// SAM + SYSTEM + optional SECURITY hive file data.
 type HiveFiles = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
 
-/// NTDS + SYSTEM files extracted from a disk image.
-#[derive(Debug)]
-pub struct NtdsArtifacts {
-    pub ntds_data: Vec<u8>,
-    pub system_data: Vec<u8>,
-    pub partition_offset: u64,
-}
-
-/// A SAM user entry with RID, username, and NT/LM hashes.
-#[derive(Debug)]
-pub struct SamEntry {
-    pub rid: u32,
-    pub username: String,
-    pub nt_hash: [u8; 16],
-    pub lm_hash: [u8; 16],
-    /// Account Control Bits from per-user F value (offset 0x38).
-    pub acb_flags: u32,
-}
-
-// Account Control Bit flags (from SAM per-user F value).
-impl SamEntry {
-    /// Account is disabled (ACB_DISABLED).
-    pub const fn is_disabled(&self) -> bool {
-        self.acb_flags & 0x0001 != 0
-    }
-
-    /// Password not required (ACB_PWNOTREQ).
-    pub const fn password_not_required(&self) -> bool {
-        self.acb_flags & 0x0004 != 0
-    }
-}
-
-/// Combined extraction result: SAM hashes + LSA secrets + cached credentials.
-#[derive(Debug, Default)]
-pub struct DiskSecrets {
-    pub sam_entries: Vec<SamEntry>,
-    pub lsa_secrets: Vec<lsa::LsaSecret>,
-    pub cached_credentials: Vec<cache::CachedCredential>,
-    /// Account-domain (machine) SID from `SAM\Domains\Account\V`, if parsed.
-    pub machine_sid: Option<String>,
-}
-
-/// Extract DPAPI master key hashes from a disk image.
-///
-/// Scans user profiles for encrypted master key files and returns
-/// Hashcat-compatible hashes (modes 15300/15900).
-pub fn extract_dpapi_masterkeys(path: &Path) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
-    extract_dpapi_masterkeys_scoped(path, None)
-}
-
-/// DPAPI master-key scan restricted to one partition when `partition_filter` is `Some`.
-///
-/// Keeps `--partition` consistent across SAM, NTDS and DPAPI; `None` scans every NTFS
-/// partition (the unchanged default used by `extract_dpapi_masterkeys`).
-pub fn extract_dpapi_masterkeys_scoped(
-    path: &Path,
-    partition_filter: Option<u64>,
-) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
-    match crate::disk::open_disk(path) {
-        Ok(mut disk) => extract_dpapi_masterkeys_from_reader(&mut disk, partition_filter),
-        Err(e) => {
-            log::info!("Cannot open disk for DPAPI scan: {e}");
-            Vec::new()
-        }
-    }
-}
-
-/// Reader-based DPAPI master key extraction, optionally scoped to one NTFS
-/// partition offset. Usable by VMFS mode, which has a reader but no path.
-pub fn extract_dpapi_masterkeys_from_reader<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-    partition_filter: Option<u64>,
-) -> Vec<dpapi_masterkey::DpapiMasterKeyHash> {
-    dpapi_masterkey::extract_from_disk_scoped(reader, partition_filter)
-}
-
-/// Extract NTDS artifacts (NTDS.dit + SYSTEM hive) from a disk image.
-///
-/// This is the input set required by offline AD secrets extraction workflows.
-pub fn extract_ntds_artifacts(path: &Path) -> Result<NtdsArtifacts> {
-    extract_ntds_artifacts_scoped(path, None)
-}
-
-/// Like [`extract_ntds_artifacts`], restricted to the NTFS partition at `partition_filter`.
-pub fn extract_ntds_artifacts_scoped(
-    path: &Path,
-    partition_filter: Option<u64>,
-) -> Result<NtdsArtifacts> {
-    let mut disk = crate::disk::open_disk(path)?;
-    extract_ntds_artifacts_from_reader_scoped(&mut disk, partition_filter)
-}
+pub use crate::secrets::{DiskSecrets, SamEntry};
 
 /// Extract secrets from a disk, trying FVEK keys for BitLocker partitions.
 ///
@@ -161,33 +63,6 @@ pub fn extract_disk_secrets_from_reader_with_bitlocker<R: Read + Seek>(
     extract_secrets_with_bitlocker(reader, fvek_keys, partition_filter)
 }
 
-/// Extract NTDS artifacts from a disk, trying FVEK keys for BitLocker partitions.
-pub fn extract_ntds_artifacts_with_bitlocker(
-    path: &Path,
-    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
-) -> Result<NtdsArtifacts> {
-    extract_ntds_artifacts_with_bitlocker_scoped(path, fvek_keys, None)
-}
-
-/// Like [`extract_ntds_artifacts_with_bitlocker`], restricted to one partition offset.
-pub fn extract_ntds_artifacts_with_bitlocker_scoped(
-    path: &Path,
-    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
-    partition_filter: Option<u64>,
-) -> Result<NtdsArtifacts> {
-    let mut disk = crate::disk::open_disk(path)?;
-    extract_ntds_with_bitlocker(&mut disk, fvek_keys, partition_filter)
-}
-
-/// Reader-based BitLocker-aware NTDS extraction, usable by VMFS-backed disks.
-pub fn extract_ntds_artifacts_from_reader_with_bitlocker<R: Read + Seek>(
-    reader: &mut R,
-    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
-    partition_filter: Option<u64>,
-) -> Result<NtdsArtifacts> {
-    extract_ntds_with_bitlocker(reader, fvek_keys, partition_filter)
-}
-
 /// Core BitLocker-aware extraction for SAM/LSA secrets.
 fn extract_secrets_with_bitlocker<R: Read + Seek>(
     reader: &mut R,
@@ -200,10 +75,9 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
         // Try unencrypted first
         if !is_bitlocker_partition(reader, partition_offset) {
             log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
-            match ntfs_reader::read_hive_files(reader, partition_offset) {
-                Ok((sam_data, system_data, security_data)) => {
-                    return process_hive_data(&sam_data, &system_data, security_data.as_deref());
-                }
+            match ntfs_reader::read_secrets(reader, partition_offset) {
+                Ok(parsed) => return parsed,
+                Err(e) if e.is_resource_limit() => return Err(e),
                 Err(e) => {
                     log::info!("Partition at 0x{partition_offset:x}: {e}");
                 }
@@ -222,73 +96,15 @@ fn extract_secrets_with_bitlocker<R: Read + Seek>(
             reader,
             partition_offset,
             fvek_keys,
-            |bl_reader, _offset| {
-                ntfs_reader::read_hive_files(bl_reader, 0)
-                    .and_then(|(sam, sys, sec)| process_hive_data(&sam, &sys, sec.as_deref()))
-            },
-        ) {
-            return Ok(secrets);
+            |bl_reader, _offset| ntfs_reader::read_secrets(bl_reader, 0),
+        )? {
+            return secrets;
         }
     }
 
     Err(crate::error::VmkatzError::DecryptionError(
         "No secrets found (BitLocker-aware scan exhausted all partitions and FVEK candidates)"
             .to_string(),
-    ))
-}
-
-/// Core BitLocker-aware extraction for NTDS artifacts.
-fn extract_ntds_with_bitlocker<R: Read + Seek>(
-    reader: &mut R,
-    fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
-    partition_filter: Option<u64>,
-) -> Result<NtdsArtifacts> {
-    let partitions = select_partition(find_ntfs_partitions(reader)?, partition_filter)?;
-
-    for &partition_offset in &partitions {
-        if !is_bitlocker_partition(reader, partition_offset) {
-            log::info!("Trying NTDS on NTFS partition at offset 0x{partition_offset:x}");
-            match ntfs_reader::read_ntds_artifacts(reader, partition_offset) {
-                Ok((ntds_data, system_data)) => {
-                    return Ok(NtdsArtifacts {
-                        ntds_data,
-                        system_data,
-                        partition_offset,
-                    });
-                }
-                Err(e) => {
-                    log::info!("Partition at 0x{partition_offset:x}: {e}");
-                }
-            }
-            continue;
-        }
-
-        log::info!(
-            "BitLocker partition at 0x{:x} — trying {} FVEK candidate(s) for NTDS",
-            partition_offset,
-            fvek_keys.len()
-        );
-
-        if let Some(artifacts) = try_bitlocker_fvek_candidates(
-            reader,
-            partition_offset,
-            fvek_keys,
-            |bl_reader, part_off| {
-                ntfs_reader::read_ntds_artifacts(bl_reader, 0).map(|(ntds_data, system_data)| {
-                    NtdsArtifacts {
-                        ntds_data,
-                        system_data,
-                        partition_offset: part_off,
-                    }
-                })
-            },
-        ) {
-            return Ok(artifacts);
-        }
-    }
-
-    Err(crate::error::VmkatzError::DecryptionError(
-        "NTDS.dit not found (BitLocker-aware scan exhausted)".to_string(),
     ))
 }
 
@@ -302,7 +118,7 @@ fn try_bitlocker_fvek_candidates<R, T, F>(
     partition_offset: u64,
     fvek_keys: &[crate::lsass::bitlocker::BitLockerKey],
     extract_fn: F,
-) -> Option<T>
+) -> Result<Option<T>>
 where
     R: Read + Seek,
     F: Fn(&mut bitlocker_decrypt::BitLockerReader<&mut R>, u64) -> Result<T>,
@@ -346,14 +162,15 @@ where
             bitlocker_decrypt::BitLockerReader::new(&mut *reader, partition_offset, xts_key);
 
         match extract_fn(&mut bl_reader, partition_offset) {
-            Ok(result) => return Some(result),
+            Ok(result) => return Ok(Some(result)),
+            Err(e) if e.is_resource_limit() => return Err(e),
             Err(e) => {
                 log::warn!("BitLocker: FVEK #{i} decrypted NTFS header but extraction failed: {e}");
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Extract both SAM hashes and LSA secrets from a disk image.
@@ -368,9 +185,21 @@ pub fn extract_disk_secrets_scoped(
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
     let mut disk = crate::disk::open_disk(path)?;
+    // Do not turn an unsupported/Linux disk into a raw recovery scan.
+    find_ntfs_partitions(&mut disk)?;
     match extract_secrets_from_reader_scoped(&mut disk, partition_filter) {
         Ok(secrets) => return Ok(secrets),
-        Err(e) if partition_filter.is_some() => return Err(e),
+        Err(e)
+            if partition_filter.is_some()
+                || e.is_resource_limit()
+                || matches!(
+                    e,
+                    crate::error::VmkatzError::RecoveryLimit(_)
+                        | crate::error::VmkatzError::NtfsEntryNotFound(_)
+                ) =>
+        {
+            return Err(e);
+        }
         Err(e) => {
             log::info!("Standard extraction failed: {e}");
         }
@@ -385,6 +214,7 @@ pub fn extract_disk_secrets_scoped(
         .unwrap_or("")
         .to_lowercase();
     if ext == "vmdk" && partition_filter.is_none() {
+        recovery::check_raw_size(disk.disk_size())?;
         log::info!("Trying VMDK grain-direct scan for registry hives");
         let mut vmdk = crate::disk::vmdk::VmdkDisk::open(path)?;
         match vmdk_scan::scan_vmdk_grains_for_hives(&mut vmdk) {
@@ -419,10 +249,7 @@ pub fn extract_secrets_ntfs_only_scoped<R: Read + Seek>(
     reader: &mut R,
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(
-        find_ntfs_partitions(reader).unwrap_or_default(),
-        partition_filter,
-    )?;
+    let partitions = select_partition(find_ntfs_partitions(reader)?, partition_filter)?;
     let mut bitlocker_found = false;
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
@@ -431,10 +258,9 @@ pub fn extract_secrets_ntfs_only_scoped<R: Read + Seek>(
             continue;
         }
         log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
-        match ntfs_reader::read_hive_files(reader, partition_offset) {
-            Ok((sam_data, system_data, security_data)) => {
-                return process_hive_data(&sam_data, &system_data, security_data.as_deref());
-            }
+        match ntfs_reader::read_secrets(reader, partition_offset) {
+            Ok(parsed) => return parsed,
+            Err(e) if e.is_resource_limit() => return Err(e),
             Err(e) => {
                 log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
@@ -461,11 +287,9 @@ pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
     reader: &mut R,
     partition_filter: Option<u64>,
 ) -> Result<DiskSecrets> {
-    let partitions = select_partition(
-        find_ntfs_partitions(reader).unwrap_or_default(),
-        partition_filter,
-    )?;
+    let partitions = select_partition(find_ntfs_partitions(reader)?, partition_filter)?;
     let mut bitlocker_found = false;
+    let mut damaged = false;
 
     for &partition_offset in &partitions {
         if is_bitlocker_partition(reader, partition_offset) {
@@ -474,11 +298,12 @@ pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
             continue;
         }
         log::info!("Trying NTFS partition at offset 0x{partition_offset:x}");
-        match ntfs_reader::read_hive_files(reader, partition_offset) {
-            Ok((sam_data, system_data, security_data)) => {
-                return process_hive_data(&sam_data, &system_data, security_data.as_deref());
-            }
+        match ntfs_reader::read_secrets(reader, partition_offset) {
+            Ok(parsed) => return parsed,
+            Err(e) if e.is_resource_limit() => return Err(e),
+            Err(crate::error::VmkatzError::NtfsEntryNotFound(_)) => {}
             Err(e) => {
+                damaged = true;
                 log::info!("Partition at 0x{partition_offset:x}: {e}");
             }
         }
@@ -496,12 +321,25 @@ pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
         });
     }
 
+    if bitlocker_found {
+        return Err(crate::error::VmkatzError::DecryptionError(
+            "BitLocker-encrypted volume; raw recovery skipped".into(),
+        ));
+    }
+    if !damaged {
+        return Err(crate::error::VmkatzError::NtfsEntryNotFound(
+            "registry hives on readable partitions".into(),
+        ));
+    }
+    recovery::check_raw_size(reader.seek(std::io::SeekFrom::End(0))?)?;
+
     // Fallback 1: scan raw disk for "regf" hive signatures (contiguous hives).
     log::info!("NTFS approach failed, trying raw regf scan fallback");
     match disk_fallbacks::scan_for_hives(reader) {
         Ok((sam_data, system_data, security_data)) => {
             return process_hive_data(&sam_data, &system_data, security_data.as_deref());
         }
+        Err(e) if e.is_resource_limit() => return Err(e),
         Err(e) => {
             log::info!("Raw regf scan failed: {e}");
         }
@@ -526,53 +364,6 @@ pub fn extract_secrets_from_reader_scoped<R: Read + Seek>(
             }
         }
     }
-}
-
-/// Extract NTDS artifacts from any Read+Seek source.
-pub fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
-    extract_ntds_artifacts_from_reader_scoped(reader, None)
-}
-
-/// Like [`extract_ntds_artifacts_from_reader`], restricted to one partition offset.
-pub fn extract_ntds_artifacts_from_reader_scoped<R: Read + Seek>(
-    reader: &mut R,
-    partition_filter: Option<u64>,
-) -> Result<NtdsArtifacts> {
-    let partitions = select_partition(
-        find_ntfs_partitions(reader).unwrap_or_default(),
-        partition_filter,
-    )?;
-    let mut bitlocker_found = false;
-
-    for &partition_offset in &partitions {
-        if is_bitlocker_partition(reader, partition_offset) {
-            log::warn!("Partition at offset 0x{partition_offset:x} is BitLocker-encrypted");
-            bitlocker_found = true;
-            continue;
-        }
-        log::info!("Trying NTDS extraction on NTFS partition at offset 0x{partition_offset:x}");
-        match ntfs_reader::read_ntds_artifacts(reader, partition_offset) {
-            Ok((ntds_data, system_data)) => {
-                return Ok(NtdsArtifacts {
-                    ntds_data,
-                    system_data,
-                    partition_offset,
-                });
-            }
-            Err(e) => {
-                log::info!("Partition at 0x{partition_offset:x}: {e}");
-            }
-        }
-    }
-
-    if bitlocker_found {
-        return Err(crate::error::VmkatzError::DecryptionError(
-            "Windows partition is BitLocker-encrypted. Provide the recovery key or extract the VMK from memory first.".to_string(),
-        ));
-    }
-    Err(crate::error::VmkatzError::DecryptionError(
-        "NTDS.dit not found on readable NTFS partitions".to_string(),
-    ))
 }
 
 /// Process extracted hive data into DiskSecrets.

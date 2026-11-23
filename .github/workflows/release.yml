@@ -143,7 +143,7 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           case "$TAG" in
-            *-beta*|*-alpha*|*-rc*)
+            *-dev*|*-beta*|*-alpha*|*-rc*)
               echo "Prerelease tag $TAG — allowed from any branch (e.g. dev)."
               exit 0
               ;;
@@ -152,7 +152,7 @@ jobs:
           if git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
             echo "Stable tag $TAG is on main — OK."
           else
-            echo "::error::Stable tag $TAG is not on main. Cut stable releases from main; tag dev builds as -beta/-rc."
+            echo "::error::Stable tag $TAG is not on main. Cut stable releases from main; tag dev builds as -dev/-alpha/-beta/-rc."
             exit 1
           fi
 
@@ -168,13 +168,13 @@ jobs:
         id: changelog
         run: |
           CURRENT_TAG="${{ github.ref_name }}"
-          # If the current tag is a prerelease (rc/beta/alpha), include previous
+          # If the current tag is a prerelease (dev/alpha/beta/rc), include previous
           # prereleases in the history. Otherwise, skip prereleases so the
           # changelog for a final release spans back to the last stable tag.
-          if echo "$CURRENT_TAG" | grep -qE -- "-(beta|alpha|rc)"; then
+          if echo "$CURRENT_TAG" | grep -qE -- "-(dev|alpha|beta|rc)"; then
             PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
           else
-            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | grep -v -E -- "-(beta|alpha|rc)" | head -1)
+            PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | grep -v -E -- "-(dev|alpha|beta|rc)" | head -1)
           fi
           if [ -z "$PREV_TAG" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
@@ -187,7 +187,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(github.ref_name, '-dev') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
           body_path: CHANGELOG.md
           files: |
             vmkatz-*

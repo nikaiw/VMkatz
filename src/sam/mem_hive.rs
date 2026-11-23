@@ -116,6 +116,15 @@ fn scan_memory(phys: &impl PhysicalMemory) -> (Vec<HiveLoc>, Vec<Hbin>, Vec<NkAn
     // Prefer the layer's parallel sweep (VMRS decompresses each block on its own
     // core); fall back to a sequential 1 MB read sweep for flat/mmap layers.
     if !phys.par_scan(&collect) {
+        locs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        bins.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        lsa.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let ps = phys.phys_size();
         let mut buf = vec![0u8; 1024 * 1024];
         let mut base = 0u64;
@@ -1043,6 +1052,38 @@ fn hive_key(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequential_retry_discards_partial_parallel_results() {
+        struct IncompleteScan([u8; 12288]);
+        impl PhysicalMemory for IncompleteScan {
+            fn read_phys(&self, gpa: u64, buf: &mut [u8]) -> crate::error::Result<()> {
+                assert_eq!(gpa, 0);
+                buf.copy_from_slice(&self.0[..buf.len()]);
+                Ok(())
+            }
+            fn phys_size(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn par_scan(&self, f: &(dyn Fn(u64, &[u8]) -> bool + Sync)) -> bool {
+                f(0, &self.0);
+                false
+            }
+        }
+        let mut memory = IncompleteScan([0; 12288]);
+        memory.0[..4].copy_from_slice(b"regf");
+        memory.0[0x28..0x2C].copy_from_slice(&4096u32.to_le_bytes());
+        memory.0[0x30..0x36].copy_from_slice(b"S\0A\0M\0");
+        memory.0[4096..4100].copy_from_slice(b"hbin");
+        memory.0[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+        let nk = &mut memory.0[8192..];
+        nk[..2].copy_from_slice(b"nk");
+        nk[0x14..0x18].copy_from_slice(&4u32.to_le_bytes());
+        nk[0x48..0x4A].copy_from_slice(&3u16.to_le_bytes());
+        nk[0x4C..0x4F].copy_from_slice(b"Lsa");
+        let (locs, bins, anchors) = scan_memory(&memory);
+        assert_eq!((locs.len(), bins.len(), anchors.len()), (1, 1, 1));
+    }
 
     fn dpapi_secret(version: u32) -> LsaSecret {
         let mut raw = vec![0u8; 44];

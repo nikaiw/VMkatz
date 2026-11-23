@@ -42,6 +42,21 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 | Hyper-V | Windows Server 2012 R2 x64 | SAM / LSA / DCC2 (`.vhdx`) | PASS | |
 | Hyper-V | Windows Server 2003 R2 x64 | SAM / LSA (`.vhdx`) | PASS | |
 
+## 1.6.0-dev.1 validation (2026-11-23)
+
+The default x86_64 musl build was exercised on ESXi 8.0.2 and Proxmox VE 9.1.1, using existing disks and captures without changing VM state.
+
+| Host | Checks | Result |
+| --- | --- | --- |
+| ESXi, VMFS-5 dense sub-blocks | Enumerate VMDKs, list/copy NTFS files, SAM, NTDS | PASS; 20 VMDKs found, 12 NTDS accounts |
+| ESXi, archived Windows 7 snapshot | LSASS from embedded `.vmsn` memory | PASS |
+| Proxmox, live Server 2025 LVM disk | List/copy NTFS files, refuse overwrite, SAM, NTDS | PASS; 54 NTDS accounts |
+| Proxmox, Server 2016 / Windows x86 / Windows 11 captures | LSASS from raw memory | PASS; CSV output identical to published dev commit `2d8c2a6` (1.5.2) |
+
+Explicit VMFS selections without an NTFS/BitLocker volume fail promptly, including the Linux test disk. Tests enforce timeouts and sample memory with a 1 GiB stop threshold. Proxmox peak RSS stayed below 100 MiB; ESXi's largest sampled memory accounting value was about 529 MiB (not an RSS measurement). No test hit either threshold.
+
+This host run does not validate a real 8 TiB image or revalidate VirtualBox, Hyper-V and QEMU savevm captures. Synthetic large-image and malformed-input cases remain covered by the local test suite; these results are not a global memory bound.
+
 ## Known limitations
 
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works.

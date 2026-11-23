@@ -64,6 +64,10 @@ pub const fn is_valid_user_ptr(ptr: u64, arch: Arch) -> bool {
 /// Format a SID from its raw bytes: 8-byte header + sub-authority data.
 /// SID header: Revision(1) + SubAuthorityCount(1) + IdentifierAuthority(6).
 /// Sub-authority data: SubAuthorityCount × u32 LE values.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "formatting primitive and string values into String is infallible"
+)]
 pub(super) fn format_sid_from_bytes(header: &[u8], sub_data: &[u8]) -> String {
     if header.len() < 8 {
         return String::new();
@@ -84,7 +88,7 @@ pub(super) fn format_sid_from_bytes(header: &[u8], sub_data: &[u8]) -> String {
             sub_data[i * 4 + 2],
             sub_data[i * 4 + 3],
         ]);
-        write!(s, "-{sub}").ok();
+        let _ = write!(s, "-{sub}");
     }
     s
 }

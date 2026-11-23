@@ -66,7 +66,7 @@ pub fn read_cng_ksp_files<R: Read + Seek>(ntfs: &ntfs::Ntfs, reader: &mut R) -> 
             let Ok(file) = crate::fs::find_entry(ntfs, &d, reader, &name) else {
                 continue;
             };
-            let Ok(bytes) = crate::fs::read_file_data(&file, reader) else {
+            let Ok(bytes) = crate::fs::read_file_data_bounded(&file, reader, MAX_FILE_LEN) else {
                 continue;
             };
             if bytes.len() <= MAX_FILE_LEN && find_dpapi_blobs(&bytes).next().is_some() {

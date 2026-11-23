@@ -83,6 +83,130 @@ resolver. A running guest can update files during the scan, so the result is
 not an atomic point-in-time image; use a Proxmox snapshot when consistency is
 required.
 
+## Listing and copying disk files
+
+```sh
+vmkatz --ls '\Windows\System32\config' disk.vmdk
+vmkatz --cp '\Windows\NTDS\ntds.dit' ./ntds.dit disk.vmdk
+```
+
+`--cp` and the `extract_file ... get` helper stream the NTFS data with a 64 KiB
+copy buffer, including files larger than 2 GiB. The destination must not already
+exist; files and symlinks are never overwritten. A read/write error or premature
+end of the NTFS stream fails the copy and removes its incomplete output. These
+copy operations do not use the NTFS registry-recovery zero-fill fallback; the
+underlying disk-format readers retain their own sparse/damaged-image behaviour.
+
+## Large disks and damaged NTFS volumes
+
+Disk extraction requires an NTFS or BitLocker volume signature in the boot
+sector. A Linux-only MBR/GPT disk is rejected without scanning its contents;
+VMFS enumeration skips it before opening associated memory snapshots. A readable
+NTFS index reporting a missing Windows path does not trigger raw recovery.
+
+Snapshot parent chains are limited to 64 parent levels across VMDK, VDI, VHD,
+VHDX and QCOW2. A longer chain or cycle is rejected instead of recursing without
+a limit.
+
+Sparse VMDK grain directories are read on demand through **four 4 KiB windows
+per snapshot level** (16 KiB of cached data), shared across that level's extents.
+The windows are allocated on first use and replaced in FIFO order. Opening an
+8 TiB disk does not load its entire grain directory into RAM. Truncated directory ranges are
+rejected before reading; parent paths and locator metadata fields are limited
+to **1 MiB each**. These limits cover disk metadata, not all extraction buffers.
+
+VDI, VHD, VHDX and QCOW2 allocation tables are also read on demand, through
+sixteen 4 KiB windows (**64 KiB of cached table data per disk in a parent chain**).
+QCOW2 L1 and L2 tables share that cache, including images with 16 MiB clusters.
+Table ranges are checked before use; neither table size nor virtual disk capacity
+causes a full-table allocation. These readers use ordinary file I/O and do not
+require `mmap`.
+
+Automatic recovery has fixed limits:
+
+- Whole-disk regf/hbin and VMDK grain recovery is disabled above **1 GiB of
+  virtual capacity**, including sparse images. Normal NTFS lookup still works
+  on larger disks.
+- An MFT fallback scan visits at most **64 MiB or 65,536 records** per invocation,
+  shared across retries and path components for directory listings. It checks
+  a **30-second deadline** between batches. Failed reads count toward the budget.
+- Recovered files and the scattered-hive block collection are capped at
+  **64 MiB** each; listing and VMDK signature collections are capped at
+  **65,536 candidates**. These are recovery limits, not a process-wide RAM limit.
+- Exceeding a budget reports `Recovery stopped`; an incomplete directory scan
+  is not reported as an empty or successful listing. A recovered NTDS database
+  larger than 64 MiB is refused; normal NTFS file reads use their existing limits.
+
+These bounds reduce automatic recovery work but can leave files unrecovered on
+damaged images, especially when the boot sector itself is missing. They do not
+throttle storage traffic or interrupt a kernel read blocked on storage. Use a
+consistent copy and external resource limits when analysing production data.
+
+Hyper-V VMRS retains at most **128 MiB of RAM-block data** in its cache, reduced
+when the host reports less available memory. Parallel scans share that budget
+between retained blocks, decompression buffers and the stacks of at most eight
+workers. The old cache is released before scanning; warming it never raises its
+limit. Metadata has separate bounds: **262,144 object entries**, a **32 MiB**
+key budget (including estimated allocation overhead), **4 KiB** key paths,
+**64** nested tables and **1,000,000** traversal steps. KeyTables use a **64 KiB**
+read buffer; their declared size no longer causes a complete allocation.
+Parallel jobs are generated on demand, including sparse high block indices.
+Sweep buffers and callback allocations are outside the RAM-cache budget.
+
+VirtualBox `.sav` reads guest RAM on demand; it does not keep a decompressed
+copy or write one to a temporary file. Its LZF cache holds at most **16 records**
+(**255 KiB** each), plus a transient compressed record of at most **2 MiB**.
+Logical-to-file checkpoints use at most **1 MiB**; spacing starts at **8 MiB**
+and widens for very large streams. Random reads may scan intervening record
+headers and decompress a cache miss; sequential reads reuse the current record.
+SSM strings are limited to **1 MiB**.
+
+VirtualBox and QEMU savevm group consecutive page mappings into runs with a
+constant offset stride. Their index is limited to **131,072 runs** (under
+**16 MiB** on 64-bit targets), with space reserved for splitting updates.
+This bounds fragmentation rather than guest RAM size: very fragmented snapshots
+can return a metadata-budget error. QEMU also limits RAM-block declarations to
+**65,536**. It still requires a whole-file virtual `mmap` for stream parsing;
+its virtual address reservation is not covered by the index budget. Existing
+pread fallbacks for other readers, including older ESXi hosts, are preserved.
+
+NTDS extraction reads ESE pages directly from NTFS, including sparse/fragmented
+files and BitLocker readers. Raw NTDS files use the same seekable reader; neither
+path requires `mmap` or a complete database buffer. The page cache retains at
+most **512 KiB**. Visited-page bitmaps allocate only reached ranges, with an
+**8 MiB** limit per traversal; pending page pointers are capped at **4 MiB**.
+Catalog records and each resolved long value have **16 MiB** payload limits.
+
+SAM, SYSTEM and SECURITY are read sequentially through **64 KiB windows**,
+with at most **512 KiB cached per hive**. Their combined file size is no longer
+limited to 128 MiB on normal NTFS or raw-file CLI paths. NTDS keeps only the
+bootkey after processing SYSTEM. The registry parser bounds individual cell/value
+reads and retained subkey enumeration at **16 MiB**, and list traversal at
+**65,536 lists**. Disconnected SYSTEM-cell recovery stops after **64 MiB** of
+scan range, **1,048,576 attempts**, or **30 seconds**; normal indexed lookups
+can reach cells anywhere in a large hive.
+
+Generic complete NTFS reads remain capped at **128 MiB per file**. For NTDS,
+use `with_ntds_bootkey` to stream both NTDS and SYSTEM. Its `output` result
+carries SYSTEM/parser errors separately from filesystem lookup failures. `NtdsContext::ntds_size`
+and `NtdsReadResult::system_size` use `u64`. `--cp` remains streamed.
+The buffered `extract_ntds_artifacts*` and `with_ntds_artifacts` APIs and
+`NtdsArtifacts` have been removed in favour of `with_ntds_bootkey`.
+DLL page recovery reads only PE headers and retained sections, sharing a
+**128 MiB** section budget across modules instead of loading complete DLLs.
+
+Browser databases and WAL files still use buffered reads, limited to **128 MiB
+per file**; a resource refusal is reported as an error, not an absent profile.
+Several profiles can retain multiple buffers. The optional Veeam `diskfs`
+library interface buffers files up to **512 MiB** and rejects larger files;
+the CLI uses `VbkDisk` with the generic NTFS streaming readers instead.
+
+These hive readers need no file-backed `mmap`, including on older ESXi hosts.
+The existing `pread` fallback remains available to other readers. Minidumps
+still need contiguous bytes and can use substantial RAM when mapping fails.
+Extracted results and other consumers may retain their own buffers: these are
+component limits, not a process-wide memory guarantee.
+
 ## Pagefile resolution
 ```
 $ vmkatz --disk disk.vmdk snapshot.vmsn
