@@ -3,7 +3,6 @@
 use std::io;
 
 pub fn child(name: &str) -> io::Result<bool> {
-    #[cfg(target_os = "linux")]
     if std::env::var_os("VMKATZ_SNAPSHOT_TEST_CHILD").is_none() {
         use std::os::unix::process::CommandExt as _;
         let mut command = std::process::Command::new(std::env::current_exe()?);
@@ -25,12 +24,9 @@ pub fn child(name: &str) -> io::Result<bool> {
         }
         return Ok(true);
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = name;
     Ok(false)
 }
 
-#[cfg(target_os = "linux")]
 fn restrict_memory() -> io::Result<()> {
     for (resource, bytes) in [(libc::RLIMIT_AS, 64 * 1024 * 1024), (libc::RLIMIT_CORE, 0)] {
         let limit = libc::rlimit {

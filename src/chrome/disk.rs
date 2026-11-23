@@ -299,8 +299,7 @@ fn extract_cookies(
             .iter()
             .filter_map(Value::as_text)
             .find(|s| s.contains('.'))
-            .map(str::to_string)
-            .unwrap_or_default();
+            .map_or_else(String::new, str::to_string);
         let path = cols
             .iter()
             .filter_map(Value::as_text)

@@ -3,6 +3,7 @@ use crate::memory::page_index::PageLocation;
 
 #[test]
 fn sixty_four_gib_index_fits_in_64_mib() -> Result<()> {
+    #[cfg(target_os = "linux")]
     if crate::memory::test_limit::child(
         "qemu::savevm::stream::tests::sixty_four_gib_index_fits_in_64_mib",
     )? {

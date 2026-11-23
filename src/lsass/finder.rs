@@ -2017,8 +2017,7 @@ fn extract_kdc_krbtgt(vmem: &dyn VirtualMemory, kdc_base: u64, build: u32) -> Op
         let name = vmem
             .read_virt_bytes(name_ptr, name_len)
             .ok()
-            .map(|b| crate::utils::utf16le_decode(&b))
-            .unwrap_or_default();
+            .map_or_else(String::new, |b| crate::utils::utf16le_decode(&b));
         if !name.eq_ignore_ascii_case("krbtgt") {
             continue;
         }

@@ -4,5 +4,9 @@ pub use reader::{PhysicalMemory, VirtualMemory};
 #[cfg(any(feature = "vbox", feature = "qemu"))]
 pub(crate) mod page_index;
 
-#[cfg(all(test, any(feature = "vbox", feature = "qemu", feature = "hyperv")))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "vbox", feature = "qemu", feature = "hyperv")
+))]
 pub(crate) mod test_limit;

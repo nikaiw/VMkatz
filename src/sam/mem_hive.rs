@@ -904,8 +904,7 @@ fn subkey_list_entries(
 fn nk_name(nk: &[u8]) -> String {
     let nl = u16_le_or0(nk, 0x48) as usize;
     nk.get(0x4C..0x4C + nl)
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default()
+        .map_or_else(String::new, |b| String::from_utf8_lossy(b).into_owned())
 }
 
 /// All (cell payload, cell GPA) pairs at a hive-relative offset, one per run that

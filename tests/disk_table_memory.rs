@@ -312,8 +312,8 @@ fn limit_memory() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn child_test(name: &str) -> anyhow::Result<bool> {
-    #[cfg(target_os = "linux")]
     if std::env::var_os("VMKATZ_TABLE_MEMORY_CHILD").is_none() {
         use std::os::unix::process::CommandExt as _;
         let mut command = std::process::Command::new(std::env::current_exe()?);
@@ -332,13 +332,12 @@ fn child_test(name: &str) -> anyhow::Result<bool> {
         );
         return Ok(true);
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = name;
     Ok(false)
 }
 
 #[test]
 fn large_disk_tables_fit_in_a_bounded_process() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     if child_test("large_disk_tables_fit_in_a_bounded_process")? {
         return Ok(());
     }
@@ -380,6 +379,7 @@ fn large_disk_tables_fit_in_a_bounded_process() -> anyhow::Result<()> {
 
 #[test]
 fn qcow_large_l2_tables_share_a_bounded_cache() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     if child_test("qcow_large_l2_tables_share_a_bounded_cache")? {
         return Ok(());
     }
@@ -394,6 +394,7 @@ fn qcow_large_l2_tables_share_a_bounded_cache() -> anyhow::Result<()> {
 
 #[test]
 fn deep_qcow_backing_chain_keeps_table_buffers_off_the_stack() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     if child_test("deep_qcow_backing_chain_keeps_table_buffers_off_the_stack")? {
         return Ok(());
     }

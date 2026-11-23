@@ -265,7 +265,7 @@ pub(crate) fn list_index<'n, R: Read + Seek>(
             }
         };
         entries.push(DirEntry {
-            name: key.name().to_string_lossy().clone(),
+            name: key.name().to_string_lossy(),
             kind,
         });
     }

@@ -66,8 +66,7 @@ pub fn run_veeam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     for entry in &disks {
         let size_note = entry
             .size
-            .map(|s| format!(" ({})", veeam_human_size(s)))
-            .unwrap_or_default();
+            .map_or_else(String::new, |s| format!(" ({})", veeam_human_size(s)));
         eprintln!(
             "\n{}=== disk image: {}{}{}",
             c.green, entry.name, size_note, c.reset

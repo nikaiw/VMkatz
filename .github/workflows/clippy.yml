@@ -15,6 +15,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,27 +26,23 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        # Pinned: floating @stable pulls new clippy lints that break the deny-gate.
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: 1.98.1
-          components: clippy, rustfmt
-          # Windows std: cfg(windows) breakage used to surface only at release time.
-          # The -gnu target stands in for -msvc here (same cfg(windows) code paths)
-          # because mingw can build the C deps on an ubuntu runner, msvc can't.
-          targets: x86_64-pc-windows-gnu
+          persist-credentials: false
+
+      - name: Install project toolchain and Windows target
+        run: |
+          rustc --version --verbose
+          rustup target add x86_64-pc-windows-gnu
 
       - name: Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
       - name: Install mingw + wine (Windows cross-check)
         run: |
@@ -67,10 +66,10 @@ jobs:
           exit 1
 
       - name: Clippy (Windows target)
-        run: cargo clippy --all-features --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       - name: Rustdoc
         run: make doc-check
@@ -85,7 +84,7 @@ jobs:
           WINEDEBUG: -all
           WINEDLLOVERRIDES: mscoree=d;mshtml=d
         run: >
-          cargo test --all-features --target x86_64-pc-windows-gnu
+          cargo test --locked --all-features --target x86_64-pc-windows-gnu
           --test memory_limits --test positioned_read
 
   # Feature powerset clippy (-D warnings) in its own job: isolated features and pairs, slow on a cold runner.
@@ -94,35 +93,64 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: 1.98.1
-          components: clippy
+          persist-credentials: false
+
+      - name: Install project toolchain
+        run: rustc --version --verbose
 
       - name: Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-hack
 
       - name: Feature matrix
         run: make check-features
+
+  binary-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install project toolchain and musl target
+        run: |
+          rustc --version --verbose
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Check musl release binary size
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl --bin vmkatz
+          bash .github/check-binary-size.sh x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/release/vmkatz
 
   deps:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install project toolchain
+        run: rustc --version --verbose
+
+      - name: Install dependency checks
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny,cargo-machete
 
       - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
-
-      - name: Install cargo-machete
-        uses: taiki-e/install-action@cargo-machete
+        run: cargo deny --locked --all-features check
 
       - name: Unused dependencies
         run: cargo machete

@@ -796,8 +796,8 @@ fn extract_active_logon_credentials(
                 results.push((
                     luid,
                     MsvCredential {
-                        username: username.clone(),
-                        domain: domain.clone(),
+                        username,
+                        domain,
                         lm_hash: cred.lm_hash,
                         nt_hash: cred.nt_hash,
                         sha1_hash: cred.sha1_hash,
@@ -1339,8 +1339,8 @@ fn walk_msv_list(
                     results.push((
                         luid,
                         MsvCredential {
-                            username: username.clone(),
-                            domain: domain.clone(),
+                            username,
+                            domain,
                             lm_hash: cred.lm_hash,
                             nt_hash: cred.nt_hash,
                             sha1_hash: cred.sha1_hash,
@@ -1833,8 +1833,8 @@ fn walk_hash_table(
                             results.push((
                                 luid,
                                 MsvCredential {
-                                    username: username.clone(),
-                                    domain: domain.clone(),
+                                    username,
+                                    domain,
                                     lm_hash: cred.lm_hash,
                                     nt_hash: cred.nt_hash,
                                     sha1_hash: cred.sha1_hash,

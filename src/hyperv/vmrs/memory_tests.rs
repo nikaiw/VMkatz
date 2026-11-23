@@ -209,6 +209,7 @@ fn table(offset: u64, size: u32) -> ObjectTableEntry {
 
 #[test]
 fn large_nested_key_tables_stream_under_64_mib_and_reject_cycles() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     if crate::memory::test_limit::child(
         "hyperv::vmrs::memory_tests::large_nested_key_tables_stream_under_64_mib_and_reject_cycles",
     )? {

@@ -32,6 +32,7 @@
 
 ### Maintenance
 
+- Pin Rust 1.100.0 for local builds, CI and releases. Update GitHub Actions and check the default x86_64 musl executable against a 4 MiB budget.
 - Clarify CLI/reader organization and the architecture guide; strengthen Clippy, feature-matrix and regression checks. Publish `-dev` tags as prereleases.
 
 ## v1.5.2

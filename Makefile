@@ -11,19 +11,19 @@ default: release
 
 .PHONY: release
 release:
-	cargo build --release
+	cargo build --locked --release --bin $(BINARY_NAME)
 	@cp $(TARGET_DIR)/release/$(BINARY_NAME) ./$(BINARY_NAME)
 	@echo "[+] Built: ./$(BINARY_NAME) ($$(du -h ./$(BINARY_NAME) | cut -f1))"
 
 .PHONY: release-musl
 release-musl:
-	RUSTUP_HOME=$(CURDIR)/.rustup cargo build --release --target $(MUSL_TARGET)
+	cargo build --locked --release --bin $(BINARY_NAME) --target $(MUSL_TARGET)
 	@cp $(TARGET_DIR)/$(MUSL_TARGET)/release/$(BINARY_NAME) ./$(BINARY_NAME)-musl
 	@echo "[+] Built: ./$(BINARY_NAME)-musl ($$(du -h ./$(BINARY_NAME)-musl | cut -f1))"
 
 .PHONY: release-minimal
 release-minimal:
-	cargo build --release --no-default-features --features vmware
+	cargo build --locked --release --bin $(BINARY_NAME) --no-default-features --features vmware
 	@cp $(TARGET_DIR)/release/$(BINARY_NAME) ./$(BINARY_NAME)-minimal
 	@echo "[+] Built: ./$(BINARY_NAME)-minimal ($$(du -h ./$(BINARY_NAME)-minimal | cut -f1))"
 

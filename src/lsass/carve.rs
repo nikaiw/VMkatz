@@ -1103,10 +1103,7 @@ fn validate_first_block(decrypted: &[u8]) -> bool {
     }
     // Buffer should be a valid user-mode pointer
     let buf_ptr = super::types::read_u64_le(decrypted, 8).unwrap_or(0);
-    if !(0x10000..0x0000_8000_0000_0000).contains(&buf_ptr) {
-        return false;
-    }
-    true
+    (0x10000..0x0000_8000_0000_0000).contains(&buf_ptr)
 }
 
 /// Read encrypted blob via DTB-based VA→PA translation only.

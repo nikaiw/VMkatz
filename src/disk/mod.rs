@@ -91,7 +91,7 @@ mod metadata_tests {
         let mut input = Cursor::new([0xAB; 512]);
         assert_eq!(read_exact_alloc(&mut input, 512)?, [0xAB; 512]);
         assert_eq!(input.position(), 512);
-        assert!(read_exact_alloc(&mut input, 0)?.is_empty());
+        assert_eq!(read_exact_alloc(&mut input, 0)?, [] as [u8; 0]);
         assert_eq!(
             read_exact_alloc(&mut input, 1).unwrap_err().kind(),
             ErrorKind::UnexpectedEof

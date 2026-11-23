@@ -666,10 +666,7 @@ pub fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
     }
     // key data at +0x34: first 16 bytes shouldn't be all zero
     let key_start = &page[off + 0x34..off + 0x34 + 16];
-    if key_start.iter().all(|&b| b == 0) {
-        return false;
-    }
-    true
+    !key_start.iter().all(|&b| b == 0)
 }
 
 /// Validate GUID bytes from a candidate DPAPI entry.

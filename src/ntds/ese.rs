@@ -559,7 +559,7 @@ impl<'a> EseDb<'a> {
 
                     let col = EseColumn {
                         id,
-                        name: name.clone(),
+                        name,
                         col_type,
                         offset: col_offset,
                         size: if is_fixed { fsize as u16 } else { col_size },

@@ -401,8 +401,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         let sid = profile
             .protect
             .first()
-            .map(|p| p.sid.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |p| p.sid.clone());
         report.undecrypted.push(Undecrypted {
             profile: profile.name.clone(),
             sid,
@@ -529,8 +528,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         let default_sid = prof
             .protect
             .first()
-            .map(|p| p.sid.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |p| p.sid.clone());
         let mut last = (
             default_sid,
             format!("masterkey {guid} not found in Protect folders"),
@@ -734,8 +732,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         let sid0 = prof
             .protect
             .first()
-            .map(|p| p.sid.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |p| p.sid.clone());
         let raw = self
             .read(dir, "Policy.vpol")
             .map_err(|e| (sid0.clone(), format!("Policy.vpol read: {e}")))?;
@@ -759,8 +756,7 @@ impl<R: Read + Seek> Walker<'_, '_, R> {
         let sid0 = prof
             .protect
             .first()
-            .map(|p| p.sid.clone())
-            .unwrap_or_default();
+            .map_or_else(String::new, |p| p.sid.clone());
         let raw = self
             .read(dir, fname)
             .map_err(|e| (sid0.clone(), e.to_string()))?;

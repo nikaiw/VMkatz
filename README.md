@@ -11,7 +11,7 @@ You are three weeks into a red team engagement. You land on a NAS attached to th
 
 VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows credentials directly from VM files — memory snapshots, virtual disks, Veeam backups: NTLM hashes, Kerberos tickets, DPAPI master keys, LSA secrets, NTDS.dit, BitLocker keys, browser secrets.
 
-Single static binary, ~3 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a VM folder and walk away with credentials, not disk images.
+The default static x86_64 musl binary fits within 4 MiB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a VM folder and walk away with credentials, not disk images.
 
 ## What It Extracts
 
@@ -310,7 +310,9 @@ See [docs/esxi.md](docs/esxi.md) for VIB bypass details, VMFS raw device access,
 
 ## Build Features
 
-VMkatz is modular. Features can be enabled/disabled at compile time:
+Rustup selects the compiler pinned in `rust-toolchain.toml` for local builds, CI and releases. CI checks the default x86_64 musl executable against a 4 MiB limit before packaging. Release jobs report executable sizes for each target.
+
+Features can be enabled or disabled at compile time:
 
 | Feature | Description | Default |
 | --- | --- | --- |

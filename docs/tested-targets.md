@@ -44,7 +44,7 @@ Tested across 7 Windows versions and 5 hypervisors/platforms.
 
 ## 1.6.0-dev.1 validation (2026-11-23)
 
-The default x86_64 musl build was exercised on ESXi 8.0.2 and Proxmox VE 9.1.1, using existing disks and captures without changing VM state.
+The default x86_64 musl build from Rust 1.99.1 was exercised on ESXi 8.0.2 and Proxmox VE 9.1.1, using existing disks and captures without changing VM state.
 
 | Host | Checks | Result |
 | --- | --- | --- |
@@ -56,6 +56,8 @@ The default x86_64 musl build was exercised on ESXi 8.0.2 and Proxmox VE 9.1.1, 
 Explicit VMFS selections without an NTFS/BitLocker volume fail promptly, including the Linux test disk. Tests enforce timeouts and sample memory with a 1 GiB stop threshold. Proxmox peak RSS stayed below 100 MiB; ESXi's largest sampled memory accounting value was about 529 MiB (not an RSS measurement). No test hit either threshold.
 
 This host run does not validate a real 8 TiB image or revalidate VirtualBox, Hyper-V and QEMU savevm captures. Synthetic large-image and malformed-input cases remain covered by the local test suite; these results are not a global memory bound.
+
+After the Rust 1.100.0 update, the same two hosts ran the default musl binary against a synthetic NTFS disk. Both listed the fixture, copied its contents byte for byte and refused to overwrite the destination. With the same features and target, the executable measured 3,945,736 bytes at `opt-level="z"` and 4,289,800 bytes at `"s"`. The earlier Rust 1.99.1 executable measured 3,953,920 bytes.
 
 ## Known limitations
 

@@ -112,6 +112,7 @@ fn corrupt_record_lengths_and_strings_return_errors() -> io::Result<()> {
 #[test]
 fn large_saved_state_fits_in_64_mib() -> anyhow::Result<()> {
     use crate::memory::PhysicalMemory as _;
+    #[cfg(target_os = "linux")]
     if crate::memory::test_limit::child(
         "vbox::layer::ssm::tests::large_saved_state_fits_in_64_mib",
     )? {

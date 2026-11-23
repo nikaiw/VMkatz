@@ -6,7 +6,7 @@ VMkatz compiles to a static musl binary that runs directly on ESXi without depen
 # Cross-compile for ESXi (musl static)
 cargo build --release --target x86_64-unknown-linux-musl
 
-# Upload (~3 MB)
+# Upload the static binary
 scp target/x86_64-unknown-linux-musl/release/vmkatz root@esxi:/tmp/
 
 # On ESXi 8.0+, allow non-VIB binaries (requires once)
